@@ -6,6 +6,7 @@ from playwright.async_api import Locator, Page
 from .conversation import ConversationClient, conversation_id_from_url, extract_dataset_messages, is_complete
 from .exceptions import AuthenticationRequired, ChatGPTUIError, CompletionTimeout
 from .models import BenchmarkTask, CapturedConversation
+from .uploads import build_file_payloads
 
 PROMPT_SELECTORS = (
     "#prompt-textarea",
@@ -75,7 +76,8 @@ class ChatGPTClient:
             file_input = self._page.locator('input[type="file"]')
         if await file_input.count() == 0:
             raise ChatGPTUIError("file upload input not found")
-        await file_input.last.set_input_files([str(p) for p in attachments])
+        payloads = build_file_payloads(attachments)
+        await file_input.last.set_input_files(payloads)
         if self._upload_settle:
             await asyncio.sleep(self._upload_settle)
 

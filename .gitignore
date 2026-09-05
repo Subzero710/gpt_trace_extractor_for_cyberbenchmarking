@@ -11,3 +11,4 @@ build/
 state/
 exports/*.jsonl
 .DS_Store
+.idea/
