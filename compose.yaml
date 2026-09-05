@@ -1,0 +1,86 @@
+name: gpt-trace-extractor
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gpt_traces}
+      POSTGRES_USER: ${POSTGRES_USER:-gpt_traces}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gpt_traces} -d ${POSTGRES_DB:-gpt_traces}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  storage:
+    build: ./apps/storage
+    environment:
+      STORAGE_DATABASE_URL: ${STORAGE_DATABASE_URL:-postgresql+psycopg://gpt_traces:change-me@postgres:5432/gpt_traces}
+      STORAGE_HOST: 0.0.0.0
+      STORAGE_PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  browser:
+    build: ./infra/browser
+    environment:
+      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
+      DISPLAY: :99
+    volumes:
+      - browser_profile:/profile
+    ports:
+      - "127.0.0.1:9222:9222"
+      - "127.0.0.1:${BROWSER_NOVNC_PORT:-7900}:7900"
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9222/json/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  runner:
+    build: ./apps/runner
+    environment:
+      STORAGE_BASE_URL: ${STORAGE_BASE_URL:-http://storage:8080}
+      BROWSER_CDP_URL: ${BROWSER_CDP_URL:-http://browser:9222?fingerprint=710}
+      BROWSER_NOVNC_URL: http://localhost:${BROWSER_NOVNC_PORT:-7900}/vnc.html?autoconnect=1&resize=scale
+      CHATGPT_BASE_URL: ${CHATGPT_BASE_URL:-https://chatgpt.com}
+      CHATGPT_CONVERSATION_TURNS: ${CHATGPT_CONVERSATION_TURNS:-100}
+      CHATGPT_POLL_INTERVAL_SECONDS: ${CHATGPT_POLL_INTERVAL_SECONDS:-2}
+      CHATGPT_COMPLETION_TIMEOUT_SECONDS: ${CHATGPT_COMPLETION_TIMEOUT_SECONDS:-1800}
+      CHATGPT_STABLE_POLLS: ${CHATGPT_STABLE_POLLS:-2}
+      CHATGPT_UPLOAD_SETTLE_SECONDS: ${CHATGPT_UPLOAD_SETTLE_SECONDS:-2}
+      RUNNER_ID: ${RUNNER_ID:-}
+      RUNNER_INTER_TASK_DELAY_SECONDS: ${RUNNER_INTER_TASK_DELAY_SECONDS:-3}
+      RUNNER_RECOVER_EXISTING: ${RUNNER_RECOVER_EXISTING:-true}
+    volumes:
+      - ./benchmarks:/data/benchmarks:ro
+      - ./tasks:/data/tasks:ro
+      - ./exports:/data/exports
+    depends_on:
+      storage:
+        condition: service_healthy
+      browser:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+volumes:
+  postgres_data:
+  browser_profile:
