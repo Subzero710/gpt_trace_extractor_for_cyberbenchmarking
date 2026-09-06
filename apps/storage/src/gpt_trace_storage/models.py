@@ -34,6 +34,10 @@ class Run(Base):
         String(255),
         nullable=True,
     )
+    task_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     attempt: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

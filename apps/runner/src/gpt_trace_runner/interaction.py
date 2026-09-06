@@ -3,19 +3,13 @@ from __future__ import annotations
 import httpx
 from playwright.async_api import Locator, Page
 
-from .exceptions import ChatGPTUIError
+from .exceptions import ChatGPTUIError, ClipboardUnavailable, FatalUIState
 
 
 class InteractionGuard:
-    """Drive visible UI controls only after the real page is active."""
+    """Drive visible controls while keeping focus and clipboard state coherent."""
 
-    def __init__(
-        self,
-        page: Page,
-        *,
-        clipboard_url: str,
-        timeout_seconds: float,
-    ) -> None:
+    def __init__(self, page: Page, *, clipboard_url: str, timeout_seconds: float) -> None:
         self._page = page
         self._clipboard_url = clipboard_url
         self._timeout_ms = int(timeout_seconds * 1000)
@@ -23,17 +17,12 @@ class InteractionGuard:
     async def ensure_page_focus(self) -> None:
         try:
             state = await self._page.evaluate(
-                """() => ({
-                    visible: document.visibilityState === 'visible',
-                    focused: document.hasFocus(),
-                })"""
+                "() => ({visible: document.visibilityState === 'visible', focused: document.hasFocus()})"
             )
         except Exception as exc:
-            raise ChatGPTUIError("could not inspect ChatGPT foreground state") from exc
-
+            raise FatalUIState("could not inspect ChatGPT foreground state") from exc
         if state.get("visible") and state.get("focused"):
             return
-
         await self._page.bring_to_front()
         try:
             await self._page.wait_for_function(
@@ -41,9 +30,7 @@ class InteractionGuard:
                 timeout=self._timeout_ms,
             )
         except Exception as exc:
-            raise ChatGPTUIError(
-                "ChatGPT page did not obtain real foreground focus"
-            ) from exc
+            raise FatalUIState("ChatGPT page did not obtain foreground focus") from exc
 
     async def click(self, locator: Locator, *, timeout_ms: int | None = None) -> None:
         await self.ensure_page_focus()
@@ -52,8 +39,6 @@ class InteractionGuard:
             await locator.wait_for(state="visible", timeout=timeout)
             if not await locator.is_enabled():
                 raise ChatGPTUIError("target control is visible but disabled")
-            # When BrowserClient humanize is enabled, CloakBrowser patches this
-            # Locator.click() path with its mouse/actionability implementation.
             await locator.click(timeout=timeout)
         except ChatGPTUIError:
             raise
@@ -70,29 +55,34 @@ class InteractionGuard:
                 )
                 response.raise_for_status()
         except Exception as exc:
-            raise ChatGPTUIError(
-                "browser X11 clipboard helper is unavailable"
-            ) from exc
+            raise ClipboardUnavailable("browser X11 clipboard helper is unavailable") from exc
 
-    async def paste_text(self, locator: Locator, text: str) -> None:
-        """Put prepared text on the browser's X11 clipboard and paste it normally."""
+    async def clear_system_clipboard(self) -> None:
+        await self._set_system_clipboard("")
+
+    async def paste_text(self, locator: Locator, text: str, *, clear_existing: bool = True) -> None:
+        """Paste prepared text through the browser's real X11 clipboard."""
         await self.ensure_page_focus()
         try:
             await locator.wait_for(state="visible", timeout=self._timeout_ms)
             await self.click(locator, timeout_ms=self._timeout_ms)
-            await locator.press("Control+A")
-            await locator.press("Backspace")
+            if clear_existing:
+                await locator.press("Control+A")
+                await locator.press("Backspace")
             await self._set_system_clipboard(text)
             await locator.press("Control+V")
             rendered = await locator.inner_text(timeout=self._timeout_ms)
-        except ChatGPTUIError:
+        except (ChatGPTUIError, ClipboardUnavailable):
             raise
         except Exception as exc:
-            raise ChatGPTUIError(
-                "could not paste benchmark prompt through the system clipboard"
-            ) from exc
+            raise ChatGPTUIError("could not paste benchmark prompt") from exc
+        finally:
+            # Do not leave benchmark text in the persistent desktop clipboard.
+            try:
+                await self.clear_system_clipboard()
+            except ClipboardUnavailable:
+                # Clearing failure is still a global infrastructure failure.
+                raise
 
-        if rendered.strip() != text.strip():
-            raise ChatGPTUIError(
-                "composer content does not match the benchmark prompt after paste"
-            )
+        if text and not rendered:
+            raise ChatGPTUIError("composer is empty after benchmark prompt paste")

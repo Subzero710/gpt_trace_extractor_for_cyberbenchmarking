@@ -10,6 +10,10 @@ class BrowserConnectionError(BatchCircuitBreaker):
     pass
 
 
+class BrowserIdentityError(BatchCircuitBreaker):
+    pass
+
+
 class AuthenticationRequired(BatchCircuitBreaker):
     pass
 
@@ -34,11 +38,31 @@ class ConcurrentTurnError(BatchCircuitBreaker):
     pass
 
 
+class ConcurrentRunnerError(BatchCircuitBreaker):
+    pass
+
+
+class ClipboardUnavailable(BatchCircuitBreaker):
+    pass
+
+
+class FatalUIState(BatchCircuitBreaker):
+    pass
+
+
+class EnvironmentDrift(BatchCircuitBreaker):
+    pass
+
+
+class ModelMismatch(BatchCircuitBreaker):
+    pass
+
+
 class ChatGPTUIError(TraceRunnerError):
     pass
 
 
-class ConversationError(TraceRunnerError):
+class ConversationError(BatchCircuitBreaker):
     pass
 
 
@@ -74,9 +98,17 @@ class RequiredToolNotUsed(TraceRunnerError):
     pass
 
 
+class AppUnavailable(TraceRunnerError):
+    """Task-specific requested App is not available/confirmable in the UI."""
+
+
 class BenchmarkError(TraceRunnerError):
     pass
 
 
 class StorageError(BatchCircuitBreaker):
+    pass
+
+
+class StorageConflict(StorageError):
     pass

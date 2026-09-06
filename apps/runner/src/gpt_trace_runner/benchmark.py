@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from .exceptions import BenchmarkError
 from .models import BenchmarkTask, BenchmarkTool
+
+MAX_PROMPT_BYTES = 8 * 1024 * 1024
 
 
 def _resolve_attachment(
@@ -72,6 +75,8 @@ def _parse_tool(
         )
     if not name:
         raise BenchmarkError(f"{manifest}:{line_number}: tool name is required")
+    if len(name) > 255:
+        raise BenchmarkError(f"{manifest}:{line_number}: tool name is too long")
 
     return BenchmarkTool(type="app", name=name, required=required)
 
@@ -103,17 +108,33 @@ def load_benchmark(
             if not isinstance(item, dict):
                 raise BenchmarkError(f"{path}:{line_number}: expected object")
 
-            task_id = str(item.get("task_id", "")).strip()
-            prompt = str(item.get("prompt", "")).strip()
+            task_id_value = item.get("task_id")
+            if not isinstance(task_id_value, str):
+                raise BenchmarkError(f"{path}:{line_number}: task_id must be a string")
+            task_id = task_id_value.strip()
+            prompt_value = item.get("prompt")
+            if not isinstance(prompt_value, str):
+                raise BenchmarkError(f"{path}:{line_number}: prompt must be a string")
+            prompt = prompt_value
 
             if not task_id:
                 raise BenchmarkError(f"{path}:{line_number}: missing task_id")
+            if task_id in {".", ".."}:
+                raise BenchmarkError(f"{path}:{line_number}: reserved task_id {task_id!r}")
+            if not re.fullmatch(r"[A-Za-z0-9._:-]{1,255}", task_id):
+                raise BenchmarkError(
+                    f"{path}:{line_number}: task_id contains unsupported characters"
+                )
             if task_id in seen:
                 raise BenchmarkError(
                     f"{path}:{line_number}: duplicate task_id {task_id!r}"
                 )
-            if not prompt:
+            if prompt.strip() == "":
                 raise BenchmarkError(f"{path}:{line_number}: missing prompt")
+            if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+                raise BenchmarkError(
+                    f"{path}:{line_number}: prompt exceeds {MAX_PROMPT_BYTES} byte clipboard limit"
+                )
 
             raw_attachments = item.get("attachments", [])
             if not isinstance(raw_attachments, list):
@@ -129,6 +150,8 @@ def load_benchmark(
                 )
                 for value in raw_attachments
             )
+            if len(set(attachments)) != len(attachments):
+                raise BenchmarkError(f"{path}:{line_number}: duplicate attachment")
 
             raw_tools = item.get("tools", [])
             if not isinstance(raw_tools, list):
@@ -143,6 +166,9 @@ def load_benchmark(
                 )
                 for value in raw_tools
             )
+            tool_names = [tool.name.casefold() for tool in tools]
+            if len(set(tool_names)) != len(tool_names):
+                raise BenchmarkError(f"{path}:{line_number}: duplicate tool/app name")
 
             tasks.append(
                 BenchmarkTask(
@@ -154,4 +180,6 @@ def load_benchmark(
             )
             seen.add(task_id)
 
+    if not tasks:
+        raise BenchmarkError(f"benchmark manifest is empty: {path}")
     return tasks

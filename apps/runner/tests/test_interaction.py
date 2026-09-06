@@ -45,3 +45,36 @@ async def test_focus_is_requested_only_when_needed() -> None:
     await guard.ensure_page_focus()
     assert page.bring_calls == 1
     assert page.wait_calls == 1
+
+
+class FakeLocator:
+    def __init__(self, holder):
+        self.holder = holder
+        self.rendered = ""
+    async def wait_for(self, **kwargs): pass
+    async def is_enabled(self): return True
+    async def click(self, **kwargs): pass
+    async def press(self, key):
+        if key == "Control+A":
+            self.holder["select_all"] = True
+        elif key == "Backspace" and self.holder.get("select_all"):
+            self.rendered = ""
+        elif key == "Control+V":
+            self.rendered += self.holder.get("clipboard", "")
+    async def inner_text(self, **kwargs): return self.rendered
+
+
+@pytest.mark.asyncio
+async def test_paste_preserves_exact_spaces_and_clears_clipboard() -> None:
+    holder = {"clipboard": ""}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(page, clipboard_url="http://browser:8765/clipboard", timeout_seconds=1)
+    calls = []
+    async def set_clipboard(value):
+        holder["clipboard"] = value
+        calls.append(value)
+    guard._set_system_clipboard = set_clipboard
+    locator = FakeLocator(holder)
+    await guard.paste_text(locator, "  exact  ")
+    assert locator.rendered == "  exact  "
+    assert calls == ["  exact  ", ""]

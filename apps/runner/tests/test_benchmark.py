@@ -176,3 +176,51 @@ def test_duplicate_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(BenchmarkError):
         load_benchmark(manifest)
+
+
+def test_prompt_is_preserved_exactly(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": "t1", "prompt": "  exact prompt  ", "attachments": []}) + "\n")
+    assert load_benchmark(manifest)[0].prompt == "  exact prompt  "
+
+
+def test_invalid_task_id_is_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": "../bad", "prompt": "x", "attachments": []}) + "\n")
+    with pytest.raises(BenchmarkError, match="unsupported characters"):
+        load_benchmark(manifest)
+
+
+def test_empty_manifest_is_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text("\n")
+    with pytest.raises(BenchmarkError, match="empty"):
+        load_benchmark(manifest)
+
+
+def test_null_task_id_is_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": None, "prompt": "x", "attachments": []}) + "\n")
+    with pytest.raises(BenchmarkError, match="task_id must be a string"):
+        load_benchmark(manifest)
+
+
+def test_whitespace_only_prompt_is_rejected_without_stripping_valid_prompts(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": "t", "prompt": "   ", "attachments": []}) + "\n")
+    with pytest.raises(BenchmarkError, match="missing prompt"):
+        load_benchmark(manifest)
+
+
+def test_duplicate_tools_are_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": "t", "prompt": "x", "tools": ["GitHub", "github"]}) + "\n")
+    with pytest.raises(BenchmarkError, match="duplicate tool"):
+        load_benchmark(manifest)
+
+
+def test_reserved_dot_task_id_is_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "benchmark.jsonl"
+    manifest.write_text(json.dumps({"task_id": "..", "prompt": "x"}) + "\n")
+    with pytest.raises(BenchmarkError, match="reserved task_id"):
+        load_benchmark(manifest)

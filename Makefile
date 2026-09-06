@@ -1,6 +1,10 @@
-.PHONY: build up down logs doctor auth run status export test
+.PHONY: init adopt-profile build up down logs doctor auth run status export test
+init:
+	python3 scripts/init_env.py
+adopt-profile:
+	BROWSER_ADOPT_EXISTING_PROFILE=true docker compose up -d browser
 build:
-	docker compose build
+	docker compose --profile runner build
 up:
 	docker compose up -d postgres storage browser
 down:
@@ -14,9 +18,9 @@ auth:
 run:
 	docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume
 status:
-	docker compose run --rm runner status
+	docker compose run --rm --no-deps runner status
 export:
-	docker compose run --rm runner export /data/exports/dataset.jsonl
+	docker compose run --rm --no-deps runner export /data/exports/dataset.jsonl
 test:
-	docker compose run --rm runner pytest
-	docker compose run --rm storage pytest
+	docker compose run --rm --no-deps --entrypoint pytest runner
+	docker compose run --rm --no-deps --entrypoint pytest storage

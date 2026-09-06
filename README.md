@@ -1,113 +1,148 @@
-# gpt_trace_extractor_for_cyberbenchmarking
+# GPT Trace Extractor for Cyber Benchmarking
 
-Containerized ChatGPT UI benchmark runner whose final dataset is the observable
-`messages[]` trajectory for each cyber task.
+Containerized runner for executing benchmark tasks through the real ChatGPT web UI and persisting the observable conversation trajectory for JSONL export.
+
+The runner deliberately leaves ChatGPT's own request-control flow to the real frontend. It does not recreate Sentinel, proof/challenge tokens, conduit tokens, cookies, device IDs, or browser security telemetry.
 
 ## Services
 
-- `browser`: CloakBrowser + cloakserve + persistent profile + noVNC viewer.
-- `runner`: JSONL benchmark loader, UI automation, ChatGPT stream observation,
-  recovery, and trajectory capture.
-- `storage`: FastAPI service for run state, runtime metadata, and JSONL export.
-- `postgres`: durable JSONB backing store.
+- `postgres` — durable run state and captured traces.
+- `storage` — FastAPI persistence API; Alembic migrations run at startup.
+- `browser` — headed CloakBrowser + persistent `/profile` + noVNC + internal X11 clipboard helper.
+- `runner` — sequential Playwright orchestrator connected to the browser over CDP.
 
-The exported dataset remains intentionally small and canonical:
+Only one benchmark task may be `running` in PostgreSQL at a time. The runner also uses a local lock and a crash journal to prevent accidental duplicate submissions.
+
+## First setup
+
+```bash
+make init
+make build
+make up
+```
+
+`make init` creates/merges `.env` and generates `BROWSER_FINGERPRINT_SEED` exactly once. Keep that seed with the `browser_profile` Docker volume.
+
+If the profile volume already existed before profile identity markers were introduced, verify that the configured seed is the one you intend to keep, then run once:
+
+```bash
+make adopt-profile
+```
+
+Do not use `BROWSER_ADOPT_EXISTING_PROFILE=true` routinely; it is only a one-time migration switch.
+
+## Authentication
+
+```bash
+make auth
+```
+
+Open the noVNC URL printed by the command and log into ChatGPT manually. The browser profile persists the session.
+
+`auth` and `doctor --chatgpt` refuse to touch ChatGPT if PostgreSQL reports an active benchmark task or if a crash journal is pending. Recover the benchmark first.
+
+## Benchmark format
+
+`benchmarks/benchmark.jsonl` contains one JSON object per line:
 
 ```json
-{"task_id":"cyber_000001","conversation_id":"...","captured_at":"...","messages":[...]}
+{"task_id":"cyber_000001","prompt":"Inspect the attached repository.","attachments":["case_001/repo.zip"],"tools":[{"type":"app","name":"Github (mosaic)","required":true}]}
 ```
 
-Runtime diagnostics such as request IDs, turn exchange IDs, stream completion
-markers, and tool-use metadata are stored in PostgreSQL but are not added to the
-dataset export.
+Attachment paths are confined to `TASKS_ROOT` (`/data/tasks` in Compose). The internal task fingerprint covers the exact prompt, attachment names/content hashes, and requested Apps. Reusing a `task_id` with a modified task specification is rejected instead of silently mixing datasets.
 
-Visible commentary, tool calls, tool outputs, recaps, and the final answer are
-preserved. Entries explicitly marked as hidden raw chain-of-thought are not
-persisted.
-
-## Completion model
-
-The runner does not poll the conversation endpoint to detect completion.
-
-Before clicking Send it arms a Playwright response watcher for the exact
-`POST /backend-api/f/conversation` request. ChatGPT keeps that response open as
-an SSE stream for the whole turn, including tool calls. The runner waits for the
-HTTP response to finish, validates the observed protocol (`assistant
-end_turn=true`, `message_stream_complete`, then `[DONE]`), and only then fetches
-the conversation JSON once to capture `messages[]`.
-
-See `docs/chatgpt-stream.md`.
-
-## Start
+## Run
 
 ```bash
-cp .env.example .env
-docker compose build
-docker compose up -d postgres storage browser
+make run
 ```
 
-Open the viewer:
-
-```text
-http://localhost:7900/vnc.html?autoconnect=1&resize=scale
-```
-
-Then:
-
-```bash
-docker compose run --rm runner auth
-docker compose run --rm runner doctor
-```
-
-## Benchmark input
-
-Artifacts are resolved under `TASKS_ROOT` (`/data/tasks` in Compose), not
-relative to the benchmark manifest.
-
-```jsonl
-{"task_id":"cyber_000001","prompt":"Inspect the attached repository.","attachments":["cyber_000001/repo.zip"],"tools":[]}
-{"task_id":"cyber_000002","prompt":"Inspect the repository and relevant GitHub state.","attachments":["cyber_000002/repo.zip"],"tools":[{"type":"app","name":"Github (mosaic)","required":true}]}
-```
-
-The shorthand form `"tools":["Github (mosaic)"]` is also accepted. Requested
-Apps must already be installed/connected in the persistent ChatGPT account.
-Custom tools should be exposed to ChatGPT as Apps/MCP integrations.
-
-Run:
+Equivalent command:
 
 ```bash
 docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume
 ```
 
-Smoke run:
+Normal lifecycle:
 
-```bash
-docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume --limit 3
+```text
+storage start/CAS
+  -> prepare existing ChatGPT page
+  -> visible UI upload / Apps / prompt
+  -> durable submission journal
+  -> one frontend POST /backend-api/f/conversation
+  -> completed SSE
+  -> validated conversation snapshot
+  -> storage complete
+  -> clear journal
 ```
 
-Status/export:
+There is no artificial random inter-task delay. Tasks are serialized by actual completion/readiness. HTTP 403/429, authentication loss, unrecovered challenges, model/environment drift, storage failure, clipboard failure, ambiguous submission, and broken streams stop the batch.
 
-```bash
-docker compose run --rm runner status
-docker compose run --rm runner export /data/exports/dataset.jsonl
+## Crash recovery
+
+Use `--resume` (the Make target already does). The runner never blindly resubmits a task whose Send may already have succeeded.
+
+The durable journal has these phases:
+
+- `starting`
+- `composer_dirty`
+- `submission_started`
+- `conversation_known`
+
+If a crash happened after Send and the conversation ID is known, it is recovered directly. If Send may have happened but the ID was not yet persisted, recovery only accepts the currently open `/c/<id>` when its user message matches the exact benchmark task fingerprint/prompt.
+
+## Model and environment integrity
+
+By default the frontend must submit:
+
+```text
+CHATGPT_EXPECTED_MODEL_SLUG=gpt-5-6-thinking
 ```
 
-## Recovery
+Change this explicitly if the intended ChatGPT model slug changes upstream. A silent model switch stops the batch.
 
-The conversation ID is persisted as soon as ChatGPT assigns `/c/<id>`.
+The runner also records only a SHA-256 of its read-only browser environment baseline and stops if the environment changes during a batch. It does not patch `navigator`, `window`, `document`, timezone, language, CPU, screen, or other browser globals.
 
-On `--resume`, the runner opens that conversation and performs one snapshot
-fetch. If it already contains a final assistant `end_turn=true`, the task is
-recovered. If generation is still incomplete, the runner fails recovery rather
-than creating a duplicate conversation. Re-attaching to an already-running
-historical stream is intentionally not guessed until that resume protocol is
-captured and tested.
+Optional CloakBrowser-native settings are `BROWSER_TIMEZONE`, `BROWSER_LOCALE`, and `BROWSER_GEOIP`. Browser healthchecks and the runner use the exact same CDP identity parameters.
 
-## Internal protocol warning
+## Clipboard
 
-`/backend-api/f/conversation` and the ChatGPT DOM are internal web-product
-interfaces and can change. Their assumptions are isolated in `stream.py`,
-`chatgpt.py`, `tools.py`, and `conversation.py`.
+Prepared benchmark text is placed in the browser container's real X11 clipboard through an internal Docker-only HTTP helper and pasted with the browser keyboard path. `chatgpt.com` is not granted clipboard permissions and no `navigator.clipboard` JavaScript is injected. The clipboard is cleared after the composer is verified.
 
-Do not commit HAR captures from authenticated ChatGPT sessions: they can contain
-session credentials and private conversation data.
+## Diagnostics
+
+Local checks only:
+
+```bash
+make doctor
+```
+
+To additionally verify that ChatGPT is authenticated/ready:
+
+```bash
+docker compose run --rm runner doctor --chatgpt
+```
+
+## Status and export
+
+```bash
+make status
+make export
+```
+
+The exported JSONL remains intentionally minimal:
+
+```json
+{"task_id":"cyber_000001","conversation_id":"...","captured_at":"...","messages":[...]}
+```
+
+Internal recovery/runtime metadata is kept in PostgreSQL and excluded from this canonical export.
+
+## Tests
+
+```bash
+make test
+```
+
+The test suite covers stream completion, required Apps, attachment confinement, prompt preservation, model/environment checks, local lock, crash journal, storage attempt CAS/idempotence, stale mutations, duplicate conversation IDs, and task fingerprint integrity.
