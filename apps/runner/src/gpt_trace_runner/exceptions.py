@@ -2,11 +2,35 @@ class TraceRunnerError(RuntimeError):
     pass
 
 
-class BrowserConnectionError(TraceRunnerError):
+class BatchCircuitBreaker(TraceRunnerError):
+    """Failure that must stop the whole batch instead of advancing tasks."""
+
+
+class BrowserConnectionError(BatchCircuitBreaker):
     pass
 
 
-class AuthenticationRequired(TraceRunnerError):
+class AuthenticationRequired(BatchCircuitBreaker):
+    pass
+
+
+class RateLimited(BatchCircuitBreaker):
+    pass
+
+
+class AccessDenied(BatchCircuitBreaker):
+    pass
+
+
+class SiteChallengeFailed(BatchCircuitBreaker):
+    pass
+
+
+class AmbiguousSubmission(BatchCircuitBreaker):
+    pass
+
+
+class ConcurrentTurnError(BatchCircuitBreaker):
     pass
 
 
@@ -18,7 +42,11 @@ class ConversationError(TraceRunnerError):
     pass
 
 
-class ConversationStreamError(TraceRunnerError):
+class CompletionTimeout(BatchCircuitBreaker):
+    pass
+
+
+class ConversationStreamError(BatchCircuitBreaker):
     pass
 
 
@@ -38,7 +66,7 @@ class ConversationStreamIncomplete(ConversationStreamError):
     pass
 
 
-class RecoveryIncomplete(TraceRunnerError):
+class RecoveryIncomplete(BatchCircuitBreaker):
     pass
 
 
@@ -50,5 +78,5 @@ class BenchmarkError(TraceRunnerError):
     pass
 
 
-class StorageError(TraceRunnerError):
+class StorageError(BatchCircuitBreaker):
     pass

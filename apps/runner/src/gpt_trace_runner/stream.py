@@ -10,10 +10,12 @@ from urllib.parse import urlparse
 from playwright.async_api import Response
 
 from .exceptions import (
+    AccessDenied,
     ConversationStreamAborted,
     ConversationStreamIncomplete,
     ConversationStreamProtocolError,
     ConversationStreamTimeout,
+    RateLimited,
 )
 
 
@@ -261,6 +263,11 @@ class ConversationStream:
         self._started_at = datetime.now(timezone.utc)
 
     async def wait(self) -> ConversationStreamResult:
+        if self._response.status == 429:
+            raise RateLimited("ChatGPT conversation stream returned HTTP 429")
+        if self._response.status == 403:
+            raise AccessDenied("ChatGPT conversation stream returned HTTP 403")
+
         content_type = (
             await self._response.header_value("content-type") or ""
         )

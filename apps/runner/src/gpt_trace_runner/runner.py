@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
+from typing import Protocol
 
 from rich.console import Console
 
 from .chatgpt import ChatGPTClient
-from .models import BenchmarkTask
-from .storage_client import StorageClient
+from .exceptions import BatchCircuitBreaker
+from .models import BenchmarkTask, CapturedConversation, StoredRun
+
+
+class StorageLike(Protocol):
+    async def get(self, task_id: str) -> StoredRun | None: ...
+    async def start(self, task_id: str, runner_id: str): ...
+    async def set_conversation(self, task_id: str, conversation_id: str) -> None: ...
+    async def complete(self, task_id: str, captured: CapturedConversation) -> None: ...
+    async def fail(self, task_id: str, error: Exception) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,17 +30,15 @@ class BenchmarkRunner:
         self,
         *,
         chatgpt: ChatGPTClient,
-        storage: StorageClient,
+        storage: StorageLike,
         runner_id: str,
         recover_existing: bool,
-        inter_task_delay_seconds: float,
         console: Console,
     ) -> None:
         self.chatgpt = chatgpt
         self.storage = storage
         self.runner_id = runner_id
         self.recover_existing = recover_existing
-        self.delay = inter_task_delay_seconds
         self.console = console
 
     async def _recover(self, task: BenchmarkTask) -> bool:
@@ -45,8 +51,7 @@ class BenchmarkRunner:
             return False
 
         self.console.print(
-            f"[yellow]{task.task_id}[/]: recovering "
-            f"{existing.conversation_id}"
+            f"[yellow]{task.task_id}[/]: recovering {existing.conversation_id}"
         )
         captured = await self.chatgpt.recover(
             existing.conversation_id,
@@ -63,13 +68,9 @@ class BenchmarkRunner:
         existing = await self.storage.get(task.task_id)
         if existing and existing.status == "completed":
             if resume:
-                self.console.print(
-                    f"[dim]{task.task_id}: completed, skip[/]"
-                )
+                self.console.print(f"[dim]{task.task_id}: completed, skip[/]")
                 return
-            raise RuntimeError(
-                f"{task.task_id} already completed; use --resume"
-            )
+            raise RuntimeError(f"{task.task_id} already completed; use --resume")
 
         if resume:
             try:
@@ -90,8 +91,7 @@ class BenchmarkRunner:
                 submitted.conversation_id,
             )
             self.console.print(
-                f"{task.task_id}: conversation "
-                f"{submitted.conversation_id}"
+                f"{task.task_id}: conversation {submitted.conversation_id}"
             )
 
             captured = await self.chatgpt.wait_for_completion(submitted)
@@ -114,20 +114,24 @@ class BenchmarkRunner:
         selected = tasks[: options.limit] if options.limit else tasks
 
         for index, task in enumerate(selected, 1):
-            self.console.rule(
-                f"{index}/{len(selected)} {task.task_id}"
-            )
+            self.console.rule(f"{index}/{len(selected)} {task.task_id}")
             try:
                 await self.run_task(task, options.resume)
             except KeyboardInterrupt:
                 raise
+            except BatchCircuitBreaker as exc:
+                self.console.print(
+                    f"[bold red]batch paused after {task.task_id}: "
+                    f"{type(exc).__name__}: {exc}[/]"
+                )
+                raise
             except Exception as exc:
                 self.console.print(
-                    f"[red]{task.task_id}: "
-                    f"{type(exc).__name__}: {exc}[/]"
+                    f"[red]{task.task_id}: {type(exc).__name__}: {exc}[/]"
                 )
                 if options.stop_on_error:
                     raise
 
-            if index < len(selected) and self.delay:
-                await asyncio.sleep(self.delay)
+            # No fixed inter-task sleep. The next task starts only after the
+            # previous turn has completed and been persisted; start_task then
+            # waits for ChatGPT's real READY state before any interaction.

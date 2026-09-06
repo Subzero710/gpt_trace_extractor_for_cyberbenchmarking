@@ -132,3 +132,4 @@ async def test_conversation_stream_wait_reads_body_after_finish() -> None:
     assert "text/event-stream" in result.content_type
     assert result.stream_started_at
     assert result.stream_completed_at
+\n\n@pytest.mark.asyncio\n@pytest.mark.parametrize(\n    "status, expected",\n    [\n        (403, "AccessDenied"),\n        (429, "RateLimited"),\n    ],\n)\nasync def test_stream_protection_statuses_are_batch_breakers(status, expected) -> None:\n    from gpt_trace_runner import exceptions\n    from gpt_trace_runner.stream import ConversationStream\n\n    response = FakeFinishedResponse(\n        b"blocked",\n        content_type="text/html",\n        status=status,\n    )\n    error_type = getattr(exceptions, expected)\n    with pytest.raises(error_type):\n        await ConversationStream(response, timeout_seconds=1).wait()\n
