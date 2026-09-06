@@ -1,34 +1,47 @@
 # Architecture
 
 ```text
-benchmark.jsonl + artifacts
-          |
-          v
-     +---------+        CDP        +------------------+
-     | runner  | ----------------> | browser          |
-     |         |                   | CloakBrowser     |
-     +----+----+                   | persistent state |
-          |                        +--------+---------+
-          |                                 |
-          |                                 v
-          |                            ChatGPT UI
-          |                                 |
-          |      conversation JSON          |
-          +---------------------------------+
-          |
-          | HTTP: run state + messages[]
-          v
-    +-------------+       SQL        +------------+
-    | storage API | ----------------> | PostgreSQL |
-    +-------------+                   +------------+
+benchmark.jsonl + artifacts + requested Apps
+                    |
+                    v
+               +---------+
+               | runner  |
+               +----+----+
+                    |
+          CDP       |      HTTP
+       +------------+------------+
+       |                         |
+       v                         v
++--------------+          +-------------+
+| browser      |          | storage API |
+| CloakBrowser |          +------+------+
+| profile      |                 |
++------+-------+                 | SQL
+       |                         v
+       v                   +------------+
+   ChatGPT UI              | PostgreSQL |
+       |                   +------------+
+       |
+       | POST /backend-api/f/conversation
+       | long-lived SSE for one turn
+       v
+ runner waits on response completion
+       |
+       | one authenticated snapshot fetch
+       v
+ /backend-api/conversations/<id>
+       |
+       v
+ messages[] -> storage
 ```
 
 Boundaries:
-- browser owns Chromium/CloakBrowser and profile state only;
-- runner owns benchmark orchestration and ChatGPT UI automation only;
-- storage owns durability, recovery state, and dataset export only;
-- postgres is never accessed directly by runner.
 
-The conversation ID is persisted immediately after prompt submission. On
-`--resume`, a non-completed task with an existing conversation ID is recovered
-before a new conversation is created.
+- browser owns Chromium/CloakBrowser and persistent ChatGPT state;
+- runner owns benchmark parsing, App selection, uploads, stream observation,
+  orchestration, and snapshot capture;
+- storage owns durable run state, runtime metadata, and dataset export;
+- PostgreSQL is never accessed directly by runner.
+
+`messages[]` is the canonical dataset payload. Network-stream information is
+operational metadata only.

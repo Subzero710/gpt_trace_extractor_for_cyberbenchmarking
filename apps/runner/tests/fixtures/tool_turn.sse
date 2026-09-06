@@ -1,0 +1,25 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"resume_conversation_token","conversation_id":"conv-tool"}
+
+data: {"o":"add","v":{"message":{"id":"commentary-1","author":{"role":"assistant"},"content":{"content_type":"text","parts":["checking"]},"status":"in_progress","end_turn":null,"recipient":"functions.exec","channel":"commentary"},"conversation_id":"conv-tool"}}
+
+data: {"o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":false}]}
+
+data: {"o":"add","v":{"message":{"id":"tool-call-1","author":{"role":"assistant"},"content":{"content_type":"code","text":"{}"},"status":"finished_successfully","end_turn":false,"recipient":"api_tool.call_tool","channel":"commentary"},"conversation_id":"conv-tool"}}
+
+data: {"o":"add","v":{"message":{"id":"tool-result-1","author":{"role":"tool","name":"api_tool.call_tool"},"content":{"content_type":"code","text":"{}"},"status":"finished_successfully","end_turn":null},"conversation_id":"conv-tool"}}
+
+data: {"o":"add","v":{"message":{"id":"final-2","author":{"role":"assistant"},"content":{"content_type":"text","parts":["done"]},"status":"in_progress","end_turn":null,"recipient":"all","channel":"final"},"conversation_id":"conv-tool"}}
+
+data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}
+
+data: {"type":"message_marker","conversation_id":"conv-tool","message_id":"final-2","marker":"last_token","event":"last"}
+
+data: {"type":"server_ste_metadata","metadata":{"request_id":"req-tool","turn_exchange_id":"turn-tool","tool_invoked":true,"tool_name":"CodeModeTool"}}
+
+data: {"type":"message_stream_complete","conversation_id":"conv-tool"}
+
+data: [DONE]
+

@@ -1,0 +1,8 @@
+data: {"type":"resume_conversation_token","conversation_id":"conv-missing-stream"}
+
+data: {"o":"add","v":{"message":{"id":"final-x","author":{"role":"assistant"},"status":"in_progress","end_turn":null,"channel":"final"},"conversation_id":"conv-missing-stream"}}
+
+data: {"o":"patch","v":[{"p":"/message/end_turn","o":"replace","v":true}]}
+
+data: [DONE]
+

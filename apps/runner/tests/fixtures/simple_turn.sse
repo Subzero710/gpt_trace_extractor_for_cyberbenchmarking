@@ -1,0 +1,17 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"resume_conversation_token","conversation_id":"conv-simple"}
+
+data: {"o":"add","v":{"message":{"id":"final-1","author":{"role":"assistant"},"content":{"content_type":"text","parts":["ok"]},"status":"in_progress","end_turn":null,"channel":"final"},"conversation_id":"conv-simple"}}
+
+data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}
+
+data: {"type":"message_marker","conversation_id":"conv-simple","message_id":"final-1","marker":"last_token","event":"last"}
+
+data: {"type":"server_ste_metadata","metadata":{"request_id":"req-simple","turn_exchange_id":"turn-simple","tool_invoked":false}}
+
+data: {"type":"message_stream_complete","conversation_id":"conv-simple"}
+
+data: [DONE]
+
