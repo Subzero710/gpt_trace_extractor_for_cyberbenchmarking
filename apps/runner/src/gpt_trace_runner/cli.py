@@ -32,6 +32,7 @@ def make_chatgpt(settings: Settings, page) -> ChatGPTClient:
         site_ready_timeout_seconds=settings.chatgpt_site_ready_timeout_seconds,
         challenge_timeout_seconds=settings.chatgpt_challenge_timeout_seconds,
         natural_snapshot_wait_seconds=settings.chatgpt_natural_snapshot_wait_seconds,
+        clipboard_url=settings.browser_clipboard_url,
     )
 
 
@@ -62,7 +63,11 @@ def doctor(
         if not chatgpt:
             return
 
-        session = await BrowserClient(settings.effective_browser_cdp_url()).connect()
+        session = await BrowserClient(
+            settings.effective_browser_cdp_url(),
+            humanize=settings.browser_humanize,
+            humanize_preset=settings.browser_humanize_preset,
+        ).connect()
         try:
             client = make_chatgpt(settings, session.page)
             try:
@@ -80,7 +85,11 @@ def doctor(
 def auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
     async def main() -> None:
         settings = Settings()
-        session = await BrowserClient(settings.effective_browser_cdp_url()).connect()
+        session = await BrowserClient(
+            settings.effective_browser_cdp_url(),
+            humanize=settings.browser_humanize,
+            humanize_preset=settings.browser_humanize_preset,
+        ).connect()
         try:
             chatgpt = make_chatgpt(settings, session.page)
             if not session.page.url.startswith(settings.chatgpt_base_url):
@@ -108,7 +117,11 @@ def run_command(
         settings = Settings()
         tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root)
         storage = StorageClient(settings.storage_base_url)
-        session = await BrowserClient(settings.effective_browser_cdp_url()).connect()
+        session = await BrowserClient(
+            settings.effective_browser_cdp_url(),
+            humanize=settings.browser_humanize,
+            humanize_preset=settings.browser_humanize_preset,
+        ).connect()
 
         try:
             await storage.health()

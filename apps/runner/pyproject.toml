@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "httpx>=0.28,<1",
+  "cloakbrowser>=0.5,<1",
   "playwright>=1.53,<2",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",

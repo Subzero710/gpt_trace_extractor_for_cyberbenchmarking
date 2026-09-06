@@ -28,3 +28,11 @@ def test_normal_task_path_does_not_reload_chatgpt_home() -> None:
     )[0]
     assert "goto_home()" not in start
     assert "_new_chat_if_needed()" in start
+
+def test_prompt_clipboard_stays_out_of_chatgpt_javascript() -> None:
+    interaction = (SRC / "interaction.py").read_text()
+    assert "navigator.clipboard" not in interaction
+    assert "grant_permissions" not in interaction
+    assert "_set_system_clipboard" in interaction
+    assert "Control+V" in interaction
+

@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import uuid
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlencode
 
 from pydantic import Field
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     browser_novnc_url: str = (
         "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
     )
+    browser_humanize: bool = True
+    browser_humanize_preset: Literal["default", "careful"] = "default"
+    browser_clipboard_url: str = "http://browser:8765/clipboard"
 
     tasks_root: Path = Path("/data/tasks")
 

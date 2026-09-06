@@ -79,6 +79,7 @@ class ChatGPTClient:
         site_ready_timeout_seconds: float,
         challenge_timeout_seconds: float,
         natural_snapshot_wait_seconds: float,
+        clipboard_url: str,
     ) -> None:
         self._page = page
         self._base_url = base_url.rstrip("/")
@@ -91,7 +92,7 @@ class ChatGPTClient:
         self._traffic = TrafficMonitor(page, base_url=self._base_url)
         self._interaction = InteractionGuard(
             page,
-            origin=self._base_url,
+            clipboard_url=clipboard_url,
             timeout_seconds=site_ready_timeout_seconds,
         )
         self._site = SiteGuard(
