@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from gpt_trace_runner.conversation import (
-    extract_dataset_messages,
-    invoked_app_names,
-    is_complete,
-)
+from gpt_trace_runner.conversation import extract_dataset_messages, invoked_app_names, is_complete
 
 
 def test_extract_filters_explicit_raw_cot() -> None:
@@ -19,35 +15,20 @@ def test_extract_filters_explicit_raw_cot() -> None:
         "author": {"role": "assistant"},
         "metadata": {"summary_type": "raw_cot"},
     }
-
-    messages = extract_dataset_messages(
-        {"messages": [hidden, visible]}
-    )
+    messages = extract_dataset_messages({"messages": [hidden, visible]})
     assert messages == [visible]
     assert is_complete(messages)
 
 
-def test_invoked_app_names_reads_tool_metadata() -> None:
+def test_invoked_app_names_reads_runtime_metadata_without_vendor_assumptions() -> None:
     messages = [
         {
             "author": {"role": "tool"},
-            "metadata": {
-                "invoked_resource": {
-                    "app_name": "Github (mosaic)",
-                }
-            },
+            "metadata": {"invoked_resource": {"app_name": "GitHub Connector"}},
         },
         {
             "author": {"role": "tool"},
-            "metadata": {
-                "invoked_resource": {
-                    "app_name": "Zotero",
-                }
-            },
+            "metadata": {"invoked_resource": {"app_name": "Browser"}},
         },
     ]
-
-    assert invoked_app_names(messages) == {
-        "Github (mosaic)",
-        "Zotero",
-    }
+    assert invoked_app_names(messages) == {"GitHub Connector", "Browser"}

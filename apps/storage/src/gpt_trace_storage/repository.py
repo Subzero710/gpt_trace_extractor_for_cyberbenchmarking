@@ -28,16 +28,19 @@ async def _check_identity(run: Run, *, attempt: int, runner_id: str) -> None:
         )
 
 
-async def start_run(session: AsyncSession, *, task_id: str, runner_id: str, expected_attempt: int, task_fingerprint: str) -> Run:
-    # Serializes starts across containers/hosts. Once a row is running, another
-    # task cannot start until it reaches a terminal state.
+async def start_run(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    runner_id: str,
+    expected_attempt: int,
+    task_fingerprint: str,
+    app_provenance: list[dict],
+) -> Run:
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))"))
-    other = await session.scalar(
-        select(Run).where(Run.status == "running", Run.task_id != task_id).limit(1)
-    )
+    other = await session.scalar(select(Run).where(Run.status == "running", Run.task_id != task_id).limit(1))
     if other is not None:
         raise RunConflict(f"another task is already running: {other.task_id}")
-
     run = await get_run(session, task_id, for_update=True)
     now = datetime.now(timezone.utc)
     if run is None:
@@ -49,6 +52,7 @@ async def start_run(session: AsyncSession, *, task_id: str, runner_id: str, expe
             runner_id=runner_id,
             attempt=1,
             task_fingerprint=task_fingerprint,
+            app_provenance=app_provenance,
             started_at=now,
         )
         session.add(run)
@@ -59,19 +63,16 @@ async def start_run(session: AsyncSession, *, task_id: str, runner_id: str, expe
     elif run.status == "completed":
         raise RunConflict("completed run is immutable")
     elif run.status == "running":
-        # Safe retry after a lost HTTP response from /start.
         if run.attempt == expected_attempt and run.runner_id == runner_id:
+            if run.app_provenance is None or run.app_provenance != app_provenance:
+                raise RunConflict("idempotent start App provenance differs")
             await session.commit()
             await session.refresh(run)
             return run
-        raise RunConflict(
-            f"task already running at attempt={run.attempt} runner={run.runner_id!r}"
-        )
+        raise RunConflict(f"task already running at attempt={run.attempt} runner={run.runner_id!r}")
     else:
         if expected_attempt != run.attempt + 1:
-            raise RunConflict(
-                f"expected next attempt {run.attempt + 1}, got {expected_attempt}"
-            )
+            raise RunConflict(f"expected next attempt {run.attempt + 1}, got {expected_attempt}")
         run.status = "running"
         run.runner_id = runner_id
         run.attempt = expected_attempt
@@ -80,16 +81,22 @@ async def start_run(session: AsyncSession, *, task_id: str, runner_id: str, expe
         run.conversation_id = None
         run.messages = None
         run.runtime_metadata = None
+        run.app_provenance = app_provenance
         run.error_type = None
         run.error_message = None
-
     await session.commit()
     await session.refresh(run)
     return run
 
 
-async def set_conversation(session: AsyncSession, *, task_id: str, conversation_id: str,
-                           attempt: int, runner_id: str) -> Run | None:
+async def set_conversation(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    conversation_id: str,
+    attempt: int,
+    runner_id: str,
+) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
     if run is None:
         return None
@@ -112,26 +119,30 @@ async def set_conversation(session: AsyncSession, *, task_id: str, conversation_
     return run
 
 
-async def complete_run(session: AsyncSession, *, task_id: str, conversation_id: str,
-                       messages: list[dict], runtime_metadata: dict,
-                       attempt: int, runner_id: str) -> Run | None:
+async def complete_run(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    conversation_id: str,
+    messages: list[dict],
+    runtime_metadata: dict,
+    attempt: int,
+    runner_id: str,
+) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
     if run is None:
         return None
     await _check_identity(run, attempt=attempt, runner_id=runner_id)
+    if run.app_provenance is None:
+        raise RunConflict("cannot complete a run without App provenance")
     if run.status == "completed":
-        if (
-            run.conversation_id == conversation_id
-            and run.messages == messages
-            and (run.runtime_metadata or {}) == runtime_metadata
-        ):
+        if run.conversation_id == conversation_id and run.messages == messages and (run.runtime_metadata or {}) == runtime_metadata:
             return run
         raise RunConflict("completed run is immutable")
     if run.status != "running":
         raise RunConflict(f"cannot complete status={run.status}")
     if run.conversation_id and run.conversation_id != conversation_id:
         raise RunConflict("completion conversation_id differs from running attempt")
-
     run.status = "completed"
     run.conversation_id = conversation_id
     run.messages = messages
@@ -148,8 +159,15 @@ async def complete_run(session: AsyncSession, *, task_id: str, conversation_id: 
     return run
 
 
-async def fail_run(session: AsyncSession, *, task_id: str, error_type: str, error_message: str,
-                   attempt: int, runner_id: str) -> Run | None:
+async def fail_run(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    error_type: str,
+    error_message: str,
+    attempt: int,
+    runner_id: str,
+) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
     if run is None:
         return None

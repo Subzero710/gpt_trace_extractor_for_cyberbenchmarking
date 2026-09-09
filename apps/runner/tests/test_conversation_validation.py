@@ -2,6 +2,7 @@ import pytest
 
 from gpt_trace_runner.conversation import (
     assistant_model_slugs,
+    benchmark_text_matches,
     conversation_matches_task,
     message_plain_text,
     validate_task_conversation,
@@ -14,11 +15,16 @@ def user_message(parts):
 
 
 def assistant(model="gpt-5-6-thinking", end=True):
-    return {"author": {"role": "assistant"}, "content": {"parts": ["ok"]}, "metadata": {"model_slug": model}, "end_turn": end}
+    return {
+        "author": {"role": "assistant"},
+        "content": {"parts": ["ok"]},
+        "metadata": {"model_slug": model},
+        "end_turn": end,
+    }
 
 
 def test_ecosystem_mention_is_ignored_when_matching_prompt() -> None:
-    msg = user_message([{"type": "ecosystemMention", "name": "Github"}, "inspect this"])
+    msg = user_message([{"type": "ecosystemMention", "name": "GitHub"}, "inspect this"])
     assert message_plain_text(msg) == "inspect this"
     assert conversation_matches_task([msg], "inspect this")
 
@@ -39,12 +45,10 @@ def test_assistant_model_slugs_collect_all_observed() -> None:
     assert assistant_model_slugs([assistant("a"), assistant("b")]) == {"a", "b"}
 
 
-def test_ecosystem_mention_from_real_har_is_removed_only_by_declared_span():
-    from gpt_trace_runner.conversation import benchmark_text_matches
-
+def test_ecosystem_mention_is_removed_only_by_declared_span() -> None:
     message = {
         "author": {"role": "user"},
-        "content": {"content_type": "text", "parts": ["@Github (mosaic) tu vois combien de repo?"]},
+        "content": {"content_type": "text", "parts": ["@GitHub Connector inspect the repository"]},
         "metadata": {
             "serialization_metadata": {
                 "custom_symbol_offsets": [
@@ -52,20 +56,18 @@ def test_ecosystem_mention_from_real_har_is_removed_only_by_declared_span():
                         "id": "plugin:test",
                         "symbol": "ecosystemMention",
                         "startIndex": 0,
-                        "endIndex": 16,
+                        "endIndex": 17,
                     }
                 ]
             }
         },
     }
-    assert benchmark_text_matches(message, "tu vois combien de repo?") is True
-    assert benchmark_text_matches(message, " tu vois combien de repo?") is True
-    assert benchmark_text_matches(message, "tu vois  combien de repo?") is False
+    assert benchmark_text_matches(message, "inspect the repository") is True
+    assert benchmark_text_matches(message, " inspect the repository") is True
+    assert benchmark_text_matches(message, "inspect  the repository") is False
 
 
-def test_ecosystem_mention_does_not_hide_unrelated_prompt_whitespace_change():
-    from gpt_trace_runner.conversation import benchmark_text_matches
-
+def test_ecosystem_mention_does_not_hide_unrelated_prompt_whitespace_change() -> None:
     message = {
         "author": {"role": "user"},
         "content": {"parts": ["hello  world @App"]},

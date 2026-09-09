@@ -1,0 +1,107 @@
+{
+  "app_id": "code-workspace",
+  "tools": [
+    {
+      "description": "Execute one shell command in the active task workspace and return bounded stdout, stderr, exit status, and timeout state.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {"description": "Shell command to execute with /bin/bash.", "minLength": 1, "type": "string"},
+          "cwd": {"default": ".", "description": "Working directory relative to the task workspace.", "type": "string"},
+          "timeout_seconds": {"default": 120, "description": "Wall-clock timeout in seconds.", "maximum": 1800, "minimum": 1, "type": "integer"}
+        },
+        "required": ["command"],
+        "type": "object"
+      },
+      "name": "exec_command"
+    },
+    {
+      "description": "Read a UTF-8 text file inside the active task workspace without following paths outside it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "end_line": {"default": null, "minimum": 1, "type": ["integer", "null"]},
+          "max_bytes": {"default": 262144, "maximum": 1048576, "minimum": 1, "type": "integer"},
+          "path": {"description": "File path relative to the task workspace.", "minLength": 1, "type": "string"},
+          "start_line": {"default": 1, "minimum": 1, "type": "integer"}
+        },
+        "required": ["path"],
+        "type": "object"
+      },
+      "name": "read_file"
+    },
+    {
+      "description": "Create or replace one UTF-8 text file inside the active task workspace.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {"description": "Complete UTF-8 file content.", "type": "string"},
+          "create_parents": {"default": true, "type": "boolean"},
+          "expected_sha256": {"default": null, "description": "When set, the existing file must have this SHA-256 before replacement.", "pattern": "^[0-9a-f]{64}$", "type": ["string", "null"]},
+          "overwrite": {"default": true, "type": "boolean"},
+          "path": {"description": "File path relative to the task workspace.", "minLength": 1, "type": "string"}
+        },
+        "required": ["path", "content"],
+        "type": "object"
+      },
+      "name": "write_file"
+    },
+    {
+      "description": "Apply ordered, exact text replacements to one workspace file after verifying its SHA-256.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+          "path": {"minLength": 1, "type": "string"},
+          "replacements": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "expected_count": {"default": 1, "minimum": 1, "type": "integer"},
+                "new": {"type": "string"},
+                "old": {"minLength": 1, "type": "string"}
+              },
+              "required": ["old", "new"],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": ["path", "expected_sha256", "replacements"],
+        "type": "object"
+      },
+      "name": "apply_patch"
+    },
+    {
+      "description": "List workspace entries in deterministic path order without following symlinks.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_entries": {"default": 1000, "maximum": 10000, "minimum": 1, "type": "integer"},
+          "path": {"default": ".", "type": "string"},
+          "recursive": {"default": false, "type": "boolean"}
+        },
+        "type": "object"
+      },
+      "name": "list_directory"
+    },
+    {
+      "description": "Search UTF-8 workspace files for a literal string and return deterministic structured matches.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "case_sensitive": {"default": false, "type": "boolean"},
+          "file_glob": {"default": "**/*", "type": "string"},
+          "max_results": {"default": 100, "maximum": 1000, "minimum": 1, "type": "integer"},
+          "path": {"default": ".", "type": "string"},
+          "query": {"minLength": 1, "type": "string"}
+        },
+        "required": ["query"],
+        "type": "object"
+      },
+      "name": "search_files"
+    }
+  ],
+  "version": "1.0.0"
+}

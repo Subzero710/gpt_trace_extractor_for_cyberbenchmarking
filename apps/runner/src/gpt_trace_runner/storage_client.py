@@ -22,18 +22,22 @@ def _stored_run(payload: dict[str, Any]) -> StoredRun:
         error_type=payload.get("error_type"),
         error_message=payload.get("error_message"),
         runtime_metadata=payload.get("runtime_metadata"),
+        app_provenance=payload.get("app_provenance"),
     )
 
 
 class StorageClient:
     def __init__(self, base_url: str) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30.0)
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            timeout=30.0,
+            trust_env=False,
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, url: str, *, json: dict | None = None,
-                       safe_retry: bool = False) -> httpx.Response:
+    async def _request(self, method: str, url: str, *, json: dict | None = None, safe_retry: bool = False) -> httpx.Response:
         attempts = 2 if safe_retry else 1
         last: Exception | None = None
         for index in range(attempts):
@@ -48,9 +52,7 @@ class StorageClient:
             if response.status_code == 409:
                 raise StorageConflict(f"storage conflict: {response.text}")
             if response.is_error:
-                raise StorageError(
-                    f"storage {method} {url} failed: {response.status_code} {response.text}"
-                )
+                raise StorageError(f"storage {method} {url} failed: {response.status_code} {response.text}")
             return response
         raise StorageError(f"storage request failed: {last}")
 
@@ -79,27 +81,41 @@ class StorageClient:
             raise StorageError(f"GET run failed: {response.status_code} {response.text}")
         return _stored_run(response.json())
 
-    async def start(self, task_id: str, runner_id: str, expected_attempt: int, task_fingerprint: str) -> StoredRun:
+    async def start(
+        self,
+        task_id: str,
+        runner_id: str,
+        expected_attempt: int,
+        task_fingerprint: str,
+        app_provenance: list[dict],
+    ) -> StoredRun:
         response = await self._request(
-            "POST", "/v1/runs/start",
-            json={"task_id": task_id, "runner_id": runner_id, "expected_attempt": expected_attempt, "task_fingerprint": task_fingerprint},
+            "POST",
+            "/v1/runs/start",
+            json={
+                "task_id": task_id,
+                "runner_id": runner_id,
+                "expected_attempt": expected_attempt,
+                "task_fingerprint": task_fingerprint,
+                "app_provenance": app_provenance,
+            },
             safe_retry=True,
         )
         return _stored_run(response.json())
 
-    async def set_conversation(self, task_id: str, conversation_id: str,
-                               *, attempt: int, runner_id: str) -> StoredRun:
+    async def set_conversation(self, task_id: str, conversation_id: str, *, attempt: int, runner_id: str) -> StoredRun:
         response = await self._request(
-            "PATCH", f"/v1/runs/{task_id}/conversation",
+            "PATCH",
+            f"/v1/runs/{task_id}/conversation",
             json={"conversation_id": conversation_id, "attempt": attempt, "runner_id": runner_id},
             safe_retry=True,
         )
         return _stored_run(response.json())
 
-    async def complete(self, task_id: str, captured: CapturedConversation,
-                       *, attempt: int, runner_id: str) -> StoredRun:
+    async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str) -> StoredRun:
         response = await self._request(
-            "POST", f"/v1/runs/{task_id}/complete",
+            "POST",
+            f"/v1/runs/{task_id}/complete",
             json={
                 "conversation_id": captured.conversation_id,
                 "messages": captured.messages,
@@ -111,10 +127,10 @@ class StorageClient:
         )
         return _stored_run(response.json())
 
-    async def fail(self, task_id: str, error: Exception,
-                   *, attempt: int, runner_id: str) -> StoredRun:
+    async def fail(self, task_id: str, error: Exception, *, attempt: int, runner_id: str) -> StoredRun:
         response = await self._request(
-            "POST", f"/v1/runs/{task_id}/fail",
+            "POST",
+            f"/v1/runs/{task_id}/fail",
             json={
                 "error_type": type(error).__name__,
                 "error_message": str(error)[:8000],
@@ -140,9 +156,7 @@ class StorageClient:
                     raise StorageConflict(f"storage export conflict: {body}")
                 if response.is_error:
                     body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise StorageError(
-                        f"export failed: {response.status_code} {body}"
-                    )
+                    raise StorageError(f"export failed: {response.status_code} {body}")
                 with tmp.open("wb") as handle:
                     async for chunk in response.aiter_bytes():
                         handle.write(chunk)
@@ -169,4 +183,3 @@ class StorageClient:
         finally:
             os.close(dir_fd)
         return count
-

@@ -13,11 +13,7 @@ from .exceptions import BrowserIdentityError
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     storage_base_url: str = "http://storage:8080"
     browser_cdp_url: str = ""
@@ -33,6 +29,8 @@ class Settings(BaseSettings):
 
     tasks_root: Path = Path("/data/tasks")
     runner_state_root: Path = Path("/data/state")
+    app_registry_path: Path = Path("/data/apps/registry/apps.json")
+    app_control_token_file: Path = Path("/run/secrets/app_control_token")
 
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_conversation_turns: int = Field(default=100, ge=1, le=1000)
@@ -74,9 +72,7 @@ class Settings(BaseSettings):
 
     def _seed(self) -> int:
         if self.browser_fingerprint_seed is None:
-            raise BrowserIdentityError(
-                "BROWSER_FINGERPRINT_SEED is required; run `make init` once"
-            )
+            raise BrowserIdentityError("BROWSER_FINGERPRINT_SEED is required; run `make init` once")
         if self.browser_fingerprint_seed <= 0:
             raise BrowserIdentityError("BROWSER_FINGERPRINT_SEED must be positive")
         return self.browser_fingerprint_seed
@@ -132,17 +128,12 @@ class Settings(BaseSettings):
             or parsed.username is not None
             or parsed.password is not None
         ):
-            raise BrowserIdentityError(
-                "BROWSER_CLIPBOARD_URL must be the internal http://browser:<port>/clipboard helper"
-            )
+            raise BrowserIdentityError("BROWSER_CLIPBOARD_URL must be the internal http://browser:<port>/clipboard helper")
         return self.browser_clipboard_url
 
     def effective_runner_id(self) -> str:
-        # Always unique per process.  RUNNER_ID is only a human-readable label;
-        # a fixed value must never make two processes look like an idempotent retry.
         label = self.runner_id.strip() or socket.gethostname()
-        label = label[:230]
-        return f"{label}-{uuid.uuid4().hex[:16]}"
+        return f"{label[:230]}-{uuid.uuid4().hex[:16]}"
 
     @property
     def runner_lock_path(self) -> Path:

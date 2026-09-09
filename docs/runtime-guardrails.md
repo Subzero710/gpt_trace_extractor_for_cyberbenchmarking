@@ -1,61 +1,77 @@
 # Runtime guardrails
 
-The runner drives the real ChatGPT frontend inside one persistent CloakBrowser profile. It observes normal frontend network activity but does not reimplement Sentinel/challenge/conduit protocols or synthesize their tokens/payloads.
+Benchmark prompts, repositories, pages and downloads are hostile inputs. A run advances only when storage, ChatGPT and every requested local App agree on one task identity.
 
-## Identity
+## Teacher browser integrity
 
-`BROWSER_FINGERPRINT_SEED` is generated once and bound to `/profile/.gpt-trace-identity` together with optional native timezone/locale/geoip settings. A mismatch fails browser startup. Existing pre-marker profiles require explicit one-time adoption.
+The `browser` service remains dedicated to the ChatGPT UI and persistent `/profile`. `BROWSER_FINGERPRINT_SEED` is generated once and bound to the profile together with optional native timezone, locale and geo-IP settings. Healthcheck and runner CDP URLs must carry the exact same identity parameters.
 
-The CDP healthcheck and runner connection use the same identity query. Duplicate or additional identity parameters in a custom `BROWSER_CDP_URL` are rejected.
+The runner observes the normal frontend and does not synthesize Sentinel, challenge, conduit, cookie, device or security telemetry. It uses the real file chooser, X11 clipboard and visible Apps menu. The submitted model, prompt, timezone and browser environment are checked against observed evidence.
 
-## Interaction
+## Local App control
 
-- Page focus is checked read-only; `bring_to_front()` is used only when needed.
-- CloakBrowser's supported humanize wrapper is applied to the remote CDP Browser when enabled.
-- Attachments use a real browser file chooser path, never direct hidden-input mutation.
-- Benchmark text uses the browser container's X11 clipboard and Ctrl+V; no page-side clipboard permission/JavaScript is used.
-- App mentions inserted by ChatGPT are validated using frontend `serialization_metadata.custom_symbol_offsets` rather than being confused with benchmark prompt text.
+The runner and local Apps share a root-only Docker secret over separate internal control networks. `prepare`, `resume`, `reset` and state inspection require its bearer value. Host-published MCP ports do not publish this secret.
 
-## Task state and duplicate prevention
+The ports bind only to `127.0.0.1`. A deployment that connects ChatGPT must place an authenticated HTTPS gateway in front of `/mcp`; direct public exposure is prohibited. Account installation, gateway authentication and TLS are outside repository control and must be completed explicitly.
 
-PostgreSQL is authoritative for run state. Every mutation includes the expected `attempt` and `runner_id`. `completed` and `failed` attempts are immutable; only an explicit new attempt may replace a failed state. `conversation_id` is unique across tasks.
+The MCP transport also enforces an exact Host allowlist through `APP_CODE_WORKSPACE_ALLOWED_HOSTS` and `APP_BROWSER_ALLOWED_HOSTS`. Add the authenticated gateway's forwarded Host value deliberately when deploying it; do not use wildcards.
 
-`start` is serialized in PostgreSQL and refuses a second `running` task. `runner_id` always includes a fresh per-process nonce even when `RUNNER_ID` supplies a human-readable label.
+Every stateful operation carries:
 
-A local flock additionally prevents multiple commands sharing the same `runner_state` volume from touching ChatGPT concurrently.
+- task ID;
+- deterministic attempt-specific environment ID;
+- task fingerprint.
 
-## Crash journal
+An App refuses data owned by another identity. Reset never blindly deletes unowned state.
 
-Before a new attempt, the runner atomically journals the task fingerprint and expected attempt. Immediately before a concrete Send click it advances to `submission_started`; after ChatGPT assigns an ID it advances to `conversation_known`.
+## Code Workspace isolation
 
-After a crash, ambiguous submission is never retried automatically. Recovery requires a matching benchmark fingerprint, storage attempt/runner identity, and exact user prompt. Known conversation IDs are recovered without Send.
+- No host bind mount, Docker socket, PostgreSQL credential, teacher profile or egress network.
+- A named volume contains only the active task workspace; a separate named volume holds root-owned identity state.
+- Tool paths reject absolute paths, traversal and symlinks.
+- Commands run as an unprivileged UID with a minimal environment, process/descriptor/file limits, a wall timeout and process-group cleanup.
+- MCP output, file reads, attachment transfer and written files have explicit byte limits.
+- Compose drops all capabilities, then restores only those required for root to prepare the unprivileged workspace and terminate descendants.
+- The root-only control token is unreadable by benchmark commands.
 
-## Completion
+The container has an internal control network so the runner can reach it, but no route to the internet.
 
-A successful live turn requires the one frontend `POST /backend-api/f/conversation` SSE to contain:
+## Browser App isolation
 
-- exactly one conversation ID;
-- final assistant `end_turn=true`;
-- `message_stream_complete`;
-- `[DONE]`.
+- Its CloakBrowser process, fingerprint seed, profile and state volume are distinct from the teacher browser.
+- It shares neither a Docker network nor a volume with PostgreSQL, storage, Code Workspace or the teacher browser.
+- Only its dedicated egress network reaches the public internet.
+- URL credentials and non-HTTP navigation are rejected; private, loopback, link-local, multicast, reserved, unspecified and metadata-network targets are blocked after DNS resolution.
+- Tabs, cookies, local storage, history and downloads are deleted by identity-matched reset before the next task.
+- Screenshots and downloads are bounded and returned with integrity metadata.
 
-The frontend-submitted model and prompt are validated from the already-observed request. A naturally observed conversation snapshot is reused only if it validates; otherwise there is exactly one browser-context fallback fetch. HTTP 403/429 and malformed/incomplete snapshots are circuit breakers.
+An explicit private-host allowlist exists for controlled test fixtures. Production configuration should keep it empty unless a benchmark owner has documented the target and isolation impact.
+
+## Duplicate prevention and recovery
+
+PostgreSQL serializes `start` and permits only one `running` task. Every mutation uses attempt and runner identity. Completed and failed attempts are immutable; conversation IDs are unique.
+
+The local journal is fsynced at these phases:
+
+| Phase | Recovery rule |
+|---|---|
+| `starting` | Reset any partially prepared state; fail a matching running attempt. |
+| `apps_prepared` | Reset the exact environments; no Send occurred. |
+| `composer_dirty` | Reset the exact environments; no Send occurred. |
+| `submission_started` | Preserve environments; recover only uniquely evidenced current conversation. |
+| `conversation_known` | Preserve environments; recover the recorded conversation ID. |
+| `cleanup_pending` | Storage is complete; reset the exact environments before clearing the journal. |
+
+Recovery verifies benchmark fingerprint, storage provenance, attempt, runner, environment IDs, UI resolution and exact prompt evidence. It never re-submits an ambiguous Send and never substitutes a fresh App environment for a submitted conversation.
+
+## Completion and provenance
+
+A live turn requires exactly one observed frontend conversation POST and a complete SSE with a single conversation ID, final assistant `end_turn=true`, stream completion and `[DONE]`. The final authenticated conversation snapshot must match the exact benchmark prompt, expected model and required App invocations.
+
+Storage completion requires App provenance, including full manifests and hashes. Export refuses completed historical rows without that evidence. Raw messages remain unchanged; observed tool-call metadata is additive runtime evidence.
 
 ## Batch circuit breakers
 
-The batch stops instead of advancing on:
+The batch stops on browser/CDP/identity failure, storage transport or conflict, clipboard failure, authentication loss, HTTP 403/429, unresolved challenge, ambiguous submission, broken stream, model mismatch, browser drift, invalid registry or manifest, local App ownership/health/control failure, or unrecoverable journal state.
 
-- browser/CDP/identity failure;
-- storage transport/conflict failure;
-- clipboard/X11 failure;
-- authentication loss;
-- HTTP 403/429;
-- unrecovered challenge/interstitial;
-- ambiguous or duplicate submission;
-- broken/incomplete SSE;
-- model mismatch;
-- browser environment drift;
-- unrecoverable crash journal;
-- accidental concurrent turn/runner.
-
-A task-specific unavailable App or a completed turn that did not invoke a `required` App may be marked failed and, unless `--stop-on-error` is used, the sequential batch can continue from a clean new chat.
+A task-specific unavailable App or completed turn that did not invoke a required App may be recorded as failed only after its local state is reset. The next task never starts while cleanup is uncertain.

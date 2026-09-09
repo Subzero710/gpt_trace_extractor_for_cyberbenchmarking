@@ -1,0 +1,56 @@
+{
+  "app_id": "browser",
+  "tools": [
+    {
+      "description": "Search the public web through the isolated task browser and return ordered result links.",
+      "inputSchema": {"additionalProperties": false, "properties": {"max_results": {"default": 10, "maximum": 20, "minimum": 1, "type": "integer"}, "query": {"minLength": 1, "type": "string"}}, "required": ["query"], "type": "object"},
+      "name": "search"
+    },
+    {
+      "description": "Navigate the active browser tab to an HTTP or HTTPS URL allowed by the network policy.",
+      "inputSchema": {"additionalProperties": false, "properties": {"url": {"minLength": 1, "type": "string"}, "wait_until": {"default": "domcontentloaded", "enum": ["domcontentloaded", "load"], "type": "string"}}, "required": ["url"], "type": "object"},
+      "name": "navigate"
+    },
+    {
+      "description": "Read visible text and interactive element references from the active browser tab.",
+      "inputSchema": {"additionalProperties": false, "properties": {"include_elements": {"default": true, "type": "boolean"}, "max_chars": {"default": 50000, "maximum": 200000, "minimum": 1, "type": "integer"}, "max_elements": {"default": 200, "maximum": 500, "minimum": 1, "type": "integer"}}, "type": "object"},
+      "name": "read_page"
+    },
+    {
+      "description": "Click an element reference returned by read_page in the active tab.",
+      "inputSchema": {"additionalProperties": false, "properties": {"ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}}, "required": ["ref"], "type": "object"},
+      "name": "click"
+    },
+    {
+      "description": "Enter text into an editable element reference and optionally submit with Enter.",
+      "inputSchema": {"additionalProperties": false, "properties": {"clear": {"default": true, "type": "boolean"}, "ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}, "submit": {"default": false, "type": "boolean"}, "text": {"type": "string"}}, "required": ["ref", "text"], "type": "object"},
+      "name": "type"
+    },
+    {
+      "description": "Press one allowed navigation or editing key in the active tab or on a referenced element.",
+      "inputSchema": {"additionalProperties": false, "properties": {"key": {"enum": ["Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End", "Backspace", "Delete"], "type": "string"}, "ref": {"default": null, "pattern": "^e[1-9][0-9]*$", "type": ["string", "null"]}}, "required": ["key"], "type": "object"},
+      "name": "press"
+    },
+    {
+      "description": "Wait for a bounded duration or until exact visible text appears in the active tab.",
+      "inputSchema": {"additionalProperties": false, "properties": {"seconds": {"default": 1, "maximum": 30, "minimum": 0, "type": "number"}, "text": {"default": null, "type": ["string", "null"]}}, "type": "object"},
+      "name": "wait"
+    },
+    {
+      "description": "Capture a PNG screenshot of the active tab and return bounded base64 content.",
+      "inputSchema": {"additionalProperties": false, "properties": {"full_page": {"default": false, "type": "boolean"}}, "type": "object"},
+      "name": "screenshot"
+    },
+    {
+      "description": "Click a referenced download control and return a bounded downloaded file as base64 with integrity metadata.",
+      "inputSchema": {"additionalProperties": false, "properties": {"max_bytes": {"default": 5242880, "maximum": 10485760, "minimum": 1, "type": "integer"}, "ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}}, "required": ["ref"], "type": "object"},
+      "name": "download"
+    },
+    {
+      "description": "List, create, select, or close tabs in the isolated task browser.",
+      "inputSchema": {"additionalProperties": false, "properties": {"action": {"default": "list", "enum": ["list", "new", "select", "close"], "type": "string"}, "index": {"default": null, "minimum": 0, "type": ["integer", "null"]}, "url": {"default": null, "type": ["string", "null"]}}, "type": "object"},
+      "name": "tabs"
+    }
+  ],
+  "version": "1.0.0"
+}

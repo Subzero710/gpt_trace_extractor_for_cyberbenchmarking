@@ -9,6 +9,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - core_internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gpt_traces} -d ${POSTGRES_DB:-gpt_traces}"]
       interval: 5s
@@ -25,6 +27,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - core_internal
     ports:
       - "127.0.0.1:8080:8080"
     healthcheck:
@@ -34,6 +38,7 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # Persistent teacher browser: this remains dedicated to the ChatGPT UI.
   browser:
     build: ./infra/browser
     environment:
@@ -47,6 +52,9 @@ services:
       BROWSER_CLIPBOARD_PORT: ${BROWSER_CLIPBOARD_PORT:-8765}
     volumes:
       - browser_profile:/profile
+    networks:
+      - core_internal
+      - ui_egress
     ports:
       - "127.0.0.1:9222:9222"
       - "127.0.0.1:${BROWSER_NOVNC_PORT:-7900}:7900"
@@ -57,6 +65,103 @@ services:
       timeout: 5s
       retries: 20
       start_period: 15s
+    restart: unless-stopped
+
+  app-code-workspace:
+    build: ./apps/code-workspace
+    init: true
+    read_only: true
+    environment:
+      CODE_WORKSPACE_ROOT: /workspace
+      CODE_WORKSPACE_STATE_ROOT: /state
+      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+      MCP_ALLOWED_HOSTS: ${APP_CODE_WORKSPACE_ALLOWED_HOSTS:?run make init}
+    secrets:
+      - source: app_control_token
+        target: app_control_token
+        uid: "0"
+        gid: "0"
+        mode: 0400
+    volumes:
+      - code_workspace_data:/workspace
+      - code_workspace_state:/state
+    networks:
+      - code_control
+    ports:
+      - "127.0.0.1:${APP_CODE_WORKSPACE_PORT:-8011}:8000"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - KILL
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 160
+    mem_limit: 2g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  app-browser:
+    build: ./apps/browser
+    init: true
+    read_only: true
+    environment:
+      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
+      APP_BROWSER_STATE_ROOT: /browser-state
+      APP_BROWSER_FINGERPRINT_SEED: ${APP_BROWSER_FINGERPRINT_SEED:?run make init}
+      APP_BROWSER_SEARCH_URL_TEMPLATE: ${APP_BROWSER_SEARCH_URL_TEMPLATE:?run make init}
+      APP_BROWSER_ALLOWED_PRIVATE_HOSTS: ${APP_BROWSER_ALLOWED_PRIVATE_HOSTS:-}
+      APP_BROWSER_HUMANIZE: ${APP_BROWSER_HUMANIZE:-true}
+      APP_BROWSER_HUMANIZE_PRESET: ${APP_BROWSER_HUMANIZE_PRESET:-default}
+      APP_BROWSER_TIMEZONE: ${APP_BROWSER_TIMEZONE:-}
+      APP_BROWSER_LOCALE: ${APP_BROWSER_LOCALE:-}
+      APP_BROWSER_GEOIP: ${APP_BROWSER_GEOIP:-false}
+      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+      MCP_ALLOWED_HOSTS: ${APP_BROWSER_ALLOWED_HOSTS:?run make init}
+    secrets:
+      - source: app_control_token
+        target: app_control_token
+        uid: "0"
+        gid: "0"
+        mode: 0400
+    volumes:
+      - app_browser_state:/browser-state
+    networks:
+      - browser_control
+      - browser_egress
+    ports:
+      - "127.0.0.1:${APP_BROWSER_PORT:-8012}:8000"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+    shm_size: "2gb"
+    cap_drop:
+      - AUDIT_WRITE
+      - MKNOD
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
     restart: unless-stopped
 
   runner:
@@ -79,6 +184,16 @@ services:
       CHATGPT_EXPECTED_MODEL_SLUG: ${CHATGPT_EXPECTED_MODEL_SLUG:-gpt-5-6-thinking}
       TASKS_ROOT: ${TASKS_ROOT:-/data/tasks}
       RUNNER_STATE_ROOT: /data/state
+      APP_REGISTRY_PATH: /data/apps/registry/apps.json
+      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+      APP_CODE_WORKSPACE_UI_NAME: ${APP_CODE_WORKSPACE_UI_NAME:-Code Workspace}
+      APP_CODE_WORKSPACE_MCP_URL: ${APP_CODE_WORKSPACE_MCP_URL:-http://app-code-workspace:8000/mcp}
+      APP_CODE_WORKSPACE_CONTROL_URL: http://app-code-workspace:8000
+      APP_BROWSER_UI_NAME: ${APP_BROWSER_UI_NAME:-Browser}
+      APP_BROWSER_MCP_URL: ${APP_BROWSER_MCP_URL:-http://app-browser:8000/mcp}
+      APP_BROWSER_CONTROL_URL: http://app-browser:8000
+      APP_GITHUB_UI_NAME: ${APP_GITHUB_UI_NAME:-}
+      APP_GITHUB_MANIFEST_PATH: ${APP_GITHUB_MANIFEST_PATH:-}
       CHATGPT_TURN_TIMEOUT_SECONDS: ${CHATGPT_TURN_TIMEOUT_SECONDS:-1800}
       CHATGPT_STREAM_START_TIMEOUT_SECONDS: ${CHATGPT_STREAM_START_TIMEOUT_SECONDS:-180}
       CHATGPT_TOOL_SELECT_TIMEOUT_SECONDS: ${CHATGPT_TOOL_SELECT_TIMEOUT_SECONDS:-20}
@@ -88,15 +203,30 @@ services:
       CHATGPT_NATURAL_SNAPSHOT_WAIT_SECONDS: ${CHATGPT_NATURAL_SNAPSHOT_WAIT_SECONDS:-0}
       RUNNER_ID: ${RUNNER_ID:-}
       RUNNER_RECOVER_EXISTING: ${RUNNER_RECOVER_EXISTING:-true}
+    secrets:
+      - source: app_control_token
+        target: app_control_token
+        uid: "0"
+        gid: "0"
+        mode: 0400
     volumes:
       - ./benchmarks:/data/benchmarks:ro
       - ./tasks:/data/tasks:ro
       - ./exports:/data/exports
+      - ./apps:/data/apps:ro
       - runner_state:/data/state
+    networks:
+      - core_internal
+      - code_control
+      - browser_control
     depends_on:
       storage:
         condition: service_healthy
       browser:
+        condition: service_healthy
+      app-code-workspace:
+        condition: service_healthy
+      app-browser:
         condition: service_healthy
     stdin_open: true
     tty: true
@@ -106,3 +236,20 @@ volumes:
   postgres_data:
   browser_profile:
   runner_state:
+  code_workspace_data:
+  code_workspace_state:
+  app_browser_state:
+
+networks:
+  core_internal:
+    internal: true
+  code_control:
+    internal: true
+  browser_control:
+    internal: true
+  ui_egress:
+  browser_egress:
+
+secrets:
+  app_control_token:
+    file: ./.secrets/app_control_token

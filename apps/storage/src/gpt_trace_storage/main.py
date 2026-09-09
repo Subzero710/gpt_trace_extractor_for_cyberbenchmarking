@@ -12,7 +12,7 @@ from .models import Run
 from .repository import RunConflict, complete_run, fail_run, get_run, set_conversation, start_run, stats
 from .schemas import CompleteRunRequest, ConversationRequest, FailRunRequest, RunResponse, StartRunRequest, StatsResponse
 
-app = FastAPI(title="GPT Trace Storage", version="0.3.0")
+app = FastAPI(title="GPT Trace Storage", version="0.4.0")
 
 
 def conflict(exc: RunConflict) -> HTTPException:
@@ -29,8 +29,12 @@ async def healthz(session: AsyncSession = Depends(get_session)) -> dict[str, str
 async def start(body: StartRunRequest, session: AsyncSession = Depends(get_session)):
     try:
         return await start_run(
-            session, task_id=body.task_id, runner_id=body.runner_id,
-            expected_attempt=body.expected_attempt, task_fingerprint=body.task_fingerprint,
+            session,
+            task_id=body.task_id,
+            runner_id=body.runner_id,
+            expected_attempt=body.expected_attempt,
+            task_fingerprint=body.task_fingerprint,
+            app_provenance=[item.model_dump(mode="json") for item in body.app_provenance],
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -45,12 +49,14 @@ async def read_run(task_id: str, session: AsyncSession = Depends(get_session)):
 
 
 @app.patch("/v1/runs/{task_id}/conversation", response_model=RunResponse)
-async def update_conversation(task_id: str, body: ConversationRequest,
-                              session: AsyncSession = Depends(get_session)):
+async def update_conversation(task_id: str, body: ConversationRequest, session: AsyncSession = Depends(get_session)):
     try:
         run = await set_conversation(
-            session, task_id=task_id, conversation_id=body.conversation_id,
-            attempt=body.attempt, runner_id=body.runner_id,
+            session,
+            task_id=task_id,
+            conversation_id=body.conversation_id,
+            attempt=body.attempt,
+            runner_id=body.runner_id,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -60,13 +66,16 @@ async def update_conversation(task_id: str, body: ConversationRequest,
 
 
 @app.post("/v1/runs/{task_id}/complete", response_model=RunResponse)
-async def complete(task_id: str, body: CompleteRunRequest,
-                   session: AsyncSession = Depends(get_session)):
+async def complete(task_id: str, body: CompleteRunRequest, session: AsyncSession = Depends(get_session)):
     try:
         run = await complete_run(
-            session, task_id=task_id, conversation_id=body.conversation_id,
-            messages=body.messages, runtime_metadata=body.runtime_metadata,
-            attempt=body.attempt, runner_id=body.runner_id,
+            session,
+            task_id=task_id,
+            conversation_id=body.conversation_id,
+            messages=body.messages,
+            runtime_metadata=body.runtime_metadata,
+            attempt=body.attempt,
+            runner_id=body.runner_id,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -76,12 +85,14 @@ async def complete(task_id: str, body: CompleteRunRequest,
 
 
 @app.post("/v1/runs/{task_id}/fail", response_model=RunResponse)
-async def fail(task_id: str, body: FailRunRequest,
-               session: AsyncSession = Depends(get_session)):
+async def fail(task_id: str, body: FailRunRequest, session: AsyncSession = Depends(get_session)):
     try:
         run = await fail_run(
-            session, task_id=task_id, error_type=body.error_type,
-            error_message=body.error_message, attempt=body.attempt,
+            session,
+            task_id=task_id,
+            error_type=body.error_type,
+            error_message=body.error_message,
+            attempt=body.attempt,
             runner_id=body.runner_id,
         )
     except RunConflict as exc:
@@ -106,26 +117,29 @@ async def export_jsonl():
                     Run.conversation_id.is_(None),
                     Run.messages.is_(None),
                     Run.completed_at.is_(None),
+                    Run.app_provenance.is_(None),
                 ),
             )
         )
         if invalid:
-            raise HTTPException(409, f"{invalid} completed run(s) have incomplete dataset state")
+            raise HTTPException(409, f"{invalid} completed run(s) have incomplete dataset/provenance state")
 
     async def rows():
         async with SessionFactory() as session:
-            result = await session.stream_scalars(
-                select(Run).where(Run.status == "completed").order_by(Run.task_id)
-            )
+            result = await session.stream_scalars(select(Run).where(Run.status == "completed").order_by(Run.task_id))
             async for run in result:
                 item = {
                     "task_id": run.task_id,
+                    "task_fingerprint": run.task_fingerprint,
                     "conversation_id": run.conversation_id,
                     "captured_at": run.completed_at.isoformat() if run.completed_at else None,
+                    "app_provenance": run.app_provenance,
+                    "runtime_metadata": run.runtime_metadata or {},
                     "messages": run.messages or [],
                 }
                 yield json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
     return StreamingResponse(
-        rows(), media_type="application/x-ndjson",
+        rows(),
+        media_type="application/x-ndjson",
         headers={"Content-Disposition": 'attachment; filename="dataset.jsonl"'},
     )

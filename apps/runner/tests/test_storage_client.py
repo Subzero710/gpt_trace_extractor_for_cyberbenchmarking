@@ -14,31 +14,37 @@ async def test_storage_conflict_is_batch_error() -> None:
     client._client = httpx.AsyncClient(base_url="http://storage", transport=httpx.MockTransport(handler))
     try:
         with pytest.raises(StorageConflict):
-            await client.start("t", "r", 1, "a" * 64)
+            await client.start("t", "r", 1, "a" * 64, [])
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
-async def test_safe_mutation_retries_one_lost_transport_response() -> None:
+async def test_safe_start_retry_preserves_app_provenance() -> None:
     calls = 0
+    bodies = []
     async def handler(request):
         nonlocal calls
         calls += 1
+        bodies.append(request.content)
         if calls == 1:
             raise httpx.ReadTimeout("lost", request=request)
         return httpx.Response(
             200,
-            json={"task_id": "t", "status": "running", "attempt": 1, "runner_id": "r"},
+            json={
+                "task_id": "t", "status": "running", "attempt": 1,
+                "runner_id": "r", "app_provenance": [{"app_id": "browser"}],
+            },
             request=request,
         )
     client = StorageClient("http://storage")
     await client._client.aclose()
     client._client = httpx.AsyncClient(base_url="http://storage", transport=httpx.MockTransport(handler))
     try:
-        result = await client.start("t", "r", 1, "a" * 64)
-        assert result.attempt == 1
+        result = await client.start("t", "r", 1, "a" * 64, [{"app_id": "browser"}])
+        assert result.app_provenance == [{"app_id": "browser"}]
         assert calls == 2
+        assert bodies[0] == bodies[1]
     finally:
         await client.close()
 

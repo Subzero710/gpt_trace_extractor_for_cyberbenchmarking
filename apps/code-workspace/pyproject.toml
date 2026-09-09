@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-code-workspace-mcp"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp>=1.28,<2",
+  "starlette>=0.41,<1",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.28,<1", "pytest>=8.3,<9", "pytest-asyncio>=0.25,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -9,6 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .app_lifecycle import AppLifecycle
 from .benchmark import load_benchmark
 from .browser import BrowserClient
 from .chatgpt import ChatGPTClient
@@ -16,8 +18,10 @@ from .config import Settings
 from .exceptions import RecoveryIncomplete, StorageError
 from .journal import JournalStore
 from .lock import RunnerLock
+from .models import task_app_provenance, task_fingerprint
+from .qwen import flatten_app_provenance
+from .registry import AppRegistry
 from .runner import BenchmarkRunner, RunOptions
-from .models import task_fingerprint
 from .storage_client import StorageClient
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -46,21 +50,16 @@ def clipboard_health_url(settings: Settings) -> str:
     return urlunparse(parsed._replace(path="/healthz", query=""))
 
 
-
 async def ensure_no_running_storage(storage: StorageClient) -> None:
     data = await storage.stats()
     if int(data.get("running", 0)) > 0:
-        raise RecoveryIncomplete(
-            "storage reports a running benchmark task; do not use auth/doctor --chatgpt until it is recovered"
-        )
+        raise RecoveryIncomplete("storage reports a running benchmark task; recover it before auth/doctor --chatgpt")
 
 
 def ensure_no_pending_journal(settings: Settings) -> None:
     journal = JournalStore(settings.journal_path).load()
     if journal is not None:
-        raise RecoveryIncomplete(
-            f"pending crash journal for {journal.task_id}; run the benchmark with --resume before auth/doctor --chatgpt"
-        )
+        raise RecoveryIncomplete(f"pending crash journal for {journal.task_id}; run the benchmark with --resume first")
 
 
 @app.command()
@@ -75,17 +74,15 @@ def doctor(chatgpt: bool = typer.Option(False, "--chatgpt")) -> None:
                 await ensure_no_running_storage(storage)
         finally:
             await storage.close()
-
         BrowserClient.check_humanize_api(settings.browser_humanize_preset)
         console.print("[green]CloakBrowser humanize API: ok[/]")
         async with httpx.AsyncClient(timeout=10) as client:
             (await client.get(settings.browser_version_url())).raise_for_status()
-            console.print("[green]browser CDP: ok[/]")
+            console.print("[green]ChatGPT browser CDP: ok[/]")
             (await client.get(clipboard_health_url(settings))).raise_for_status()
-            console.print("[green]browser clipboard/X11: ok[/]")
+            console.print("[green]ChatGPT browser clipboard/X11: ok[/]")
         if not chatgpt:
             return
-
         ensure_no_pending_journal(settings)
         with RunnerLock(settings.runner_lock_path):
             session = await BrowserClient(
@@ -94,8 +91,7 @@ def doctor(chatgpt: bool = typer.Option(False, "--chatgpt")) -> None:
                 humanize_preset=settings.browser_humanize_preset,
             ).connect()
             try:
-                client = make_chatgpt(settings, session.page)
-                await client.prepare_session()
+                await make_chatgpt(settings, session.page).prepare_session()
                 console.print("[green]ChatGPT: authenticated and ready[/]")
             finally:
                 await session.disconnect()
@@ -140,9 +136,11 @@ def run_command(
 ) -> None:
     async def main() -> None:
         settings = Settings()
-        tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root)
+        registry = AppRegistry.load(settings.app_registry_path)
+        tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root, registry=registry)
         selected = tasks[:limit] if limit else tasks
         storage = StorageClient(settings.storage_base_url)
+        lifecycle = AppLifecycle(settings.app_control_token_file)
         try:
             await storage.health()
             journal = JournalStore(settings.journal_path).load()
@@ -150,25 +148,16 @@ def run_command(
             if journal is not None:
                 journal_task = selected_by_id.get(journal.task_id)
                 if journal_task is None:
-                    raise RecoveryIncomplete(
-                        f"pending journal task {journal.task_id!r} is not in the selected benchmark"
-                    )
+                    raise RecoveryIncomplete(f"pending journal task {journal.task_id!r} is not in the selected benchmark")
                 if journal.task_fingerprint != task_fingerprint(journal_task):
                     raise RecoveryIncomplete("pending journal fingerprint differs from benchmark")
-
             states = [await storage.get(task.task_id) for task in selected]
             for task, state in zip(selected, states, strict=True):
                 if state is not None and state.task_fingerprint != task_fingerprint(task):
-                    raise StorageError(
-                        f"{task.task_id} stored task fingerprint differs from benchmark"
-                    )
-            # Fast path: a completed --resume selection does not touch ChatGPT.
-            if resume and journal is None and states and all(
-                state and state.status == "completed" for state in states
-            ):
+                    raise StorageError(f"{task.task_id} stored task fingerprint differs from benchmark")
+            if resume and journal is None and states and all(state and state.status == "completed" for state in states):
                 console.print("[green]all selected tasks already completed[/]")
                 return
-
             with RunnerLock(settings.runner_lock_path):
                 session = await BrowserClient(
                     settings.effective_browser_cdp_url(),
@@ -179,20 +168,40 @@ def run_command(
                     runner = BenchmarkRunner(
                         chatgpt=make_chatgpt(settings, session.page),
                         storage=storage,
+                        lifecycle=lifecycle,
                         runner_id=settings.effective_runner_id(),
                         recover_existing=settings.runner_recover_existing,
                         console=console,
                         journal=JournalStore(settings.journal_path),
                     )
-                    await runner.run(
-                        tasks,
-                        RunOptions(resume=resume, stop_on_error=stop_on_error, limit=limit),
-                    )
+                    await runner.run(tasks, RunOptions(resume=resume, stop_on_error=stop_on_error, limit=limit))
                 finally:
                     await session.disconnect()
         finally:
+            await lifecycle.close()
             await storage.close()
     asyncio.run(main())
+
+
+@app.command("inspect-tools")
+def inspect_tools(
+    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
+    task_id: str = typer.Option(..., "--task-id"),
+) -> None:
+    settings = Settings()
+    registry = AppRegistry.load(settings.app_registry_path)
+    tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root, registry=registry)
+    matches = [task for task in tasks if task.task_id == task_id]
+    if len(matches) != 1:
+        raise typer.BadParameter(f"task_id {task_id!r} is not present exactly once")
+    task = matches[0]
+    value = {
+        "task_id": task.task_id,
+        "task_fingerprint": task_fingerprint(task),
+        "apps": task_app_provenance(task),
+        "qwen": flatten_app_provenance(task_app_provenance(task)),
+    }
+    console.print_json(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
 @app.command()

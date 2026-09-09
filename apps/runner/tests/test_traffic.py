@@ -9,6 +9,7 @@ from gpt_trace_runner.traffic import TrafficMonitor
 class FakePage:
     def __init__(self) -> None:
         self.handlers = {}
+
     def on(self, name, callback):
         self.handlers[name] = callback
 
@@ -26,6 +27,7 @@ class FakeResponse:
         self.status = status
         self.request = request or FakeRequest(url, method)
         self._payload = payload or {}
+
     async def body(self):
         return json.dumps(self._payload).encode()
 
@@ -69,14 +71,19 @@ def test_late_response_is_not_counted_in_next_task() -> None:
     assert monitor.runtime_metadata()["responses_403"] == 0
 
 
-def test_conversation_post_extracts_model_and_timezone_only() -> None:
+def test_conversation_post_extracts_only_audited_runtime_fields() -> None:
     page = FakePage()
     monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
     monitor.begin_task()
     request = FakeRequest(
         "https://chatgpt.com/backend-api/f/conversation",
         "POST",
-        {"model": "gpt-5-6-thinking", "timezone": "Europe/Zurich", "timezone_offset_min": 120, "secret": "not-kept"},
+        {
+            "model": "gpt-5-6-thinking",
+            "timezone": "Europe/Zurich",
+            "timezone_offset_min": 120,
+            "secret": "not-kept",
+        },
     )
     page.handlers["request"](request)
     meta = monitor.runtime_metadata()
@@ -107,7 +114,7 @@ def test_failed_request_is_cleaned_and_counted() -> None:
     assert monitor.runtime_metadata()["requests_failed"] == 1
 
 
-def test_conversation_post_prompt_with_app_mention_matches_benchmark():
+def test_conversation_post_prompt_with_configured_app_mention_matches_benchmark() -> None:
     page = FakePage()
     monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
     monitor.begin_task()
@@ -121,11 +128,11 @@ def test_conversation_post_prompt_with_app_mention_matches_benchmark():
             "messages": [
                 {
                     "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": ["@Github (mosaic) inspect repo"]},
+                    "content": {"content_type": "text", "parts": ["@GitHub Connector inspect repo"]},
                     "metadata": {
                         "serialization_metadata": {
                             "custom_symbol_offsets": [
-                                {"symbol": "ecosystemMention", "startIndex": 0, "endIndex": 16}
+                                {"symbol": "ecosystemMention", "startIndex": 0, "endIndex": 17}
                             ]
                         }
                     },
