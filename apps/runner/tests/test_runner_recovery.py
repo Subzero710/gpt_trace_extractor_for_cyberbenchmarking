@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from gpt_trace_runner.exceptions import AmbiguousSubmission
+from gpt_trace_runner.exceptions import AmbiguousSubmission, RequiredToolNotUsed
 from gpt_trace_runner.journal import JournalStore, SubmissionJournal
 from gpt_trace_runner.models import BenchmarkTask, CapturedConversation, StoredRun, task_fingerprint
 from gpt_trace_runner.runner import BenchmarkRunner, RunOptions
@@ -19,9 +19,10 @@ def fp():
 class Lifecycle:
     def __init__(self): self.calls = []
     def environment_ids(self, task, *, attempt, fingerprint): return {}
-    async def prepare(self, task, environments, fingerprint): self.calls.append("prepare")
-    async def assert_resume(self, task, environments, fingerprint): self.calls.append("resume")
-    async def reset(self, task, environments, fingerprint): self.calls.append("reset")
+    async def prepare(self, task, environments, fingerprint, *, attempt): self.calls.append("prepare")
+    async def assert_resume(self, task, environments, fingerprint, *, attempt): self.calls.append("resume")
+    async def runtime_metadata(self, task, environments, fingerprint, *, attempt): return {}
+    async def reset(self, task, environments, fingerprint, *, attempt): self.calls.append("reset")
 
 
 class Storage:
@@ -125,4 +126,40 @@ async def test_completed_row_with_cleanup_journal_is_reset(tmp_path: Path) -> No
     lifecycle = Lifecycle()
     await runner(RecoveryChatGPT(), storage, store, lifecycle).reconcile_journal([TASK])
     assert lifecycle.calls == ["reset"]
+    assert store.load() is None
+
+
+class MissingRequiredOnRecover(RecoveryChatGPT):
+    async def recover(self, conversation_id, *, task):
+        raise RequiredToolNotUsed("required App was not used")
+
+
+class MissingRequiredCandidate(RecoveryChatGPT):
+    async def recover_current_candidate(self, *, task):
+        raise RequiredToolNotUsed("required App was not used")
+
+
+@pytest.mark.asyncio
+async def test_known_conversation_required_tool_failure_terminalizes_and_cleans_environment(tmp_path: Path) -> None:
+    store = JournalStore(tmp_path / "j.json")
+    store.write(SubmissionJournal("t", "old", 3, "conversation_known", "known", fp()))
+    storage = Storage(StoredRun("t", "running", "known", 3, "old", fp(), app_provenance=[]))
+    lifecycle = Lifecycle()
+    with pytest.raises(RequiredToolNotUsed):
+        await runner(MissingRequiredOnRecover(), storage, store, lifecycle).reconcile_journal([TASK])
+    assert storage.existing.status == "failed"
+    assert lifecycle.calls == ["resume", "reset"]
+    assert store.load() is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_candidate_required_tool_failure_terminalizes_and_cleans_environment(tmp_path: Path) -> None:
+    store = JournalStore(tmp_path / "j.json")
+    store.write(SubmissionJournal("t", "old", 3, "submission_started", task_fingerprint=fp()))
+    storage = Storage(StoredRun("t", "running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
+    lifecycle = Lifecycle()
+    with pytest.raises(RequiredToolNotUsed):
+        await runner(MissingRequiredCandidate(), storage, store, lifecycle).reconcile_journal([TASK])
+    assert storage.existing.status == "failed"
+    assert lifecycle.calls == ["resume", "reset"]
     assert store.load() is None

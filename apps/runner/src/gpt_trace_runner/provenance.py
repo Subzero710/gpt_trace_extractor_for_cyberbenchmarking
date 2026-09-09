@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 from .models import BenchmarkTask, CapturedConversation, task_app_provenance
+from .workspace_seed import snapshot as workspace_snapshot
 
 
 def invoked_tool_calls(
@@ -65,6 +66,7 @@ def enrich_capture(
     *,
     task: BenchmarkTask,
     app_environments: dict[str, str],
+    app_runtime: dict[str, Any] | None = None,
 ) -> CapturedConversation:
     metadata = deepcopy(captured.runtime_metadata)
     metadata["requested_tools"] = [
@@ -80,5 +82,12 @@ def enrich_capture(
     ]
     metadata["app_provenance"] = task_app_provenance(task)
     metadata["app_environments"] = dict(sorted(app_environments.items()))
+    workspace = workspace_snapshot(task.initial_workspace)
+    metadata["initial_workspace"] = {
+        "sha256": workspace.sha256,
+        "files": workspace.files,
+        "bytes": workspace.bytes,
+    }
+    metadata["app_runtime"] = deepcopy(app_runtime or {})
     metadata["used_tool_calls"] = invoked_tool_calls(captured.messages, task=task)
     return CapturedConversation(captured.conversation_id, captured.messages, metadata)

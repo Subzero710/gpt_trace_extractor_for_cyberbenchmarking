@@ -52,11 +52,11 @@ All paths are relative to the owned task workspace. Absolute paths, `..`, symlin
 | `list_directory` | Returns typed entries in deterministic path order. |
 | `search_files` | Performs literal UTF-8 content search with deterministic file/line/column ordering. |
 
-Attachments are integrity-checked and copied to `attachments/<basename>` during `prepare`. A workspace is usable only while its persisted task ID, attempt-derived environment ID and task fingerprint match.
+For each attempt the runner creates a fresh Workspace container. `tasks/<task_id>/initial_workspace/` is copied to `/workspace` before the gateway is bound; attachments are copied to `/workspace/attachments/<basename>`. Neither source tree is mounted into the container. The container is destroyed at terminal cleanup.
 
 ## Browser contract
 
-The Browser App owns a dedicated CloakBrowser process and profile. `read_page` assigns ephemeral element references such as `e1`; interaction tools reject stale or ambiguous references.
+Every Browser attempt owns a newly created CloakBrowser container and profile. `read_page` assigns ephemeral element references such as `e1`; interaction tools reject stale or ambiguous references. The entire Browser container is destroyed at terminal cleanup.
 
 | Tool | Stable behavior |
 |---|---|
@@ -113,7 +113,7 @@ The live output contains the complete committed schema. When names collide acros
 
 ## Add or change a local App
 
-1. Use one dedicated container and one MCP server for one coherent capability bundle.
+1. Use one coherent capability bundle and a stable MCP gateway when the backend must be ephemeral per attempt.
 2. Define precise Qwen-oriented tools in the App's `contracts.py` and generate the matching `tool-manifest.json`.
 3. Change the semantic version for a model-visible semantic or schema change.
 4. Canonicalize JSON with sorted keys and compact separators, calculate SHA-256, and update the registry's `version` and `manifest_sha256`.

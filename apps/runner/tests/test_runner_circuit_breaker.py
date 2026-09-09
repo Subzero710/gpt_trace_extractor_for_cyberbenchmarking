@@ -12,9 +12,10 @@ from gpt_trace_runner.runner import BenchmarkRunner, RunOptions
 class Lifecycle:
     def __init__(self): self.calls = []
     def environment_ids(self, task, *, attempt, fingerprint): return {}
-    async def prepare(self, task, environments, fingerprint): self.calls.append("prepare")
-    async def assert_resume(self, task, environments, fingerprint): self.calls.append("resume")
-    async def reset(self, task, environments, fingerprint): self.calls.append("reset")
+    async def prepare(self, task, environments, fingerprint, *, attempt): self.calls.append("prepare")
+    async def assert_resume(self, task, environments, fingerprint, *, attempt): self.calls.append("resume")
+    async def runtime_metadata(self, task, environments, fingerprint, *, attempt): return {}
+    async def reset(self, task, environments, fingerprint, *, attempt): self.calls.append("reset")
 
 
 class FakeChatGPT:

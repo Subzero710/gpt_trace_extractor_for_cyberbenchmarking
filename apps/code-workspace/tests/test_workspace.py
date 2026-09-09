@@ -115,8 +115,15 @@ async def test_exec_command_returns_streams_status_and_timeout(manager: Workspac
     })
     assert timed["timed_out"] is True
     pid = int((manager.workspace_root / "child.pid").read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    try:
+        stat_fields = Path(f"/proc/{pid}/stat").read_text().split()
+    except FileNotFoundError:
+        stat_fields = []
+    # killpg terminates the command tree. On a host test runner the child can
+    # briefly remain as a zombie until PID 1 reaps it; inside the real runtime
+    # container `Init: true` performs that reaping. A zombie is not running and
+    # consumes no CPU. The entire container is destroyed at task completion.
+    assert not stat_fields or stat_fields[2] == "Z"
 
 
 @pytest.mark.asyncio

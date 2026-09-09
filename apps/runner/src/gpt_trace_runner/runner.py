@@ -126,10 +126,34 @@ class BenchmarkRunner:
         fingerprint: str,
     ) -> None:
         recovery_task = self._recovery_task(task, existing)
-        await self.lifecycle.assert_resume(recovery_task, environments, fingerprint)
+        await self.lifecycle.assert_resume(recovery_task, environments, fingerprint, attempt=existing.attempt)
         identity = existing.runner_id or self.runner_id
-        captured = await self.chatgpt.recover(conversation_id, task=recovery_task)
-        captured = enrich_capture(captured, task=recovery_task, app_environments=environments)
+        try:
+            captured = await self.chatgpt.recover(conversation_id, task=recovery_task)
+        except RequiredToolNotUsed as exc:
+            await self.storage.fail(
+                task.task_id, exc, attempt=existing.attempt, runner_id=identity
+            )
+            await self.lifecycle.reset(
+                recovery_task,
+                environments,
+                fingerprint,
+                attempt=existing.attempt,
+            )
+            self.journal.clear()
+            raise
+        app_runtime = await self.lifecycle.runtime_metadata(
+            recovery_task,
+            environments,
+            fingerprint,
+            attempt=existing.attempt,
+        )
+        captured = enrich_capture(
+            captured,
+            task=recovery_task,
+            app_environments=environments,
+            app_runtime=app_runtime,
+        )
         await self.storage.set_conversation(task.task_id, conversation_id, attempt=existing.attempt, runner_id=identity)
         await self.storage.complete(task.task_id, captured, attempt=existing.attempt, runner_id=identity)
         self.journal.write(
@@ -143,7 +167,7 @@ class BenchmarkRunner:
                 conversation_id=conversation_id,
             )
         )
-        await self.lifecycle.reset(recovery_task, environments, fingerprint)
+        await self.lifecycle.reset(recovery_task, environments, fingerprint, attempt=existing.attempt)
         self.journal.clear()
         self.console.print(f"[green]{task.task_id}: recovered ({len(captured.messages)} messages)[/]")
 
@@ -168,7 +192,7 @@ class BenchmarkRunner:
             raise RecoveryIncomplete("submission journal UI App resolution does not match stored provenance")
 
         if existing is not None and existing.status == "completed":
-            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint)
+            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             self.journal.clear()
             return
         if (
@@ -177,12 +201,12 @@ class BenchmarkRunner:
             and existing.attempt == entry.attempt
             and existing.runner_id == entry.runner_id
         ):
-            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint)
+            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             self.journal.clear()
             return
 
         if entry.phase in {"starting", "apps_prepared", "composer_dirty"}:
-            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint)
+            await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             if existing is None:
                 self.journal.clear()
                 return
@@ -212,8 +236,21 @@ class BenchmarkRunner:
             return
         if entry.phase != "submission_started":
             raise RecoveryIncomplete("conversation_known journal has no conversation_id")
-        await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint)
-        captured = await self.chatgpt.recover_current_candidate(task=recovery_task)
+        await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
+        try:
+            captured = await self.chatgpt.recover_current_candidate(task=recovery_task)
+        except RequiredToolNotUsed as exc:
+            await self.storage.fail(
+                entry.task_id, exc, attempt=entry.attempt, runner_id=entry.runner_id
+            )
+            await self.lifecycle.reset(
+                recovery_task,
+                expected_environments,
+                fingerprint,
+                attempt=entry.attempt,
+            )
+            self.journal.clear()
+            raise
         conversation_id = captured.conversation_id
         self.journal.write(
             self._entry(
@@ -227,7 +264,18 @@ class BenchmarkRunner:
             )
         )
         await self.storage.set_conversation(entry.task_id, conversation_id, attempt=entry.attempt, runner_id=entry.runner_id)
-        captured = enrich_capture(captured, task=recovery_task, app_environments=expected_environments)
+        app_runtime = await self.lifecycle.runtime_metadata(
+            recovery_task,
+            expected_environments,
+            fingerprint,
+            attempt=entry.attempt,
+        )
+        captured = enrich_capture(
+            captured,
+            task=recovery_task,
+            app_environments=expected_environments,
+            app_runtime=app_runtime,
+        )
         await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id)
         self.journal.write(
             self._entry(
@@ -240,7 +288,7 @@ class BenchmarkRunner:
                 conversation_id=conversation_id,
             )
         )
-        await self.lifecycle.reset(recovery_task, expected_environments, fingerprint)
+        await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
         self.journal.clear()
         self.console.print(f"[green]{entry.task_id}: crash recovery completed[/]")
 
@@ -304,7 +352,7 @@ class BenchmarkRunner:
             )
             if started.attempt != expected_attempt or started.runner_id != self.runner_id:
                 raise StorageError("storage /start returned unexpected attempt identity")
-            await self.lifecycle.prepare(task, environments, fingerprint)
+            await self.lifecycle.prepare(task, environments, fingerprint, attempt=expected_attempt)
             phase = "apps_prepared"
             self.journal.write(
                 self._entry(
@@ -367,7 +415,18 @@ class BenchmarkRunner:
             )
             self.console.print(f"{task.task_id}: conversation {submitted.conversation_id}")
             captured = await self.chatgpt.wait_for_completion(submitted)
-            captured = enrich_capture(captured, task=task, app_environments=environments)
+            app_runtime = await self.lifecycle.runtime_metadata(
+                task,
+                environments,
+                fingerprint,
+                attempt=expected_attempt,
+            )
+            captured = enrich_capture(
+                captured,
+                task=task,
+                app_environments=environments,
+                app_runtime=app_runtime,
+            )
             await self.storage.complete(task.task_id, captured, attempt=expected_attempt, runner_id=self.runner_id)
             phase = "cleanup_pending"
             self.journal.write(
@@ -381,18 +440,18 @@ class BenchmarkRunner:
                     conversation_id=submitted.conversation_id,
                 )
             )
-            await self.lifecycle.reset(task, environments, fingerprint)
+            await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
             self.journal.clear()
             self.console.print(f"[green]{task.task_id}: completed ({len(captured.messages)} messages)[/]")
         except Exception as exc:
             if phase == "starting" and started is None and isinstance(exc, StorageConflict):
                 self.journal.clear()
             elif phase in {"starting", "apps_prepared", "composer_dirty"} and started is not None and not isinstance(exc, StorageError):
-                await self.lifecycle.reset(task, environments, fingerprint)
+                await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
                 await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
                 self.journal.clear()
             elif isinstance(exc, RequiredToolNotUsed) and started is not None:
-                await self.lifecycle.reset(task, environments, fingerprint)
+                await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
                 await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
                 self.journal.clear()
             raise

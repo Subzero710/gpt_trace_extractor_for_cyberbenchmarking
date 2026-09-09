@@ -32,6 +32,22 @@ class Settings(BaseSettings):
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
     app_control_token_file: Path = Path("/run/secrets/app_control_token")
 
+    docker_socket_path: Path = Path("/var/run/docker.sock")
+    app_code_workspace_image: str = "gpt-trace-code-workspace:latest"
+    app_browser_image: str = "gpt-trace-browser:latest"
+    workspace_gateway_container: str = "gpt-trace-workspace-gateway"
+    browser_gateway_container: str = "gpt-trace-browser-gateway"
+
+    cloakbrowser_license_key: str = ""
+    app_browser_fingerprint_seed: int | None = None
+    app_browser_search_url_template: str = "https://duckduckgo.com/?q={query}"
+    app_browser_allowed_private_hosts: str = ""
+    app_browser_humanize: bool = True
+    app_browser_humanize_preset: Literal["default", "careful"] = "default"
+    app_browser_timezone: str = ""
+    app_browser_locale: str = ""
+    app_browser_geoip: bool = False
+
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_conversation_turns: int = Field(default=100, ge=1, le=1000)
     chatgpt_turn_timeout_seconds: float = Field(default=1800.0, gt=0)
@@ -46,7 +62,7 @@ class Settings(BaseSettings):
     runner_id: str = ""
     runner_recover_existing: bool = True
 
-    @field_validator("browser_timezone")
+    @field_validator("browser_timezone", "app_browser_timezone")
     @classmethod
     def _valid_timezone(cls, value: str) -> str:
         value = value.strip()
@@ -54,7 +70,7 @@ class Settings(BaseSettings):
             raise ValueError("BROWSER_TIMEZONE contains unsupported characters")
         return value
 
-    @field_validator("browser_locale")
+    @field_validator("browser_locale", "app_browser_locale")
     @classmethod
     def _valid_locale(cls, value: str) -> str:
         value = value.strip()
@@ -130,6 +146,24 @@ class Settings(BaseSettings):
         ):
             raise BrowserIdentityError("BROWSER_CLIPBOARD_URL must be the internal http://browser:<port>/clipboard helper")
         return self.browser_clipboard_url
+
+    def dynamic_browser_environment(self) -> dict[str, str]:
+        seed = self.app_browser_fingerprint_seed
+        if seed is None or seed <= 0:
+            raise BrowserIdentityError("APP_BROWSER_FINGERPRINT_SEED must be a positive integer; run `make init`")
+        if "{query}" not in self.app_browser_search_url_template:
+            raise BrowserIdentityError("APP_BROWSER_SEARCH_URL_TEMPLATE must contain {query}")
+        return {
+            "CLOAKBROWSER_LICENSE_KEY": self.cloakbrowser_license_key,
+            "APP_BROWSER_FINGERPRINT_SEED": str(seed),
+            "APP_BROWSER_SEARCH_URL_TEMPLATE": self.app_browser_search_url_template,
+            "APP_BROWSER_ALLOWED_PRIVATE_HOSTS": self.app_browser_allowed_private_hosts,
+            "APP_BROWSER_HUMANIZE": "true" if self.app_browser_humanize else "false",
+            "APP_BROWSER_HUMANIZE_PRESET": self.app_browser_humanize_preset,
+            "APP_BROWSER_TIMEZONE": self.app_browser_timezone.strip(),
+            "APP_BROWSER_LOCALE": self.app_browser_locale.strip(),
+            "APP_BROWSER_GEOIP": "true" if self.app_browser_geoip else "false",
+        }
 
     def effective_runner_id(self) -> str:
         label = self.runner_id.strip() or socket.gethostname()

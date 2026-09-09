@@ -8,8 +8,8 @@
       "display_name_default": "Code Workspace",
       "version": "1.0.0",
       "mcp_endpoint_env": "APP_CODE_WORKSPACE_MCP_URL",
-      "mcp_endpoint_default": "http://app-code-workspace:8000/mcp",
-      "control_endpoint_default": "http://app-code-workspace:8000",
+      "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
+      "control_endpoint_default": "http://workspace-gateway:8000",
       "manifest_path_default": "../code-workspace/tool-manifest.json",
       "manifest_sha256": "6b1fd0906b9b4ceaf189f77b24d8c3f547dd812f94e0f642b3aa65268aaea3ac",
       "attachment_mode": "copy",
@@ -22,8 +22,8 @@
       "display_name_default": "Browser",
       "version": "1.0.0",
       "mcp_endpoint_env": "APP_BROWSER_MCP_URL",
-      "mcp_endpoint_default": "http://app-browser:8000/mcp",
-      "control_endpoint_default": "http://app-browser:8000",
+      "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
+      "control_endpoint_default": "http://browser-gateway:8000",
       "manifest_path_default": "../browser/tool-manifest.json",
       "manifest_sha256": "324ea8330f1d854c0c096fa1aa6e7f50a7718573455c884272690793d28761a6",
       "attachment_mode": "none",
@@ -35,7 +35,9 @@
       "display_name_env": "APP_GITHUB_UI_NAME",
       "manifest_path_env": "APP_GITHUB_MANIFEST_PATH",
       "attachment_mode": "none",
-      "aliases": ["github-connector"]
+      "aliases": [
+        "github-connector"
+      ]
     }
   ]
 }

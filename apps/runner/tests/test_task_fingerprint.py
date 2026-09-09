@@ -28,3 +28,14 @@ def test_fingerprint_uses_canonical_contract_not_mutable_ui_name(tmp_path: Path)
     assert task_fingerprint(task) != task_fingerprint(changed_hash)
     changed_version = replace(task, tools=(replace(task.tools[0], version="9.0.0"),))
     assert task_fingerprint(task) != task_fingerprint(changed_version)
+
+
+def test_fingerprint_changes_when_initial_workspace_changes(tmp_path: Path) -> None:
+    root = tmp_path / "initial_workspace"
+    root.mkdir()
+    source = root / "main.py"
+    source.write_text("print(1)\n")
+    task = BenchmarkTask("t", "x", (), initial_workspace=root)
+    first = task_fingerprint(task)
+    source.write_text("print(2)\n")
+    assert task_fingerprint(task) != first

@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
+from .workspace_seed import snapshot as workspace_snapshot
+
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkTool:
@@ -44,6 +46,7 @@ class BenchmarkTask:
     prompt: str
     attachments: tuple[Path, ...]
     tools: tuple[BenchmarkTool, ...] = ()
+    initial_workspace: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,10 +87,16 @@ def task_fingerprint(task: BenchmarkTask) -> str:
         {"name": path.name, "sha256": _file_sha256(path)}
         for path in task.attachments
     ]
+    workspace = workspace_snapshot(task.initial_workspace)
     payload = {
         "task_id": task.task_id,
         "prompt": task.prompt,
         "attachments": attachments,
+        "initial_workspace": {
+            "sha256": workspace.sha256,
+            "files": workspace.files,
+            "bytes": workspace.bytes,
+        },
         "apps": [
             {
                 "type": tool.type,

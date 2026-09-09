@@ -33,10 +33,12 @@ def _boolean(name: str, default: bool) -> bool:
 
 
 def _control_token(path: Path) -> str:
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError(f"cannot read control token at {path}") from exc
+    value = os.environ.get("APP_CONTROL_TOKEN", "").strip()
+    if not value:
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read control token at {path}") from exc
     if len(value) < 32:
         raise RuntimeError("control token is missing or too short")
     return value

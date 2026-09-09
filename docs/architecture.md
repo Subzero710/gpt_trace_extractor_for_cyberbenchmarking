@@ -1,6 +1,6 @@
 # Architecture
 
-Qwen-compatible function calling is the canonical representation. ChatGPT is the teacher runtime, and a ChatGPT App is a deployment grouping that makes one or more canonical tools available during capture.
+Qwen-compatible function calling is the canonical representation. ChatGPT is the teacher runtime. A ChatGPT App is only a deployment grouping around canonical tools.
 
 ```mermaid
 flowchart TB
@@ -8,14 +8,17 @@ flowchart TB
     T --> C[ChatGPT UI]
     R --> S[Storage API]
     S --> P[(PostgreSQL)]
-    R --> W[Code Workspace MCP]
-    R --> B[Browser MCP]
-    C -. configured Apps .-> W
-    C -. configured Apps .-> B
+    C -. Code Workspace App .-> WG[Workspace gateway]
+    C -. Browser App .-> BG[Browser gateway]
     C -. configured connector .-> G[External GitHub]
+    R --> D[Docker API]
+    D --> W[Workspace container - current attempt]
+    D --> B[Browser container - current attempt]
+    WG --> W
+    BG --> B
 ```
 
-The dotted edges are ChatGPT account/deployment configuration, not Docker network links. Local MCP endpoints require an authenticated HTTPS gateway reachable by ChatGPT. Compose itself binds them only to host loopback.
+The gateways are stable MCP endpoints. They contain no benchmark workspace, browser profile, cookies, downloads or task files. The runner creates and destroys the execution containers.
 
 ## Identity layers
 
@@ -24,65 +27,73 @@ The dotted edges are ChatGPT account/deployment configuration, not Docker networ
 | Benchmark | logical `app_id` | optional legacy name selector |
 | Canonical tool | `(app_id, tool_name)` | none |
 | Contract | semantic version + canonical manifest SHA-256 | none |
-| ChatGPT UI | resolved visible App name | may change through configuration |
-| MCP deployment | endpoint/container | transport concern |
-| Task environment | deterministic environment ID | owned profile/workspace state |
+| ChatGPT UI | resolved visible App name | configurable |
+| MCP deployment | gateway endpoint | transport concern |
+| Attempt runtime | task + attempt + fingerprint + environment ID | container/image/network IDs |
 
-The registry resolves a logical ID only after loading and validating its exact manifest. Manifest bytes are canonical JSON: UTF-8, sorted object keys, no insignificant whitespace. The hash therefore changes for a tool name, description, argument schema, required field, or version change.
-
-## Task sequence
+## Attempt lifecycle
 
 ```mermaid
 sequenceDiagram
     participant R as Runner
-    participant S as Storage
-    participant A as Local Apps
+    participant D as Docker
+    participant G as MCP gateway
     participant C as ChatGPT
-    R->>S: Start attempt + provenance
-    R->>A: Prepare owned environments
-    R->>C: Fresh chat + Apps + prompt
-    R->>C: Send once
+    participant S as Storage
+    R->>S: start attempt + App provenance
+    R->>D: create per-attempt network(s)
+    R->>D: create requested Workspace/Browser container(s)
+    R->>D: copy initial workspace + attachments to Workspace
+    R->>G: bind gateway to exact backend container
+    R->>C: fresh chat + Apps + prompt
+    R->>C: send once
     C-->>R: SSE + conversation snapshot
-    R->>S: Complete raw capture
-    R->>A: Reset exact environments
+    R->>S: complete raw capture + runtime provenance
+    R->>G: unbind backend
+    R->>D: rm -f -v task container(s)
+    R->>D: remove per-attempt network(s)
 ```
 
-The runner persists a journal before each irreversible boundary. Its phases are `starting`, `apps_prepared`, `composer_dirty`, `submission_started`, `conversation_known`, and `cleanup_pending`.
+A task requesting only GitHub creates no local execution container. Workspace-only and Browser-only tasks create exactly one corresponding container.
 
-- Before `submission_started`, recovery may reset state and fail the interrupted attempt.
-- At or after `submission_started`, the exact environment is preserved because a conversation may depend on it.
-- Recovery verifies stored contract provenance and asserts the exact local environment before reading the known or uniquely evidenced conversation.
-- After storage completion, `cleanup_pending` remains until every local App acknowledges an identity-matched reset.
+## Initial workspace
 
-No recovered conversation is paired with a fresh workspace or browser profile.
+`tasks/<task_id>/initial_workspace/` is only a host-side source tree read by the runner. It is never mounted into the execution container. Before the Workspace backend is exposed through the gateway, the runner copies that tree into `/workspace`. Attachments are copied separately under `/workspace/attachments/`.
+
+The initial workspace hash participates in the task fingerprint. Symlinks and special files are rejected.
+
+## Recovery
+
+The journal phases remain `starting`, `apps_prepared`, `composer_dirty`, `submission_started`, `conversation_known`, and `cleanup_pending`. Environment IDs and container names are deterministic from task identity, attempt and fingerprint.
+
+- Before `submission_started`, partial local runtimes may be destroyed and the attempt failed.
+- At or after `submission_started`, the exact containers are preserved for recovery.
+- Recovery discovers the existing containers and validates labels, networks, image identity and environment identity.
+- If an expected container or network is missing, recovery fails instead of creating a replacement.
+- Terminal cleanup destroys containers with volumes and removes attempt networks.
+
+No recovered conversation is ever paired with a fresh workspace or browser profile.
+
+## Networks
+
+| Network | Members | Internet | Lifetime |
+|---|---|---|---|
+| `core_internal` | PostgreSQL, storage, teacher browser, runner | No | persistent |
+| `ui_egress` | teacher browser | Yes | persistent |
+| `app_control` | runner + stable gateways | No | persistent |
+| `gpt-trace-task-<id>` | requested backend container(s) + corresponding gateways | No | one attempt |
+| `gpt-trace-egress-<id>` | Browser backend only | Yes | one attempt |
+
+Workspace has no internet route. Browser receives a separate, non-internal egress network for its attempt. Both per-attempt networks are deleted during cleanup.
+
+## Docker ownership
+
+Only the runner receives `/var/run/docker.sock`. Workspace containers, Browser containers and gateways never receive the socket. The model sees only canonical MCP tools, not Docker operations.
 
 ## Qwen flattening
 
-An App boundary is removed during dataset transformation. Unique tool names stay unchanged. If multiple Apps expose the same canonical tool name, every colliding function is deterministically named `<normalized_app_id>__<tool_name>` in the flattened Qwen view. The export keeps an identity map back to `(app_id, tool_name, manifest_sha256)`.
-
-Transport-generated names, OpenAI connector identifiers, and UI labels never become canonical Qwen names.
-
-## Network and state boundaries
-
-| Network | Members | Internet |
-|---|---|---|
-| `core_internal` | PostgreSQL, storage, teacher browser, runner | No |
-| `ui_egress` | teacher browser | Yes |
-| `code_control` | runner, Code Workspace | No |
-| `browser_control` | runner, Browser App | No |
-| `browser_egress` | Browser App | Yes |
-
-The Code Workspace has no Docker socket, host mount, database credential, teacher profile, or egress network. The Browser App has a dedicated CloakBrowser process and profile volume and shares neither network nor volume with the teacher browser. The runner is the only multi-homed control participant; it exposes no listening service.
+App boundaries are removed during dataset transformation. Unique canonical tool names stay unchanged. Collisions are deterministically namespaced in the Qwen view while provenance preserves `(app_id, tool_name, manifest_sha256)`. UI labels and Docker names never become canonical model tool names.
 
 ## Stored evidence
 
-Storage keeps raw captured messages unchanged alongside:
-
-- logical Apps available to the trajectory;
-- exact versions, manifests and manifest hashes;
-- runtime-resolved UI names;
-- deterministic local environment IDs;
-- requested/required Apps and observed invocation metadata;
-- model, stream, browser-environment and capture metadata.
-
-Source-dataset adapters for Codex, SWE-agent, ExploitBench, OpenHands or other agents belong in a later transformation layer. Equivalent observed operations may map to `code-workspace/exec_command`; they do not require duplicate runtime Apps.
+Storage keeps raw captured messages plus exact App manifests/hashes, resolved UI names, environment IDs, initial workspace hash and per-attempt Docker provenance such as container ID, image reference and resolved image ID.

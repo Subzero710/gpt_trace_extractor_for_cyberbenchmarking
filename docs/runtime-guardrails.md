@@ -1,77 +1,52 @@
 # Runtime guardrails
 
-Benchmark prompts, repositories, pages and downloads are hostile inputs. A run advances only when storage, ChatGPT and every requested local App agree on one task identity.
+Benchmark prompts, repositories, pages and downloads are hostile inputs. The main isolation boundary for local Apps is a fresh execution container per task attempt.
 
-## Teacher browser integrity
+## Teacher browser
 
-The `browser` service remains dedicated to the ChatGPT UI and persistent `/profile`. `BROWSER_FINGERPRINT_SEED` is generated once and bound to the profile together with optional native timezone, locale and geo-IP settings. Healthcheck and runner CDP URLs must carry the exact same identity parameters.
+The persistent `browser` service is reserved for automating the ChatGPT UI. Its profile is never mounted into benchmark Browser containers.
 
-The runner observes the normal frontend and does not synthesize Sentinel, challenge, conduit, cookie, device or security telemetry. It uses the real file chooser, X11 clipboard and visible Apps menu. The submitted model, prompt, timezone and browser environment are checked against observed evidence.
+## Stable gateways
 
-## Local App control
+`workspace-gateway` and `browser-gateway` are persistent only so ChatGPT can use stable MCP URLs. They contain no task state. The runner binds each gateway to one exact backend using an internal bearer token and task/attempt/environment/fingerprint identity. A conflicting binding is rejected.
 
-The runner and local Apps share a root-only Docker secret over separate internal control networks. `prepare`, `resume`, `reset` and state inspection require its bearer value. Host-published MCP ports do not publish this secret.
+The gateways have no Docker socket. Backend URLs must match the deterministic internal container-name format. Model-facing MCP requests are proxied without forwarding the external `Host` header. Backend control calls use a per-environment token derived by the runner.
 
-The ports bind only to `127.0.0.1`. A deployment that connects ChatGPT must place an authenticated HTTPS gateway in front of `/mcp`; direct public exposure is prohibited. Account installation, gateway authentication and TLS are outside repository control and must be completed explicitly.
+## Workspace container
 
-The MCP transport also enforces an exact Host allowlist through `APP_CODE_WORKSPACE_ALLOWED_HOSTS` and `APP_BROWSER_ALLOWED_HOSTS`. Add the authenticated gateway's forwarded Host value deliberately when deploying it; do not use wildcards.
+For every attempt requesting `code-workspace`, the runner creates a new container. It has:
 
-Every stateful operation carries:
+- no Docker socket or sensitive host bind mounts;
+- no PostgreSQL/storage credentials or teacher profile;
+- an internal-only task network and no internet route;
+- bounded memory, CPU, PIDs, file descriptors and tmpfs;
+- a read-only image root with writable `/workspace`, `/state` and `/tmp`;
+- shell commands executed as the sandbox UID with a minimal environment;
+- process-group termination on command timeout.
 
-- task ID;
-- deterministic attempt-specific environment ID;
-- task fingerprint.
+The initial workspace is copied into the new container, not bind-mounted. Tool paths reject absolute paths, traversal and symlinks. At terminal cleanup the whole container is removed with `force=true&v=true`, so all remaining processes and mutable filesystem state disappear.
 
-An App refuses data owned by another identity. Reset never blindly deletes unowned state.
+## Browser container
 
-## Code Workspace isolation
+For every attempt requesting `browser`, the runner creates a new CloakBrowser container. Browser profile/state/tmp data live only in that container's writable tmpfs. The container joins:
 
-- No host bind mount, Docker socket, PostgreSQL credential, teacher profile or egress network.
-- A named volume contains only the active task workspace; a separate named volume holds root-owned identity state.
-- Tool paths reject absolute paths, traversal and symlinks.
-- Commands run as an unprivileged UID with a minimal environment, process/descriptor/file limits, a wall timeout and process-group cleanup.
-- MCP output, file reads, attachment transfer and written files have explicit byte limits.
-- Compose drops all capabilities, then restores only those required for root to prepare the unprivileged workspace and terminate descendants.
-- The root-only control token is unreadable by benchmark commands.
+1. the internal task network used to reach its gateway; and
+2. a unique non-internal egress network used only by that Browser attempt.
 
-The container has an internal control network so the runner can reach it, but no route to the internet.
+It never shares the teacher profile, Workspace filesystem or Docker socket. URL policy blocks non-web schemes, credentials, loopback, link-local, private, reserved and metadata-network targets unless an explicit controlled-test allowlist is configured.
 
-## Browser App isolation
+At terminal cleanup the Browser container and both task-specific networks are removed. No cookie/localStorage/download/profile reset is relied on as the inter-task isolation mechanism.
 
-- Its CloakBrowser process, fingerprint seed, profile and state volume are distinct from the teacher browser.
-- It shares neither a Docker network nor a volume with PostgreSQL, storage, Code Workspace or the teacher browser.
-- Only its dedicated egress network reaches the public internet.
-- URL credentials and non-HTTP navigation are rejected; private, loopback, link-local, multicast, reserved, unspecified and metadata-network targets are blocked after DNS resolution.
-- Tabs, cookies, local storage, history and downloads are deleted by identity-matched reset before the next task.
-- Screenshots and downloads are bounded and returned with integrity metadata.
+## Recovery
 
-An explicit private-host allowlist exists for controlled test fixtures. Production configuration should keep it empty unless a benchmark owner has documented the target and isolation impact.
+If Send may have happened, containers are deliberately preserved. Recovery must find the same deterministic container and network identities and validate their labels. Missing resources cause `RecoveryIncomplete`/App infrastructure failure; the runner never creates fresh replacements for an already-submitted conversation.
 
-## Duplicate prevention and recovery
+`RequiredToolNotUsed` during recovery terminalizes the storage row as failed, unbinds gateways, destroys the exact attempt runtime and clears the journal.
 
-PostgreSQL serializes `start` and permits only one `running` task. Every mutation uses attempt and runner identity. Completed and failed attempts are immutable; conversation IDs are unique.
+## Provenance
 
-The local journal is fsynced at these phases:
-
-| Phase | Recovery rule |
-|---|---|
-| `starting` | Reset any partially prepared state; fail a matching running attempt. |
-| `apps_prepared` | Reset the exact environments; no Send occurred. |
-| `composer_dirty` | Reset the exact environments; no Send occurred. |
-| `submission_started` | Preserve environments; recover only uniquely evidenced current conversation. |
-| `conversation_known` | Preserve environments; recover the recorded conversation ID. |
-| `cleanup_pending` | Storage is complete; reset the exact environments before clearing the journal. |
-
-Recovery verifies benchmark fingerprint, storage provenance, attempt, runner, environment IDs, UI resolution and exact prompt evidence. It never re-submits an ambiguous Send and never substitutes a fresh App environment for a submitted conversation.
-
-## Completion and provenance
-
-A live turn requires exactly one observed frontend conversation POST and a complete SSE with a single conversation ID, final assistant `end_turn=true`, stream completion and `[DONE]`. The final authenticated conversation snapshot must match the exact benchmark prompt, expected model and required App invocations.
-
-Storage completion requires App provenance, including full manifests and hashes. Export refuses completed historical rows without that evidence. Raw messages remain unchanged; observed tool-call metadata is additive runtime evidence.
+The runtime records the configured image reference and Docker's resolved image ID for each backend. This allows the project to use moving image tags during normal collection while still knowing which image actually generated a trajectory.
 
 ## Batch circuit breakers
 
-The batch stops on browser/CDP/identity failure, storage transport or conflict, clipboard failure, authentication loss, HTTP 403/429, unresolved challenge, ambiguous submission, broken stream, model mismatch, browser drift, invalid registry or manifest, local App ownership/health/control failure, or unrecoverable journal state.
-
-A task-specific unavailable App or completed turn that did not invoke a required App may be recorded as failed only after its local state is reset. The next task never starts while cleanup is uncertain.
+Browser/CDP failure, storage conflict, authentication loss, HTTP 403/429, ambiguous submission, model drift, invalid manifests, gateway conflicts, Docker runtime identity mismatch and incomplete recovery stop the batch. A new task does not start while cleanup identity is uncertain.

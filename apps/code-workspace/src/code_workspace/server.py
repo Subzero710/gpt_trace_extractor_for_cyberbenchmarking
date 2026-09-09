@@ -27,10 +27,12 @@ MAX_CONTROL_BODY = 180 * 1024 * 1024
 
 
 def _load_control_token(path: Path) -> str:
-    try:
-        token = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError(f"cannot read control token at {path}") from exc
+    token = os.environ.get("APP_CONTROL_TOKEN", "").strip()
+    if not token:
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read control token at {path}") from exc
     if len(token) < 32:
         raise RuntimeError("control token is missing or too short")
     return token

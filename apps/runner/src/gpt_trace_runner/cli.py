@@ -15,6 +15,7 @@ from .benchmark import load_benchmark
 from .browser import BrowserClient
 from .chatgpt import ChatGPTClient
 from .config import Settings
+from .docker_runtime import DockerRuntime
 from .exceptions import RecoveryIncomplete, StorageError
 from .journal import JournalStore
 from .lock import RunnerLock
@@ -140,7 +141,25 @@ def run_command(
         tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root, registry=registry)
         selected = tasks[:limit] if limit else tasks
         storage = StorageClient(settings.storage_base_url)
-        lifecycle = AppLifecycle(settings.app_control_token_file)
+        needs_browser_app = any(
+            tool.app_id == "browser" and tool.kind == "local_mcp"
+            for task in selected
+            for tool in task.tools
+        )
+        docker_runtime = DockerRuntime(
+            settings.docker_socket_path,
+            workspace_image=settings.app_code_workspace_image,
+            browser_image=settings.app_browser_image,
+            workspace_gateway_container=settings.workspace_gateway_container,
+            browser_gateway_container=settings.browser_gateway_container,
+            browser_environment=(
+                settings.dynamic_browser_environment() if needs_browser_app else {}
+            ),
+        )
+        lifecycle = AppLifecycle(
+            settings.app_control_token_file,
+            runtime=docker_runtime,
+        )
         try:
             await storage.health()
             journal = JournalStore(settings.journal_path).load()

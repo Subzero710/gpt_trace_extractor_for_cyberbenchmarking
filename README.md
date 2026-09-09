@@ -11,9 +11,11 @@ Qwen-style function tools are the architectural source of truth. A ChatGPT App i
 | `postgres` | Durable run state and captures | `postgres_data` |
 | `storage` | FastAPI persistence API and Alembic migrations | PostgreSQL |
 | `browser` | Teacher-only CloakBrowser controlling `chatgpt.com` | `browser_profile` |
-| `runner` | Sequential task, App, recovery, capture and provenance orchestration | `runner_state` |
-| `app-code-workspace` | Local MCP App for shell and workspace tools | `code_workspace_data`, `code_workspace_state` |
-| `app-browser` | Local MCP App with an independent CloakBrowser | `app_browser_state` |
+| `runner` | Sequential task, Docker runtime, recovery, capture and provenance orchestration | `runner_state` |
+| `workspace-gateway` | Stable MCP endpoint routing to the current task's Workspace container | none |
+| `browser-gateway` | Stable MCP endpoint routing to the current task's Browser container | none |
+
+`Code Workspace` and `Browser` execution containers are **not persistent services**. The runner creates a fresh container for each attempt that requests the App and destroys that container at terminal cleanup. A task that does not request an App gets no container for it.
 
 The existing external GitHub connector is reused. It is not duplicated in Compose.
 
@@ -25,7 +27,7 @@ make build
 make up
 ```
 
-`make init` merges missing settings into `.env`, creates independent persistent fingerprint seeds for the teacher browser and Browser App, and creates `.secrets/app_control_token`. Existing values are preserved. Keep each seed with its corresponding Docker volume.
+`make init` merges missing settings into `.env`, creates fingerprint seeds for the teacher browser and Browser App, and creates `.secrets/app_control_token`. The teacher profile is persistent; benchmark Browser containers are ephemeral and use the configured Browser App seed only for deterministic runtime identity.
 
 For a teacher profile created before identity markers existed, verify the configured teacher seed and run once:
 
@@ -71,7 +73,7 @@ Use stable logical App IDs:
 
 `name` and string shorthand remain accepted when they match a logical ID, a registry alias, or the currently configured UI name. New benchmark files should use `id` so a UI rename does not alter benchmark semantics.
 
-Attachment paths are confined to `TASKS_ROOT`. The task fingerprint covers the exact prompt, attachment names and hashes, logical App IDs, `required` flags, App versions, and manifest SHA-256 values. Mutable UI labels are deliberately excluded.
+Attachment paths are confined to `TASKS_ROOT`. If `tasks/<task_id>/initial_workspace/` exists, its deterministic filesystem hash is also part of the task fingerprint. The fingerprint covers the exact prompt, attachments, initial workspace, logical App IDs, `required` flags, App versions, and manifest SHA-256 values. Mutable UI labels are deliberately excluded.
 
 Inspect the exact effective App and Qwen tool surface without running a task:
 
@@ -91,9 +93,9 @@ Equivalent command:
 docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume
 ```
 
-For each task the runner resolves the registry, starts the storage attempt, prepares owned local App environments, opens a fresh ChatGPT conversation, selects the configured UI Apps, submits once, validates and stores the capture with exact provenance, and resets local state.
+For each task the runner resolves the registry, starts the storage attempt, creates only the requested local App containers, copies `tasks/<task_id>/initial_workspace/` into the fresh Workspace container when present, binds the stable MCP gateways to those exact containers, opens a fresh ChatGPT conversation, submits once, captures the trajectory, then destroys the task containers and per-attempt networks.
 
-The durable journal records App environment IDs and UI resolution. If Send may have succeeded, the runner preserves the exact Code Workspace and Browser App state and will not submit again. Recovery resumes only when task, attempt, fingerprint, App contracts, environment IDs, and conversation evidence agree. Cleanup is journaled after storage completion so a crash cannot leak state into the next task.
+The durable journal records deterministic App environment IDs and UI resolution. If Send may have succeeded, the runner preserves the exact attempt containers and will not submit again. Recovery succeeds only if those same containers, networks, fingerprint, App contracts, environment IDs, and conversation evidence still agree. A missing attempt container is a recovery error; the runner never substitutes a fresh Workspace or Browser.
 
 Only one task may be `running` in PostgreSQL. HTTP 403/429, authentication loss, model or browser drift, App infrastructure failure, storage failure, ambiguous submission, and incomplete streams stop the batch.
 

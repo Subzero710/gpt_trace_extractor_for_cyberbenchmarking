@@ -8,6 +8,7 @@ from typing import Any
 from .exceptions import BenchmarkError
 from .models import BenchmarkTask, BenchmarkTool
 from .registry import AppRegistry, ResolvedApp
+from .workspace_seed import snapshot as workspace_snapshot
 
 MAX_PROMPT_BYTES = 8 * 1024 * 1024
 
@@ -149,13 +150,40 @@ def load_benchmark(path: Path, *, tasks_root: Path | None = None, registry: AppR
                 _parse_tool(value, manifest=path, line_number=line_number, registry=registry)
                 for value in raw_tools
             )
+            task_root = (artifact_root / task_id).resolve()
+            try:
+                task_root.relative_to(artifact_root)
+            except ValueError as exc:
+                raise BenchmarkError(f"{path}:{line_number}: task workspace path escapes TASKS_ROOT") from exc
+            initial_workspace_candidate = task_root / "initial_workspace"
+            if initial_workspace_candidate.exists():
+                if not initial_workspace_candidate.is_dir():
+                    raise BenchmarkError(
+                        f"{path}:{line_number}: initial workspace is not a directory: {initial_workspace_candidate}"
+                    )
+                initial_workspace: Path | None = initial_workspace_candidate.resolve()
+                try:
+                    initial_workspace.relative_to(artifact_root)
+                    workspace_snapshot(initial_workspace)
+                except (ValueError, OSError) as exc:
+                    raise BenchmarkError(f"{path}:{line_number}: invalid initial workspace: {exc}") from exc
+            else:
+                initial_workspace = None
             app_ids = [tool.app_id for tool in tools]
             if len(set(app_ids)) != len(app_ids):
                 raise BenchmarkError(f"{path}:{line_number}: duplicate logical App")
             ui_names = [tool.ui_name.casefold() for tool in tools]
             if len(set(ui_names)) != len(ui_names):
                 raise BenchmarkError(f"{path}:{line_number}: requested Apps resolve to a duplicate UI name")
-            tasks.append(BenchmarkTask(task_id=task_id, prompt=prompt, attachments=attachments, tools=tools))
+            tasks.append(
+                BenchmarkTask(
+                    task_id=task_id,
+                    prompt=prompt,
+                    attachments=attachments,
+                    tools=tools,
+                    initial_workspace=initial_workspace,
+                )
+            )
             seen.add(task_id)
     if not tasks:
         raise BenchmarkError(f"benchmark manifest is empty: {path}")

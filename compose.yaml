@@ -38,7 +38,7 @@ services:
       retries: 20
     restart: unless-stopped
 
-  # Persistent teacher browser: this remains dedicated to the ChatGPT UI.
+  # Persistent teacher browser. It is never shared with benchmark Browser containers.
   browser:
     build: ./infra/browser
     environment:
@@ -67,102 +67,93 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  app-code-workspace:
-    build: ./apps/code-workspace
-    init: true
-    read_only: true
+  # Stable MCP endpoint for ChatGPT. The runner binds it to one fresh
+  # Code Workspace container for the current attempt only.
+  workspace-gateway:
+    build: ./apps/mcp-gateway
+    container_name: ${WORKSPACE_GATEWAY_CONTAINER:-gpt-trace-workspace-gateway}
     environment:
-      CODE_WORKSPACE_ROOT: /workspace
-      CODE_WORKSPACE_STATE_ROOT: /state
+      GATEWAY_APP_ID: code-workspace
+      GATEWAY_BACKEND_PREFIX: gpt-trace-workspace-
       APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
-      MCP_ALLOWED_HOSTS: ${APP_CODE_WORKSPACE_ALLOWED_HOSTS:?run make init}
     secrets:
       - source: app_control_token
         target: app_control_token
         uid: "0"
         gid: "0"
         mode: 0400
-    volumes:
-      - code_workspace_data:/workspace
-      - code_workspace_state:/state
     networks:
-      - code_control
+      - app_control
     ports:
       - "127.0.0.1:${APP_CODE_WORKSPACE_PORT:-8011}:8000"
+    read_only: true
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - KILL
-      - SETGID
-      - SETUID
     security_opt:
       - no-new-privileges:true
-    pids_limit: 160
-    mem_limit: 2g
-    cpus: 2.0
-    ulimits:
-      nofile:
-        soft: 1024
-        hard: 1024
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
-      interval: 10s
+      interval: 5s
       timeout: 3s
       retries: 20
     restart: unless-stopped
 
-  app-browser:
-    build: ./apps/browser
-    init: true
-    read_only: true
+  # Stable MCP endpoint for ChatGPT. The runner binds it to one fresh
+  # Browser container for the current attempt only.
+  browser-gateway:
+    build: ./apps/mcp-gateway
+    container_name: ${BROWSER_GATEWAY_CONTAINER:-gpt-trace-browser-gateway}
     environment:
-      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
-      APP_BROWSER_STATE_ROOT: /browser-state
-      APP_BROWSER_FINGERPRINT_SEED: ${APP_BROWSER_FINGERPRINT_SEED:?run make init}
-      APP_BROWSER_SEARCH_URL_TEMPLATE: ${APP_BROWSER_SEARCH_URL_TEMPLATE:?run make init}
-      APP_BROWSER_ALLOWED_PRIVATE_HOSTS: ${APP_BROWSER_ALLOWED_PRIVATE_HOSTS:-}
-      APP_BROWSER_HUMANIZE: ${APP_BROWSER_HUMANIZE:-true}
-      APP_BROWSER_HUMANIZE_PRESET: ${APP_BROWSER_HUMANIZE_PRESET:-default}
-      APP_BROWSER_TIMEZONE: ${APP_BROWSER_TIMEZONE:-}
-      APP_BROWSER_LOCALE: ${APP_BROWSER_LOCALE:-}
-      APP_BROWSER_GEOIP: ${APP_BROWSER_GEOIP:-false}
+      GATEWAY_APP_ID: browser
+      GATEWAY_BACKEND_PREFIX: gpt-trace-browser-
       APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
-      MCP_ALLOWED_HOSTS: ${APP_BROWSER_ALLOWED_HOSTS:?run make init}
     secrets:
       - source: app_control_token
         target: app_control_token
         uid: "0"
         gid: "0"
         mode: 0400
-    volumes:
-      - app_browser_state:/browser-state
     networks:
-      - browser_control
-      - browser_egress
+      - app_control
     ports:
       - "127.0.0.1:${APP_BROWSER_PORT:-8012}:8000"
+    read_only: true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
-    shm_size: "2gb"
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     cap_drop:
-      - AUDIT_WRITE
-      - MKNOD
-      - NET_RAW
+      - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 512
-    mem_limit: 4g
-    cpus: 2.0
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 30s
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
+
+  # Build-only image definitions. These services are never part of the normal
+  # stack; the runner creates a new container from the image for each attempt.
+  workspace-runtime-image:
+    profiles: ["runtime-images"]
+    build: ./apps/code-workspace
+    image: ${APP_CODE_WORKSPACE_IMAGE:-gpt-trace-code-workspace:latest}
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  browser-runtime-image:
+    profiles: ["runtime-images"]
+    build: ./apps/browser
+    image: ${APP_BROWSER_IMAGE:-gpt-trace-browser:latest}
+    entrypoint: ["/bin/true"]
+    restart: "no"
 
   runner:
     profiles: ["runner"]
@@ -187,13 +178,25 @@ services:
       APP_REGISTRY_PATH: /data/apps/registry/apps.json
       APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
       APP_CODE_WORKSPACE_UI_NAME: ${APP_CODE_WORKSPACE_UI_NAME:-Code Workspace}
-      APP_CODE_WORKSPACE_MCP_URL: ${APP_CODE_WORKSPACE_MCP_URL:-http://app-code-workspace:8000/mcp}
-      APP_CODE_WORKSPACE_CONTROL_URL: http://app-code-workspace:8000
+      APP_CODE_WORKSPACE_MCP_URL: ${APP_CODE_WORKSPACE_MCP_URL:-http://workspace-gateway:8000/mcp}
       APP_BROWSER_UI_NAME: ${APP_BROWSER_UI_NAME:-Browser}
-      APP_BROWSER_MCP_URL: ${APP_BROWSER_MCP_URL:-http://app-browser:8000/mcp}
-      APP_BROWSER_CONTROL_URL: http://app-browser:8000
+      APP_BROWSER_MCP_URL: ${APP_BROWSER_MCP_URL:-http://browser-gateway:8000/mcp}
       APP_GITHUB_UI_NAME: ${APP_GITHUB_UI_NAME:-}
       APP_GITHUB_MANIFEST_PATH: ${APP_GITHUB_MANIFEST_PATH:-}
+      DOCKER_SOCKET_PATH: /var/run/docker.sock
+      APP_CODE_WORKSPACE_IMAGE: ${APP_CODE_WORKSPACE_IMAGE:-gpt-trace-code-workspace:latest}
+      APP_BROWSER_IMAGE: ${APP_BROWSER_IMAGE:-gpt-trace-browser:latest}
+      WORKSPACE_GATEWAY_CONTAINER: ${WORKSPACE_GATEWAY_CONTAINER:-gpt-trace-workspace-gateway}
+      BROWSER_GATEWAY_CONTAINER: ${BROWSER_GATEWAY_CONTAINER:-gpt-trace-browser-gateway}
+      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
+      APP_BROWSER_FINGERPRINT_SEED: ${APP_BROWSER_FINGERPRINT_SEED:?run make init}
+      APP_BROWSER_SEARCH_URL_TEMPLATE: ${APP_BROWSER_SEARCH_URL_TEMPLATE:?run make init}
+      APP_BROWSER_ALLOWED_PRIVATE_HOSTS: ${APP_BROWSER_ALLOWED_PRIVATE_HOSTS:-}
+      APP_BROWSER_HUMANIZE: ${APP_BROWSER_HUMANIZE:-true}
+      APP_BROWSER_HUMANIZE_PRESET: ${APP_BROWSER_HUMANIZE_PRESET:-default}
+      APP_BROWSER_TIMEZONE: ${APP_BROWSER_TIMEZONE:-}
+      APP_BROWSER_LOCALE: ${APP_BROWSER_LOCALE:-}
+      APP_BROWSER_GEOIP: ${APP_BROWSER_GEOIP:-false}
       CHATGPT_TURN_TIMEOUT_SECONDS: ${CHATGPT_TURN_TIMEOUT_SECONDS:-1800}
       CHATGPT_STREAM_START_TIMEOUT_SECONDS: ${CHATGPT_STREAM_START_TIMEOUT_SECONDS:-180}
       CHATGPT_TOOL_SELECT_TIMEOUT_SECONDS: ${CHATGPT_TOOL_SELECT_TIMEOUT_SECONDS:-20}
@@ -215,18 +218,18 @@ services:
       - ./exports:/data/exports
       - ./apps:/data/apps:ro
       - runner_state:/data/state
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - core_internal
-      - code_control
-      - browser_control
+      - app_control
     depends_on:
       storage:
         condition: service_healthy
       browser:
         condition: service_healthy
-      app-code-workspace:
+      workspace-gateway:
         condition: service_healthy
-      app-browser:
+      browser-gateway:
         condition: service_healthy
     stdin_open: true
     tty: true
@@ -236,19 +239,13 @@ volumes:
   postgres_data:
   browser_profile:
   runner_state:
-  code_workspace_data:
-  code_workspace_state:
-  app_browser_state:
 
 networks:
   core_internal:
     internal: true
-  code_control:
-    internal: true
-  browser_control:
+  app_control:
     internal: true
   ui_egress:
-  browser_egress:
 
 secrets:
   app_control_token:

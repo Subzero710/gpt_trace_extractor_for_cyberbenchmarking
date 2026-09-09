@@ -132,6 +132,31 @@ class WorkspaceManager:
                 child.unlink()
         self._fsync_dir(self.workspace_root)
 
+    def _adopt_seeded_workspace(self) -> None:
+        """Make Docker-injected seed files writable by the sandbox user."""
+        for base, dirs, files in os.walk(self.workspace_root, topdown=True, followlinks=False):
+            base_path = Path(base)
+            if base_path.is_symlink():
+                raise WorkspaceError("seeded workspace contains a symlink")
+            os.chmod(base_path, 0o770)
+            self._chown_sandbox(base_path)
+            for name in dirs:
+                path = base_path / name
+                if path.is_symlink():
+                    raise WorkspaceError("seeded workspace contains a symlink")
+                if not path.is_dir():
+                    raise WorkspaceError("seeded workspace contains a special file")
+                os.chmod(path, 0o770)
+                self._chown_sandbox(path)
+            for name in files:
+                path = base_path / name
+                if path.is_symlink() or not path.is_file():
+                    raise WorkspaceError("seeded workspace contains a special file")
+                executable = bool(path.stat().st_mode & 0o111)
+                os.chmod(path, 0o770 if executable else 0o660)
+                self._chown_sandbox(path)
+        self._fsync_dir(self.workspace_root)
+
     def _same_identity(self, state: ActiveWorkspace, payload: dict[str, Any]) -> bool:
         return (
             state.task_id == payload["task_id"]
@@ -253,8 +278,6 @@ class WorkspaceManager:
                 raise WorkspaceError(
                     f"workspace is owned by task {state.task_id!r} environment {state.environment_id!r}"
                 )
-            if state is None and any(self.workspace_root.iterdir()):
-                raise WorkspaceError("workspace contains data without an ownership state")
             if state is not None and state.status == "ready":
                 for relative, _, digest in attachments:
                     path = self.safe_path(relative.as_posix(), must_exist=True)
@@ -264,12 +287,15 @@ class WorkspaceManager:
 
             preparing = ActiveWorkspace(**normalized, status="preparing")
             self._write_state(preparing)
-            self._clear_workspace()
-            for relative, content, _ in attachments:
-                path = self.safe_path(relative.as_posix())
-                self._atomic_write(path, content)
-            os.chmod(self.workspace_root, 0o770)
-            self._chown_sandbox(self.workspace_root)
+            if attachments:
+                if any(self.workspace_root.iterdir()):
+                    raise WorkspaceError(
+                        "legacy attachment payload cannot be combined with a Docker-seeded workspace"
+                    )
+                for relative, content, _ in attachments:
+                    path = self.safe_path(relative.as_posix())
+                    self._atomic_write(path, content)
+            self._adopt_seeded_workspace()
             ready = ActiveWorkspace(**normalized, status="ready")
             self._write_state(ready)
             return {**asdict(ready), "workspace": str(self.workspace_root)}
@@ -589,7 +615,7 @@ class WorkspaceManager:
         if not cwd.is_dir():
             raise WorkspaceError("cwd is not a directory")
         environment = {
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(self.workspace_root),
             "TMPDIR": "/tmp",
             "LANG": "C.UTF-8",

@@ -48,8 +48,16 @@ def make_registry(tmp_path: Path, *, github_ui: str = "GitHub Connector") -> App
             entry.update({
                 "display_name_default": display,
                 "version": version,
-                "mcp_endpoint_default": f"http://{app_id}:8000/mcp",
-                "control_endpoint_default": f"http://app-{app_id}:8000",
+                "mcp_endpoint_default": (
+                    "http://workspace-gateway:8000/mcp"
+                    if app_id == "code-workspace"
+                    else "http://browser-gateway:8000/mcp"
+                ),
+                "control_endpoint_default": (
+                    "http://workspace-gateway:8000"
+                    if app_id == "code-workspace"
+                    else "http://browser-gateway:8000"
+                ),
                 "manifest_sha256": hashlib.sha256(canonical_json_bytes(manifest)).hexdigest(),
             })
         apps.append(entry)

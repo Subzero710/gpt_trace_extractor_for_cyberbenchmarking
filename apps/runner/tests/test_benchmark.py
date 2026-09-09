@@ -96,3 +96,29 @@ def test_empty_manifest_is_rejected(tmp_path: Path) -> None:
     manifest.write_text("\n")
     with pytest.raises(BenchmarkError, match="empty"):
         load_benchmark(manifest)
+
+
+def test_task_initial_workspace_is_discovered_by_task_id(tmp_path: Path) -> None:
+    tasks_root = tmp_path / "tasks"
+    initial = tasks_root / "task-a" / "initial_workspace"
+    initial.mkdir(parents=True)
+    (initial / "main.py").write_text("print('ok')\n")
+    manifest = write_manifest(tmp_path / "benchmark.jsonl", {
+        "task_id": "task-a", "prompt": "inspect", "attachments": [], "tools": [],
+    })
+    task = load_benchmark(manifest, tasks_root=tasks_root)[0]
+    assert task.initial_workspace == initial.resolve()
+
+
+def test_initial_workspace_rejects_symlinks(tmp_path: Path) -> None:
+    tasks_root = tmp_path / "tasks"
+    initial = tasks_root / "task-a" / "initial_workspace"
+    initial.mkdir(parents=True)
+    target = tmp_path / "outside.txt"
+    target.write_text("secret")
+    (initial / "escape").symlink_to(target)
+    manifest = write_manifest(tmp_path / "benchmark.jsonl", {
+        "task_id": "task-a", "prompt": "inspect", "attachments": [], "tools": [],
+    })
+    with pytest.raises(BenchmarkError, match="symlink"):
+        load_benchmark(manifest, tasks_root=tasks_root)
