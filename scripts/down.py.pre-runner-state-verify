@@ -301,82 +301,31 @@ def _clear_runner_state_without_container(
     configured_volumes: dict[str, str],
 ) -> None:
     volume = configured_volumes.get("runner_state")
-    if volume is None:
-        print("runner_state is not configured; nothing to purge", flush=True)
-        return
-    if not _volume_exists(volume):
+    if volume is None or not _volume_exists(volume):
         print("runner_state volume does not exist; nothing to purge", flush=True)
         return
 
     mountpoint = _volume_mountpoint(volume)
     if mountpoint is None:
-        raise DownError(
-            f"cannot resolve mountpoint for runner_state volume {volume}"
-        )
+        raise DownError(f"cannot resolve mountpoint for runner_state volume {volume}")
 
-    try:
-        root = mountpoint.resolve(strict=True)
-    except OSError as exc:
-        raise DownError(
-            f"cannot resolve runner_state mountpoint {mountpoint}: {exc}"
-        ) from exc
-
-    if not root.is_dir():
-        raise DownError(
-            f"runner_state mountpoint is not a directory: {root}"
-        )
-
-    recovery_names = {
-        "submission.json",
-        "submission.json.tmp",
-        "runner.lock",
-    }
-
-    def scan() -> list[Path]:
-        found: list[Path] = []
-        for name in sorted(recovery_names):
-            found.extend(root.rglob(name))
-        return sorted(set(found), key=lambda p: str(p))
-
-    targets = scan()
-    if not targets:
-        print(
-            f"runner recovery state already empty in volume {volume}",
-            flush=True,
-        )
-        return
-
+    # Native Docker exposes the volume mountpoint on the host. `sudo make down`
+    # has permission to remove these files directly, with zero helper container.
+    targets = (
+        mountpoint / "submission.json",
+        mountpoint / "submission.json.tmp",
+        mountpoint / "runner.lock",
+    )
     for target in targets:
-        if target.is_dir() and not target.is_symlink():
-            raise DownError(
-                f"refusing to remove recovery marker directory: {target}"
-            )
         try:
             target.unlink()
+            print(f"removed runner state: {target.name}", flush=True)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise DownError(
-                f"cannot remove runner recovery marker {target}: {exc}"
-            ) from exc
-        else:
-            print(
-                f"removed runner recovery marker: "
-                f"{target.relative_to(root)}",
-                flush=True,
-            )
+            raise DownError(f"cannot remove runner state file {target}: {exc}") from exc
 
-    remaining = scan()
-    if remaining:
-        raise DownError(
-            "runner recovery state survived down: "
-            + ", ".join(str(path.relative_to(root)) for path in remaining)
-        )
 
-    print(
-        f"runner recovery state verified empty in volume {volume}",
-        flush=True,
-    )
 def _verify_no_execution_resources(project: str) -> None:
     project_containers = _container_ids(
         f"label=com.docker.compose.project={project}"

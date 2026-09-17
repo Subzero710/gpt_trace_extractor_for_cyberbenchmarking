@@ -31,10 +31,6 @@ mkdir -p "$profile_dir"
 # cloakserve starts Chromium.
 if [[ "$(id -u)" -eq 0 ]]; then
   chown -R browser:browser "$profile_dir"
-  # GPT_TRACE_BROWSER_HOME_READY
-  install -d -m 0700 -o browser -g browser \
-    /home/browser/.cache /home/browser/.config
-  chown -R browser:browser /home/browser
   x11_ready=false
   for _ in $(seq 1 100); do
     if xdpyinfo -display "$display" >/dev/null 2>&1; then
@@ -103,7 +99,7 @@ done
 }
 
 python /usr/local/bin/clipboard-server --port "${BROWSER_CLIPBOARD_PORT:-8765}" &
-x11vnc -display "$display" -forever -shared -nopw -noshm -rfbport 5900 -quiet &
+x11vnc -display "$display" -forever -shared -nopw -rfbport 5900 -quiet &
 websockify --web=/usr/share/novnc 7900 localhost:5900 &
 
 exec cloakserve --headless=false --data-dir="$profile_dir"

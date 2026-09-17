@@ -11,7 +11,6 @@ import httpx
 from .docker_runtime import AttemptRuntime, DockerRuntime, RuntimeResource
 from .exceptions import AppInfrastructureError
 from .models import BenchmarkTask
-from .workspace_seed import build_workspace_archive
 
 
 class AppLifecycle:
@@ -204,43 +203,6 @@ class AppLifecycle:
                 )
             await asyncio.sleep(0.5)
 
-    async def _seed_workspace(self, task: BenchmarkTask, tool) -> None:
-        if tool.app_id != "code-workspace":
-            return
-        if task.initial_workspace is None and not task.attachments:
-            return
-        if not tool.control_endpoint:
-            raise AppInfrastructureError("local App 'code-workspace' has no control endpoint")
-        self._validate_control_endpoint(tool.app_id, tool.control_endpoint)
-        archive = build_workspace_archive(task.initial_workspace, task.attachments)
-        digest = hashlib.sha256(archive).hexdigest()
-        try:
-            response = await self._client.post(
-                f"{tool.control_endpoint.rstrip('/')}/control/seed",
-                content=archive,
-                headers={**self._headers(), "content-type": "application/x-tar"},
-                timeout=180.0,
-            )
-        except httpx.HTTPError as exc:
-            raise AppInfrastructureError("code-workspace gateway transport failed for /control/seed") from exc
-        if response.status_code != 200:
-            raise AppInfrastructureError(
-                f"code-workspace gateway /control/seed failed: HTTP {response.status_code}: "
-                f"{response.text[:1000]}"
-            )
-        try:
-            value = response.json()
-        except ValueError as exc:
-            raise AppInfrastructureError("code-workspace seed returned invalid JSON") from exc
-        if not isinstance(value, dict):
-            raise AppInfrastructureError("code-workspace seed returned a non-object")
-        if (
-            value.get("status") != "seeded"
-            or value.get("archive_bytes") != len(archive)
-            or value.get("sha256") != digest
-        ):
-            raise AppInfrastructureError("code-workspace seed integrity response mismatch")
-
     async def _operation(
         self,
         task: BenchmarkTask,
@@ -293,7 +255,6 @@ class AppLifecycle:
                 )
                 activated.append(tool)
                 await self._wait_backend(tool)
-                await self._seed_workspace(task, tool)
                 await self._operation(
                     task,
                     tool,

@@ -59,6 +59,9 @@ services:
       - "127.0.0.1:9222:9222"
       - "127.0.0.1:${BROWSER_NOVNC_PORT:-7900}:7900"
     shm_size: "2gb"
+    security_opt:
+      - seccomp=./infra/browser/seccomp_profile.json
+    init: true
     healthcheck:
       test: ["CMD", "/usr/local/bin/browser-healthcheck"]
       interval: 10s

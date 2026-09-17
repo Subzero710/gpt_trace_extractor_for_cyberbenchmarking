@@ -12,6 +12,7 @@ import httpx
 
 from .exceptions import AppInfrastructureError
 from .models import BenchmarkTask
+from .workspace_seed import build_workspace_archive
 
 MANAGED_LABEL = "gpttrace.managed"
 TASK_LABEL = "gpttrace.task_id"
@@ -322,10 +323,10 @@ class DockerRuntime:
         response = await self._request(
             "POST",
             f"/networks/{quote(network_name, safe='')}/disconnect",
-            expected={200, 403, 404, 500},
+            expected={200, 403, 404},
             json_body={"Container": container, "Force": True},
         )
-        if response.status_code in {403, 500}:
+        if response.status_code == 403:
             message = response.text.casefold()
             if "not connected" not in message and "is not connected" not in message:
                 raise AppInfrastructureError(
@@ -487,6 +488,16 @@ class DockerRuntime:
                     f"/containers/{quote(container_id, safe='')}/start",
                     expected={204, 304},
                 )
+                if tool.app_id == "code-workspace":
+                    archive = build_workspace_archive(task.initial_workspace, task.attachments)
+                    if archive:
+                        await self._request(
+                            "PUT",
+                            f"/containers/{quote(container_id, safe='')}/archive?path=%2Fworkspace",
+                            expected={200},
+                            content=archive,
+                            headers={"content-type": "application/x-tar"},
+                        )
                 gateway = self._gateway_container(tool.app_id)
                 await self._connect(network_name, gateway)
                 connected_gateways.append(gateway)

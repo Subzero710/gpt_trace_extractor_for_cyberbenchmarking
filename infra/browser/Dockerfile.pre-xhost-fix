@@ -39,10 +39,8 @@ PY
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       x11vnc novnc websockify xclip x11-utils x11-xserver-utils xdotool gosu util-linux \
+       x11vnc novnc websockify xclip x11-utils xdotool gosu util-linux \
     && rm -rf /var/lib/apt/lists/*
-
-RUN command -v xhost >/dev/null && command -v unshare >/dev/null # GPT_TRACE_VERIFY_XHOST=1
 
 COPY start-browser.sh /usr/local/bin/start-browser
 COPY browser-healthcheck.sh /usr/local/bin/browser-healthcheck
@@ -70,44 +68,6 @@ compile(patched, str(target), "exec")
 target.write_text(patched, encoding="utf-8")
 PY
 
-RUN python - <<'PY_INNER'
-from pathlib import Path
-
-target = Path("/usr/local/bin/cloakserve")
-source = target.read_text(encoding="utf-8")
-
-needle = "            process = subprocess.Popen(\n                full_args,\n"
-replacement = """            # GPT_TRACE_STRIP_NO_SANDBOX_FINAL_ARGV
-            full_args = [
-                arg
-                for arg in full_args
-                if arg.split("=", 1)[0] != "--no-sandbox"
-            ]
-            if any(
-                arg.split("=", 1)[0] == "--no-sandbox"
-                for arg in full_args
-            ):
-                raise RuntimeError("--no-sandbox survived final argv sanitization")
-
-            process = subprocess.Popen(
-                full_args,
-"""
-
-if source.count(needle) != 1:
-    raise SystemExit(
-        "unexpected cloakserve source in pinned image: "
-        f"expected exactly one Popen(full_args) site, found {source.count(needle)}"
-    )
-
-patched = source.replace(needle, replacement, 1)
-compile(patched, str(target), "exec")
-if "GPT_TRACE_STRIP_NO_SANDBOX_FINAL_ARGV" not in patched:
-    raise SystemExit("cloakserve final argv guard was not installed")
-
-target.write_text(patched, encoding="utf-8")
-target.chmod(0o755)
-PY_INNER
-
 RUN set -eux; \
     groupadd --gid 10001 browser; \
     useradd --uid 10001 --gid 10001 --create-home --home-dir /home/browser --shell /bin/bash browser; \
@@ -120,8 +80,6 @@ RUN set -eux; \
 
 ENV CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser-cache \
     HOME=/home/browser \
-    XDG_CACHE_HOME=/home/browser/.cache \
-    XDG_CONFIG_HOME=/home/browser/.config \
     GPT_TRACE_SANDBOXED_CLOAKBROWSER=1
 
 EXPOSE 9222 5900 7900 8765

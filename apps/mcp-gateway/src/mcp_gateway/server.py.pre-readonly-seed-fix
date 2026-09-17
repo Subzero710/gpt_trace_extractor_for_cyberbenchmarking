@@ -20,7 +20,6 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 MAX_CONTROL_BODY = 1024 * 1024
-MAX_SEED_UPLOAD_BYTES = 672 * 1024 * 1024
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -245,53 +244,6 @@ def create_app(state: GatewayState) -> Starlette:
             data = {"status": "ok"}
         return JSONResponse(data)
 
-    async def seed_proxy(request: Request) -> JSONResponse:
-        if not state.authorized(request):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if state.app_id != "code-workspace":
-            return JSONResponse({"detail": "not found"}, status_code=404)
-        active = state.active
-        if active is None:
-            return JSONResponse({"detail": "no active backend"}, status_code=503)
-        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
-        if content_type != "application/x-tar":
-            return JSONResponse({"detail": "seed content-type must be application/x-tar"}, status_code=415)
-        declared = request.headers.get("content-length")
-        if declared is not None:
-            try:
-                if int(declared) > MAX_SEED_UPLOAD_BYTES:
-                    return JSONResponse({"detail": "seed archive is too large"}, status_code=413)
-            except ValueError:
-                return JSONResponse({"detail": "invalid content-length"}, status_code=400)
-
-        async def body_stream():
-            total = 0
-            async for chunk in request.stream():
-                total += len(chunk)
-                if total > MAX_SEED_UPLOAD_BYTES:
-                    raise ValueError("seed archive is too large")
-                yield chunk
-
-        try:
-            response = await state.client.post(
-                f"{active.backend_url}/control/seed",
-                content=body_stream(),
-                headers={
-                    "authorization": f"Bearer {active.backend_token}",
-                    "content-type": "application/x-tar",
-                },
-                timeout=180.0,
-            )
-        except ValueError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=413)
-        except httpx.HTTPError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=503)
-        try:
-            data = response.json()
-        except ValueError:
-            data = {"detail": response.text[:1000]}
-        return JSONResponse(data, status_code=response.status_code)
-
     async def control_proxy(request: Request) -> JSONResponse:
         if not state.authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
@@ -379,7 +331,6 @@ def create_app(state: GatewayState) -> Starlette:
             Route("/control/activate", activate, methods=["POST"]),
             Route("/control/deactivate", deactivate, methods=["POST"]),
             Route("/control/backend-health", backend_health, methods=["GET"]),
-            Route("/control/seed", seed_proxy, methods=["POST"]),
             Route("/control/{operation}", control_proxy, methods=["POST"]),
             Route("/mcp", mcp_proxy, methods=["GET", "POST", "DELETE"]),
             Route("/mcp/{path:path}", mcp_proxy, methods=["GET", "POST", "DELETE"]),

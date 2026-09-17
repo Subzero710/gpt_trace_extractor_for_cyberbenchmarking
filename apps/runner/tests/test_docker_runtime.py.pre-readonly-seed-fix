@@ -1,4 +1,6 @@
+import io
 import json
+import tarfile
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -200,8 +202,12 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert (attempt.network_name, "gpt-trace-workspace-gateway") in mock.gateway_connects
     assert (attempt.network_name, "gpt-trace-browser-gateway") in mock.gateway_connects
 
-    assert mock.archives == {}
-    assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is True
+    workspace_id = attempt.resources["code-workspace"].container_id
+    archive = mock.archives[workspace_id]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tf:
+        names = sorted(member.name for member in tf.getmembers())
+    assert "Cargo.toml" in names
+    assert "attachments/input.txt" in names
 
     assert attempt.resources["code-workspace"].image_id.startswith("sha256:")
     assert attempt.resources["browser"].image_id.startswith("sha256:")

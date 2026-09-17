@@ -10,17 +10,14 @@ import resource
 import shutil
 import signal
 import tempfile
-import tarfile
 from dataclasses import asdict, dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
-MAX_SEED_PAYLOAD_BYTES = 640 * 1024 * 1024
-MAX_SEED_ENTRIES = 100_000
 STATE_FILE = "active.json"
 
 
@@ -134,87 +131,6 @@ class WorkspaceManager:
             else:
                 child.unlink()
         self._fsync_dir(self.workspace_root)
-
-    def seed_archive(self, archive_path: Path) -> dict[str, int]:
-        archive_path = archive_path.resolve()
-        if archive_path.parent != self.workspace_root:
-            raise WorkspaceError("seed archive must be staged inside the workspace")
-        if self.load_state() is not None:
-            raise WorkspaceError("cannot seed a workspace that already has task state")
-        existing = [child for child in self.workspace_root.iterdir() if child != archive_path]
-        if existing:
-            raise WorkspaceError("workspace must be empty before seeding")
-
-        seen: set[str] = set()
-        files = 0
-        total = 0
-        extraction_started = False
-        try:
-            with tarfile.open(archive_path, mode="r:*") as tf:
-                for member in tf:
-                    raw_name = member.name
-                    rel = PurePosixPath(raw_name)
-                    if (
-                        not raw_name
-                        or rel.is_absolute()
-                        or any(part in {"", ".", ".."} for part in rel.parts)
-                    ):
-                        raise WorkspaceError(f"unsafe seed archive path: {raw_name!r}")
-                    normalized = rel.as_posix()
-                    if normalized in seen:
-                        raise WorkspaceError(f"duplicate seed archive path: {normalized}")
-                    seen.add(normalized)
-                    if len(seen) > MAX_SEED_ENTRIES:
-                        raise WorkspaceError("seed archive contains too many entries")
-
-                    target = self.workspace_root.joinpath(*rel.parts)
-                    if target == archive_path:
-                        raise WorkspaceError("seed archive collides with staging file")
-                    extraction_started = True
-                    if member.isdir():
-                        if target.exists() and not target.is_dir():
-                            raise WorkspaceError(f"seed path type collision: {normalized}")
-                        target.mkdir(parents=True, exist_ok=True)
-                        os.chmod(target, 0o770)
-                        continue
-                    if not member.isfile():
-                        raise WorkspaceError(f"seed archive contains unsupported entry: {normalized}")
-
-                    total += member.size
-                    if total > MAX_SEED_PAYLOAD_BYTES:
-                        raise WorkspaceError("seed archive payload exceeds workspace limit")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    if target.exists():
-                        raise WorkspaceError(f"seed path collision: {normalized}")
-                    source = tf.extractfile(member)
-                    if source is None:
-                        raise WorkspaceError(f"cannot read seed archive entry: {normalized}")
-                    written = 0
-                    with source, target.open("xb") as handle:
-                        while True:
-                            chunk = source.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            written += len(chunk)
-                            if written > member.size:
-                                raise WorkspaceError(f"seed archive size mismatch: {normalized}")
-                            handle.write(chunk)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    if written != member.size:
-                        raise WorkspaceError(f"seed archive size mismatch: {normalized}")
-                    os.chmod(target, 0o770 if (member.mode & 0o111) else 0o660)
-                    files += 1
-            self._fsync_dir(self.workspace_root)
-            return {"files": files, "payload_bytes": total}
-        except WorkspaceError:
-            if extraction_started:
-                self._clear_workspace()
-            raise
-        except (OSError, tarfile.TarError) as exc:
-            if extraction_started:
-                self._clear_workspace()
-            raise WorkspaceError("cannot extract workspace seed archive") from exc
 
     def _adopt_seeded_workspace(self) -> None:
         """Make Docker-injected seed files writable by the sandbox user."""

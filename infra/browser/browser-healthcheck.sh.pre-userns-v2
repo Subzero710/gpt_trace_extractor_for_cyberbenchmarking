@@ -65,7 +65,6 @@ seed = sys.argv[1]
 profile_dir = sys.argv[2].rstrip("/")
 roots = []
 bad = []
-unsafe = []  # GPT_TRACE_VERIFY_BROWSER_SANDBOX
 
 for entry in Path("/proc").iterdir():
     if not entry.name.isdigit():
@@ -85,20 +84,6 @@ for entry in Path("/proc").iterdir():
     if not exe.endswith("/chrome"):
         continue
 
-    if "--no-sandbox" in args[1:]:
-        unsafe.append((entry.name, "--no-sandbox"))
-
-    try:
-        status = (entry / "status").read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
-        status = ""
-    for line in status.splitlines():
-        if line.startswith("Uid:"):
-            fields = line.split()
-            if len(fields) >= 2 and fields[1] == "0":
-                unsafe.append((entry.name, "uid=0"))
-            break
-
     for arg in args[1:]:
         if arg == "--headless" or arg.startswith("--headless="):
             bad.append((entry.name, arg))
@@ -110,9 +95,6 @@ for entry in Path("/proc").iterdir():
 
 if bad:
     raise SystemExit(f"Chromium is headless: {bad!r}")
-
-if unsafe:
-    raise SystemExit(f"Chromium sandbox invariant violated: {unsafe!r}")
 
 if len(roots) != 1:
     raise SystemExit(f"expected exactly one root Chromium process, got {len(roots)}")
