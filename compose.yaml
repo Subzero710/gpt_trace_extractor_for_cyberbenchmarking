@@ -79,9 +79,6 @@ services:
     secrets:
       - source: app_control_token
         target: app_control_token
-        uid: "0"
-        gid: "0"
-        mode: 0400
     networks:
       - app_control
     ports:
@@ -91,6 +88,8 @@ services:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
     pids_limit: 64
@@ -115,9 +114,6 @@ services:
     secrets:
       - source: app_control_token
         target: app_control_token
-        uid: "0"
-        gid: "0"
-        mode: 0400
     networks:
       - app_control
     ports:
@@ -127,6 +123,8 @@ services:
       - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
     pids_limit: 64
@@ -209,9 +207,6 @@ services:
     secrets:
       - source: app_control_token
         target: app_control_token
-        uid: "0"
-        gid: "0"
-        mode: 0400
     volumes:
       - ./benchmarks:/data/benchmarks:ro
       - ./tasks:/data/tasks:ro
