@@ -151,23 +151,9 @@ def doctor(
 
 
 @app.command()
-def auth(
-    timeout_minutes: int = typer.Option(30, min=1),
-    benchmark: Path = typer.Option(
-        Path("/data/benchmarks/benchmark.jsonl"),
-        "--benchmark",
-        exists=True,
-        dir_okay=False,
-    ),
-) -> None:
+def auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
     async def main() -> None:
         settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
-        )
         storage = StorageClient(settings.storage_base_url)
         try:
             await storage.health()
@@ -187,12 +173,10 @@ def auth(
                 # it before navigation so login/challenge transitions are
                 # observable while the auth waiter runs.
                 console.print(f"Open noVNC and log in:\n[bold]{settings.browser_novnc_url}[/]")
+                if not session.page.url.startswith(settings.chatgpt_base_url):
+                    await chatgpt.goto_home()
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
-                console.print("[green]authentication detected via /backend-api/me[/]")
-                await chatgpt.verify_apps_available(
-                    tuple(tool for task in tasks for tool in task.tools)
-                )
-                console.print("[green]ChatGPT benchmark Apps: ok[/]")
+                console.print("[green]authentication detected[/]")
             finally:
                 await session.disconnect()
     asyncio.run(main())
@@ -245,17 +229,8 @@ def run_command(
                     humanize_preset=settings.browser_humanize_preset,
                 ).connect()
                 try:
-                    chatgpt = make_chatgpt(settings, session.page)
-                    await chatgpt.wait_until_authenticated(
-                        settings.chatgpt_site_ready_timeout_seconds
-                    )
-                    console.print("[green]ChatGPT backend session: ok[/]")
-                    await chatgpt.verify_apps_available(
-                        tuple(tool for task in selected for tool in task.tools)
-                    )
-                    console.print("[green]ChatGPT benchmark Apps: ok[/]")
                     runner = BenchmarkRunner(
-                        chatgpt=chatgpt,
+                        chatgpt=make_chatgpt(settings, session.page),
                         storage=storage,
                         lifecycle=lifecycle,
                         runner_id=settings.effective_runner_id(),

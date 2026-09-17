@@ -187,8 +187,10 @@ def auth(
                 # it before navigation so login/challenge transitions are
                 # observable while the auth waiter runs.
                 console.print(f"Open noVNC and log in:\n[bold]{settings.browser_novnc_url}[/]")
+                if not session.page.url.startswith(settings.chatgpt_base_url):
+                    await chatgpt.goto_home()
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
-                console.print("[green]authentication detected via /backend-api/me[/]")
+                console.print("[green]authentication detected[/]")
                 await chatgpt.verify_apps_available(
                     tuple(tool for task in tasks for tool in task.tools)
                 )
@@ -246,10 +248,6 @@ def run_command(
                 ).connect()
                 try:
                     chatgpt = make_chatgpt(settings, session.page)
-                    await chatgpt.wait_until_authenticated(
-                        settings.chatgpt_site_ready_timeout_seconds
-                    )
-                    console.print("[green]ChatGPT backend session: ok[/]")
                     await chatgpt.verify_apps_available(
                         tuple(tool for task in selected for tool in task.tools)
                     )

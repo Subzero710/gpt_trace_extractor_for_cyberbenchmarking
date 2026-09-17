@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import httpx
 from playwright.async_api import Locator, Page
 
@@ -72,21 +71,7 @@ class InteractionGuard:
                 await locator.press("Backspace")
             await self._set_system_clipboard(text)
             await locator.press("Control+V")
-
-            # ChatGPT's Lexical composer applies paste updates asynchronously.
-            # inner_text() returns immediately; it does not wait for the editor
-            # model to commit the pasted content. Keep the real X11 clipboard
-            # populated until the visible editor actually contains text.
-            rendered = ""
-            if text:
-                deadline = asyncio.get_running_loop().time() + (self._timeout_ms / 1000)
-                while asyncio.get_running_loop().time() < deadline:
-                    rendered = await locator.inner_text(timeout=self._timeout_ms)
-                    if rendered:
-                        break
-                    await asyncio.sleep(0.05)
-            else:
-                rendered = await locator.inner_text(timeout=self._timeout_ms)
+            rendered = await locator.inner_text(timeout=self._timeout_ms)
         except (ChatGPTUIError, ClipboardUnavailable):
             raise
         except Exception as exc:

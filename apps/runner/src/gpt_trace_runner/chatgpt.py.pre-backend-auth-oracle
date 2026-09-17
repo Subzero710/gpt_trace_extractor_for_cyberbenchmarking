@@ -33,7 +33,7 @@ from .exceptions import (
 )
 from .interaction import InteractionGuard
 from .models import BenchmarkTask, BenchmarkTool, CapturedConversation
-from .site_guard import SiteGuard, first_visible
+from .site_guard import AUTH_SELECTORS, PROMPT_SELECTORS, SiteGuard, first_visible
 from .stream import ConversationStream, is_conversation_stream_response
 from .tools import assert_apps_available, select_apps
 from .traffic import TrafficMonitor
@@ -180,31 +180,16 @@ class ChatGPTClient:
         await self._check_environment()
 
     async def wait_until_authenticated(self, timeout_seconds: float) -> None:
-        """Use ChatGPT's own backend identity request as the auth oracle.
-
-        The supplied HAR shows authenticated frontend startup issuing:
-        GET /backend-api/me -> HTTP 200 with
-        {"object": "user", "id": "<non-empty>", ...}.
-        """
-        self._traffic.reset_auth_probe()
-
-        # TrafficMonitor is already listening before this navigation. Refreshing
-        # once makes an existing persistent session emit a fresh /backend-api/me;
-        # an unauthenticated session can then complete login normally in noVNC,
-        # after which the frontend emits the successful /me response.
-        if self._page.url.startswith(self._base_url):
-            try:
-                await self._page.reload(wait_until="commit", timeout=60_000)
-            except PlaywrightTimeoutError as exc:
-                raise FatalUIState(
-                    "ChatGPT authentication probe reload did not commit within 60 seconds"
-                ) from exc
-        else:
-            await self.goto_home()
-
-        await self._traffic.wait_for_authenticated_user(
-            timeout_seconds=timeout_seconds
-        )
+        import asyncio
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if await first_visible(self._page, PROMPT_SELECTORS) is not None:
+                return
+            if await first_visible(self._page, AUTH_SELECTORS) is None:
+                await asyncio.sleep(0.25)
+                continue
+            await asyncio.sleep(0.25)
+        raise AuthenticationRequired("authentication timeout")
 
     async def _new_chat_if_needed(self) -> None:
         old_id = conversation_id_from_url(self._page.url)

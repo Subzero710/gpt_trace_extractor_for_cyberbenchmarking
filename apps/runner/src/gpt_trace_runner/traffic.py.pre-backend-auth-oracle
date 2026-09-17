@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 from playwright.async_api import Page, Response
 
 from .conversation import benchmark_text_matches
-from .exceptions import AuthenticationRequired
 
 
 _CONVERSATION_SNAPSHOT = re.compile(r"^/backend-api/conversations/([^/]+)$")
@@ -41,10 +40,7 @@ class TrafficMonitor:
     """Count browser traffic without retaining security headers, cookies, or bodies."""
 
     def __init__(self, page: Page, *, base_url: str) -> None:
-        parsed_base = urlparse(base_url)
-        self._base_scheme = parsed_base.scheme
-        self._base_host = parsed_base.hostname or "chatgpt.com"
-        self._base_port = parsed_base.port
+        self._base_host = urlparse(base_url).hostname or "chatgpt.com"
         self._generation = 0
         self._stats = TrafficStats()
         self._snapshots: dict[str, Response] = {}
@@ -53,11 +49,6 @@ class TrafficMonitor:
         self._task_403 = False
         self._sticky_429 = False
         self._submitted_user_message: dict[str, Any] | None = None
-        # HAR-observed authentication oracle. We retain only the Response
-        # object/status required for validation; never auth headers or payloads.
-        self._auth_me_response: Response | None = None
-        self._auth_me_last_status: int | None = None
-        self._auth_me_event = asyncio.Event()
         page.on("request", self._on_request)
         page.on("response", self._on_response)
         page.on("requestfailed", self._on_request_failed)
@@ -79,71 +70,6 @@ class TrafficMonitor:
             or host == "openai.com"
             or host.endswith(".openai.com")
         )
-
-    def _is_exact_base_origin(self, url: str) -> bool:
-        parsed = urlparse(url)
-        return (
-            parsed.scheme == self._base_scheme
-            and parsed.hostname == self._base_host
-            and parsed.port == self._base_port
-        )
-
-    def reset_auth_probe(self) -> None:
-        self._auth_me_response = None
-        self._auth_me_last_status = None
-        self._auth_me_event.clear()
-
-    @property
-    def auth_me_last_status(self) -> int | None:
-        return self._auth_me_last_status
-
-    async def wait_for_authenticated_user(self, *, timeout_seconds: float) -> None:
-        """Require exact-origin GET /backend-api/me -> valid user JSON."""
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
-        while True:
-            response = self._auth_me_response
-            if response is not None:
-                try:
-                    payload = json.loads((await response.body()).decode("utf-8"))
-                except Exception as exc:
-                    raise AuthenticationRequired(
-                        "ChatGPT /backend-api/me returned unreadable JSON"
-                    ) from exc
-                user_id = payload.get("id") if isinstance(payload, dict) else None
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("object") == "user"
-                    and isinstance(user_id, str)
-                    and bool(user_id.strip())
-                ):
-                    return
-                raise AuthenticationRequired(
-                    "ChatGPT /backend-api/me returned HTTP 200 without a valid user identity"
-                )
-
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                detail = (
-                    f"; last /backend-api/me status={self._auth_me_last_status}"
-                    if self._auth_me_last_status is not None
-                    else "; no /backend-api/me response observed"
-                )
-                raise AuthenticationRequired(
-                    "ChatGPT backend session was not authenticated" + detail
-                )
-            try:
-                await asyncio.wait_for(self._auth_me_event.wait(), timeout=remaining)
-            except TimeoutError:
-                detail = (
-                    f"; last /backend-api/me status={self._auth_me_last_status}"
-                    if self._auth_me_last_status is not None
-                    else "; no /backend-api/me response observed"
-                )
-                raise AuthenticationRequired(
-                    "ChatGPT backend session was not authenticated" + detail
-                )
-            finally:
-                self._auth_me_event.clear()
 
     @staticmethod
     def _is_backend_path(path: str) -> bool:
@@ -197,19 +123,6 @@ class TrafficMonitor:
             return
         current = self._belongs_to_current(response.request)
         path = urlparse(response.url).path.rstrip("/")
-
-        if (
-            self._is_exact_base_origin(response.url)
-            and path == "/backend-api/me"
-            and response.request.method.upper() == "GET"
-        ):
-            self._auth_me_last_status = response.status
-            if response.status == 200:
-                self._auth_me_response = response
-                self._auth_me_event.set()
-            else:
-                self._auth_me_response = None
-                self._auth_me_event.clear()
         if self._is_backend_path(path):
             if response.status == 429:
                 self._sticky_429 = True

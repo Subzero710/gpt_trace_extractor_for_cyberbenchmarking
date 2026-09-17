@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import pytest
 
 from gpt_trace_runner.interaction import InteractionGuard
@@ -79,40 +78,3 @@ async def test_paste_preserves_exact_spaces_and_clears_clipboard() -> None:
     await guard.paste_text(locator, "  exact  ")
     assert locator.rendered == "  exact  "
     assert calls == ["  exact  ", ""]
-
-
-class DelayedPasteLocator(FakeLocator):
-    async def press(self, key):
-        if key != "Control+V":
-            await super().press(key)
-            return
-
-        async def commit():
-            await asyncio.sleep(0.05)
-            self.rendered += self.holder.get("clipboard", "")
-
-        asyncio.create_task(commit())
-
-
-@pytest.mark.asyncio
-async def test_paste_waits_for_async_composer_commit_before_clearing_clipboard() -> None:
-    holder = {"clipboard": ""}
-    page = FakePage({"visible": True, "focused": True})
-    guard = InteractionGuard(
-        page,
-        clipboard_url="http://browser:8765/clipboard",
-        timeout_seconds=1,
-    )
-    calls = []
-
-    async def set_clipboard(value):
-        holder["clipboard"] = value
-        calls.append(value)
-
-    guard._set_system_clipboard = set_clipboard
-    locator = DelayedPasteLocator(holder)
-
-    await guard.paste_text(locator, "delayed prompt")
-
-    assert locator.rendered == "delayed prompt"
-    assert calls == ["delayed prompt", ""]
