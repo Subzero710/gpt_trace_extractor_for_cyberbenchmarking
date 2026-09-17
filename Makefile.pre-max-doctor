@@ -1,4 +1,4 @@
-.PHONY: init adopt-profile build up down logs doctor auth run inspect-tools status export test
+.PHONY: init adopt-profile build up down logs doctor auth run preflight-run inspect-tools status export test
 init:
 	python3 scripts/init_env.py
 adopt-profile:
@@ -17,6 +17,8 @@ auth:
 	docker compose run --rm runner auth
 run:
 	docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume
+preflight-run:
+	docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --preflight-only
 inspect-tools:
 	@test -n "$(TASK_ID)" || (echo "TASK_ID is required" >&2; exit 2)
 	docker compose run --rm --no-deps runner inspect-tools /data/benchmarks/benchmark.jsonl --task-id "$(TASK_ID)"

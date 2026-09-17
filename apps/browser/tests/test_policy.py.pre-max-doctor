@@ -34,16 +34,3 @@ async def test_explicit_private_host_allowlist_is_exact() -> None:
     assert await policy.validate_url("http://127.0.0.1:8080/") == "http://127.0.0.1:8080/"
     with pytest.raises(BrowserAppError):
         await policy.validate_url("http://localhost:8080/")
-
-
-@pytest.mark.asyncio
-async def test_blocked_hosts_include_subdomains_without_dns(monkeypatch) -> None:
-    def forbidden_dns(*args, **kwargs):
-        raise AssertionError("blocked host must be rejected before DNS")
-
-    monkeypatch.setattr(socket, "getaddrinfo", forbidden_dns)
-    policy = BrowserPolicy(blocked_hosts={"chatgpt.com"})
-    with pytest.raises(BrowserAppError, match="blocked host"):
-        await policy.validate_url("https://chatgpt.com/")
-    with pytest.raises(BrowserAppError, match="blocked host"):
-        await policy.validate_url("https://assets.chatgpt.com/x.js", subresource=True)

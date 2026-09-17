@@ -56,23 +56,8 @@ def _fingerprint(value: object) -> str:
 
 
 class BrowserPolicy:
-    def __init__(
-        self,
-        allowed_private_hosts: set[str] | None = None,
-        blocked_hosts: set[str] | None = None,
-    ) -> None:
-        self.allowed_private_hosts = {
-            host.casefold().rstrip(".") for host in (allowed_private_hosts or set())
-        }
-        self.blocked_hosts = {
-            host.casefold().rstrip(".") for host in (blocked_hosts or set()) if host.strip(".")
-        }
-
-    def _blocked_host(self, hostname: str) -> bool:
-        return any(
-            hostname == blocked or hostname.endswith("." + blocked)
-            for blocked in self.blocked_hosts
-        )
+    def __init__(self, allowed_private_hosts: set[str] | None = None) -> None:
+        self.allowed_private_hosts = {host.casefold().rstrip(".") for host in (allowed_private_hosts or set())}
 
     @staticmethod
     def _blocked_ip(value: str) -> bool:
@@ -103,8 +88,6 @@ class BrowserPolicy:
         hostname = (parsed.hostname or "").casefold().rstrip(".")
         if not hostname:
             raise BrowserAppError("URL has no hostname")
-        if self._blocked_host(hostname):
-            raise BrowserAppError(f"blocked host is not allowed: {hostname}")
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError as exc:

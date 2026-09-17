@@ -47,12 +47,7 @@ def make_chatgpt(settings: Settings, page) -> ChatGPTClient:
     )
 
 
-def make_lifecycle(
-    settings: Settings,
-    tasks,
-    *,
-    browser_blocked_hosts: tuple[str, ...] = (),
-) -> AppLifecycle:
+def make_lifecycle(settings: Settings, tasks) -> AppLifecycle:
     needs_browser_app = any(
         tool.app_id == "browser" and tool.kind == "local_mcp"
         for task in tasks
@@ -67,7 +62,6 @@ def make_lifecycle(
         browser_environment=(
             settings.dynamic_browser_environment() if needs_browser_app else {}
         ),
-        browser_blocked_hosts=browser_blocked_hosts,
     )
     return AppLifecycle(
         settings.app_control_token_file,
@@ -83,7 +77,7 @@ def clipboard_health_url(settings: Settings) -> str:
 async def ensure_no_running_storage(storage: StorageClient) -> None:
     data = await storage.stats()
     if int(data.get("running", 0)) > 0:
-        raise RecoveryIncomplete("storage reports a running benchmark task; recover it before doctor/auth")
+        raise RecoveryIncomplete("storage reports a running benchmark task; recover it before auth/doctor --chatgpt")
 
 
 def ensure_no_pending_journal(settings: Settings) -> None:
@@ -100,6 +94,7 @@ def doctor(
         exists=True,
         dir_okay=False,
     ),
+    chatgpt: bool = typer.Option(False, "--chatgpt"),
 ) -> None:
     async def main() -> None:
         settings = Settings()
@@ -124,28 +119,33 @@ def doctor(
         console.print("[green]CloakBrowser humanize API: ok[/]")
         async with httpx.AsyncClient(timeout=10) as client:
             (await client.get(settings.browser_version_url())).raise_for_status()
-            console.print("[green]operator browser CDP: ok[/]")
+            console.print("[green]ChatGPT browser CDP: ok[/]")
             (await client.get(clipboard_health_url(settings))).raise_for_status()
-            console.print("[green]operator browser clipboard/X11: ok[/]")
+            console.print("[green]ChatGPT browser clipboard/X11: ok[/]")
 
-        lifecycle = make_lifecycle(
-            settings,
-            tasks,
-            browser_blocked_hosts=("chatgpt.com",),
-        )
+        lifecycle = make_lifecycle(settings, tasks)
         try:
             with RunnerLock(settings.runner_lock_path):
-                await preflight_tasks(
-                    lifecycle,
-                    tasks,
-                    console=console,
-                    require_chatgpt_block=True,
-                )
+                await preflight_tasks(lifecycle, tasks, console=console)
         finally:
             await lifecycle.close()
 
-        console.print("[green]doctor: maximal non-ChatGPT preflight passed[/]")
+        console.print("[green]benchmark runtime preflight: ok[/]")
 
+        if not chatgpt:
+            return
+
+        with RunnerLock(settings.runner_lock_path):
+            session = await BrowserClient(
+                settings.effective_browser_cdp_url(),
+                humanize=settings.browser_humanize,
+                humanize_preset=settings.browser_humanize_preset,
+            ).connect()
+            try:
+                await make_chatgpt(settings, session.page).prepare_session()
+                console.print("[green]ChatGPT: authenticated and ready[/]")
+            finally:
+                await session.disconnect()
 
     asyncio.run(main())
 
@@ -188,6 +188,7 @@ def run_command(
     resume: bool = typer.Option(False, "--resume"),
     stop_on_error: bool = typer.Option(False, "--stop-on-error"),
     limit: int | None = typer.Option(None, min=1),
+    preflight_only: bool = typer.Option(False, "--preflight-only"),
 ) -> None:
     async def main() -> None:
         settings = Settings()
@@ -198,6 +199,14 @@ def run_command(
         lifecycle = make_lifecycle(settings, selected)
         try:
             await storage.health()
+
+            if preflight_only:
+                await ensure_no_running_storage(storage)
+                ensure_no_pending_journal(settings)
+                with RunnerLock(settings.runner_lock_path):
+                    await preflight_tasks(lifecycle, selected, console=console)
+                console.print("[green]run preflight-only: ok[/]")
+                return
 
             journal = JournalStore(settings.journal_path).load()
             selected_by_id = {task.task_id: task for task in selected}

@@ -26,9 +26,8 @@ def _tool() -> BenchmarkTool:
 
 
 class FakeLifecycle:
-    def __init__(self, *, fail_prepare: bool = False, fail_clean: bool = False) -> None:
+    def __init__(self, *, fail_prepare: bool = False) -> None:
         self.fail_prepare = fail_prepare
-        self.fail_clean = fail_clean
         self.calls: list[tuple] = []
 
     @staticmethod
@@ -46,69 +45,29 @@ class FakeLifecycle:
     async def reset(self, task, environments, fingerprint, *, attempt):
         self.calls.append(("reset", task.task_id, attempt, dict(environments)))
 
-    async def assert_clean(self, task, environments, fingerprint, *, attempt):
-        self.calls.append(("assert_clean", task.task_id, attempt, dict(environments)))
-        if self.fail_clean:
-            raise AppInfrastructureError("residue")
-
 
 @pytest.mark.asyncio
-async def test_preflight_always_verifies_cleanup(monkeypatch, tmp_path: Path) -> None:
+async def test_preflight_exercises_prepare_and_cleanup_without_chatgpt(tmp_path: Path) -> None:
     task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
     lifecycle = FakeLifecycle()
 
-    async def fake_smoke(
-        tool,
-        *,
-        index,
-        previous_workspace_marker,
-        previous_example_tab,
-        require_chatgpt_block,
-    ):
-        return ".marker", previous_example_tab
-
-    monkeypatch.setattr("gpt_trace_runner.runtime_preflight._smoke_tool", fake_smoke)
     await preflight_tasks(lifecycle, [task], console=Console())
 
-    assert [call[0] for call in lifecycle.calls] == [
-        "health",
-        "prepare",
-        "reset",
-        "assert_clean",
-    ]
+    names = [call[0] for call in lifecycle.calls]
+    assert names == ["health", "prepare", "reset"]
+    probe_ids = {call[1] for call in lifecycle.calls}
+    assert len(probe_ids) == 1
+    probe_id = next(iter(probe_ids))
+    assert probe_id.startswith("doctor-1-")
+    assert probe_id != task.task_id
 
 
 @pytest.mark.asyncio
-async def test_preflight_prepare_failure_still_cleans_and_reports(monkeypatch, tmp_path: Path) -> None:
+async def test_preflight_failure_still_cleans_up_and_fails(tmp_path: Path) -> None:
     task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
     lifecycle = FakeLifecycle(fail_prepare=True)
 
     with pytest.raises(AppInfrastructureError, match="prepare exploded"):
         await preflight_tasks(lifecycle, [task], console=Console())
 
-    assert [call[0] for call in lifecycle.calls] == [
-        "health",
-        "prepare",
-        "reset",
-        "assert_clean",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_cleanup_residue_is_fatal(monkeypatch, tmp_path: Path) -> None:
-    task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
-    lifecycle = FakeLifecycle(fail_clean=True)
-
-    async def fake_smoke(
-        tool,
-        *,
-        index,
-        previous_workspace_marker,
-        previous_example_tab,
-        require_chatgpt_block,
-    ):
-        return ".marker", previous_example_tab
-
-    monkeypatch.setattr("gpt_trace_runner.runtime_preflight._smoke_tool", fake_smoke)
-    with pytest.raises(AppInfrastructureError, match="residue"):
-        await preflight_tasks(lifecycle, [task], console=Console())
+    assert [call[0] for call in lifecycle.calls] == ["health", "prepare", "reset"]

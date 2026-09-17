@@ -81,7 +81,6 @@ class DockerRuntime:
         workspace_gateway_container: str,
         browser_gateway_container: str,
         browser_environment: dict[str, str],
-        browser_blocked_hosts: tuple[str, ...] = (),
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.socket_path = socket_path
@@ -90,9 +89,6 @@ class DockerRuntime:
         self.workspace_gateway_container = workspace_gateway_container
         self.browser_gateway_container = browser_gateway_container
         self.browser_environment = dict(browser_environment)
-        self.browser_blocked_hosts = tuple(
-            sorted({host.casefold().rstrip(".") for host in browser_blocked_hosts if host.strip(".")})
-        )
         if client is None:
             transport = httpx.AsyncHTTPTransport(uds=str(socket_path))
             client = httpx.AsyncClient(
@@ -238,10 +234,6 @@ class DockerRuntime:
             for key, value in sorted(self.browser_environment.items()):
                 if value != "":
                     env.append(f"{key}={value}")
-            if self.browser_blocked_hosts:
-                env.append(
-                    "APP_BROWSER_BLOCKED_HOSTS=" + ",".join(self.browser_blocked_hosts)
-                )
             env.append("APP_BROWSER_STATE_ROOT=/browser-state")
             host_config = {
                 "ReadonlyRootfs": True,
@@ -312,21 +304,12 @@ class DockerRuntime:
             raise AppInfrastructureError("Docker network inspect returned a non-object")
         return value
 
-    async def _connect(
-        self,
-        network_name: str,
-        container: str,
-        *,
-        aliases: list[str] | None = None,
-    ) -> None:
-        body: dict[str, Any] = {"Container": container}
-        if aliases:
-            body["EndpointConfig"] = {"Aliases": aliases}
+    async def _connect(self, network_name: str, container: str) -> None:
         response = await self._request(
             "POST",
             f"/networks/{quote(network_name, safe='')}/connect",
             expected={200, 403, 404},
-            json_body=body,
+            json_body={"Container": container},
         )
         if response.status_code == 404:
             raise AppInfrastructureError(f"Docker network not found while connecting {container}: {network_name}")
@@ -500,11 +483,7 @@ class DockerRuntime:
                     raise AppInfrastructureError("Docker container create returned no id")
                 created_containers.append(container_name)
                 if tool.app_id == "browser":
-                    await self._connect(
-                        network_name,
-                        container_id,
-                        aliases=[container_name],
-                    )
+                    await self._connect(network_name, container_id)
                 await self._request(
                     "POST",
                     f"/containers/{quote(container_id, safe='')}/start",
@@ -646,37 +625,6 @@ class DockerRuntime:
             egress_network_id,
             resources,
         )
-
-    async def assert_absent(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-    ) -> None:
-        residue: list[str] = []
-        network_name = self._network_name(task, attempt, fingerprint)
-        if await self._inspect_network(network_name) is not None:
-            residue.append(f"network:{network_name}")
-        has_browser = any(
-            tool.kind == "local_mcp" and tool.app_id == "browser"
-            for tool in task.tools
-        )
-        if has_browser:
-            egress = self._egress_network_name(task, attempt, fingerprint)
-            if await self._inspect_network(egress) is not None:
-                residue.append(f"network:{egress}")
-        for tool in task.tools:
-            if tool.kind != "local_mcp":
-                continue
-            name = self._container_name(tool.app_id, environments[tool.app_id])
-            if await self._inspect_container(name) is not None:
-                residue.append(f"container:{name}")
-        if residue:
-            raise AppInfrastructureError(
-                "runtime cleanup residue remains after reset: " + ", ".join(residue)
-            )
 
     async def snapshot(
         self,

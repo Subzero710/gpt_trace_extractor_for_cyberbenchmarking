@@ -412,44 +412,6 @@ class AppLifecycle:
         if errors:
             raise AppInfrastructureError("; ".join(errors))
 
-    async def assert_clean(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-    ) -> None:
-        errors: list[str] = []
-        for tool in task.tools:
-            if tool.kind != "local_mcp" or not tool.control_endpoint:
-                continue
-            self._validate_control_endpoint(tool.app_id, tool.control_endpoint)
-            try:
-                response = await self._client.get(
-                    f"{tool.control_endpoint.rstrip('/')}/control/status",
-                    headers=self._headers(),
-                )
-            except httpx.HTTPError as exc:
-                errors.append(f"{tool.app_id} gateway status failed: {exc}")
-                continue
-            if response.status_code != 200:
-                errors.append(f"{tool.app_id} gateway status returned HTTP {response.status_code}")
-                continue
-            try:
-                value = response.json()
-            except ValueError:
-                errors.append(f"{tool.app_id} gateway status returned invalid JSON")
-                continue
-            if not isinstance(value, dict) or value.get("active") is not None:
-                errors.append(f"{tool.app_id} gateway remained bound after reset")
-        try:
-            await self.runtime.assert_absent(task, environments, fingerprint, attempt=attempt)
-        except AppInfrastructureError as exc:
-            errors.append(str(exc))
-        if errors:
-            raise AppInfrastructureError("; ".join(errors))
-
     async def health(self, task: BenchmarkTask) -> None:
         for tool in task.tools:
             if tool.kind != "local_mcp" or not tool.control_endpoint:

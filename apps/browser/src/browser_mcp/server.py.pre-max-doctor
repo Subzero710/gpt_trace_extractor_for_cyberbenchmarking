@@ -174,16 +174,11 @@ def build_runtime() -> BrowserRuntime:
         for item in os.environ.get("APP_BROWSER_ALLOWED_PRIVATE_HOSTS", "").split(",")
         if item.strip()
     }
-    blocked = {
-        item.strip().casefold().rstrip(".")
-        for item in os.environ.get("APP_BROWSER_BLOCKED_HOSTS", "").split(",")
-        if item.strip()
-    }
     return BrowserRuntime(
         Path(os.environ.get("APP_BROWSER_STATE_ROOT", "/browser-state")),
         fingerprint_seed=seed,
         search_url_template=os.environ.get("APP_BROWSER_SEARCH_URL_TEMPLATE", "https://duckduckgo.com/?q={query}"),
-        policy=BrowserPolicy(allowed, blocked),
+        policy=BrowserPolicy(allowed),
         humanize=_boolean("APP_BROWSER_HUMANIZE", True),
         humanize_preset=os.environ.get("APP_BROWSER_HUMANIZE_PRESET", "default"),
         timezone=os.environ.get("APP_BROWSER_TIMEZONE", "").strip(),
