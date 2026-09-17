@@ -308,7 +308,6 @@ class ChatGPTClient:
         await self._interaction.paste_text(editor, task.prompt)
         await select_apps(
             self._page,
-            editor=editor,
             tools=task.tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
