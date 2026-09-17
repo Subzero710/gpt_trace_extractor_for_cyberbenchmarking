@@ -60,17 +60,7 @@ def _lines(cmd: list[str], *, check: bool = True) -> list[str]:
 def _compose_config() -> dict:
     # Pure config rendering: does not create/start/pull Docker resources.
     result = _run(
-        [
-            "docker",
-            "compose",
-            "--profile",
-            "runner",
-            "--profile",
-            "runtime-images",
-            "config",
-            "--format",
-            "json",
-        ],
+        ["docker", "compose", "config", "--format", "json"],
         capture=True,
     )
     try:
