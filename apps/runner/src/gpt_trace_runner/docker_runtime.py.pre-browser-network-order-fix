@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import hmac
 import json
 from dataclasses import dataclass
@@ -313,45 +312,6 @@ class DockerRuntime:
             raise AppInfrastructureError("Docker network inspect returned a non-object")
         return value
 
-    @staticmethod
-    def _backend_url_from_inspect(
-        inspected: dict[str, Any],
-        *,
-        network_name: str,
-        container_name: str,
-    ) -> str:
-        network_settings = inspected.get("NetworkSettings")
-        networks = (
-            network_settings.get("Networks")
-            if isinstance(network_settings, dict)
-            else None
-        )
-        endpoint = networks.get(network_name) if isinstance(networks, dict) else None
-        address = endpoint.get("IPAddress") if isinstance(endpoint, dict) else None
-        if not isinstance(address, str) or not address:
-            raise AppInfrastructureError(
-                "Docker inspect omitted the task-network backend IP: "
-                f"{container_name} on {network_name}"
-            )
-        try:
-            parsed = ipaddress.ip_address(address)
-        except ValueError as exc:
-            raise AppInfrastructureError(
-                "Docker inspect returned an invalid task-network backend IP: "
-                f"{container_name} -> {address!r}"
-            ) from exc
-        if parsed.version != 4:
-            raise AppInfrastructureError(
-                "task backend must currently have an IPv4 address: "
-                f"{container_name} -> {address!r}"
-            )
-        if parsed.is_loopback or parsed.is_unspecified or parsed.is_multicast:
-            raise AppInfrastructureError(
-                "Docker inspect returned an unusable task-network backend IP: "
-                f"{container_name} -> {address!r}"
-            )
-        return f"http://{parsed.compressed}:8000"
-
     async def _connect(
         self,
         network_name: str,
@@ -539,37 +499,17 @@ class DockerRuntime:
                 if not isinstance(container_id, str) or not container_id:
                     raise AppInfrastructureError("Docker container create returned no id")
                 created_containers.append(container_name)
+                if tool.app_id == "browser":
+                    await self._connect(
+                        network_name,
+                        container_id,
+                        aliases=[container_name],
+                    )
                 await self._request(
                     "POST",
                     f"/containers/{quote(container_id, safe='')}/start",
                     expected={204, 304},
                 )
-                if tool.app_id == "browser":
-                    # A browser starts on its dedicated egress network. Attach
-                    # its task network only after the container is running so
-                    # Docker registers the secondary-network DNS endpoint
-                    # immediately and consistently.
-                    await self._connect(
-                        network_name,
-                        container_name,
-                        aliases=[container_name],
-                    )
-                    attached = await self._inspect_container(container_name)
-                    if attached is None:
-                        raise AppInfrastructureError(
-                            f"browser container disappeared after task-network attach: {container_name}"
-                        )
-                    networks = attached.get("NetworkSettings", {}).get("Networks", {})
-                    endpoint = networks.get(network_name) if isinstance(networks, dict) else None
-                    aliases = endpoint.get("Aliases") if isinstance(endpoint, dict) else None
-                    if (
-                        not isinstance(aliases, list)
-                        or container_name not in aliases
-                    ):
-                        raise AppInfrastructureError(
-                            "browser task-network DNS alias was not installed: "
-                            f"{container_name} on {network_name}"
-                        )
                 gateway = self._gateway_container(tool.app_id)
                 await self._connect(network_name, gateway)
                 connected_gateways.append(gateway)
@@ -581,11 +521,6 @@ class DockerRuntime:
                 image = config_inspect.get("Image") if isinstance(config_inspect, dict) else None
                 if not isinstance(image_id, str) or not isinstance(image, str):
                     raise AppInfrastructureError("Docker inspect omitted image provenance")
-                backend_url = self._backend_url_from_inspect(
-                    inspected,
-                    network_name=network_name,
-                    container_name=container_name,
-                )
                 resources[tool.app_id] = RuntimeResource(
                     tool.app_id,
                     environment_id,
@@ -593,7 +528,7 @@ class DockerRuntime:
                     container_id,
                     image,
                     image_id,
-                    backend_url,
+                    f"http://{container_name}:8000",
                     backend_token,
                 )
             return AttemptRuntime(
@@ -694,11 +629,6 @@ class DockerRuntime:
             image = config_inspect.get("Image") if isinstance(config_inspect, dict) else None
             if not isinstance(image_id, str) or not isinstance(image, str):
                 raise AppInfrastructureError("Docker inspect omitted image provenance")
-            backend_url = self._backend_url_from_inspect(
-                inspected,
-                network_name=network_name,
-                container_name=container_name,
-            )
             resources[tool.app_id] = RuntimeResource(
                 tool.app_id,
                 environment_id,
@@ -706,7 +636,7 @@ class DockerRuntime:
                 str(inspected.get("Id", container_name)),
                 image,
                 image_id,
-                backend_url,
+                f"http://{container_name}:8000",
                 self.backend_token(control_token, tool.app_id, environment_id),
             )
         return AttemptRuntime(

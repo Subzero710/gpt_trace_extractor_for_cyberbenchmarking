@@ -22,20 +22,5 @@ COPY tests /app/tests
 COPY tool-manifest.json /app/tool-manifest.json
 RUN pip install --no-cache-dir -e ".[test]"
 
-# The upstream CloakBrowser image pre-downloads Chromium into root's cache.
-# Runtime cloakserve is intentionally dropped to uid/gid 10001, so do not make
-# each task rediscover/download Chromium under its per-task HOME. Move the
-# already verified binary bundle to a stable, world-readable image location.
-RUN set -eux; \
-    browser_binary="$(python -c 'from cloakbrowser.download import ensure_binary; print(ensure_binary())')"; \
-    test -x "$browser_binary"; \
-    browser_dir="$(dirname "$browser_binary")"; \
-    mkdir -p /opt/cloakbrowser; \
-    mv "$browser_dir" /opt/cloakbrowser/chromium; \
-    chmod -R a+rX /opt/cloakbrowser; \
-    test -x /opt/cloakbrowser/chromium/chrome
-
-ENV CLOAKBROWSER_BINARY_PATH=/opt/cloakbrowser/chromium/chrome
-
 EXPOSE 8000
 ENTRYPOINT ["python", "-m", "browser_mcp.server"]

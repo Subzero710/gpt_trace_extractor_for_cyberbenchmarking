@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import shlex
 from dataclasses import replace
@@ -243,29 +242,6 @@ async def _workspace_smoke(
     return marker
 
 
-def _assert_screenshot_integrity(image: dict[str, Any]) -> None:
-    encoded = image.get("content_base64")
-    if image.get("mime_type") != "image/png" or not isinstance(encoded, str):
-        raise AppInfrastructureError("browser screenshot returned invalid metadata")
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except Exception as exc:
-        raise AppInfrastructureError("browser screenshot base64 is invalid") from exc
-
-    # PNG file signature: 89 50 4e 47 0d 0a 1a 0a.
-    # The previous doctor accidentally checked for the literal characters
-    # "\\x89PNG\\r\\n..." instead of these bytes.
-    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise AppInfrastructureError("browser screenshot is not a PNG")
-    if image.get("size") != len(raw):
-        raise AppInfrastructureError("browser screenshot size mismatch")
-
-    reported_sha256 = image.get("sha256")
-    actual_sha256 = hashlib.sha256(raw).hexdigest()
-    if reported_sha256 != actual_sha256:
-        raise AppInfrastructureError("browser screenshot SHA-256 mismatch")
-
-
 async def _browser_smoke(
     session: ClientSession,
     tool: BenchmarkTool,
@@ -320,7 +296,15 @@ async def _browser_smoke(
     await _call(session, tool, "press", {"key": "Home"})
 
     image = await _call(session, tool, "screenshot", {"full_page": False})
-    _assert_screenshot_integrity(image)
+    encoded = image.get("content_base64")
+    if image.get("mime_type") != "image/png" or not isinstance(encoded, str):
+        raise AppInfrastructureError("browser screenshot returned invalid metadata")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise AppInfrastructureError("browser screenshot base64 is invalid") from exc
+    if not raw.startswith(b"\\x89PNG\\r\\n\\x1a\\n") or image.get("size") != len(raw):
+        raise AppInfrastructureError("browser screenshot content/integrity mismatch")
 
     new_tab = await _call(session, tool, "tabs", {"action": "new"})
     active = new_tab.get("active_index")

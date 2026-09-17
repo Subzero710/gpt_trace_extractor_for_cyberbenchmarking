@@ -53,14 +53,3 @@ async def test_task_profiles_are_owned_recoverable_and_reset(tmp_path: Path) -> 
     assert runtime.state_response() == {"status": "idle"}
     assert not runtime.active_root.exists()
     assert runtime.idle_profile.exists()
-
-
-def test_runtime_browser_binary_override_is_required_and_stable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Path(__file__).parents[1] / "src" / "browser_mcp" / "core.py"
-    text = source.read_text(encoding="utf-8")
-    assert 'CLOAKBROWSER_BINARY_PATH is required; runtime browser downloads are forbidden' in text
-    assert 'environment["CLOAKBROWSER_BINARY_PATH"] = binary_override' in text
-    assert 'ensure_binary' not in text

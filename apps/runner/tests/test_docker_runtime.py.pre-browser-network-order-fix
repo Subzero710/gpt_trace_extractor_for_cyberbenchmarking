@@ -55,17 +55,7 @@ class DockerMock:
             container = body["Container"]
             item = self._container(container)
             if item is not None:
-                if not item["State"]["Running"]:
-                    return httpx.Response(
-                        409,
-                        text="secondary network attach requires a running container",
-                        request=request,
-                    )
-                endpoint = dict(body.get("EndpointConfig") or {})
-                endpoint.setdefault(
-                    "IPAddress",
-                    f"172.30.1.{10 + len(item['NetworkSettings']['Networks'])}",
-                )
+                endpoint = body.get("EndpointConfig") or {}
                 item["NetworkSettings"]["Networks"][name] = endpoint
             else:
                 self.gateway_connects.append((name, container))
@@ -88,15 +78,12 @@ class DockerMock:
             config = json.loads(request.content)
             cid = f"cid-{len(self.containers)+1}"
             primary = config["HostConfig"]["NetworkMode"]
-            address = f"172.30.0.{10 + len(self.containers)}"
             item = {
                 "Id": cid,
                 "Image": f"sha256:{name}",
                 "Config": {"Image": config["Image"], "Labels": config["Labels"]},
                 "State": {"Running": False},
-                "NetworkSettings": {
-                    "Networks": {primary: {"IPAddress": address}}
-                },
+                "NetworkSettings": {"Networks": {primary: {}}},
             }
             self.containers[name] = item
             self.ids[cid] = name
@@ -213,7 +200,6 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert attempt.network_name in mock.containers[browser_name]["NetworkSettings"]["Networks"]
     browser_task_endpoint = mock.containers[browser_name]["NetworkSettings"]["Networks"][attempt.network_name]
     assert browser_name in browser_task_endpoint["Aliases"]
-    assert mock.containers[browser_name]["State"]["Running"] is True
     assert "Binds" not in workspace_cfg["HostConfig"]
     assert "Binds" not in browser_cfg["HostConfig"]
     assert "/var/run/docker.sock" not in json.dumps(workspace_cfg)
@@ -234,10 +220,6 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
 
     assert attempt.resources["code-workspace"].image_id.startswith("sha256:")
     assert attempt.resources["browser"].image_id.startswith("sha256:")
-    assert attempt.resources["code-workspace"].backend_url.startswith("http://172.30.0.")
-    assert attempt.resources["browser"].backend_url.startswith("http://172.30.1.")
-    assert "gpt-trace-" not in attempt.resources["code-workspace"].backend_url
-    assert "gpt-trace-" not in attempt.resources["browser"].backend_url
 
     await rt.destroy(task, environments, fp, attempt=1)
     assert mock.containers == {}

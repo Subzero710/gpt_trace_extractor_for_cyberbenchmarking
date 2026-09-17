@@ -364,20 +364,6 @@ def create_app(state: GatewayState) -> Starlette:
             for key, value in request.headers.items()
             if key.casefold() not in HOP_BY_HOP
         }
-
-        # When the trusted backend is reached through its Docker-inspected
-        # private IP, the MCP transport's DNS-rebinding protection would reject
-        # the automatic "Host: <ip>:8000" authority. Every runtime backend is
-        # explicitly configured to allow localhost:8000, so use that internal
-        # authority while keeping the TCP destination pinned to backend_url.
-        backend_hostname = urlparse(active.backend_url).hostname or ""
-        try:
-            backend_ip = ipaddress.ip_address(backend_hostname)
-        except ValueError:
-            backend_ip = None
-        if backend_ip is not None:
-            headers["host"] = "localhost:8000"
-
         body = await request.body()
         try:
             outgoing = state.client.build_request(

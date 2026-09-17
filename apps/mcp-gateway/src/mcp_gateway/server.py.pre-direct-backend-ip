@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import hmac
-import ipaddress
 import json
 import os
 import re
@@ -73,25 +72,11 @@ class GatewayState:
         expected_name = re.fullmatch(
             re.escape(self.backend_prefix) + r"[0-9a-f]{20}", hostname
         )
-        private_backend_ip = False
-        try:
-            candidate_ip = ipaddress.ip_address(hostname)
-        except ValueError:
-            candidate_ip = None
-        if candidate_ip is not None:
-            private_backend_ip = (
-                candidate_ip.version == 4
-                and candidate_ip.is_private
-                and not candidate_ip.is_loopback
-                and not candidate_ip.is_unspecified
-                and not candidate_ip.is_multicast
-                and not candidate_ip.is_link_local
-            )
         if (
             parsed.scheme != "http"
             or parsed.port != 8000
             or parsed.hostname is None
-            or (expected_name is None and not private_backend_ip)
+            or expected_name is None
             or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
@@ -99,8 +84,7 @@ class GatewayState:
             or parsed.password is not None
         ):
             raise ValueError(
-                "backend_url must be an internal task backend at port 8000 "
-                f"(Docker name {self.backend_prefix}* or private IPv4)"
+                f"backend_url must be an internal http://{self.backend_prefix}*:8000 endpoint"
             )
         return value.rstrip("/")
 
@@ -364,20 +348,6 @@ def create_app(state: GatewayState) -> Starlette:
             for key, value in request.headers.items()
             if key.casefold() not in HOP_BY_HOP
         }
-
-        # When the trusted backend is reached through its Docker-inspected
-        # private IP, the MCP transport's DNS-rebinding protection would reject
-        # the automatic "Host: <ip>:8000" authority. Every runtime backend is
-        # explicitly configured to allow localhost:8000, so use that internal
-        # authority while keeping the TCP destination pinned to backend_url.
-        backend_hostname = urlparse(active.backend_url).hostname or ""
-        try:
-            backend_ip = ipaddress.ip_address(backend_hostname)
-        except ValueError:
-            backend_ip = None
-        if backend_ip is not None:
-            headers["host"] = "localhost:8000"
-
         body = await request.body()
         try:
             outgoing = state.client.build_request(
