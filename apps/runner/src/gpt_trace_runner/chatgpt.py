@@ -114,8 +114,30 @@ class ChatGPTClient:
         self._environment_baseline: dict[str, Any] | None = None
         self._environment_hash: str | None = None
 
+    async def _navigate(self, url: str) -> None:
+        # BrowserClient applies cloakbrowser.human.patch_browser_async() to the
+        # connected Browser before this Page reaches ChatGPTClient. Calling the
+        # public Page.goto API here therefore goes through CloakBrowser's
+        # frame-aware/humanized wrapper. Never bypass it via private/original
+        # Playwright methods.
+        #
+        # Navigation and page readiness are separate invariants. "commit"
+        # proves the navigation response was received; SiteGuard or the auth
+        # waiter then handles login pages, interstitials/challenges and the
+        # final actionable ChatGPT UI.
+        try:
+            await self._page.goto(
+                url,
+                wait_until="commit",
+                timeout=60_000,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise FatalUIState(
+                "ChatGPT navigation did not commit within 60 seconds"
+            ) from exc
+
     async def goto_home(self) -> None:
-        await self._page.goto(self._base_url, wait_until="domcontentloaded", timeout=60_000)
+        await self._navigate(self._base_url)
 
     async def _environment(self) -> dict[str, Any]:
         try:
@@ -456,11 +478,7 @@ class ChatGPTClient:
     async def recover(self, conversation_id: str, *, task: BenchmarkTask) -> CapturedConversation:
         if self._active_turn is not None:
             raise ConcurrentTurnError("cannot recover while another turn is active")
-        await self._page.goto(
-            f"{self._base_url}/c/{conversation_id}",
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
+        await self._navigate(f"{self._base_url}/c/{conversation_id}")
         await self._site.wait_ready()
         await self._check_environment()
         conversation = await self._conversation.fetch(conversation_id)

@@ -118,9 +118,12 @@ def auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
             ).connect()
             try:
                 chatgpt = make_chatgpt(settings, session.page)
+                # noVNC is the operator surface for headed CloakBrowser. Show
+                # it before navigation so login/challenge transitions are
+                # observable while the auth waiter runs.
+                console.print(f"Open noVNC and log in:\n[bold]{settings.browser_novnc_url}[/]")
                 if not session.page.url.startswith(settings.chatgpt_base_url):
                     await chatgpt.goto_home()
-                console.print(f"Open noVNC and log in:\n[bold]{settings.browser_novnc_url}[/]")
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
                 console.print("[green]authentication detected[/]")
             finally:
