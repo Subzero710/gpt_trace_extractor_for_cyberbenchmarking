@@ -202,13 +202,6 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
 
     assert mock.archives == {}
     assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is True
-    assert workspace_cfg["User"] == "10002:10002"
-    assert workspace_cfg["HostConfig"]["CapDrop"] == ["ALL"]
-    assert "CapAdd" not in workspace_cfg["HostConfig"]
-    assert "uid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
-    assert "gid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
-    assert "uid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
-    assert "gid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
 
     assert attempt.resources["code-workspace"].image_id.startswith("sha256:")
     assert attempt.resources["browser"].image_id.startswith("sha256:")

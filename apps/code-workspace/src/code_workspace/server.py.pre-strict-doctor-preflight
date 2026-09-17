@@ -192,9 +192,9 @@ def create_app(
     async def control(request: Request) -> JSONResponse:
         if not authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        operation = request.path_params["operation"]
         try:
             body = await _json_body(request)
+            operation = request.path_params["operation"]
             if operation == "prepare":
                 result = await manager.prepare(body)
             elif operation == "resume":
@@ -206,17 +206,6 @@ def create_app(
             return JSONResponse(result)
         except WorkspaceError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=409)
-        except Exception as exc:
-            LOG.exception("workspace control operation %s failed", operation)
-            return JSONResponse(
-                {
-                    "detail": (
-                        f"{operation} internal failure: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                },
-                status_code=500,
-            )
 
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:

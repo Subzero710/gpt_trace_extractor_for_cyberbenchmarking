@@ -218,15 +218,16 @@ class DockerRuntime:
                 "ReadonlyRootfs": True,
                 "Init": True,
                 "CapDrop": ["ALL"],
+                "CapAdd": ["CHOWN", "KILL", "SETGID", "SETUID"],
                 "SecurityOpt": ["no-new-privileges"],
                 "PidsLimit": 160,
                 "Memory": 2 * 1024 * 1024 * 1024,
                 "NanoCpus": 2_000_000_000,
                 "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 1024}],
                 "Tmpfs": {
-                    "/workspace": "rw,nosuid,nodev,size=2147483648,mode=0770,uid=10002,gid=10002",
-                    "/state": "rw,nosuid,nodev,noexec,size=16777216,mode=0700,uid=10002,gid=10002",
-                    "/tmp": "rw,nosuid,nodev,noexec,size=268435456,mode=1777,uid=10002,gid=10002",
+                    "/workspace": "rw,nosuid,nodev,size=2147483648,mode=0770",
+                    "/state": "rw,nosuid,nodev,noexec,size=16777216,mode=0700",
+                    "/tmp": "rw,nosuid,nodev,noexec,size=268435456,mode=1777",
                 },
                 "NetworkMode": network_name,
             }
@@ -257,7 +258,7 @@ class DockerRuntime:
         else:
             primary_network = network_name
         host_config["NetworkMode"] = primary_network
-        config: dict[str, Any] = {
+        return {
             "Image": self._image(app_id),
             "Env": env,
             "Labels": self._labels(
@@ -271,9 +272,6 @@ class DockerRuntime:
             "HostConfig": host_config,
             "NetworkingConfig": {"EndpointsConfig": {primary_network: {}}},
         }
-        if app_id == "code-workspace":
-            config["User"] = "10002:10002"
-        return config
 
     async def _inspect_container(self, name_or_id: str) -> dict[str, Any] | None:
         response = await self._request(
