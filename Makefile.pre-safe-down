@@ -8,7 +8,7 @@ build:
 up:
 	docker compose up -d postgres storage browser workspace-gateway browser-gateway
 down:
-	python3 scripts/down.py
+	docker compose down --remove-orphans
 logs:
 	docker compose logs -f --tail=200
 doctor:
