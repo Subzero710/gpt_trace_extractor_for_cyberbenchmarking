@@ -156,35 +156,6 @@ services:
     entrypoint: ["/bin/true"]
     restart: "no"
 
-  # Isolated local-only MCP capability probe for validating ChatGPT Plus.
-  # It is not part of the benchmark runtime and only starts under profile mcp-probe.
-  mcp-probe:
-    profiles: ["mcp-probe"]
-    build: ./apps/mcp-probe
-    environment:
-      MCP_PROBE_STATE_PATH: /tmp/mcp-probe-state.json
-      MCP_ALLOWED_HOSTS: 127.0.0.1:${MCP_PROBE_PORT:-8099},localhost:${MCP_PROBE_PORT:-8099},127.0.0.1:8000,localhost:8000,mcp-probe:8000
-    ports:
-      - "127.0.0.1:${MCP_PROBE_PORT:-8099}:8000"
-    networks:
-      - app_control
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=8m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 64
-    mem_limit: 128m
-    cpus: 0.25
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
-      interval: 3s
-      timeout: 2s
-      retries: 20
-    restart: "no"
-
   runner:
     profiles: ["runner"]
     build: ./apps/runner
