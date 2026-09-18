@@ -1,4 +1,4 @@
-.PHONY: init adopt-profile build up down logs doctor auth run inspect-tools status export test mcp-probe-up mcp-probe-check mcp-probe-state mcp-probe-tunnel-doctor mcp-probe-tunnel mcp-probe-tunnel-logs mcp-probe-tunnel-down mcp-probe-down
+.PHONY: init adopt-profile build up down logs doctor auth run inspect-tools status export test mcp-probe-up mcp-probe-check mcp-probe-state mcp-probe-tunnel-doctor mcp-probe-tunnel mcp-probe-down
 init:
 	python3 scripts/init_env.py
 adopt-profile:
@@ -38,13 +38,14 @@ mcp-probe-check:
 mcp-probe-state:
 	@curl -fsS "http://127.0.0.1:$${MCP_PROBE_PORT:-8099}/state"; echo
 mcp-probe-tunnel-doctor:
-	docker compose --profile mcp-probe run --rm mcp-tunnel doctor --explain
+	@command -v tunnel-client >/dev/null 2>&1 || (echo "tunnel-client is not installed/in PATH" >&2; exit 2)
+	@test -n "$$CONTROL_PLANE_TUNNEL_ID" || (echo "CONTROL_PLANE_TUNNEL_ID is required" >&2; exit 2)
+	@test -n "$$CONTROL_PLANE_API_KEY" || (echo "CONTROL_PLANE_API_KEY is required" >&2; exit 2)
+	@MCP_SERVER_URL="http://127.0.0.1:$${MCP_PROBE_PORT:-8099}/mcp/" tunnel-client doctor --explain
 mcp-probe-tunnel:
-	docker compose --profile mcp-probe up -d mcp-tunnel
-	@docker compose --profile mcp-probe ps mcp-tunnel
-mcp-probe-tunnel-logs:
-	docker compose --profile mcp-probe logs -f --tail=100 mcp-tunnel
-mcp-probe-tunnel-down:
-	docker compose --profile mcp-probe rm -sf mcp-tunnel
+	@command -v tunnel-client >/dev/null 2>&1 || (echo "tunnel-client is not installed/in PATH" >&2; exit 2)
+	@test -n "$$CONTROL_PLANE_TUNNEL_ID" || (echo "CONTROL_PLANE_TUNNEL_ID is required" >&2; exit 2)
+	@test -n "$$CONTROL_PLANE_API_KEY" || (echo "CONTROL_PLANE_API_KEY is required" >&2; exit 2)
+	@MCP_SERVER_URL="http://127.0.0.1:$${MCP_PROBE_PORT:-8099}/mcp/" tunnel-client run --log.level=info --log.format=struct-text
 mcp-probe-down:
 	docker compose --profile mcp-probe rm -sf mcp-probe

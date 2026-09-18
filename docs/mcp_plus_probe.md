@@ -1,22 +1,40 @@
 # ChatGPT Plus MCP capability probe
 
-This probe answers one narrow question with the actual account/UI:
+This probe determines whether this ChatGPT Plus account can discover and invoke
+a private MCP server through Secure MCP Tunnel, including a tool explicitly
+annotated as write/modify.
 
-> Can this ChatGPT Plus account discover and invoke a private MCP server through
-> Secure MCP Tunnel, including a tool explicitly annotated as a write/modify tool?
+Everything runtime-related is containerized. Nothing needs to be installed on
+the host other than Docker / Docker Compose.
 
-It deliberately has only three tools:
+The probe exposes exactly three tools:
 
 - `probe_ping`: read-only connectivity.
 - `probe_read_state`: read-only state inspection.
 - `probe_write_state`: changes private probe state and declares
   `readOnlyHint=false`.
 
-No OpenAI model API is used. `tunnel-client` does require a Platform runtime API
-key for the tunnel control plane. The MCP server itself stays private and is
-published only on `127.0.0.1`.
+## Configuration
 
-## 1. Start and self-test locally
+Put only the tunnel identity/runtime key in the repository `.env`:
+
+```dotenv
+CONTROL_PLANE_TUNNEL_ID=tunnel_...
+CONTROL_PLANE_API_KEY=sk-...
+```
+
+Do not commit `.env` and do not paste the runtime key into chat.
+
+`MCP_SERVER_URL` is intentionally not taken from `.env`. Inside Compose the
+official OpenAI tunnel-client container talks to:
+
+```text
+http://mcp-probe:8000/mcp/
+```
+
+over the dedicated `mcp_probe_host` Docker bridge.
+
+## Local probe
 
 ```bash
 sudo make mcp-probe-up
@@ -24,92 +42,72 @@ sudo make mcp-probe-check
 sudo make mcp-probe-state
 ```
 
-The local self-test intentionally sets the probe value to `local-smoke`.
-
-## 2. Create a Secure MCP Tunnel
-
-In the ChatGPT "New Plugin" dialog choose `Tunnel` and click **Create tunnel**,
-or create the tunnel in Platform tunnel settings.
-
-Create a **runtime** API key with only the tunnel permissions required by the
-OpenAI tunnel documentation. Do not put that key in this repository or `.env`.
-
-Install the current `tunnel-client` from the tunnel setup UI / official
-`openai/tunnel-client` release, then verify:
-
-```bash
-tunnel-client --version
-tunnel-client help quickstart
-```
-
-Export the values in your shell:
-
-```bash
-export CONTROL_PLANE_TUNNEL_ID='tunnel_...'
-read -rsp 'CONTROL_PLANE_API_KEY: ' CONTROL_PLANE_API_KEY; echo
-export CONTROL_PLANE_API_KEY
-```
-
-Do not run the tunnel client through `sudo`; keep the runtime key in your normal
-user shell.
-
-Validate the route:
-
-```bash
-make mcp-probe-tunnel-doctor
-```
-
-Then keep this running in its own terminal:
-
-```bash
-make mcp-probe-tunnel
-```
-
-The Make target sets:
+Expected tool set:
 
 ```text
-MCP_SERVER_URL=http://127.0.0.1:8099/mcp/
+probe_ping
+probe_read_state
+probe_write_state
 ```
 
-The trailing slash intentionally avoids the Starlette `/mcp -> /mcp/` redirect.
+## Tunnel doctor
 
-## 3. Create the personal ChatGPT plugin
+The official image is pinned in Compose:
 
-In ChatGPT:
+```text
+ghcr.io/openai/tunnel-client:v0.0.14
+```
 
-1. Open the New Plugin dialog.
-2. Name: `MCP Plus Probe`.
-3. Connection: `Tunnel`.
-4. Select the tunnel you created.
-5. Authentication: no MCP-server authentication (`None` / `No authentication`,
-   wording may vary). Tunnel control-plane authentication is separate.
-6. Accept the custom MCP risk acknowledgement.
-7. Create/scan the plugin.
+No host `tunnel-client` binary is used.
 
-Confirm that ChatGPT discovers exactly:
+Run:
 
-- `probe_ping`
-- `probe_read_state`
-- `probe_write_state`
+```bash
+sudo make mcp-probe-tunnel-doctor
+```
 
-and that the write tool is shown as a modifying/non-read-only action if the UI
-surfaces annotations.
+This executes `tunnel-client doctor --explain` in an ephemeral container.
 
-## 4. Test where the plugin is usable, then test read/write
+## Start tunnel
 
-First try a fresh normal **Chat** conversation, because the benchmark runner
-currently automates Chat. If the personal plugin is not available there, repeat
-the same test in **Work**. Record which surface actually exposes the plugin;
-this determines whether the benchmark runner can stay on Chat or must switch to
-Work.
+```bash
+sudo make mcp-probe-tunnel
+```
 
-With the plugin enabled on the surface being tested, first ask:
+Inspect live logs with:
+
+```bash
+sudo make mcp-probe-tunnel-logs
+```
+
+Stop only the tunnel container with:
+
+```bash
+sudo make mcp-probe-tunnel-down
+```
+
+## ChatGPT plugin
+
+Create/finish the personal plugin:
+
+- Name: `MCP Plus Probe`
+- Connection: `Tunnel`
+- Tunnel: the configured tunnel ID
+- MCP authentication: none
+
+Confirm ChatGPT discovers exactly the three probe tools.
+
+First test a normal Chat conversation because the benchmark runner currently
+automates Chat. If the personal plugin is unavailable there, repeat in Work and
+record which surface exposes it.
+
+Read test:
 
 ```text
 Use MCP Plus Probe to call probe_read_state. Report the exact JSON result.
 ```
 
-Then ask:
+Write test:
 
 ```text
 Use MCP Plus Probe to call probe_write_state and set value exactly to:
@@ -117,25 +115,18 @@ plus-write-probe-2026-09-18
 Then call probe_read_state and report the exact JSON result.
 ```
 
-If ChatGPT shows an approval prompt for the write, approve it. The purpose is to
-test whether Plus permits the call, not whether approval can be bypassed.
+If ChatGPT displays an approval prompt for the write, approve it.
 
-Verify independently on the VM:
+Verify independently:
 
 ```bash
 sudo make mcp-probe-state
 ```
 
-Success for full write MCP means the local result contains
-`"value":"plus-write-probe-2026-09-18"`. The revision is intentionally not
-fixed because the local smoke test and repeated experiments can increment it.
-The decisive fact is that the value changed through the ChatGPT plugin.
+Full write support is proven when the local state contains:
 
-Interpretation:
+```text
+"value":"plus-write-probe-2026-09-18"
+```
 
-- Discovery fails: tunnel/plugin connectivity problem; we have not tested Plus
-  capability yet.
-- Read works, write tool is hidden or refused by ChatGPT: Plus is effectively
-  read-only for this custom MCP path.
-- Write invocation reaches the server and `mcp-probe-state` changes: the native
-  private-MCP architecture is viable for `Code Workspace` and `Browser`.
+The revision number is not fixed because repeated experiments can increment it.

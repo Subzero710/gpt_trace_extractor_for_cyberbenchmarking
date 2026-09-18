@@ -185,36 +185,6 @@ services:
       retries: 20
     restart: "no"
 
-  # Official OpenAI tunnel client. No host installation is required.
-  # It shares only the dedicated probe network and reaches the MCP by Docker DNS.
-  mcp-tunnel:
-    profiles: ["mcp-probe"]
-    image: ghcr.io/openai/tunnel-client:v0.0.14
-    entrypoint: ["/usr/bin/tunnel-client"]
-    command: ["run", "--log.level=info", "--log.format=struct-text"]
-    environment:
-      CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID:?set CONTROL_PLANE_TUNNEL_ID in .env}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?set CONTROL_PLANE_API_KEY in .env}
-      MCP_SERVER_URL: http://mcp-probe:8000/mcp/
-      HEALTH_LISTEN_ADDR: :8080
-      HOME: /tmp/tunnel-home
-    depends_on:
-      mcp-probe:
-        condition: service_healthy
-    networks:
-      - mcp_probe_host
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
-    restart: unless-stopped
-
   runner:
     profiles: ["runner"]
     build: ./apps/runner
