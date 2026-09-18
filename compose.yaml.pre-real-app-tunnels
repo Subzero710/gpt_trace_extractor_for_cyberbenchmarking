@@ -236,69 +236,6 @@ services:
     cpus: 0.50
     restart: unless-stopped
 
-  # Secure MCP Tunnel for the real Code Workspace App.
-  # The tunnel has outbound Internet on mcp_tunnel_egress and reaches only the
-  # stable gateway over app_control. The runner swaps the ephemeral backend
-  # behind that gateway for each attempt.
-  mcp-tunnel-workspace:
-    profiles: ["app-tunnels"]
-    image: ghcr.io/openai/tunnel-client:v0.0.14
-    entrypoint: ["/usr/bin/tunnel-client"]
-    command: ["run", "--log.level=info", "--log.format=struct-text"]
-    environment:
-      CONTROL_PLANE_TUNNEL_ID: ${APP_CODE_WORKSPACE_TUNNEL_ID:-}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
-      MCP_SERVER_URL: http://workspace-gateway:8000/mcp
-      HEALTH_LISTEN_ADDR: :8080
-      HOME: /tmp/tunnel-home
-    depends_on:
-      workspace-gateway:
-        condition: service_healthy
-    networks:
-      - app_control
-      - mcp_tunnel_egress
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
-    restart: unless-stopped
-
-  # Secure MCP Tunnel for the real Browser App.
-  mcp-tunnel-browser:
-    profiles: ["app-tunnels"]
-    image: ghcr.io/openai/tunnel-client:v0.0.14
-    entrypoint: ["/usr/bin/tunnel-client"]
-    command: ["run", "--log.level=info", "--log.format=struct-text"]
-    environment:
-      CONTROL_PLANE_TUNNEL_ID: ${APP_BROWSER_TUNNEL_ID:-}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
-      MCP_SERVER_URL: http://browser-gateway:8000/mcp
-      HEALTH_LISTEN_ADDR: :8080
-      HOME: /tmp/tunnel-home
-    depends_on:
-      browser-gateway:
-        condition: service_healthy
-    networks:
-      - app_control
-      - mcp_tunnel_egress
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
-    restart: unless-stopped
-
   runner:
     profiles: ["runner"]
     build:
@@ -391,9 +328,6 @@ networks:
     internal: true
   # Dedicated non-internal bridge for the local-only MCP probe.
   mcp_probe_host:
-  # Outbound-only bridge for the real ChatGPT tunnel-client containers.
-  # They also attach to internal app_control to reach the stable gateways.
-  mcp_tunnel_egress:
   ui_egress:
 
 secrets:

@@ -293,10 +293,8 @@ class ChatGPTClient:
     ) -> None:
         """Fail before benchmark execution if a required ChatGPT App is absent."""
         await self._new_chat_if_needed()
-        editor = await self._site.wait_ready()
         await assert_apps_available(
             self._page,
-            editor=editor,
             tools=tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
@@ -304,9 +302,8 @@ class ChatGPTClient:
         await self._site.wait_ready()
 
     async def _compose(self, task: BenchmarkTask) -> None:
-        # Paste first, then append Apps through ChatGPT's @ mention autocomplete.
-        # App mentions are structured composer nodes; never Ctrl+A after adding
-        # them or the mention may be deleted.
+        # Paste first. App selection can create a structured ecosystemMention;
+        # never Ctrl+A after selecting an app or that mention may be deleted.
         editor = await self._site.wait_ready()
         await self._interaction.paste_text(editor, task.prompt)
         await select_apps(

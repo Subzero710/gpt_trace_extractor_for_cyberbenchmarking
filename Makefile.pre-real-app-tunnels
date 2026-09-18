@@ -1,4 +1,4 @@
-.PHONY: init adopt-profile build build-clean build-cache-status up down logs doctor auth run inspect-tools status export test apps-register app-tunnels-doctor app-tunnels-up app-tunnels-logs app-tunnels-down mcp-probe-up mcp-probe-check mcp-probe-state mcp-probe-tunnel-doctor mcp-probe-tunnel mcp-probe-tunnel-logs mcp-probe-tunnel-down mcp-probe-down
+.PHONY: init adopt-profile build build-clean build-cache-status up down logs doctor auth run inspect-tools status export test mcp-probe-up mcp-probe-check mcp-probe-state mcp-probe-tunnel-doctor mcp-probe-tunnel mcp-probe-tunnel-logs mcp-probe-tunnel-down mcp-probe-down
 init:
 	python3 scripts/init_env.py
 adopt-profile:
@@ -24,18 +24,6 @@ run:
 inspect-tools:
 	@test -n "$(TASK_ID)" || (echo "TASK_ID is required" >&2; exit 2)
 	docker compose run --rm --no-deps runner inspect-tools /data/benchmarks/benchmark.jsonl --task-id "$(TASK_ID)"
-apps-register:
-	docker compose run --rm runner register-apps /data/benchmarks/benchmark.jsonl --task-id smoke_isolation_001
-app-tunnels-doctor:
-	docker compose --profile app-tunnels run --rm mcp-tunnel-workspace doctor --explain
-	docker compose --profile app-tunnels run --rm mcp-tunnel-browser doctor --explain
-app-tunnels-up:
-	docker compose --profile app-tunnels up -d mcp-tunnel-workspace mcp-tunnel-browser
-	@docker compose --profile app-tunnels ps mcp-tunnel-workspace mcp-tunnel-browser
-app-tunnels-logs:
-	docker compose --profile app-tunnels logs -f --tail=100 mcp-tunnel-workspace mcp-tunnel-browser
-app-tunnels-down:
-	docker compose --profile app-tunnels rm -sf mcp-tunnel-workspace mcp-tunnel-browser
 status:
 	docker compose run --rm --no-deps runner status
 export:

@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import asyncio
+
+from playwright.async_api import Locator, Page
+
+from .exceptions import AppUnavailable, FatalUIState
+from .interaction import InteractionGuard
+from .models import BenchmarkTool
+
+_TOOL_MENU_BUTTONS = (
+    'button[data-testid="composer-tools-menu-button"]',
+    'button[data-testid="composer-plus-btn"]',
+    'button[aria-label*="Tools"]',
+    'button[aria-label*="Add"]',
+)
+_MENU_ITEMS = (
+    '[role="menuitem"]',
+    '[role="option"]',
+    '[cmdk-item]',
+    '[data-radix-collection-item]',
+)
+_SUBMENU_LABELS = ("Apps", "Connectors", "Tools")
+
+
+async def _first_visible(page: Page, selectors: tuple[str, ...]) -> Locator | None:
+    for selector in selectors:
+        locators = page.locator(selector)
+        try:
+            for index in range(await locators.count()):
+                candidate = locators.nth(index)
+                if await candidate.is_visible():
+                    return candidate
+        except Exception:
+            continue
+    return None
+
+
+async def _find_menu_item(page: Page, text: str, *, timeout_seconds: float) -> Locator | None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    combined = ", ".join(_MENU_ITEMS)
+    while asyncio.get_running_loop().time() < deadline:
+        candidates = page.locator(combined).filter(has_text=text)
+        try:
+            for index in range(await candidates.count()):
+                candidate = candidates.nth(index)
+                if await candidate.is_visible():
+                    label = (await candidate.inner_text()).strip()
+                    if label == text or text in label:
+                        return candidate
+        except Exception:
+            pass
+
+        exact = page.get_by_text(text, exact=True)
+        try:
+            for index in range(await exact.count()):
+                candidate = exact.nth(index)
+                if await candidate.is_visible():
+                    return candidate
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+    return None
+
+
+_POPUP_ROOTS = (
+    '[role="menu"]',
+    '[role="listbox"]',
+    '[role="dialog"]',
+    '[cmdk-root]',
+    '[data-radix-menu-content]',
+    '[data-radix-popover-content]',
+)
+
+
+async def _visible_popup_snapshot(page: Page) -> tuple[str, ...]:
+    """Capture text only from currently visible popup surfaces.
+
+    This is diagnostic-only. It deliberately does not scan menu items across the
+    entire ChatGPT page, because persistent navigation controls such as
+    "Chat"/"Work" are unrelated to the composer app picker.
+    """
+    roots = page.locator(", ".join(_POPUP_ROOTS))
+    snapshots: list[str] = []
+    try:
+        for index in range(await roots.count()):
+            root = roots.nth(index)
+            if not await root.is_visible():
+                continue
+            text = " ".join((await root.inner_text()).split())
+            if text and text not in snapshots:
+                snapshots.append(text[:1200])
+    except Exception:
+        return tuple(snapshots)
+    return tuple(snapshots[:8])
+
+
+async def _find_app_from_open_menu(
+    page: Page,
+    *,
+    name: str,
+    interaction: InteractionGuard,
+    timeout_seconds: float,
+) -> tuple[Locator | None, tuple[str, ...], tuple[str, ...]]:
+    snapshots: list[str] = []
+    attempted_submenus: list[str] = []
+
+    async def capture() -> None:
+        for text in await _visible_popup_snapshot(page):
+            if text not in snapshots:
+                snapshots.append(text)
+
+    await capture()
+    app = await _find_menu_item(page, name, timeout_seconds=min(2.0, timeout_seconds))
+    if app is not None:
+        return app, tuple(snapshots), tuple(attempted_submenus)
+
+    for label in _SUBMENU_LABELS:
+        submenu = await _find_menu_item(
+            page,
+            label,
+            timeout_seconds=min(2.0, timeout_seconds),
+        )
+        if submenu is None:
+            continue
+        attempted_submenus.append(label)
+        await interaction.click(submenu)
+        await capture()
+        app = await _find_menu_item(page, name, timeout_seconds=timeout_seconds)
+        if app is not None:
+            return app, tuple(snapshots), tuple(attempted_submenus)
+
+    await capture()
+    return None, tuple(snapshots), tuple(attempted_submenus)
+
+
+async def assert_apps_available(
+    page: Page,
+    *,
+    tools: tuple[BenchmarkTool, ...],
+    interaction: InteractionGuard,
+    timeout_seconds: float,
+) -> None:
+    """Verify benchmark Apps are visible without selecting or submitting them."""
+    seen: set[str] = set()
+    for tool in tools:
+        if tool.type != "app":
+            raise FatalUIState(f"unsupported benchmark tool type at runtime: {tool.type}")
+        if tool.name in seen:
+            continue
+        seen.add(tool.name)
+
+        button = await _first_visible(page, _TOOL_MENU_BUTTONS)
+        if button is None:
+            raise FatalUIState("ChatGPT Tools/Apps menu button was not found")
+
+        await interaction.click(button)
+        try:
+            app, snapshots, attempted_submenus = await _find_app_from_open_menu(
+                page,
+                name=tool.name,
+                interaction=interaction,
+                timeout_seconds=timeout_seconds,
+            )
+            if app is None:
+                details: list[str] = []
+                if attempted_submenus:
+                    details.append(f"submenus tried={attempted_submenus!r}")
+                if snapshots:
+                    details.append(f"app-picker snapshots={snapshots!r}")
+                detail = "; " + "; ".join(details) if details else ""
+                raise AppUnavailable(
+                    f"ChatGPT app {tool.name!r} is not available in the visible Apps UI"
+                    + detail
+                )
+        finally:
+            try:
+                await page.keyboard.press("Escape")
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+
+async def select_apps(
+    page: Page,
+    *,
+    editor: Locator,
+    tools: tuple[BenchmarkTool, ...],
+    interaction: InteractionGuard,
+    timeout_seconds: float,
+) -> None:
+    for tool in tools:
+        if tool.type != "app":
+            raise FatalUIState(f"unsupported benchmark tool type at runtime: {tool.type}")
+        button = await _first_visible(page, _TOOL_MENU_BUTTONS)
+        if button is None:
+            raise FatalUIState("ChatGPT Tools/Apps menu button was not found")
+        await interaction.click(button)
+
+        app, snapshots, attempted_submenus = await _find_app_from_open_menu(
+            page,
+            name=tool.name,
+            interaction=interaction,
+            timeout_seconds=timeout_seconds,
+        )
+        if app is None:
+            details: list[str] = []
+            if attempted_submenus:
+                details.append(f"submenus tried={attempted_submenus!r}")
+            if snapshots:
+                details.append(f"app-picker snapshots={snapshots!r}")
+            detail = "; " + "; ".join(details) if details else ""
+            raise AppUnavailable(
+                f"ChatGPT app {tool.name!r} is not available in the visible Apps UI"
+                + detail
+            )
+
+        before = ""
+        try:
+            before = (await editor.inner_text()).strip()
+        except Exception:
+            pass
+
+        await interaction.click(app)
+
+        # Selecting an App commonly closes the popup. Confirm selection in the
+        # composer, where ChatGPT inserts the structured ecosystemMention,
+        # instead of looking for the now-closed menu item.
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                rendered = (await editor.inner_text()).strip()
+            except Exception:
+                rendered = ""
+            if tool.name in rendered and rendered != before:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AppUnavailable(
+                f"ChatGPT app {tool.name!r} was clicked but no app mention appeared "
+                "in the composer"
+            )
