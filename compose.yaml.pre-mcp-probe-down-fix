@@ -193,8 +193,8 @@ services:
     entrypoint: ["/usr/bin/tunnel-client"]
     command: ["run", "--log.level=info", "--log.format=struct-text"]
     environment:
-      CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID:-}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
+      CONTROL_PLANE_TUNNEL_ID: ${CONTROL_PLANE_TUNNEL_ID:?set CONTROL_PLANE_TUNNEL_ID in .env}
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?set CONTROL_PLANE_API_KEY in .env}
       MCP_SERVER_URL: http://mcp-probe:8000/mcp/
       HEALTH_LISTEN_ADDR: :8080
       HOME: /tmp/tunnel-home
