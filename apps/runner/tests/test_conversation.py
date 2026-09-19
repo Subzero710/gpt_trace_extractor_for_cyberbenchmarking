@@ -47,7 +47,14 @@ def test_invoked_app_names_reads_runtime_metadata_without_vendor_assumptions() -
 async def test_conversation_fetch_classifies_401_as_authentication_failure() -> None:
     page = type("PageDouble", (), {})()
     page.evaluate = AsyncMock(
-        return_value={"status": 401, "ok": False, "statusText": "Unauthorized", "text": ""}
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 401,
+            "ok": False,
+            "statusText": "Unauthorized",
+            "text": "",
+        }
     )
     client = ConversationClient(page)
 
@@ -56,10 +63,63 @@ async def test_conversation_fetch_classifies_401_as_authentication_failure() -> 
 
 
 @pytest.mark.asyncio
+async def test_conversation_fetch_uses_in_page_bearer_without_returning_token() -> None:
+    page = type("PageDouble", (), {})()
+    page.evaluate = AsyncMock(
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 200,
+            "ok": True,
+            "statusText": "OK",
+            "text": '{"messages":[]}',
+        }
+    )
+    client = ConversationClient(page)
+
+    payload = await client.fetch("conv")
+    assert payload == {"messages": []}
+
+    javascript, endpoint = page.evaluate.await_args.args
+    assert endpoint.startswith("/backend-api/conversations/conv?")
+    assert "/api/auth/session" in javascript
+    assert "payload.accessToken" in javascript
+    assert "authorization: `Bearer ${accessToken}`" in javascript
+    assert "accessToken:" not in javascript
+    assert "tokenPresent: true" in javascript
+
+
+@pytest.mark.asyncio
+async def test_conversation_fetch_requires_session_access_token() -> None:
+    page = type("PageDouble", (), {})()
+    page.evaluate = AsyncMock(
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": False,
+            "status": 0,
+            "ok": False,
+            "statusText": "",
+            "text": "",
+        }
+    )
+    client = ConversationClient(page)
+
+    with pytest.raises(AuthenticationRequired, match="did not yield a backend access token"):
+        await client.fetch("conv")
+
+
+@pytest.mark.asyncio
 async def test_conversation_fetch_classifies_404_as_missing_conversation() -> None:
     page = type("PageDouble", (), {})()
     page.evaluate = AsyncMock(
-        return_value={"status": 404, "ok": False, "statusText": "Not Found", "text": ""}
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 404,
+            "ok": False,
+            "statusText": "Not Found",
+            "text": "",
+        }
     )
     client = ConversationClient(page)
 

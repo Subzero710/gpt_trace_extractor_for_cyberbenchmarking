@@ -208,8 +208,56 @@ class ConversationClient:
         try:
             result = await self._page.evaluate(
                 """async (endpoint) => {
-                    const r = await fetch(endpoint, {credentials:'include', cache:'no-store'});
-                    return {status:r.status, ok:r.ok, statusText:r.statusText, text:await r.text()};
+                    // Current ChatGPT backend conversation reads use a short-lived
+                    // bearer token in addition to the browser session cookie.
+                    // Keep that token entirely in page JavaScript: never return it
+                    // to Python, logs, storage, or artifacts.
+                    const session = await fetch(
+                        '/api/auth/session',
+                        {credentials:'include', cache:'no-store'}
+                    );
+
+                    let accessToken = null;
+                    if (session.ok) {
+                        try {
+                            const payload = await session.json();
+                            if (
+                                payload &&
+                                typeof payload.accessToken === 'string' &&
+                                payload.accessToken.trim()
+                            ) {
+                                accessToken = payload.accessToken;
+                            }
+                        } catch (_) {
+                        }
+                    }
+
+                    if (!accessToken) {
+                        return {
+                            sessionStatus: session.status,
+                            tokenPresent: false,
+                            status: 0,
+                            ok: false,
+                            statusText: '',
+                            text: ''
+                        };
+                    }
+
+                    const r = await fetch(endpoint, {
+                        credentials: 'include',
+                        cache: 'no-store',
+                        headers: {
+                            authorization: `Bearer ${accessToken}`
+                        }
+                    });
+                    return {
+                        sessionStatus: session.status,
+                        tokenPresent: true,
+                        status: r.status,
+                        ok: r.ok,
+                        statusText: r.statusText,
+                        text: await r.text()
+                    };
                 }""",
                 endpoint,
             )
@@ -217,10 +265,20 @@ class ConversationClient:
             raise ConversationError(f"fetch {conversation_id} failed: {exc}") from exc
         if not isinstance(result, dict):
             raise ConversationError("conversation fetch returned invalid result")
+
+        session_status = int(result.get("sessionStatus", 0))
+        token_present = result.get("tokenPresent") is True
+        if not token_present:
+            raise AuthenticationRequired(
+                "ChatGPT browser session did not yield a backend access token "
+                f"(session HTTP {session_status})"
+            )
+
         status = int(result.get("status", 0))
         if status == 401:
             raise AuthenticationRequired(
-                "conversation snapshot returned HTTP 401; ChatGPT session is not authenticated"
+                "conversation snapshot rejected the authenticated backend token "
+                "(HTTP 401)"
             )
         if status == 403:
             raise AccessDenied("conversation snapshot returned HTTP 403")
