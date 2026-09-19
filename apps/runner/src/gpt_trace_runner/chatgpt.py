@@ -74,49 +74,6 @@ class SubmittedTurn:
 
 
 
-def _prompt_for_chatgpt(task: BenchmarkTask) -> str:
-    # task.prompt is immutable provenance and participates in task_fingerprint.
-    # Remove only redundant App-activation prose from the UI projection because
-    # Apps are already represented by structured @ mentions in the composer.
-    prompt = task.prompt
-    names = tuple(tool.name for tool in task.tools)
-    if not names:
-        return prompt
-
-    if len(names) == 1:
-        name = names[0]
-        prefix = f"Use the {name} app. "
-        if prompt.startswith(prefix):
-            prompt = prompt[len(prefix):]
-
-        suffixes = (
-            f" You must use {name} and must not answer from reasoning alone.",
-            f" You must use {name} and must not answer from prior knowledge.",
-            f" You must use {name}.",
-        )
-        for suffix in suffixes:
-            if prompt.endswith(suffix):
-                prompt = prompt[:-len(suffix)]
-                break
-
-    elif len(names) == 2:
-        joined = f"{names[0]} and {names[1]}"
-        prefix = f"Use both {joined}. "
-        if prompt.startswith(prefix):
-            prompt = prompt[len(prefix):]
-
-        suffix = f" You must use both {joined}."
-        if prompt.endswith(suffix):
-            prompt = prompt[:-len(suffix)]
-
-    projected = prompt.strip()
-    if not projected:
-        raise FatalUIState(
-            "benchmark prompt contains only App activation prose"
-        )
-    return projected
-
-
 class ChatGPTClient:
     def __init__(
         self,
@@ -392,9 +349,9 @@ class ChatGPTClient:
         await self._site.wait_ready()
 
     async def _compose(self, task: BenchmarkTask) -> None:
-        # Resolve Apps first through ChatGPT's real @ mention autocomplete.
-        # task.prompt stays canonical for provenance/fingerprints. Only the
-        # composer projection removes redundant App-activation prose.
+        # Apps are transport metadata represented by structured @ mentions.
+        # task.prompt is the exact benchmark text typed into ChatGPT and later
+        # validated against the frontend POST and captured conversation.
         await select_apps(
             self._page,
             get_editor=self._site.wait_ready,
@@ -403,14 +360,12 @@ class ChatGPTClient:
             timeout_seconds=self._tool_select_timeout,
         )
 
-        prompt = _prompt_for_chatgpt(task)
-
-        # App mentions are structured nodes. Append the projected prompt after
-        # them and never clear/select-all the composer after mentions exist.
+        # App mentions are structured nodes. Append the exact benchmark prompt
+        # after them and never clear/select-all the composer after mentions exist.
         editor = await self._site.wait_ready()
         await self._interaction.type_text(
             editor,
-            prompt,
+            task.prompt,
             clear_existing=False,
         )
         await self._site.wait_ready()

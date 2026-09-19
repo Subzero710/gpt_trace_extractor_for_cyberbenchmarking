@@ -188,6 +188,27 @@ async def fail_run(
     return run
 
 
+async def reset_run(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    expected_task_fingerprint: str,
+) -> bool:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))")
+    )
+    run = await get_run(session, task_id, for_update=True)
+    if run is None:
+        return False
+    if run.task_fingerprint != expected_task_fingerprint:
+        raise RunConflict("stale reset fingerprint differs from stored run")
+    if run.status == "running":
+        raise RunConflict("running run cannot be reset; recover or stop it explicitly first")
+    await session.delete(run)
+    await session.commit()
+    return True
+
+
 async def stats(session: AsyncSession) -> dict[str, int]:
     rows = (await session.execute(select(Run.status, func.count(Run.id)).group_by(Run.status))).all()
     output = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}

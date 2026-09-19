@@ -201,6 +201,89 @@ def auth(
     asyncio.run(main())
 
 
+@app.command("reset-stale")
+def reset_stale_command(
+    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
+    yes: bool = typer.Option(False, "--yes", help="Confirm deletion of stale benchmark state."),
+) -> None:
+    """Delete only stored runs whose fingerprint no longer matches the benchmark."""
+
+    async def main() -> None:
+        if not yes:
+            raise typer.BadParameter("reset-stale requires --yes")
+
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        tasks = load_benchmark(
+            benchmark,
+            tasks_root=settings.tasks_root,
+            registry=registry,
+        )
+        by_id = {task.task_id: task for task in tasks}
+        storage = StorageClient(settings.storage_base_url)
+        journal_store = JournalStore(settings.journal_path)
+        try:
+            await storage.health()
+            with RunnerLock(settings.runner_lock_path):
+                journal = journal_store.load()
+                if journal is not None:
+                    journal_task = by_id.get(journal.task_id)
+                    if journal_task is None:
+                        raise RecoveryIncomplete(
+                            f"pending journal task {journal.task_id!r} is not in benchmark; "
+                            "refusing automatic deletion"
+                        )
+                    current = task_fingerprint(journal_task)
+                    if journal.task_fingerprint == current:
+                        raise RecoveryIncomplete(
+                            "pending journal matches current benchmark; resume it instead of resetting"
+                        )
+
+                stale: list[tuple[object, object, str]] = []
+                for task in tasks:
+                    state = await storage.get(task.task_id)
+                    if state is None:
+                        continue
+                    current = task_fingerprint(task)
+                    if state.task_fingerprint == current:
+                        continue
+                    if state.status == "running":
+                        raise RecoveryIncomplete(
+                            f"stale run {task.task_id} is marked running; "
+                            "refusing reset until that run is explicitly recovered/stopped"
+                        )
+                    if not state.task_fingerprint:
+                        raise StorageError(
+                            f"{task.task_id} has no stored fingerprint; refusing blind reset"
+                        )
+                    stale.append((task, state, current))
+
+                if not stale and journal is None:
+                    console.print("[green]no stale benchmark state[/]")
+                    return
+
+                for task, state, current in stale:
+                    removed = await storage.reset_stale(
+                        task.task_id,
+                        expected_task_fingerprint=state.task_fingerprint,
+                    )
+                    if removed:
+                        console.print(
+                            f"[yellow]reset stale run[/] {task.task_id}: "
+                            f"{state.task_fingerprint[:12]} -> {current[:12]}"
+                        )
+
+                if journal is not None:
+                    journal_store.clear()
+                    console.print(
+                        f"[yellow]cleared stale submission journal[/] {journal.task_id}"
+                    )
+        finally:
+            await storage.close()
+
+    asyncio.run(main())
+
+
 @app.command("run")
 def run_command(
     benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),

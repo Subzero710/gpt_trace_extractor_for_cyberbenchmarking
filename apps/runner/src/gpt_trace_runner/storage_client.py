@@ -141,6 +141,21 @@ class StorageClient:
         )
         return _stored_run(response.json())
 
+    async def reset_stale(
+        self,
+        task_id: str,
+        *,
+        expected_task_fingerprint: str,
+    ) -> bool:
+        response = await self._request(
+            "POST",
+            f"/v1/runs/{task_id}/reset",
+            json={"expected_task_fingerprint": expected_task_fingerprint},
+            safe_retry=True,
+        )
+        payload = response.json()
+        return bool(payload.get("reset"))
+
     async def stats(self) -> dict[str, Any]:
         return (await self._request("GET", "/v1/stats")).json()
 

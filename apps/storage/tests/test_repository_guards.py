@@ -145,3 +145,39 @@ async def test_failed_run_is_immutable_for_same_attempt(monkeypatch):
             session, task_id="x", error_type="DifferentError", error_message="different",
             attempt=2, runner_id="runner",
         )
+
+@pytest.mark.asyncio
+async def test_reset_run_deletes_only_matching_non_running_state(monkeypatch) -> None:
+    item = Run(
+        task_id="t", status="failed", attempt=1, runner_id="old",
+        task_fingerprint="a" * 64,
+    )
+    monkeypatch.setattr(repository, "get_run", AsyncMock(return_value=item))
+    session = StartSession(other=None)
+    session.delete = AsyncMock()
+    removed = await repository.reset_run(
+        session, task_id="t", expected_task_fingerprint="a" * 64
+    )
+    assert removed is True
+    session.delete.assert_awaited_once_with(item)
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reset_run_refuses_running_or_changed_identity(monkeypatch) -> None:
+    running = Run(
+        task_id="t", status="running", attempt=1, runner_id="r",
+        task_fingerprint="a" * 64,
+    )
+    monkeypatch.setattr(repository, "get_run", AsyncMock(return_value=running))
+    with pytest.raises(repository.RunConflict, match="running run cannot be reset"):
+        await repository.reset_run(
+            StartSession(), task_id="t", expected_task_fingerprint="a" * 64
+        )
+
+    running.status = "failed"
+    with pytest.raises(repository.RunConflict, match="fingerprint differs"):
+        await repository.reset_run(
+            StartSession(), task_id="t", expected_task_fingerprint="b" * 64
+        )
+

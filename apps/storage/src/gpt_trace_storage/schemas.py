@@ -96,6 +96,10 @@ class FailRunRequest(MutationBase):
     error_message: str = Field(max_length=8000)
 
 
+class ResetRunRequest(BaseModel):
+    expected_task_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     task_id: str

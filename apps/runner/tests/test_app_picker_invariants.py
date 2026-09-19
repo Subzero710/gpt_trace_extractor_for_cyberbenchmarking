@@ -79,30 +79,37 @@ def test_each_app_resolves_current_composer() -> None:
     assert "get_editor=self._site.wait_ready" in compose
 
 
-def test_chatgpt_compose_selects_apps_before_appending_projected_prompt() -> None:
+def test_chatgpt_compose_selects_apps_before_appending_exact_benchmark_prompt() -> None:
     source = _source("chatgpt.py")
     compose = source.split("async def _compose", 1)[1].split(
         "async def prepare_task", 1
     )[0]
+
     assert "await select_apps(" in compose
-    assert "prompt = _prompt_for_chatgpt(task)" in compose
     assert "self._interaction.type_text(" in compose
+    assert "            task.prompt," in compose
     assert "clear_existing=False" in compose
-    assert compose.index("select_apps") < compose.index("_prompt_for_chatgpt")
-    assert compose.index("_prompt_for_chatgpt") < compose.index("type_text")
-    assert "paste_text(editor, task.prompt)" not in compose
+    assert compose.index("select_apps") < compose.index("type_text")
+    assert "_prompt_for_chatgpt" not in source
 
 
-def test_chat_prompt_projection_keeps_fingerprint_prompt_immutable() -> None:
+def test_chatgpt_uses_one_prompt_identity_for_transport_and_validation() -> None:
     source = _source("chatgpt.py")
-    helper = source.split("def _prompt_for_chatgpt", 1)[1].split(
-        "class ChatGPTClient", 1
+    submit = source.split("async def submit_task", 1)[1].split(
+        "def _validate_required_tools", 1
+    )[0]
+    validated = source.split("def _validated_messages", 1)[1].split(
+        "async def wait_for_completion", 1
     )[0]
 
-    assert "prompt = task.prompt" in helper
-    assert 'prefix = f"Use the {name} app. "' in helper
-    assert 'prefix = f"Use both {joined}. "' in helper
-    assert "task.prompt =" not in helper
+    assert "submitted_prompt_matches(prepared.task.prompt)" in submit
+    assert "validate_task_conversation(messages, task.prompt)" in validated
+    assert "_prompt_for_chatgpt" not in source
+    prepared = source.split("class PreparedTurn", 1)[1].split(
+        "@dataclass(slots=True)\nclass SubmittedTurn", 1
+    )[0]
+
+    assert "submitted_prompt" not in prepared
 
 
 def test_new_chat_wait_for_function_uses_keyword_arg() -> None:

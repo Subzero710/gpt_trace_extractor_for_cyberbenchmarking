@@ -61,3 +61,24 @@ async def test_get_transport_failure_is_storage_error() -> None:
             await client.get("t")
     finally:
         await client.close()
+
+@pytest.mark.asyncio
+async def test_reset_stale_sends_expected_fingerprint() -> None:
+    async def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/v1/runs/t/reset"
+        assert request.content == b'{"expected_task_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+        return httpx.Response(200, json={"reset": True}, request=request)
+
+    client = StorageClient("http://storage")
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(
+        base_url="http://storage", transport=httpx.MockTransport(handler)
+    )
+    try:
+        assert await client.reset_stale(
+            "t", expected_task_fingerprint="a" * 64
+        ) is True
+    finally:
+        await client.close()
+

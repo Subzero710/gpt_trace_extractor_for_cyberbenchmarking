@@ -1,4 +1,4 @@
-.PHONY: build up doctor tools auth run down
+.PHONY: build up doctor tools auth reset-stale run down
 
 build:
 	python3 scripts/build.py
@@ -18,6 +18,10 @@ tools:
 auth:
 	python3 scripts/project_state.py core
 	docker compose run --rm runner auth
+
+reset-stale:
+	python3 scripts/project_state.py core
+	docker compose run --rm --no-deps runner reset-stale /data/benchmarks/benchmark.jsonl --yes
 
 run:
 	python3 scripts/project_state.py core
