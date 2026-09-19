@@ -519,7 +519,9 @@ class ChatGPTClient:
             stream_result = await submitted.stream.wait()
             if stream_result.conversation_id != submitted.conversation_id:
                 raise AmbiguousSubmission(
-                    "conversation ID mismatch between browser URL and completed SSE"
+                    "conversation ID mismatch between browser URL and completed SSE: "
+                    f"url={submitted.conversation_id!r}, "
+                    f"sse={stream_result.conversation_id!r}"
                 )
             self._traffic.validate_single_stream_request()
             self._validate_submitted_model()
