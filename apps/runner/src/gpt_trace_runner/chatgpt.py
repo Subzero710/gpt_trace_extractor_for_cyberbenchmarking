@@ -406,18 +406,25 @@ class ChatGPTClient:
         await self._interaction.click(button)
 
     async def _wait_for_conversation_id(self) -> str:
+        # ChatGPT can expose a transient /c/WEB:<client-id> route while a new
+        # conversation is being created. That route is not the persistent
+        # conversation identity returned by the completed conversation stream.
+        # Wait for the durable /c/<id> route instead of accepting the first
+        # syntactically valid /c/... URL.
         try:
             await self._page.wait_for_url(
-                re.compile(r"/c/[^/?#]+"),
+                re.compile(r"/c/(?!WEB:)[^/?#]+"),
                 timeout=int(self._stream_start_timeout * 1000),
             )
         except Exception as exc:
             raise AmbiguousSubmission(
-                "conversation SSE started but no conversation URL was assigned"
+                "conversation SSE started but no stable conversation URL was assigned"
             ) from exc
         value = conversation_id_from_url(self._page.url)
-        if not value:
-            raise AmbiguousSubmission("conversation URL has no usable ID")
+        if not value or value.startswith("WEB:"):
+            raise AmbiguousSubmission(
+                f"conversation URL is still transient: {self._page.url!r}"
+            )
         return value
 
     def _validate_submitted_model(self) -> None:

@@ -6,7 +6,11 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from gpt_trace_runner.chatgpt import ChatGPTClient
-from gpt_trace_runner.exceptions import AuthenticationRequired, FatalUIState
+from gpt_trace_runner.exceptions import (
+    AmbiguousSubmission,
+    AuthenticationRequired,
+    FatalUIState,
+)
 
 
 @pytest.mark.asyncio
@@ -183,4 +187,54 @@ def test_run_recovery_skips_mutating_chatgpt_preflight() -> None:
     assert "wait_until_authenticated" not in recovery
     assert "verify_apps_available" not in recovery
     assert "conversation fetch will classify 401 vs 404" in recovery
+
+@pytest.mark.asyncio
+async def test_wait_for_conversation_id_ignores_transient_web_route() -> None:
+    stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
+    page = type("PageDouble", (), {})()
+    page.url = f"https://chatgpt.com/c/{stable}"
+    page.wait_for_url = AsyncMock(return_value=None)
+
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._page = page
+    client._stream_start_timeout = 17.0
+
+    result = await client._wait_for_conversation_id()
+
+    assert result == stable
+    pattern = page.wait_for_url.await_args.args[0]
+    assert pattern.search("https://chatgpt.com/c/WEB:565d236a-8024-4ec4-ac02-06dfc91cc8da") is None
+    assert pattern.search(f"https://chatgpt.com/c/{stable}") is not None
+    assert page.wait_for_url.await_args.kwargs["timeout"] == 17_000
+
+
+@pytest.mark.asyncio
+async def test_wait_for_conversation_id_refuses_web_route_defensively() -> None:
+    page = type("PageDouble", (), {})()
+    page.url = "https://chatgpt.com/c/WEB:565d236a-8024-4ec4-ac02-06dfc91cc8da"
+    page.wait_for_url = AsyncMock(return_value=None)
+
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._page = page
+    client._stream_start_timeout = 17.0
+
+    with pytest.raises(AmbiguousSubmission, match="still transient"):
+        await client._wait_for_conversation_id()
+
+
+def test_completion_still_requires_stable_url_id_to_equal_sse_id() -> None:
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "chatgpt.py"
+    ).read_text(encoding="utf-8")
+    wait = source.split("async def wait_for_completion", 1)[1].split(
+        "async def recover", 1
+    )[0]
+
+    assert "stream_result.conversation_id != submitted.conversation_id" in wait
+    assert "conversation ID mismatch between browser URL and completed SSE" in wait
 
