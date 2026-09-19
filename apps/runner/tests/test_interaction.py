@@ -77,6 +77,8 @@ class FakeLocator:
         self.receipt_active = False
         self.receipt_before = ""
         self.receipt_input = ""
+        self.receipt_text_input = ""
+        self.receipt_keydown = ""
         self.receipt_mutations = 0
     async def wait_for(self, **kwargs): pass
     async def is_enabled(self): return True
@@ -90,13 +92,19 @@ class FakeLocator:
             self.receipt_active = True
             self.receipt_before = ""
             self.receipt_input = ""
+            self.receipt_text_input = ""
+            self.receipt_keydown = ""
             self.receipt_mutations = 0
             return True
         if arg == "stop":
             result = {
                 "before": self.receipt_before,
                 "input": self.receipt_input,
+                "textInput": self.receipt_text_input,
+                "keydown": self.receipt_keydown,
                 "mutations": self.receipt_mutations,
+                "trust": {"trusted": 0, "untrusted": 1},
+                "types": {},
             }
             self.receipt_active = False
             return result
@@ -108,6 +116,8 @@ class FakeLocator:
         if self.receipt_active:
             self.receipt_before += text
             self.receipt_input += text
+            self.receipt_text_input += text
+            self.receipt_keydown += text
             self.receipt_mutations += 1
     async def press(self, key):
         if key == "Control+A":
@@ -357,4 +367,43 @@ async def test_type_text_rejects_inexact_keyboard_receipt_even_if_dom_looks_ok()
         await guard.type_text(locator, "**exact source**")
 
     assert locator.rendered == "**exact source**"
+
+class KeydownOnlyReceiptLocator(FakeLocator):
+    def record_keyboard_input(self, text):
+        if self.receipt_active:
+            self.receipt_keydown += text
+            self.receipt_mutations += 1
+
+
+@pytest.mark.asyncio
+async def test_type_text_accepts_exact_keydown_fallback_for_synthetic_input() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = KeydownOnlyReceiptLocator(holder)
+    page.keyboard.locator = locator
+
+    await guard.type_text(locator, "`code` **bold** # heading")
+
+    assert locator.receipt_before == ""
+    assert locator.receipt_input == ""
+    assert locator.receipt_keydown == "`code` **bold** # heading"
+
+
+def test_receipt_js_does_not_discard_untrusted_browser_events() -> None:
+    from pathlib import Path
+
+    source = Path(__file__).parents[1] / "src" / "gpt_trace_runner" / "interaction.py"
+    text = source.read_text(encoding="utf-8")
+    receipt = text.split('_COMPOSER_INPUT_RECEIPT_JS = r"""', 1)[1].split('"""', 1)[0]
+
+    assert "if (!event.isTrusted) return null" not in receipt
+    assert 'addEventListener("beforeinput"' in receipt
+    assert 'addEventListener("input"' in receipt
+    assert 'addEventListener("textInput"' in receipt
+    assert 'addEventListener("keydown"' in receipt
 

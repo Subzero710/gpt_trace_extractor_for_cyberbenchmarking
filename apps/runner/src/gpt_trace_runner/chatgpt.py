@@ -223,6 +223,51 @@ class ChatGPTClient:
         await self._site.wait_ready()
         await self._check_environment()
 
+    async def assert_authenticated_current_page(self) -> None:
+        """Verify the current ChatGPT page without navigation or reload."""
+        if not self._page.url.startswith(self._base_url):
+            raise AuthenticationRequired(
+                "resume requires the existing ChatGPT page; "
+                f"current URL is {self._page.url!r}"
+            )
+
+        try:
+            value = await self._page.evaluate(
+                """async () => {
+                    const response = await fetch('/backend-api/me', {
+                        method: 'GET',
+                        credentials: 'include',
+                        cache: 'no-store',
+                    });
+                    let payload = null;
+                    try {
+                        payload = await response.json();
+                    } catch (_) {
+                    }
+                    return {
+                        status: response.status,
+                        object: payload && payload.object,
+                        id: payload && payload.id,
+                    };
+                }"""
+            )
+        except Exception as exc:
+            raise AuthenticationRequired(
+                "could not verify the existing ChatGPT session during resume"
+            ) from exc
+
+        if (
+            not isinstance(value, dict)
+            or value.get("status") != 200
+            or value.get("object") != "user"
+            or not isinstance(value.get("id"), str)
+            or not value["id"]
+        ):
+            raise AuthenticationRequired(
+                "existing ChatGPT browser session is not authenticated; "
+                "resume will not reload or replace it"
+            )
+
     async def wait_until_authenticated(self, timeout_seconds: float) -> None:
         """Use ChatGPT's own backend identity request as the auth oracle.
 

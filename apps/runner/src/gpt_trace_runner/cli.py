@@ -233,30 +233,59 @@ def run_command(
             if resume and journal is None and states and all(state and state.status == "completed" for state in states):
                 console.print("[green]all selected tasks already completed[/]")
                 return
+            recovery_active = resume and (
+                journal is not None
+                or any(
+                    state is not None and state.status == "running"
+                    for state in states
+                )
+            )
+
             with RunnerLock(settings.runner_lock_path):
-                if journal is None:
+                if not recovery_active:
                     await preflight_tasks(lifecycle, selected, console=console)
                     console.print("[green]pre-auth runtime preflight: ok[/]")
                 else:
                     console.print(
-                        "[yellow]runtime preflight skipped: crash recovery journal is active[/]"
+                        "[yellow]runtime preflight skipped: recovery is active[/]"
                     )
 
-                session = await BrowserClient(
+                browser_client = BrowserClient(
                     settings.effective_browser_cdp_url(),
                     humanize=settings.browser_humanize,
                     humanize_preset=settings.browser_humanize_preset,
-                ).connect()
+                )
+
+                # --resume means the persistent teacher browser is an input to
+                # recovery, never a dependency that may be recreated.
+                if resume:
+                    await browser_client.assert_existing_process()
+
+                session = await browser_client.connect(
+                    require_existing_page=recovery_active,
+                )
                 try:
                     chatgpt = make_chatgpt(settings, session.page)
-                    await chatgpt.wait_until_authenticated(
-                        settings.chatgpt_site_ready_timeout_seconds
-                    )
-                    console.print("[green]ChatGPT backend session: ok[/]")
-                    await chatgpt.verify_apps_available(
-                        tuple(tool for task in selected for tool in task.tools)
-                    )
-                    console.print("[green]ChatGPT benchmark Apps: ok[/]")
+                    if recovery_active:
+                        # Reload/new-chat verification would destroy the exact
+                        # browser state that crash recovery is meant to inspect.
+                        await chatgpt.assert_authenticated_current_page()
+                        console.print(
+                            "[green]existing ChatGPT backend session: ok[/]"
+                        )
+                        console.print(
+                            "[yellow]ChatGPT App availability preflight skipped "
+                            "during recovery[/]"
+                        )
+                    else:
+                        await chatgpt.wait_until_authenticated(
+                            settings.chatgpt_site_ready_timeout_seconds
+                        )
+                        console.print("[green]ChatGPT backend session: ok[/]")
+                        await chatgpt.verify_apps_available(
+                            tuple(tool for task in selected for tool in task.tools)
+                        )
+                        console.print("[green]ChatGPT benchmark Apps: ok[/]")
                     runner = BenchmarkRunner(
                         chatgpt=chatgpt,
                         storage=storage,

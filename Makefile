@@ -20,7 +20,9 @@ auth:
 
 run:
 	python3 scripts/project_state.py core
-	docker compose run --rm runner run /data/benchmarks/benchmark.jsonl --resume
+	# Resume must never start/recreate dependencies, especially the persistent
+	# teacher CloakBrowser that owns the authenticated ChatGPT session.
+	docker compose run --rm --no-deps runner run /data/benchmarks/benchmark.jsonl --resume
 
 down:
 	python3 scripts/down.py

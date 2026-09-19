@@ -6,7 +6,7 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from gpt_trace_runner.chatgpt import ChatGPTClient
-from gpt_trace_runner.exceptions import FatalUIState
+from gpt_trace_runner.exceptions import AuthenticationRequired, FatalUIState
 
 
 @pytest.mark.asyncio
@@ -120,3 +120,66 @@ def test_auth_waiter_does_not_use_frontend_auth_selectors() -> None:
     assert "/backend-api/me" in waiter
     assert "AUTH_SELECTORS" not in waiter
     assert "PROMPT_SELECTORS" not in waiter
+
+@pytest.mark.asyncio
+async def test_resume_auth_check_is_non_mutating() -> None:
+    page = type("PageDouble", (), {})()
+    page.url = "https://chatgpt.com/c/existing"
+    page.evaluate = AsyncMock(return_value={"status": 200, "object": "user", "id": "user-1"})
+    page.reload = AsyncMock()
+    page.goto = AsyncMock()
+
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._page = page
+    client._base_url = "https://chatgpt.com"
+
+    await client.assert_authenticated_current_page()
+
+    page.reload.assert_not_awaited()
+    page.goto.assert_not_awaited()
+    page.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_auth_check_rejects_missing_session_without_reload() -> None:
+    page = type("PageDouble", (), {})()
+    page.url = "https://chatgpt.com/c/existing"
+    page.evaluate = AsyncMock(return_value={"status": 401, "object": None, "id": None})
+    page.reload = AsyncMock()
+
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._page = page
+    client._base_url = "https://chatgpt.com"
+
+    with pytest.raises(AuthenticationRequired, match="will not reload or replace it"):
+        await client.assert_authenticated_current_page()
+
+    page.reload.assert_not_awaited()
+
+
+def test_make_run_never_starts_dependencies_during_resume() -> None:
+    from pathlib import Path
+
+    makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
+    run_block = makefile.split("run:", 1)[1].split("down:", 1)[0]
+    assert "docker compose run --rm --no-deps runner run" in run_block
+    assert "--resume" in run_block
+
+
+def test_run_recovery_skips_mutating_chatgpt_preflight() -> None:
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1] / "src" / "gpt_trace_runner" / "cli.py"
+    ).read_text(encoding="utf-8")
+    run = source.split("def run_command(", 1)[1].split(
+        '@app.command("register-apps")', 1
+    )[0]
+    assert "recovery_active = resume and" in run
+    assert "await browser_client.assert_existing_process()" in run
+    assert "require_existing_page=recovery_active" in run
+    recovery = run.split("if recovery_active:", 1)[1].split("else:", 1)[0]
+    assert "assert_authenticated_current_page" in recovery
+    assert "wait_until_authenticated" not in recovery
+    assert "verify_apps_available" not in recovery
+

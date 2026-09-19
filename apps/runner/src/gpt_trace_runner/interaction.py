@@ -9,11 +9,9 @@ from .exceptions import ChatGPTUIError, ClipboardUnavailable, FatalUIState
 
 _COMPOSER_INPUT_RECEIPT_JS = r"""
 (el, op) => {
-    const key = "__gptTraceInputReceiptV1";
+    const key = "__gptTraceInputReceiptV2";
 
-    const decode = event => {
-        if (!event.isTrusted) return null;
-
+    const decodeInput = event => {
         const inputType = event.inputType || "";
         if (
             inputType === "insertLineBreak" ||
@@ -22,20 +20,35 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
             return "\n";
         }
 
-        if (
-            inputType === "insertText" ||
-            inputType === "insertCompositionText"
-        ) {
-            return typeof event.data === "string" ? event.data : null;
+        if (typeof event.data === "string" && inputType.startsWith("insert")) {
+            return event.data;
         }
 
         return null;
+    };
+
+    const decodeKey = event => {
+        if (event.ctrlKey || event.metaKey || event.altKey) return null;
+        if (event.key === "Enter" && event.shiftKey) return "\n";
+        if (typeof event.key === "string" && event.key.length === 1) {
+            return event.key;
+        }
+        return null;
+    };
+
+    const bump = (state, kind, event) => {
+        const trustedKey = event.isTrusted ? "trusted" : "untrusted";
+        state.trust[trustedKey] += 1;
+        const type = event.inputType || event.type || "unknown";
+        state.types[kind][type] = (state.types[kind][type] || 0) + 1;
     };
 
     const cleanup = slot => {
         try {
             el.removeEventListener("beforeinput", slot.beforeHandler, true);
             el.removeEventListener("input", slot.inputHandler, true);
+            el.removeEventListener("textInput", slot.textHandler, true);
+            el.removeEventListener("keydown", slot.keyHandler, true);
         } catch (_) {
         }
         try {
@@ -54,16 +67,36 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
         const state = {
             before: [],
             input: [],
+            textInput: [],
+            keydown: [],
             mutations: 0,
+            trust: {trusted: 0, untrusted: 0},
+            types: {
+                beforeinput: {},
+                input: {},
+                textInput: {},
+                keydown: {},
+            },
         };
 
         const beforeHandler = event => {
-            const chunk = decode(event);
+            bump(state, "beforeinput", event);
+            const chunk = decodeInput(event);
             if (chunk !== null) state.before.push(chunk);
         };
         const inputHandler = event => {
-            const chunk = decode(event);
+            bump(state, "input", event);
+            const chunk = decodeInput(event);
             if (chunk !== null) state.input.push(chunk);
+        };
+        const textHandler = event => {
+            bump(state, "textInput", event);
+            if (typeof event.data === "string") state.textInput.push(event.data);
+        };
+        const keyHandler = event => {
+            bump(state, "keydown", event);
+            const chunk = decodeKey(event);
+            if (chunk !== null) state.keydown.push(chunk);
         };
         const observer = new MutationObserver(records => {
             state.mutations += records.length;
@@ -71,6 +104,8 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
 
         el.addEventListener("beforeinput", beforeHandler, true);
         el.addEventListener("input", inputHandler, true);
+        el.addEventListener("textInput", textHandler, true);
+        el.addEventListener("keydown", keyHandler, true);
         observer.observe(el, {
             subtree: true,
             childList: true,
@@ -81,6 +116,8 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
             state,
             beforeHandler,
             inputHandler,
+            textHandler,
+            keyHandler,
             observer,
         };
         return true;
@@ -98,7 +135,11 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
         const result = {
             before: slot.state.before.join(""),
             input: slot.state.input.join(""),
+            textInput: slot.state.textInput.join(""),
+            keydown: slot.state.keydown.join(""),
             mutations: slot.state.mutations,
+            trust: slot.state.trust,
+            types: slot.state.types,
         };
 
         cleanup(slot);
@@ -237,24 +278,50 @@ class InteractionGuard:
 
             before = receipt.get("before")
             after = receipt.get("input")
+            text_input = receipt.get("textInput")
+            keydown = receipt.get("keydown")
             mutations = receipt.get("mutations")
 
-            exact_before = before == expected
-            exact_after = after == expected
-            committed_via_dom = (
-                exact_before
-                and isinstance(mutations, int)
-                and mutations > 0
-            )
+            # input/textInput are post-edit channels. beforeinput/keydown prove
+            # the exact source reached the editor boundary, so require an
+            # observed DOM mutation when using either as the fallback proof.
+            exact_post_edit = after == expected or text_input == expected
+            exact_pre_edit = before == expected or keydown == expected
+            mutated = isinstance(mutations, int) and mutations > 0
 
-            # Native input is post-edit. If Lexical prevents native editing and
-            # commits its own editor-model update, the exact beforeinput stream
-            # plus an observed DOM mutation is the equivalent proof.
-            if exact_after or committed_via_dom:
+            if exact_post_edit or (exact_pre_edit and mutated):
                 return
 
+            def first_mismatch(actual: object) -> int | None:
+                if not isinstance(actual, str):
+                    return None
+                limit = min(len(expected), len(actual))
+                for index in range(limit):
+                    if expected[index] != actual[index]:
+                        return index
+                if len(expected) != len(actual):
+                    return limit
+                return None
+
+            details = {
+                "expected_len": len(expected),
+                "before_len": len(before) if isinstance(before, str) else None,
+                "input_len": len(after) if isinstance(after, str) else None,
+                "text_input_len": (
+                    len(text_input) if isinstance(text_input, str) else None
+                ),
+                "keydown_len": len(keydown) if isinstance(keydown, str) else None,
+                "before_mismatch": first_mismatch(before),
+                "input_mismatch": first_mismatch(after),
+                "text_input_mismatch": first_mismatch(text_input),
+                "keydown_mismatch": first_mismatch(keydown),
+                "mutations": mutations,
+                "trust": receipt.get("trust"),
+                "types": receipt.get("types"),
+            }
             raise ChatGPTUIError(
-                "composer keyboard input receipt differs from benchmark prompt"
+                "composer keyboard input receipt differs from benchmark prompt: "
+                f"{details}"
             )
         except ChatGPTUIError:
             raise
