@@ -6,11 +6,28 @@ import pytest
 from gpt_trace_runner.interaction import InteractionGuard
 
 
+class FakeKeyboard:
+    def __init__(self):
+        self.events = []
+        self.locator = None
+
+    async def type(self, text):
+        self.events.append(("type", text))
+        if self.locator is not None:
+            self.locator.rendered += text
+
+    async def press(self, key):
+        self.events.append(("press", key))
+        if key == "Shift+Enter" and self.locator is not None:
+            self.locator.rendered += "\n"
+
+
 class FakePage:
     def __init__(self, state):
         self.state = state
         self.bring_calls = 0
         self.wait_calls = 0
+        self.keyboard = FakeKeyboard()
 
     async def evaluate(self, expression):
         return self.state
@@ -116,3 +133,45 @@ async def test_paste_waits_for_async_composer_commit_before_clearing_clipboard()
 
     assert locator.rendered == "delayed prompt"
     assert calls == ["delayed prompt", ""]
+
+
+@pytest.mark.asyncio
+async def test_type_text_uses_keyboard_and_shift_enter() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = FakeLocator(holder)
+    page.keyboard.locator = locator
+
+    await guard.type_text(locator, "first line\nsecond line")
+
+    assert locator.rendered == "first line\nsecond line"
+    assert page.keyboard.events == [
+        ("type", "first line"),
+        ("press", "Shift+Enter"),
+        ("type", "second line"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_type_text_does_not_touch_clipboard() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = FakeLocator(holder)
+    page.keyboard.locator = locator
+
+    async def forbidden_clipboard(_value):
+        raise AssertionError("keyboard prompt entry must not touch clipboard")
+
+    guard._set_system_clipboard = forbidden_clipboard
+    await guard.type_text(locator, "prompt")
+    assert locator.rendered == "prompt"

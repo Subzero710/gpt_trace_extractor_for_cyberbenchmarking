@@ -46,6 +46,51 @@ class InteractionGuard:
         except Exception as exc:
             raise ChatGPTUIError("browser UI click failed") from exc
 
+    async def type_text(
+        self,
+        locator: Locator,
+        text: str,
+        *,
+        clear_existing: bool = True,
+    ) -> None:
+        """Type benchmark text through real keyboard events.
+
+        CloakBrowser owns keyboard humanization. Newlines use Shift+Enter so a
+        multiline prompt cannot submit before composition is complete.
+        """
+        await self.ensure_page_focus()
+        try:
+            await locator.wait_for(state="visible", timeout=self._timeout_ms)
+            await self.click(locator, timeout_ms=self._timeout_ms)
+            if clear_existing:
+                await locator.press("Control+A")
+                await locator.press("Backspace")
+
+            expected = text.replace("\r\n", "\n").replace("\r", "\n")
+            for index, line in enumerate(expected.split("\n")):
+                if index:
+                    await self._page.keyboard.press("Shift+Enter")
+                if line:
+                    await self._page.keyboard.type(line)
+
+            deadline = asyncio.get_running_loop().time() + (self._timeout_ms / 1000)
+            rendered = ""
+            while asyncio.get_running_loop().time() < deadline:
+                rendered = (
+                    await locator.inner_text(timeout=self._timeout_ms)
+                ).replace("\r\n", "\n").replace("\r", "\n")
+                if rendered == expected:
+                    return
+                await asyncio.sleep(0.05)
+        except ChatGPTUIError:
+            raise
+        except Exception as exc:
+            raise ChatGPTUIError("could not type benchmark prompt") from exc
+
+        raise ChatGPTUIError(
+            "composer text differs from benchmark prompt after keyboard entry"
+        )
+
     async def _set_system_clipboard(self, text: str) -> None:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:

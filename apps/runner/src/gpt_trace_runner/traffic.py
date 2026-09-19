@@ -35,6 +35,7 @@ class TrafficStats:
     submitted_model: str | None = None
     submitted_timezone: str | None = None
     submitted_timezone_offset_min: int | None = None
+    app_system_hints: tuple[str, ...] = ()
 
 
 class TrafficMonitor:
@@ -163,6 +164,36 @@ class TrafficMonitor:
             self._stats.conversation_requests += 1
         if path == "/backend-api/f/conversation/prepare":
             self._stats.conversation_prepare_requests += 1
+
+        # HAR-observed App-selection signal. Accepting an App mention causes
+        # ChatGPT to emit plugin:asdk_app_* entries in system_hints on
+        # conversation/init and/or f/conversation/prepare. Capture only those
+        # non-secret identifiers for audit; do not retain request headers/body.
+        if (
+            request.method.upper() == "POST"
+            and path in {
+                "/backend-api/conversation/init",
+                "/backend-api/f/conversation/prepare",
+                "/backend-api/f/conversation",
+            }
+        ):
+            try:
+                payload = request.post_data_json
+                if isinstance(payload, dict):
+                    hints = payload.get("system_hints")
+                    if isinstance(hints, list):
+                        observed = {
+                            hint
+                            for hint in hints
+                            if isinstance(hint, str)
+                            and hint.startswith("plugin:asdk_app_")
+                        }
+                        if observed:
+                            combined = set(self._stats.app_system_hints)
+                            combined.update(observed)
+                            self._stats.app_system_hints = tuple(sorted(combined))
+            except Exception:
+                pass
         if path == "/backend-api/f/conversation" and request.method.upper() == "POST":
             self._stats.conversation_stream_requests += 1
             try:
@@ -259,6 +290,10 @@ class TrafficMonitor:
     def submitted_prompt_matches(self, prompt: str) -> bool:
         message = self._submitted_user_message
         return isinstance(message, dict) and benchmark_text_matches(message, prompt)
+
+    @property
+    def app_system_hints(self) -> tuple[str, ...]:
+        return self._stats.app_system_hints
 
     @property
     def conversation_stream_requests(self) -> int:

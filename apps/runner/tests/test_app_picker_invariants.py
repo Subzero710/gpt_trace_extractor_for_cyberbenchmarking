@@ -10,31 +10,32 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_probe_diagnostics_are_popup_scoped() -> None:
+def test_app_selection_uses_keyboard_enter_not_popup_dom() -> None:
     source = _source("tools.py")
-    assert "async def _visible_popup_snapshot" in source
-    diagnostic = source.split("async def _visible_popup_snapshot", 1)[1].split(
-        "async def _find_app_from_open_menu", 1
+    assert 'await page.keyboard.type("@")' in source
+    assert "await page.keyboard.type(tool.name)" in source
+    assert 'await page.keyboard.press("Enter")' in source
+    assert "_find_mention_result" not in source
+    assert "_POPUP_ROOTS" not in source
+    assert "_MENTION_ITEMS" not in source
+    assert "delay=20" not in source
+
+
+def test_app_selection_requires_raw_to_structured_mention_transition() -> None:
+    source = _source("tools.py")
+    assert 'raw_mention = f"@{tool.name}"' in source
+    assert "typed_rendered.rstrip().endswith(raw_mention)" in source
+    assert "rendered != typed_rendered" in source
+    assert "tail.endswith(tool.name)" in source
+    assert "not tail.endswith(raw_mention)" in source
+
+
+def test_chatgpt_compose_types_prompt_before_app_mentions() -> None:
+    source = _source("chatgpt.py")
+    compose = source.split("async def _compose", 1)[1].split(
+        "async def prepare_task", 1
     )[0]
-    assert '_POPUP_ROOTS' in source
-    assert 'page.locator(", ".join(_POPUP_ROOTS))' in diagnostic
-    assert "_visible_menu_labels" not in source
-
-
-def test_app_picker_opening_selectors_are_not_rewritten() -> None:
-    source = _source("tools.py")
-    block = source.split("_TOOL_MENU_BUTTONS =", 1)[1].split(")", 1)[0]
-    assert 'composer-tools-menu-button' in block
-    assert 'composer-plus-btn' in block
-    assert 'aria-label*="Tools"' in block
-    assert 'aria-label*="Add"' in block
-
-
-def test_app_selection_is_confirmed_in_composer() -> None:
-    tools = _source("tools.py")
-    chatgpt = _source("chatgpt.py")
-    assert "editor: Locator" in tools
-    assert "tool.name in rendered" in tools
-    assert "rendered != before" in tools
-    assert "editor=editor" in chatgpt
-    assert "confirmation = await _find_menu_item" not in tools
+    assert "self._interaction.type_text(editor, task.prompt)" in compose
+    assert "await select_apps(" in compose
+    assert compose.index("type_text") < compose.index("select_apps")
+    assert "paste_text(editor, task.prompt)" not in compose

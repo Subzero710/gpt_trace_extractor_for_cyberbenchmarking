@@ -225,3 +225,43 @@ async def test_backend_me_401_can_be_replaced_by_later_success() -> None:
     )
     await monitor.wait_for_authenticated_user(timeout_seconds=0.1)
     assert monitor.auth_me_last_status == 200
+
+
+def test_app_system_hints_are_captured_from_init_and_prepare() -> None:
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    monitor.begin_task()
+
+    page.handlers["request"](
+        FakeRequest(
+            "https://chatgpt.com/backend-api/conversation/init",
+            "POST",
+            {
+                "system_hints": [
+                    "plugin:asdk_app_workspace",
+                    "unrelated:hint",
+                ]
+            },
+        )
+    )
+    page.handlers["request"](
+        FakeRequest(
+            "https://chatgpt.com/backend-api/f/conversation/prepare",
+            "POST",
+            {
+                "system_hints": [
+                    "plugin:asdk_app_workspace",
+                    "plugin:asdk_app_browser",
+                ]
+            },
+        )
+    )
+
+    assert monitor.app_system_hints == (
+        "plugin:asdk_app_browser",
+        "plugin:asdk_app_workspace",
+    )
+    assert monitor.runtime_metadata()["app_system_hints"] == (
+        "plugin:asdk_app_browser",
+        "plugin:asdk_app_workspace",
+    )

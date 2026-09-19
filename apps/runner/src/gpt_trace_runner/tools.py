@@ -9,94 +9,14 @@ from .interaction import InteractionGuard
 from .models import BenchmarkTool
 
 # ChatGPT's @ mention autocomplete is the canonical App resolution path for the
-# runner. The "+" / Tools menu is intentionally not used: its visible contents
-# can be incomplete or reordered independently of whether an App is actually
-# resolvable by the composer.
-_MENTION_ITEMS = (
-    '[role="option"]',
-    '[role="menuitem"]',
-    '[cmdk-item]',
-    '[data-radix-collection-item]',
-    'button',
-)
-_POPUP_ROOTS = (
-    '[role="menu"]',
-    '[role="listbox"]',
-    '[role="dialog"]',
-    '[cmdk-root]',
-    '[data-radix-menu-content]',
-    '[data-radix-popover-content]',
-)
-
-
-async def _visible_popup_snapshot(page: Page) -> tuple[str, ...]:
-    """Capture diagnostic text only from currently visible popup surfaces."""
-    roots = page.locator(", ".join(_POPUP_ROOTS))
-    snapshots: list[str] = []
-    try:
-        for index in range(await roots.count()):
-            root = roots.nth(index)
-            if not await root.is_visible():
-                continue
-            text = " ".join((await root.inner_text()).split())
-            if text and text not in snapshots:
-                snapshots.append(text[:1200])
-    except Exception:
-        return tuple(snapshots)
-    return tuple(snapshots[:8])
-
-
-async def _find_mention_result(
-    page: Page,
-    *,
-    name: str,
-    timeout_seconds: float,
-) -> Locator | None:
-    """Resolve an exact App name from the popup opened by typing '@'."""
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    while asyncio.get_running_loop().time() < deadline:
-        roots = page.locator(", ".join(_POPUP_ROOTS))
-        try:
-            for root_index in range(await roots.count()):
-                root = roots.nth(root_index)
-                if not await root.is_visible():
-                    continue
-
-                # Prefer an exact visible text node inside the popup. Clicking
-                # the text itself is sufficient for ChatGPT's delegated item
-                # handlers and avoids matching the typed query in the composer.
-                exact = root.get_by_text(name, exact=True)
-                for index in range(await exact.count()):
-                    candidate = exact.nth(index)
-                    if await candidate.is_visible():
-                        return candidate
-
-                # Fallback for results whose accessible item contains a small
-                # description in addition to the exact App display name.
-                for selector in _MENTION_ITEMS:
-                    candidates = root.locator(selector).filter(has_text=name)
-                    for index in range(await candidates.count()):
-                        candidate = candidates.nth(index)
-                        if not await candidate.is_visible():
-                            continue
-                        label = " ".join((await candidate.inner_text()).split())
-                        if label == name or name in label:
-                            return candidate
-        except Exception:
-            pass
-        await asyncio.sleep(0.1)
-    return None
-
-
-async def _popup_still_visible(page: Page) -> bool:
-    roots = page.locator(", ".join(_POPUP_ROOTS))
-    try:
-        for index in range(await roots.count()):
-            if await roots.nth(index).is_visible():
-                return True
-    except Exception:
-        return False
-    return False
+# runner. The "+" / Tools menu is intentionally not used.
+#
+# Selection is keyboard-native: after typing the exact @App query, ChatGPT's
+# autocomplete highlights the matching result. Enter accepts that result.
+# This deliberately avoids brittle popup DOM selectors.
+#
+# No per-key delay is added here. CloakBrowser owns humanization for normal
+# Playwright keyboard events.
 
 
 async def _select_app_via_mention(
@@ -126,45 +46,57 @@ async def _select_app_via_mention(
     if before and not before.endswith((" ", "\n")):
         await page.keyboard.type(" ")
 
-    # Key events are deliberate here. insert_text()/clipboard paste can bypass
-    # the key handling ChatGPT uses to open the @ mention autocomplete.
+    raw_mention = f"@{tool.name}"
+
+    # Real key events are required to drive ChatGPT's mention autocomplete.
+    # CloakBrowser applies the configured keyboard humanization; do not add a
+    # second artificial per-character delay in the runner.
     await page.keyboard.type("@")
     await asyncio.sleep(0.15)
-    await page.keyboard.type(tool.name, delay=20)
+    await page.keyboard.type(tool.name)
 
-    result = await _find_mention_result(
-        page,
-        name=tool.name,
-        timeout_seconds=timeout_seconds,
-    )
-    if result is None:
-        snapshots = await _visible_popup_snapshot(page)
-        detail = f"; mention-popup snapshots={snapshots!r}" if snapshots else ""
+    # Verify that the raw query reached the composer before accepting it.
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    typed_rendered = ""
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            typed_rendered = await editor.inner_text()
+        except Exception:
+            typed_rendered = ""
+        if typed_rendered.rstrip().endswith(raw_mention):
+            break
+        await asyncio.sleep(0.05)
+    else:
         raise AppUnavailable(
-            f"ChatGPT app {tool.name!r} could not be resolved with @ mention search"
-            + detail
+            f"ChatGPT app mention query {raw_mention!r} was not reflected in the composer"
         )
 
-    await interaction.click(result)
+    # The visible autocomplete result is already keyboard-selected. Accept it
+    # exactly as a user does instead of trying to rediscover/click popup DOM.
+    await page.keyboard.press("Enter")
 
-    # Selecting the suggestion should close the autocomplete and leave the
-    # visible App mention in the composer. This exercises the same path used by
-    # a human typing @App, rather than merely checking a separate Apps menu.
+    # The accepted App is a structured mention node. In visible text, the
+    # trailing raw '@Name' query becomes 'Name'. This local transition is enough
+    # to prove Enter was handled as mention acceptance rather than leaving raw
+    # text behind.
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
         try:
             rendered = await editor.inner_text()
         except Exception:
             rendered = ""
-        if tool.name in rendered and not await _popup_still_visible(page):
+        tail = rendered.rstrip()
+        if (
+            rendered != typed_rendered
+            and tail.endswith(tool.name)
+            and not tail.endswith(raw_mention)
+        ):
             return
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
-    snapshots = await _visible_popup_snapshot(page)
-    detail = f"; mention-popup snapshots={snapshots!r}" if snapshots else ""
     raise AppUnavailable(
-        f"ChatGPT app {tool.name!r} was found by @ search but no accepted app "
-        f"mention was observed in the composer{detail}"
+        f"ChatGPT app {tool.name!r} was typed but Enter did not produce "
+        "an accepted App mention in the composer"
     )
 
 

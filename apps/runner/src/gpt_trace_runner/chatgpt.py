@@ -304,11 +304,14 @@ class ChatGPTClient:
         await self._site.wait_ready()
 
     async def _compose(self, task: BenchmarkTask) -> None:
-        # Paste first, then append Apps through ChatGPT's @ mention autocomplete.
+        # Type the benchmark prompt through real keyboard events, then append
+        # Apps through ChatGPT's @ mention autocomplete. CloakBrowser owns
+        # humanization; the runner adds no artificial per-key delay.
+        #
         # App mentions are structured composer nodes; never Ctrl+A after adding
         # them or the mention may be deleted.
         editor = await self._site.wait_ready()
-        await self._interaction.paste_text(editor, task.prompt)
+        await self._interaction.type_text(editor, task.prompt)
         await select_apps(
             self._page,
             editor=editor,
