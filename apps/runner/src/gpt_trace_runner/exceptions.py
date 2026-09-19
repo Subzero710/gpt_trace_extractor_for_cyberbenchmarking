@@ -20,6 +20,7 @@ class FatalUIState(BatchCircuitBreaker): pass
 class EnvironmentDrift(BatchCircuitBreaker): pass
 class ModelMismatch(BatchCircuitBreaker): pass
 class ConversationError(BatchCircuitBreaker): pass
+class ConversationNotFound(ConversationError): pass
 class CompletionTimeout(BatchCircuitBreaker): pass
 class ConversationStreamError(BatchCircuitBreaker): pass
 class ConversationStreamTimeout(ConversationStreamError): pass

@@ -179,7 +179,8 @@ def test_run_recovery_skips_mutating_chatgpt_preflight() -> None:
     assert "await browser_client.assert_existing_process()" in run
     assert "require_existing_page=recovery_active" in run
     recovery = run.split("if recovery_active:", 1)[1].split("else:", 1)[0]
-    assert "assert_authenticated_current_page" in recovery
+    assert "assert_authenticated_current_page" not in recovery
     assert "wait_until_authenticated" not in recovery
     assert "verify_apps_available" not in recovery
+    assert "conversation fetch will classify 401 vs 404" in recovery
 

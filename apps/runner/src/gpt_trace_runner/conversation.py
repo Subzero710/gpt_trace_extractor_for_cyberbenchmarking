@@ -5,7 +5,13 @@ from typing import Any
 
 from playwright.async_api import Page
 
-from .exceptions import AccessDenied, ConversationError, RateLimited
+from .exceptions import (
+    AccessDenied,
+    AuthenticationRequired,
+    ConversationError,
+    ConversationNotFound,
+    RateLimited,
+)
 
 
 def conversation_id_from_url(url: str) -> str | None:
@@ -212,10 +218,18 @@ class ConversationClient:
         if not isinstance(result, dict):
             raise ConversationError("conversation fetch returned invalid result")
         status = int(result.get("status", 0))
-        if status == 429:
-            raise RateLimited("conversation snapshot returned HTTP 429")
+        if status == 401:
+            raise AuthenticationRequired(
+                "conversation snapshot returned HTTP 401; ChatGPT session is not authenticated"
+            )
         if status == 403:
             raise AccessDenied("conversation snapshot returned HTTP 403")
+        if status == 404:
+            raise ConversationNotFound(
+                f"conversation {conversation_id!r} was not found (HTTP 404)"
+            )
+        if status == 429:
+            raise RateLimited("conversation snapshot returned HTTP 429")
         if not result.get("ok"):
             raise ConversationError(
                 f"conversation snapshot HTTP {status} {result.get('statusText', '')}"

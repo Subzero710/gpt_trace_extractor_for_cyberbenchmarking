@@ -23,6 +23,7 @@ from .exceptions import (
     AuthenticationRequired,
     ChatGPTUIError,
     ConcurrentTurnError,
+    ConversationNotFound,
     EnvironmentDrift,
     FatalUIState,
     ModelMismatch,
@@ -568,7 +569,14 @@ class ChatGPTClient:
         await self._navigate(f"{self._base_url}/c/{conversation_id}")
         await self._site.wait_ready()
         await self._check_environment()
-        conversation = await self._conversation.fetch(conversation_id)
+        try:
+            conversation = await self._conversation.fetch(conversation_id)
+        except ConversationNotFound as exc:
+            raise RecoveryIncomplete(
+                f"conversation {conversation_id!r} no longer exists; "
+                "it may have been deleted. Abandon this recovery explicitly "
+                "before starting a new attempt."
+            ) from exc
         try:
             messages = self._validated_messages(conversation, task)
         except Exception as exc:

@@ -6,7 +6,7 @@ from rich.console import Console
 from gpt_trace_runner.exceptions import AmbiguousSubmission, RequiredToolNotUsed
 from gpt_trace_runner.journal import JournalStore, SubmissionJournal
 from gpt_trace_runner.models import BenchmarkTask, CapturedConversation, StoredRun, task_fingerprint
-from gpt_trace_runner.runner import BenchmarkRunner, RunOptions
+from gpt_trace_runner.runner import BenchmarkRunner, RunOptions, abandon_recovery
 
 
 TASK = BenchmarkTask("t", "p", ())
@@ -163,3 +163,52 @@ async def test_unknown_candidate_required_tool_failure_terminalizes_and_cleans_e
     assert storage.existing.status == "failed"
     assert lifecycle.calls == ["resume", "reset"]
     assert store.load() is None
+
+@pytest.mark.asyncio
+async def test_abandon_recovery_fails_attempt_resets_apps_and_clears_journal(tmp_path: Path) -> None:
+    store = JournalStore(tmp_path / "j.json")
+    store.write(
+        SubmissionJournal(
+            "t",
+            "old",
+            3,
+            "conversation_known",
+            "deleted-conv",
+            fp(),
+            {},
+            {},
+        )
+    )
+    storage = Storage(
+        StoredRun(
+            "t",
+            "running",
+            "deleted-conv",
+            3,
+            "old",
+            fp(),
+            app_provenance=[],
+        )
+    )
+    lifecycle = Lifecycle()
+
+    await abandon_recovery(
+        TASK,
+        storage=storage,
+        lifecycle=lifecycle,
+        journal=store,
+    )
+
+    assert storage.failed == [("t", "RecoveryIncomplete", 3, "old")]
+    assert storage.existing.status == "failed"
+    assert lifecycle.calls == ["reset"]
+    assert store.load() is None
+
+
+def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None:
+    makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
+    block = makefile.split("reset-recovery:", 1)[1].split("reset-stale:", 1)[0]
+    assert 'test -n "$(TASK)"' in block
+    assert "docker compose run --rm --no-deps runner reset-recovery" in block
+    assert '"$(TASK)" --yes' in block
+

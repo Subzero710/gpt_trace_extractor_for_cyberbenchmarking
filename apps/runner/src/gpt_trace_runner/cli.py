@@ -22,7 +22,7 @@ from .lock import RunnerLock
 from .models import task_app_provenance, task_fingerprint
 from .qwen import flatten_app_provenance
 from .registry import AppRegistry
-from .runner import BenchmarkRunner, RunOptions
+from .runner import BenchmarkRunner, RunOptions, abandon_recovery
 from .runtime_preflight import preflight_tasks
 from .storage_client import StorageClient
 from .tools import check_playwright_ui_contracts
@@ -201,6 +201,53 @@ def auth(
     asyncio.run(main())
 
 
+@app.command("reset-recovery")
+def reset_recovery_command(
+    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
+    task_id: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", help="Confirm abandonment of this recovery attempt."),
+) -> None:
+    """Abandon one unrecoverable running attempt and preserve browser authentication."""
+
+    async def main() -> None:
+        if not yes:
+            raise typer.BadParameter("reset-recovery requires --yes")
+
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        tasks = load_benchmark(
+            benchmark,
+            tasks_root=settings.tasks_root,
+            registry=registry,
+        )
+        by_id = {task.task_id: task for task in tasks}
+        task = by_id.get(task_id)
+        if task is None:
+            raise typer.BadParameter(f"unknown benchmark task_id: {task_id}")
+
+        storage = StorageClient(settings.storage_base_url)
+        lifecycle = make_lifecycle(settings, [task])
+        journal_store = JournalStore(settings.journal_path)
+        try:
+            await storage.health()
+            with RunnerLock(settings.runner_lock_path):
+                await abandon_recovery(
+                    task,
+                    storage=storage,
+                    lifecycle=lifecycle,
+                    journal=journal_store,
+                )
+                console.print(
+                    f"[yellow]abandoned recovery[/] {task.task_id}; "
+                    "next --resume run will start a new attempt"
+                )
+        finally:
+            await lifecycle.close()
+            await storage.close()
+
+    asyncio.run(main())
+
+
 @app.command("reset-stale")
 def reset_stale_command(
     benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
@@ -350,15 +397,13 @@ def run_command(
                 try:
                     chatgpt = make_chatgpt(settings, session.page)
                     if recovery_active:
-                        # Reload/new-chat verification would destroy the exact
-                        # browser state that crash recovery is meant to inspect.
-                        await chatgpt.assert_authenticated_current_page()
+                        # Do not pre-classify auth through /backend-api/me here.
+                        # Recovery's conversation fetch is authoritative for the
+                        # operation we actually need: HTTP 401 means auth expired,
+                        # while HTTP 404 means the conversation no longer exists.
                         console.print(
-                            "[green]existing ChatGPT backend session: ok[/]"
-                        )
-                        console.print(
-                            "[yellow]ChatGPT App availability preflight skipped "
-                            "during recovery[/]"
+                            "[yellow]ChatGPT auth/App preflight skipped during recovery; "
+                            "conversation fetch will classify 401 vs 404[/]"
                         )
                     else:
                         await chatgpt.wait_until_authenticated(

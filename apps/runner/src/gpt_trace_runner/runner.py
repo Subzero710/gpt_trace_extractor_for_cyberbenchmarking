@@ -49,6 +49,71 @@ class RunOptions:
     limit: int | None = None
 
 
+async def abandon_recovery(
+    task: BenchmarkTask,
+    *,
+    storage: StorageLike,
+    lifecycle: AppLifecycle,
+    journal: JournalStore,
+) -> None:
+    """Abandon one current running attempt without touching the teacher browser."""
+    entry = journal.load()
+    if entry is None:
+        raise RecoveryIncomplete("no pending recovery journal")
+    if entry.task_id != task.task_id:
+        raise RecoveryIncomplete(
+            f"pending recovery belongs to {entry.task_id!r}, not {task.task_id!r}"
+        )
+
+    fingerprint = task_fingerprint(task)
+    if entry.task_fingerprint != fingerprint:
+        raise RecoveryIncomplete(
+            "pending recovery fingerprint does not match the current benchmark"
+        )
+
+    expected_environments = lifecycle.environment_ids(
+        task,
+        attempt=entry.attempt,
+        fingerprint=fingerprint,
+    )
+    if entry.app_environments != expected_environments:
+        raise RecoveryIncomplete(
+            "pending recovery App environments do not match this attempt"
+        )
+
+    existing = await storage.get(task.task_id)
+    if existing is None:
+        raise RecoveryIncomplete("pending recovery has no matching storage row")
+    if existing.task_fingerprint != fingerprint:
+        raise RecoveryIncomplete(
+            "stored recovery fingerprint does not match the current benchmark"
+        )
+    if existing.status != "running":
+        raise RecoveryIncomplete(
+            f"recovery storage row is {existing.status!r}, not 'running'"
+        )
+    if existing.attempt != entry.attempt or existing.runner_id != entry.runner_id:
+        raise RecoveryIncomplete(
+            "pending recovery attempt/runner does not match storage"
+        )
+
+    # Terminalize first. If App cleanup then fails, keep the journal so the
+    # normal reconcile path can retry cleanup of the now-failed attempt.
+    await storage.fail(
+        task.task_id,
+        RecoveryIncomplete("operator abandoned unrecoverable conversation"),
+        attempt=entry.attempt,
+        runner_id=entry.runner_id,
+    )
+    await lifecycle.reset(
+        task,
+        expected_environments,
+        fingerprint,
+        attempt=entry.attempt,
+    )
+    journal.clear()
+
+
 class InterruptedBeforeSubmission(RuntimeError):
     pass
 

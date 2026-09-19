@@ -1,4 +1,4 @@
-.PHONY: build up doctor tools auth reset-stale run down
+.PHONY: build up doctor tools auth reset-recovery reset-stale run down
 
 build:
 	python3 scripts/build.py
@@ -18,6 +18,11 @@ tools:
 auth:
 	python3 scripts/project_state.py core
 	docker compose run --rm runner auth
+
+reset-recovery:
+	@test -n "$(TASK)" || (echo "usage: sudo make reset-recovery TASK=<task_id>" >&2; exit 2)
+	python3 scripts/project_state.py core
+	docker compose run --rm --no-deps runner reset-recovery /data/benchmarks/benchmark.jsonl "$(TASK)" --yes
 
 reset-stale:
 	python3 scripts/project_state.py core
