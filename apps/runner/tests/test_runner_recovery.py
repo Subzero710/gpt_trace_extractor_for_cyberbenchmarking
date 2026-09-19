@@ -61,11 +61,15 @@ class AmbiguousChatGPT:
 
 
 class RecoveryChatGPT:
+    def __init__(self):
+        self.deleted = []
     async def prepare_session(self, *, fresh_home=False): pass
     async def recover_current_candidate(self, *, task):
         return CapturedConversation("conv", [{"id": "m"}], {})
     async def recover(self, conversation_id, *, task):
         return CapturedConversation(conversation_id, [{"id": "m"}], {})
+    async def delete_completed_conversation(self, conversation_id):
+        self.deleted.append(conversation_id)
 
 
 def runner(chatgpt, storage, journal, lifecycle=None):
@@ -124,7 +128,9 @@ async def test_completed_row_with_cleanup_journal_is_reset(tmp_path: Path) -> No
     store.write(SubmissionJournal("t", "old", 4, "cleanup_pending", "known", fp()))
     storage = Storage(StoredRun("t", "completed", "known", 4, "old", fp(), app_provenance=[]))
     lifecycle = Lifecycle()
-    await runner(RecoveryChatGPT(), storage, store, lifecycle).reconcile_journal([TASK])
+    chatgpt = RecoveryChatGPT()
+    await runner(chatgpt, storage, store, lifecycle).reconcile_journal([TASK])
+    assert chatgpt.deleted == ["known"]
     assert lifecycle.calls == ["reset"]
     assert store.load() is None
 
@@ -211,4 +217,20 @@ def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None
     assert 'test -n "$(TASK)"' in block
     assert "docker compose run --rm --no-deps runner reset-recovery" in block
     assert '"$(TASK)" --yes' in block
+
+
+def test_runner_deletes_completed_remote_conversation_before_app_reset() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "runner.py"
+    ).read_text(encoding="utf-8")
+    run_task = source.split("async def run_task", 1)[1].split("async def run(", 1)[0]
+
+    delete_call = "await self.chatgpt.delete_completed_conversation(submitted.conversation_id)"
+    reset_call = "await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)"
+    assert delete_call in run_task
+    assert run_task.index(delete_call) < run_task.index(reset_call)
+    assert "await self.chatgpt.delete_completed_conversation(existing.conversation_id)" in run_task
 

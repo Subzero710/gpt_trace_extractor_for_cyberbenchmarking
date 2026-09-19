@@ -299,3 +299,91 @@ class ConversationClient:
         if not isinstance(payload, dict):
             raise ConversationError("conversation endpoint returned non-object JSON")
         return payload
+
+    async def delete(self, conversation_id: str) -> None:
+        endpoint = f"/backend-api/conversation/id/{conversation_id}"
+        try:
+            result = await self._page.evaluate(
+                """async (endpoint) => {
+                    const session = await fetch(
+                        '/api/auth/session',
+                        {credentials:'include', cache:'no-store'}
+                    );
+
+                    let accessToken = null;
+                    if (session.ok) {
+                        try {
+                            const payload = await session.json();
+                            if (
+                                payload &&
+                                typeof payload.accessToken === 'string' &&
+                                payload.accessToken.trim()
+                            ) {
+                                accessToken = payload.accessToken;
+                            }
+                        } catch (_) {
+                        }
+                    }
+
+                    if (!accessToken) {
+                        return {
+                            sessionStatus: session.status,
+                            tokenPresent: false,
+                            status: 0,
+                            ok: false,
+                            statusText: ''
+                        };
+                    }
+
+                    const r = await fetch(endpoint, {
+                        method: 'DELETE',
+                        credentials: 'include',
+                        cache: 'no-store',
+                        headers: {
+                            authorization: `Bearer ${accessToken}`
+                        }
+                    });
+                    return {
+                        sessionStatus: session.status,
+                        tokenPresent: true,
+                        status: r.status,
+                        ok: r.ok,
+                        statusText: r.statusText
+                    };
+                }""",
+                endpoint,
+            )
+        except Exception as exc:
+            raise ConversationError(
+                f"delete conversation {conversation_id} failed: {exc}"
+            ) from exc
+
+        if not isinstance(result, dict):
+            raise ConversationError("conversation delete returned invalid result")
+
+        session_status = int(result.get("sessionStatus", 0))
+        token_present = result.get("tokenPresent") is True
+        if not token_present:
+            raise AuthenticationRequired(
+                "ChatGPT browser session did not yield a backend access token "
+                f"(session HTTP {session_status})"
+            )
+
+        status = int(result.get("status", 0))
+        # DELETE is intentionally idempotent for crash cleanup: a prior cleanup
+        # may already have removed the conversation before the process stopped.
+        if status in {200, 204, 404}:
+            return
+        if status == 401:
+            raise AuthenticationRequired(
+                "conversation delete rejected the authenticated backend token "
+                "(HTTP 401)"
+            )
+        if status == 403:
+            raise AccessDenied("conversation delete returned HTTP 403")
+        if status == 429:
+            raise RateLimited("conversation delete returned HTTP 429")
+        raise ConversationError(
+            f"conversation delete HTTP {status} {result.get('statusText', '')}"
+        )
+

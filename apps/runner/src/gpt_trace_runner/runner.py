@@ -232,6 +232,7 @@ class BenchmarkRunner:
                 conversation_id=conversation_id,
             )
         )
+        await self.chatgpt.delete_completed_conversation(conversation_id)
         await self.lifecycle.reset(recovery_task, environments, fingerprint, attempt=existing.attempt)
         self.journal.clear()
         self.console.print(f"[green]{task.task_id}: recovered ({len(captured.messages)} messages)[/]")
@@ -257,6 +258,9 @@ class BenchmarkRunner:
             raise RecoveryIncomplete("submission journal UI App resolution does not match stored provenance")
 
         if existing is not None and existing.status == "completed":
+            conversation_id = entry.conversation_id or existing.conversation_id
+            if conversation_id:
+                await self.chatgpt.delete_completed_conversation(conversation_id)
             await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             self.journal.clear()
             return
@@ -353,6 +357,7 @@ class BenchmarkRunner:
                 conversation_id=conversation_id,
             )
         )
+        await self.chatgpt.delete_completed_conversation(conversation_id)
         await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
         self.journal.clear()
         self.console.print(f"[green]{entry.task_id}: crash recovery completed[/]")
@@ -382,6 +387,8 @@ class BenchmarkRunner:
                 raise StorageError(f"{task.task_id} benchmark specification changed since the stored attempt")
         if existing and existing.status == "completed":
             if resume:
+                if existing.conversation_id:
+                    await self.chatgpt.delete_completed_conversation(existing.conversation_id)
                 self.console.print(f"[dim]{task.task_id}: completed, skip[/]")
                 return
             raise RuntimeError(f"{task.task_id} already completed; use --resume")
@@ -505,6 +512,7 @@ class BenchmarkRunner:
                     conversation_id=submitted.conversation_id,
                 )
             )
+            await self.chatgpt.delete_completed_conversation(submitted.conversation_id)
             await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
             self.journal.clear()
             self.console.print(f"[green]{task.task_id}: completed ({len(captured.messages)} messages)[/]")

@@ -126,3 +126,44 @@ async def test_conversation_fetch_classifies_404_as_missing_conversation() -> No
     with pytest.raises(ConversationNotFound, match="HTTP 404"):
         await client.fetch("deleted-conv")
 
+
+@pytest.mark.asyncio
+async def test_conversation_delete_uses_bearer_and_exact_delete_endpoint() -> None:
+    page = type("PageDouble", (), {})()
+    page.evaluate = AsyncMock(
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 200,
+            "ok": True,
+            "statusText": "OK",
+        }
+    )
+    client = ConversationClient(page)
+
+    await client.delete("conv-123")
+
+    javascript, endpoint = page.evaluate.await_args.args
+    assert endpoint == "/backend-api/conversation/id/conv-123"
+    assert "method: 'DELETE'" in javascript
+    assert "/api/auth/session" in javascript
+    assert "authorization: `Bearer ${accessToken}`" in javascript
+    assert "accessToken:" not in javascript
+
+
+@pytest.mark.asyncio
+async def test_conversation_delete_404_is_idempotent_success() -> None:
+    page = type("PageDouble", (), {})()
+    page.evaluate = AsyncMock(
+        return_value={
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 404,
+            "ok": False,
+            "statusText": "Not Found",
+        }
+    )
+    client = ConversationClient(page)
+
+    await client.delete("already-gone")
+

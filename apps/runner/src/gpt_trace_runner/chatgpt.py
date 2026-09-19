@@ -141,6 +141,18 @@ class ChatGPTClient:
     async def goto_home(self) -> None:
         await self._navigate(self._base_url)
 
+    async def delete_completed_conversation(self, conversation_id: str) -> None:
+        """Delete only a benchmark conversation already persisted by storage."""
+        await self._conversation.delete(conversation_id)
+
+        # A direct backend DELETE does not execute ChatGPT's React mutation
+        # callback, so explicitly land on the clean home composer if this page
+        # still displays the conversation we just removed. Never navigate away
+        # from some other conversation that the operator may have opened.
+        if conversation_id_from_url(self._page.url) == conversation_id:
+            await self.goto_home()
+            await self._site.wait_ready()
+
     async def _environment(self) -> dict[str, Any]:
         try:
             value = await self._page.evaluate(
