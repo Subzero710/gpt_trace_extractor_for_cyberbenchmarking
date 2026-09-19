@@ -14,11 +14,13 @@ class FakeKeyboard:
     async def type(self, text):
         self.events.append(("type", text))
         if self.locator is not None:
+            self.locator.record_keyboard_input(text)
             self.locator.rendered += text
 
     async def press(self, key):
         self.events.append(("press", key))
         if key == "Shift+Enter" and self.locator is not None:
+            self.locator.record_keyboard_input("\n")
             self.locator.rendered += "\n"
 
 
@@ -72,6 +74,10 @@ class FakeLocator:
         self.click_calls = 0
         self.focus_calls = 0
         self.focused = False
+        self.receipt_active = False
+        self.receipt_before = ""
+        self.receipt_input = ""
+        self.receipt_mutations = 0
     async def wait_for(self, **kwargs): pass
     async def is_enabled(self): return True
     async def click(self, **kwargs):
@@ -79,8 +85,30 @@ class FakeLocator:
     async def focus(self, **kwargs):
         self.focus_calls += 1
         self.focused = True
-    async def evaluate(self, expression):
+    async def evaluate(self, expression, arg=None):
+        if arg == "start":
+            self.receipt_active = True
+            self.receipt_before = ""
+            self.receipt_input = ""
+            self.receipt_mutations = 0
+            return True
+        if arg == "stop":
+            result = {
+                "before": self.receipt_before,
+                "input": self.receipt_input,
+                "mutations": self.receipt_mutations,
+            }
+            self.receipt_active = False
+            return result
+        if arg == "cancel":
+            self.receipt_active = False
+            return True
         return self.focused
+    def record_keyboard_input(self, text):
+        if self.receipt_active:
+            self.receipt_before += text
+            self.receipt_input += text
+            self.receipt_mutations += 1
     async def press(self, key):
         if key == "Control+A":
             self.holder["select_all"] = True
@@ -237,4 +265,96 @@ async def test_type_text_focuses_composer_without_pointer_click() -> None:
     assert locator.rendered == (
         "Code Workspace Use exec_command to inspect the workspace."
     )
+
+class RenderTransformingLocator(FakeLocator):
+    async def inner_text(self, **kwargs):
+        text = self.rendered
+        replacements = (
+            ("# ", ""),
+            ("> ", ""),
+            ("- [x] ", ""),
+            ("- ", ""),
+            ("1. ", ""),
+            ("```python", ""),
+            ("```", ""),
+            ("***", ""),
+            ("___", ""),
+            ("**", ""),
+            ("__", ""),
+            ("~~", ""),
+            ("==", ""),
+            ("*", ""),
+            ("_", ""),
+            ("`", ""),
+            ("[OpenAI](https://openai.com)", "OpenAI"),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        return text
+
+
+@pytest.mark.asyncio
+async def test_type_text_validates_input_receipt_not_rendered_lexical_dom() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = RenderTransformingLocator(holder)
+    locator.rendered = "Code Workspace"
+    page.keyboard.locator = locator
+
+    prompt = (
+        "# heading\n"
+        "> quote\n"
+        "- bullet\n"
+        "1. ordered\n"
+        "- [x] checked\n"
+        "***bold italic*** **bold** *italic* ~~strike~~ ==highlight== "
+        "`inline code` [OpenAI](https://openai.com)\n"
+        "```python\nprint('x')\n```"
+    )
+
+    await guard.type_text(
+        locator,
+        prompt,
+        clear_existing=False,
+    )
+
+    assert locator.receipt_before == prompt
+    assert locator.receipt_input == prompt
+    assert await locator.inner_text() != "Code Workspace " + prompt
+
+
+class DroppedInputReceiptLocator(FakeLocator):
+    def record_keyboard_input(self, text):
+        if not self.receipt_active:
+            return
+        damaged = text[:-1] if text else text
+        self.receipt_before += damaged
+        self.receipt_input += damaged
+        self.receipt_mutations += 1
+
+
+@pytest.mark.asyncio
+async def test_type_text_rejects_inexact_keyboard_receipt_even_if_dom_looks_ok() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = DroppedInputReceiptLocator(holder)
+    page.keyboard.locator = locator
+
+    with pytest.raises(
+        Exception,
+        match="keyboard input receipt differs",
+    ):
+        await guard.type_text(locator, "**exact source**")
+
+    assert locator.rendered == "**exact source**"
 

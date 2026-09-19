@@ -7,6 +7,116 @@ from playwright.async_api import Locator, Page
 from .exceptions import ChatGPTUIError, ClipboardUnavailable, FatalUIState
 
 
+_COMPOSER_INPUT_RECEIPT_JS = r"""
+(el, op) => {
+    const key = "__gptTraceInputReceiptV1";
+
+    const decode = event => {
+        if (!event.isTrusted) return null;
+
+        const inputType = event.inputType || "";
+        if (
+            inputType === "insertLineBreak" ||
+            inputType === "insertParagraph"
+        ) {
+            return "\n";
+        }
+
+        if (
+            inputType === "insertText" ||
+            inputType === "insertCompositionText"
+        ) {
+            return typeof event.data === "string" ? event.data : null;
+        }
+
+        return null;
+    };
+
+    const cleanup = slot => {
+        try {
+            el.removeEventListener("beforeinput", slot.beforeHandler, true);
+            el.removeEventListener("input", slot.inputHandler, true);
+        } catch (_) {
+        }
+        try {
+            slot.observer.disconnect();
+        } catch (_) {
+        }
+    };
+
+    if (op === "start") {
+        const previous = el[key];
+        if (previous) {
+            cleanup(previous);
+            delete el[key];
+        }
+
+        const state = {
+            before: [],
+            input: [],
+            mutations: 0,
+        };
+
+        const beforeHandler = event => {
+            const chunk = decode(event);
+            if (chunk !== null) state.before.push(chunk);
+        };
+        const inputHandler = event => {
+            const chunk = decode(event);
+            if (chunk !== null) state.input.push(chunk);
+        };
+        const observer = new MutationObserver(records => {
+            state.mutations += records.length;
+        });
+
+        el.addEventListener("beforeinput", beforeHandler, true);
+        el.addEventListener("input", inputHandler, true);
+        observer.observe(el, {
+            subtree: true,
+            childList: true,
+            characterData: true,
+        });
+
+        el[key] = {
+            state,
+            beforeHandler,
+            inputHandler,
+            observer,
+        };
+        return true;
+    }
+
+    const slot = el[key];
+    if (!slot) return null;
+
+    if (op === "stop") {
+        try {
+            slot.state.mutations += slot.observer.takeRecords().length;
+        } catch (_) {
+        }
+
+        const result = {
+            before: slot.state.before.join(""),
+            input: slot.state.input.join(""),
+            mutations: slot.state.mutations,
+        };
+
+        cleanup(slot);
+        delete el[key];
+        return result;
+    }
+
+    if (op === "cancel") {
+        cleanup(slot);
+        delete el[key];
+        return true;
+    }
+
+    throw new Error("unknown input receipt operation");
+}
+"""
+
+
 class InteractionGuard:
     """Drive visible controls while keeping focus and clipboard state coherent."""
 
@@ -80,10 +190,12 @@ class InteractionGuard:
         CloakBrowser owns keyboard humanization. Newlines use Shift+Enter so a
         multiline prompt cannot submit before composition is complete.
 
-        When clear_existing is False, preserve any structured App mentions
-        already present in the composer, append one separating space when
-        needed, and validate only the newly appended prompt suffix.
+        Validation is against the exact trusted browser input events received by
+        the composer, not Lexical's rendered innerText. Lexical may legitimately
+        turn Markdown-like source into structured DOM after the keystrokes are
+        accepted.
         """
+        receipt_started = False
         try:
             # Never click the composer to type. If a structured App mention is
             # present, a pointer click may activate its link/details.
@@ -102,32 +214,61 @@ class InteractionGuard:
                     await self._page.keyboard.type(" ")
 
             expected = text.replace("\r\n", "\n").replace("\r", "\n")
+
+            await locator.evaluate(_COMPOSER_INPUT_RECEIPT_JS, "start")
+            receipt_started = True
+
             for index, line in enumerate(expected.split("\n")):
                 if index:
                     await self._page.keyboard.press("Shift+Enter")
                 if line:
                     await self._page.keyboard.type(line)
 
-            deadline = asyncio.get_running_loop().time() + (self._timeout_ms / 1000)
-            rendered = ""
-            while asyncio.get_running_loop().time() < deadline:
-                rendered = (
-                    await locator.inner_text(timeout=self._timeout_ms)
-                ).replace("\r\n", "\n").replace("\r", "\n")
-                if clear_existing:
-                    if rendered == expected:
-                        return
-                elif rendered.endswith(expected):
-                    return
-                await asyncio.sleep(0.05)
+            receipt = await locator.evaluate(
+                _COMPOSER_INPUT_RECEIPT_JS,
+                "stop",
+            )
+            receipt_started = False
+
+            if not isinstance(receipt, dict):
+                raise ChatGPTUIError(
+                    "composer input receipt was unavailable after keyboard entry"
+                )
+
+            before = receipt.get("before")
+            after = receipt.get("input")
+            mutations = receipt.get("mutations")
+
+            exact_before = before == expected
+            exact_after = after == expected
+            committed_via_dom = (
+                exact_before
+                and isinstance(mutations, int)
+                and mutations > 0
+            )
+
+            # Native input is post-edit. If Lexical prevents native editing and
+            # commits its own editor-model update, the exact beforeinput stream
+            # plus an observed DOM mutation is the equivalent proof.
+            if exact_after or committed_via_dom:
+                return
+
+            raise ChatGPTUIError(
+                "composer keyboard input receipt differs from benchmark prompt"
+            )
         except ChatGPTUIError:
             raise
         except Exception as exc:
             raise ChatGPTUIError("could not type benchmark prompt") from exc
-
-        raise ChatGPTUIError(
-            "composer text differs from benchmark prompt after keyboard entry"
-        )
+        finally:
+            if receipt_started:
+                try:
+                    await locator.evaluate(
+                        _COMPOSER_INPUT_RECEIPT_JS,
+                        "cancel",
+                    )
+                except Exception:
+                    pass
 
     async def _set_system_clipboard(self, text: str) -> None:
         try:
