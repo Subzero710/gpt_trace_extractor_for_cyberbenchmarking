@@ -25,6 +25,7 @@ from .registry import AppRegistry
 from .runner import BenchmarkRunner, RunOptions
 from .runtime_preflight import preflight_tasks
 from .storage_client import StorageClient
+from .tools import check_playwright_ui_contracts
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 console = Console()
@@ -122,6 +123,8 @@ def doctor(
 
         BrowserClient.check_humanize_api(settings.browser_humanize_preset)
         console.print("[green]CloakBrowser humanize API: ok[/]")
+        check_playwright_ui_contracts()
+        console.print("[green]Playwright UI API contracts: ok[/]")
         async with httpx.AsyncClient(timeout=10) as client:
             (await client.get(settings.browser_version_url())).raise_for_status()
             console.print("[green]operator browser CDP: ok[/]")

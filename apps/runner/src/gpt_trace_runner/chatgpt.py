@@ -293,10 +293,9 @@ class ChatGPTClient:
     ) -> None:
         """Fail before benchmark execution if a required ChatGPT App is absent."""
         await self._new_chat_if_needed()
-        editor = await self._site.wait_ready()
         await assert_apps_available(
             self._page,
-            editor=editor,
+            get_editor=self._site.wait_ready,
             tools=tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
@@ -314,7 +313,7 @@ class ChatGPTClient:
         await self._interaction.type_text(editor, task.prompt)
         await select_apps(
             self._page,
-            editor=editor,
+            get_editor=self._site.wait_ready,
             tools=task.tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
