@@ -175,7 +175,7 @@ def runtime(
         browser_image="gpt-trace-browser:latest",
         workspace_gateway_container="gpt-trace-workspace-gateway",
         browser_gateway_container="gpt-trace-browser-gateway",
-        browser_environment={"APP_BROWSER_FINGERPRINT_SEED": "123"},
+        browser_environment={},
         browser_blocked_hosts=browser_blocked_hosts,
         client=client,
     )

@@ -44,11 +44,13 @@ RUN apt-get update \
 
 RUN command -v xhost >/dev/null && command -v unshare >/dev/null # GPT_TRACE_VERIFY_XHOST=1
 
+COPY browser_identity.py /usr/local/bin/browser-identity
 COPY start-browser.sh /usr/local/bin/start-browser
 COPY browser-healthcheck.sh /usr/local/bin/browser-healthcheck
 COPY clipboard_server.py /usr/local/bin/clipboard-server
 
 RUN chmod +x \
+    /usr/local/bin/browser-identity \
     /usr/local/bin/start-browser \
     /usr/local/bin/browser-healthcheck \
     /usr/local/bin/clipboard-server

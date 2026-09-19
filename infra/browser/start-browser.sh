@@ -1,37 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-seed="${BROWSER_FINGERPRINT_SEED:?BROWSER_FINGERPRINT_SEED is required}"
-[[ "$seed" =~ ^[1-9][0-9]*$ ]] || { echo "invalid BROWSER_FINGERPRINT_SEED" >&2; exit 64; }
-
-geoip="${BROWSER_GEOIP:-false}"
-[[ "$geoip" == "true" || "$geoip" == "false" ]] || {
-  echo "BROWSER_GEOIP must be true or false" >&2
-  exit 64
-}
-
-timezone="${BROWSER_TIMEZONE:-}"
-locale="${BROWSER_LOCALE:-}"
-[[ -z "$timezone" || "$timezone" =~ ^[A-Za-z0-9._+/-]{1,128}$ ]] || {
-  echo "invalid BROWSER_TIMEZONE" >&2
-  exit 64
-}
-[[ -z "$locale" || "$locale" =~ ^[A-Za-z0-9-]{1,64}$ ]] || {
-  echo "invalid BROWSER_LOCALE" >&2
-  exit 64
-}
-
 display="${DISPLAY:-:99}"
 profile_dir="${BROWSER_PROFILE_DIR:-/profile}"
 mkdir -p "$profile_dir"
 
-# GPT_TRACE_BROWSER_NONROOT_READY
-# The base image entrypoint starts Xvfb/Openbox as root. Perform only the
-# filesystem/X11 handoff as root, then permanently drop privileges before
-# cloakserve starts Chromium.
 if [[ "$(id -u)" -eq 0 ]]; then
   chown -R browser:browser "$profile_dir"
-  # GPT_TRACE_BROWSER_HOME_READY
   install -d -m 0700 -o browser -g browser \
     /home/browser/.cache /home/browser/.config
   chown -R browser:browser /home/browser
@@ -69,25 +44,9 @@ if "--no-sandbox" in args:
     raise SystemExit("CloakBrowser still injects --no-sandbox; refusing to launch")
 PY
 
-printf -v identity \
-  'fingerprint=%s\ntimezone=%s\nlocale=%s\ngeoip=%s' \
-  "$seed" "$timezone" "$locale" "$geoip"
-
-marker="$profile_dir/.gpt-trace-identity"
-if [[ -f "$marker" ]]; then
-  [[ "$(cat "$marker")" == "$identity" ]] || {
-    echo "browser profile identity does not match configured fingerprint/timezone/locale" >&2
-    exit 65
-  }
-else
-  if find "$profile_dir" -mindepth 1 -maxdepth 1 ! -name '.gpt-trace-identity' -print -quit | grep -q .; then
-    [[ "${BROWSER_ADOPT_EXISTING_PROFILE:-false}" == "true" ]] || {
-      echo "existing browser profile has no identity marker; set BROWSER_ADOPT_EXISTING_PROFILE=true once after verifying the seed" >&2
-      exit 66
-    }
-  fi
-  printf '%s' "$identity" > "$marker"
-fi
+# The persistent profile owns the teacher-browser identity. Existing legacy
+# markers are canonicalized in-place (not replaced with config from .env).
+python /usr/local/bin/browser-identity ensure "$profile_dir"
 
 x11_ready=false
 for _ in $(seq 1 100); do

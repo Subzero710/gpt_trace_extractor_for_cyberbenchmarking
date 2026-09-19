@@ -4,10 +4,8 @@
     {
       "id": "code-workspace",
       "kind": "local_mcp",
-      "display_name_env": "APP_CODE_WORKSPACE_UI_NAME",
       "display_name_default": "Code Workspace",
       "version": "1.0.0",
-      "mcp_endpoint_env": "APP_CODE_WORKSPACE_MCP_URL",
       "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
       "control_endpoint_default": "http://workspace-gateway:8000",
       "manifest_path_default": "../code-workspace/tool-manifest.json",
@@ -18,10 +16,8 @@
     {
       "id": "browser",
       "kind": "local_mcp",
-      "display_name_env": "APP_BROWSER_UI_NAME",
-      "display_name_default": "Browser",
+      "display_name_default": "Cloak Browser",
       "version": "1.0.0",
-      "mcp_endpoint_env": "APP_BROWSER_MCP_URL",
       "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
       "control_endpoint_default": "http://browser-gateway:8000",
       "manifest_path_default": "../browser/tool-manifest.json",

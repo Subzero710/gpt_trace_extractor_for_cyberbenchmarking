@@ -8,7 +8,7 @@ from gpt_trace_storage.config import settings
 from gpt_trace_storage.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.storage_database_url)
+config.set_main_option("sqlalchemy.url", settings.storage_database_url.replace("%", "%%"))
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 target_metadata = Base.metadata

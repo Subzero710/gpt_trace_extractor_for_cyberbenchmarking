@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -11,60 +12,76 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose"]
 REGISTRATION_READY = "registration backends: ready"
+TUNNELS_PATH = ROOT / "state" / "tunnels.json"
+REGISTRY_PATH = ROOT / "apps" / "registry" / "apps.json"
+TUNNEL_ID = re.compile(r"^tunnel_[a-z0-9]{32}$")
+
 TUNNELS = (
     ("mcp-tunnel-workspace", "code-workspace"),
     ("mcp-tunnel-browser", "browser"),
 )
 
 
-def load_dotenv(path: Path) -> dict[str, str]:
+def parse_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.is_file():
-        return values
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[7:].lstrip()
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if (
-            len(value) >= 2
-            and value[0] == value[-1]
-            and value[0] in {"'", '"'}
-        ):
-            value = value[1:-1]
-        values[key] = value
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise RuntimeError(f"invalid .env line: {raw!r}")
+        values[key.strip()] = value.strip().strip("'\"")
     return values
 
 
+def tunnel_state() -> dict[str, str]:
+    payload = json.loads(TUNNELS_PATH.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("tunnels"), dict)
+    ):
+        raise RuntimeError("state/tunnels.json is malformed")
+    tunnels = payload["tunnels"]
+    result: dict[str, str] = {}
+    for app_id in ("code-workspace", "browser"):
+        value = tunnels.get(app_id)
+        if not isinstance(value, str) or not TUNNEL_ID.fullmatch(value):
+            raise RuntimeError(f"invalid/missing tunnel id for {app_id}")
+        result[app_id] = value
+    return result
+
+
+def app_names() -> dict[str, str]:
+    payload = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    names: dict[str, str] = {}
+    for row in payload.get("apps", []):
+        if not isinstance(row, dict):
+            continue
+        app_id = row.get("id")
+        name = row.get("display_name_default")
+        if isinstance(app_id, str) and isinstance(name, str) and name.strip():
+            names[app_id] = name.strip()
+    return names
+
+
 def compose_env() -> dict[str, str]:
+    subprocess.run(
+        ["python3", "scripts/project_state.py", "tools"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+    )
     env = dict(os.environ)
-    dotenv = load_dotenv(ROOT / ".env")
-    # Existing process variables win, matching Compose precedence.
-    for key, value in dotenv.items():
-        env.setdefault(key, value)
+    for key, value in parse_env(ROOT / ".env").items():
+        env[key] = value
+    tunnels = tunnel_state()
+    env["APP_CODE_WORKSPACE_TUNNEL_ID"] = tunnels["code-workspace"]
+    env["APP_BROWSER_TUNNEL_ID"] = tunnels["browser"]
     return env
-
-
-def validate_env(env: dict[str, str]) -> None:
-    problems: list[str] = []
-
-    key = env.get("CONTROL_PLANE_API_KEY", "")
-    if not (key.startswith("sk-") and len(key) > 20):
-        problems.append("CONTROL_PLANE_API_KEY is missing/invalid")
-
-    tunnel_re = re.compile(r"^tunnel_[a-z0-9]{32}$")
-    for name in ("APP_CODE_WORKSPACE_TUNNEL_ID", "APP_BROWSER_TUNNEL_ID"):
-        if not tunnel_re.fullmatch(env.get(name, "")):
-            problems.append(f"{name} is missing/invalid")
-
-    if problems:
-        raise RuntimeError("; ".join(problems))
 
 
 def run(
@@ -206,21 +223,16 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
             raise RuntimeError(f"{service} failed to initialize MCP")
 
 
-def finish_registration(
-    proc: subprocess.Popen[str],
-) -> None:
+def finish_registration(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
     if proc.stdin is None:
         raise RuntimeError("register-apps stdin is unavailable")
-
     proc.stdin.write("\n")
     proc.stdin.flush()
-
     if proc.stdout is not None:
         for line in proc.stdout:
             print(line, end="", flush=True)
-
     rc = proc.wait(timeout=60)
     if rc != 0:
         raise RuntimeError(f"register-apps cleanup exited with code {rc}")
@@ -228,8 +240,6 @@ def finish_registration(
 
 def main() -> int:
     env = compose_env()
-    validate_env(env)
-
     active = active_runner_containers(env)
     if active:
         details = "\n  ".join(active)
@@ -264,8 +274,9 @@ def main() -> int:
         wait_for_registration(proc)
         ensure_tunnels_ready(env)
 
-        code_name = env.get("APP_CODE_WORKSPACE_UI_NAME", "Code Workspace")
-        browser_name = env.get("APP_BROWSER_UI_NAME", "Cloak Browser")
+        names = app_names()
+        code_name = names.get("code-workspace", "Code Workspace")
+        browser_name = names.get("browser", "Cloak Browser")
 
         print()
         print("MCP backends + Secure MCP Tunnels: ready")

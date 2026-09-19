@@ -165,6 +165,16 @@ class DockerRuntime:
         message = f"backend\0{app_id}\0{environment_id}".encode("utf-8")
         return hmac.new(control_token.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
+    @staticmethod
+    def _browser_fingerprint_seed(
+        task: BenchmarkTask,
+        attempt: int,
+        fingerprint: str,
+    ) -> int:
+        raw = f"browser-fingerprint\0{task.task_id}\0{attempt}\0{fingerprint}"
+        digest = hashlib.sha256(raw.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") % 2_000_000_000 + 1
+
     def _gateway_container(self, app_id: str) -> str:
         if app_id == "code-workspace":
             return self.workspace_gateway_container
@@ -236,7 +246,12 @@ class DockerRuntime:
                 "NetworkMode": network_name,
             }
         else:
+            env.append(
+                f"APP_BROWSER_FINGERPRINT_SEED={self._browser_fingerprint_seed(task, attempt, fingerprint)}"
+            )
             for key, value in sorted(self.browser_environment.items()):
+                if key == "APP_BROWSER_FINGERPRINT_SEED":
+                    continue
                 if value != "":
                     env.append(f"{key}={value}")
             if self.browser_blocked_hosts:
@@ -278,7 +293,15 @@ class DockerRuntime:
             ),
             "ExposedPorts": {"8000/tcp": {}},
             "HostConfig": host_config,
-            "NetworkingConfig": {"EndpointsConfig": {primary_network: {}}},
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    primary_network: (
+                        {"GwPriority": 1}
+                        if app_id == "browser"
+                        else {}
+                    )
+                }
+            },
         }
         if app_id == "code-workspace":
             config["User"] = "10002:10002"
@@ -358,10 +381,16 @@ class DockerRuntime:
         container: str,
         *,
         aliases: list[str] | None = None,
+        gw_priority: int | None = None,
     ) -> None:
         body: dict[str, Any] = {"Container": container}
+        endpoint: dict[str, Any] = {}
         if aliases:
-            body["EndpointConfig"] = {"Aliases": aliases}
+            endpoint["Aliases"] = aliases
+        if gw_priority is not None:
+            endpoint["GwPriority"] = gw_priority
+        if endpoint:
+            body["EndpointConfig"] = endpoint
         response = await self._request(
             "POST",
             f"/networks/{quote(network_name, safe='')}/connect",
@@ -553,6 +582,7 @@ class DockerRuntime:
                         network_name,
                         container_name,
                         aliases=[container_name],
+                        gw_priority=0,
                     )
                     attached = await self._inspect_container(container_name)
                     if attached is None:
