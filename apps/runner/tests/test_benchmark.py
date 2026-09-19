@@ -122,3 +122,25 @@ def test_initial_workspace_rejects_symlinks(tmp_path: Path) -> None:
     })
     with pytest.raises(BenchmarkError, match="symlink"):
         load_benchmark(manifest, tasks_root=tasks_root)
+
+
+def test_repository_smoke_prompts_keep_canonical_app_contract() -> None:
+    manifest = Path(__file__).parents[3] / "benchmarks" / "benchmark.jsonl"
+    rows = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
+    by_id = {row["task_id"]: row["prompt"] for row in rows}
+
+    assert by_id["smoke_workspace_001"].startswith("Use the Code Workspace app. ")
+    assert by_id["smoke_workspace_001"].endswith(
+        "You must use Code Workspace and must not answer from reasoning alone."
+    )
+    assert by_id["smoke_browser_001"].startswith("Use the Browser app. ")
+    assert by_id["smoke_browser_001"].endswith(
+        "You must use Browser and must not answer from prior knowledge."
+    )
+    assert by_id["smoke_isolation_001"].startswith(
+        "Use both Code Workspace and Browser. "
+    )
+    assert by_id["smoke_isolation_001"].endswith(
+        "You must use both Code Workspace and Browser."
+    )
+

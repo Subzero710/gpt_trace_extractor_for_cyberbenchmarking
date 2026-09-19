@@ -79,15 +79,39 @@ def test_each_app_resolves_current_composer() -> None:
     assert "get_editor=self._site.wait_ready" in compose
 
 
-def test_chatgpt_compose_types_prompt_before_app_mentions() -> None:
+def test_chatgpt_compose_selects_apps_before_appending_projected_prompt() -> None:
     source = _source("chatgpt.py")
     compose = source.split("async def _compose", 1)[1].split(
         "async def prepare_task", 1
     )[0]
-    assert "self._interaction.type_text(editor, task.prompt)" in compose
     assert "await select_apps(" in compose
-    assert compose.index("type_text") < compose.index("select_apps")
+    assert "prompt = _prompt_for_chatgpt(task)" in compose
+    assert "self._interaction.type_text(" in compose
+    assert "clear_existing=False" in compose
+    assert compose.index("select_apps") < compose.index("_prompt_for_chatgpt")
+    assert compose.index("_prompt_for_chatgpt") < compose.index("type_text")
     assert "paste_text(editor, task.prompt)" not in compose
+
+
+def test_chat_prompt_projection_keeps_fingerprint_prompt_immutable() -> None:
+    source = _source("chatgpt.py")
+    helper = source.split("def _prompt_for_chatgpt", 1)[1].split(
+        "class ChatGPTClient", 1
+    )[0]
+
+    assert "prompt = task.prompt" in helper
+    assert 'prefix = f"Use the {name} app. "' in helper
+    assert 'prefix = f"Use both {joined}. "' in helper
+    assert "task.prompt =" not in helper
+
+
+def test_new_chat_wait_for_function_uses_keyword_arg() -> None:
+    source = _source("chatgpt.py")
+    new_chat = source.split("async def _new_chat_if_needed", 1)[1].split(
+        "async def _visible_exact_text", 1
+    )[0]
+    assert "arg=old_id" in new_chat
+    assert "\n                old_id,\n" not in new_chat
 
 def test_wait_for_function_payload_is_keyword_only() -> None:
     source = _source("tools.py")
@@ -111,4 +135,14 @@ def test_doctor_checks_playwright_ui_contracts() -> None:
     cli = _source("cli.py")
     doctor = cli.split("def doctor(", 1)[1].split("@app.command()", 1)[0]
     assert "check_playwright_ui_contracts()" in doctor
+
+def test_app_selection_focuses_composer_without_pointer_click() -> None:
+    source = _source("tools.py")
+    select = source.split("async def _select_app_via_mention", 1)[1].split(
+        "async def _composer_has_keyboard_focus", 1
+    )[0]
+
+    assert "await interaction.focus(editor)" in select
+    assert "interaction.click(editor)" not in select
+    assert 'await editor.press("Control+End")' in select
 

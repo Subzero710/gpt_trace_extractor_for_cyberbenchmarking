@@ -128,13 +128,14 @@ async def _select_app_via_mention(
         raise FatalUIState(f"unsupported benchmark tool type at runtime: {tool.type}")
 
     editor = await get_editor()
-    await interaction.click(editor)
-    try:
-        # Runtime composition can already contain the benchmark prompt. Keep it
-        # intact and append the App mention at the end before Enter.
-        await editor.press("Control+End")
-    except Exception:
-        pass
+
+    # Never pointer-click the composer here. Once an App mention exists, a
+    # generic click on the contenteditable can land on the structured App chip
+    # and open its link/details instead of placing the caret.
+    await interaction.focus(editor)
+
+    # Keyboard-only caret placement at the end of the current composer.
+    await editor.press("Control+End")
 
     try:
         before = await editor.inner_text()

@@ -46,6 +46,28 @@ class InteractionGuard:
         except Exception as exc:
             raise ChatGPTUIError("browser UI click failed") from exc
 
+    async def focus(self, locator: Locator, *, timeout_ms: int | None = None) -> None:
+        # Focus a contenteditable without generating a pointer click. This is
+        # required when structured App chips are already present in the
+        # composer: clicking the editor can activate the chip/link itself.
+        await self.ensure_page_focus()
+        timeout = timeout_ms or self._timeout_ms
+        try:
+            await locator.wait_for(state="visible", timeout=timeout)
+            await locator.focus(timeout=timeout)
+            owns_focus = await locator.evaluate(
+                "el => el === document.activeElement || "
+                "el.contains(document.activeElement)"
+            )
+            if not owns_focus:
+                raise ChatGPTUIError(
+                    "target editor is visible but did not obtain keyboard focus"
+                )
+        except ChatGPTUIError:
+            raise
+        except Exception as exc:
+            raise ChatGPTUIError("browser UI focus failed") from exc
+
     async def type_text(
         self,
         locator: Locator,
@@ -57,14 +79,27 @@ class InteractionGuard:
 
         CloakBrowser owns keyboard humanization. Newlines use Shift+Enter so a
         multiline prompt cannot submit before composition is complete.
+
+        When clear_existing is False, preserve any structured App mentions
+        already present in the composer, append one separating space when
+        needed, and validate only the newly appended prompt suffix.
         """
-        await self.ensure_page_focus()
         try:
-            await locator.wait_for(state="visible", timeout=self._timeout_ms)
-            await self.click(locator, timeout_ms=self._timeout_ms)
+            # Never click the composer to type. If a structured App mention is
+            # present, a pointer click may activate its link/details.
+            await self.focus(locator, timeout_ms=self._timeout_ms)
+
+            existing = ""
             if clear_existing:
                 await locator.press("Control+A")
                 await locator.press("Backspace")
+            else:
+                existing = (
+                    await locator.inner_text(timeout=self._timeout_ms)
+                ).replace("\r\n", "\n").replace("\r", "\n")
+                await locator.press("Control+End")
+                if existing and not existing.endswith((" ", "\n")):
+                    await self._page.keyboard.type(" ")
 
             expected = text.replace("\r\n", "\n").replace("\r", "\n")
             for index, line in enumerate(expected.split("\n")):
@@ -79,7 +114,10 @@ class InteractionGuard:
                 rendered = (
                     await locator.inner_text(timeout=self._timeout_ms)
                 ).replace("\r\n", "\n").replace("\r", "\n")
-                if rendered == expected:
+                if clear_existing:
+                    if rendered == expected:
+                        return
+                elif rendered.endswith(expected):
                     return
                 await asyncio.sleep(0.05)
         except ChatGPTUIError:

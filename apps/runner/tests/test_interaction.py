@@ -69,9 +69,18 @@ class FakeLocator:
     def __init__(self, holder):
         self.holder = holder
         self.rendered = ""
+        self.click_calls = 0
+        self.focus_calls = 0
+        self.focused = False
     async def wait_for(self, **kwargs): pass
     async def is_enabled(self): return True
-    async def click(self, **kwargs): pass
+    async def click(self, **kwargs):
+        self.click_calls += 1
+    async def focus(self, **kwargs):
+        self.focus_calls += 1
+        self.focused = True
+    async def evaluate(self, expression):
+        return self.focused
     async def press(self, key):
         if key == "Control+A":
             self.holder["select_all"] = True
@@ -175,3 +184,57 @@ async def test_type_text_does_not_touch_clipboard() -> None:
     guard._set_system_clipboard = forbidden_clipboard
     await guard.type_text(locator, "prompt")
     assert locator.rendered == "prompt"
+
+@pytest.mark.asyncio
+async def test_type_text_appends_after_structured_app_without_clearing() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = FakeLocator(holder)
+    locator.rendered = "Code Workspace"
+    page.keyboard.locator = locator
+
+    await guard.type_text(
+        locator,
+        "Use exec_command to inspect the workspace.",
+        clear_existing=False,
+    )
+
+    assert locator.rendered == (
+        "Code Workspace Use exec_command to inspect the workspace."
+    )
+    assert holder.get("select_all") is None
+    assert page.keyboard.events == [
+        ("type", " "),
+        ("type", "Use exec_command to inspect the workspace."),
+    ]
+
+@pytest.mark.asyncio
+async def test_type_text_focuses_composer_without_pointer_click() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = FakeLocator(holder)
+    locator.rendered = "Code Workspace"
+    page.keyboard.locator = locator
+
+    await guard.type_text(
+        locator,
+        "Use exec_command to inspect the workspace.",
+        clear_existing=False,
+    )
+
+    assert locator.click_calls == 0
+    assert locator.focus_calls == 1
+    assert locator.rendered == (
+        "Code Workspace Use exec_command to inspect the workspace."
+    )
+

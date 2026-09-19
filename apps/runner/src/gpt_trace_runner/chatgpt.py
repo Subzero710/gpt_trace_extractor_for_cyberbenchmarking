@@ -73,6 +73,50 @@ class SubmittedTurn:
     task: BenchmarkTask
 
 
+
+def _prompt_for_chatgpt(task: BenchmarkTask) -> str:
+    # task.prompt is immutable provenance and participates in task_fingerprint.
+    # Remove only redundant App-activation prose from the UI projection because
+    # Apps are already represented by structured @ mentions in the composer.
+    prompt = task.prompt
+    names = tuple(tool.name for tool in task.tools)
+    if not names:
+        return prompt
+
+    if len(names) == 1:
+        name = names[0]
+        prefix = f"Use the {name} app. "
+        if prompt.startswith(prefix):
+            prompt = prompt[len(prefix):]
+
+        suffixes = (
+            f" You must use {name} and must not answer from reasoning alone.",
+            f" You must use {name} and must not answer from prior knowledge.",
+            f" You must use {name}.",
+        )
+        for suffix in suffixes:
+            if prompt.endswith(suffix):
+                prompt = prompt[:-len(suffix)]
+                break
+
+    elif len(names) == 2:
+        joined = f"{names[0]} and {names[1]}"
+        prefix = f"Use both {joined}. "
+        if prompt.startswith(prefix):
+            prompt = prompt[len(prefix):]
+
+        suffix = f" You must use both {joined}."
+        if prompt.endswith(suffix):
+            prompt = prompt[:-len(suffix)]
+
+    projected = prompt.strip()
+    if not projected:
+        raise FatalUIState(
+            "benchmark prompt contains only App activation prose"
+        )
+    return projected
+
+
 class ChatGPTClient:
     def __init__(
         self,
@@ -226,7 +270,7 @@ class ChatGPTClient:
         try:
             await self._page.wait_for_function(
                 "old => !location.pathname.startsWith('/c/' + old)",
-                old_id,
+                arg=old_id,
                 timeout=int(self._stream_start_timeout * 1000),
             )
         except Exception as exc:
@@ -303,20 +347,26 @@ class ChatGPTClient:
         await self._site.wait_ready()
 
     async def _compose(self, task: BenchmarkTask) -> None:
-        # Type the benchmark prompt through real keyboard events, then append
-        # Apps through ChatGPT's @ mention autocomplete. CloakBrowser owns
-        # humanization; the runner adds no artificial per-key delay.
-        #
-        # App mentions are structured composer nodes; never Ctrl+A after adding
-        # them or the mention may be deleted.
-        editor = await self._site.wait_ready()
-        await self._interaction.type_text(editor, task.prompt)
+        # Resolve Apps first through ChatGPT's real @ mention autocomplete.
+        # task.prompt stays canonical for provenance/fingerprints. Only the
+        # composer projection removes redundant App-activation prose.
         await select_apps(
             self._page,
             get_editor=self._site.wait_ready,
             tools=task.tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
+        )
+
+        prompt = _prompt_for_chatgpt(task)
+
+        # App mentions are structured nodes. Append the projected prompt after
+        # them and never clear/select-all the composer after mentions exist.
+        editor = await self._site.wait_ready()
+        await self._interaction.type_text(
+            editor,
+            prompt,
+            clear_existing=False,
         )
         await self._site.wait_ready()
 
