@@ -52,6 +52,13 @@ def tunnel_state() -> dict[str, str]:
         if not isinstance(value, str) or not TUNNEL_ID.fullmatch(value):
             raise RuntimeError(f"invalid/missing tunnel id for {app_id}")
         result[app_id] = value
+
+    if result["code-workspace"] == result["browser"]:
+        raise RuntimeError(
+            "invalid tunnel state: code-workspace and browser must use "
+            "different tunnel IDs"
+        )
+
     return result
 
 

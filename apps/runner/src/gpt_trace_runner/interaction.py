@@ -11,29 +11,77 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
 (el, op) => {
     const key = "__gptTraceInputReceiptV2";
 
-    const decodeInput = event => {
+    const dropLastGrapheme = value => {
+        if (!value) return "";
+
+        try {
+            if (typeof Intl !== "undefined" && Intl.Segmenter) {
+                const segments = Array.from(
+                    new Intl.Segmenter(undefined, {granularity: "grapheme"})
+                        .segment(value)
+                );
+                if (!segments.length) return "";
+                return value.slice(0, segments[segments.length - 1].index);
+            }
+        } catch (_) {
+        }
+
+        const codepoints = Array.from(value);
+        codepoints.pop();
+        return codepoints.join("");
+    };
+
+    const appendChunk = (state, field, chunk) => {
+        if (typeof chunk !== "string" || chunk === "") return;
+        state[field] += chunk;
+    };
+
+    const deleteBackward = (state, field) => {
+        state[field] = dropLastGrapheme(state[field]);
+        state.corrections[field] += 1;
+    };
+
+    const applyInputEdit = (state, field, event) => {
         const inputType = event.inputType || "";
+
+        if (inputType === "deleteContentBackward") {
+            deleteBackward(state, field);
+            return;
+        }
+
         if (
             inputType === "insertLineBreak" ||
             inputType === "insertParagraph"
         ) {
-            return "\n";
+            appendChunk(state, field, "\n");
+            return;
         }
 
         if (typeof event.data === "string" && inputType.startsWith("insert")) {
-            return event.data;
+            appendChunk(state, field, event.data);
         }
-
-        return null;
     };
 
-    const decodeKey = event => {
-        if (event.ctrlKey || event.metaKey || event.altKey) return null;
-        if (event.key === "Enter" && event.shiftKey) return "\n";
-        if (typeof event.key === "string" && event.key.length === 1) {
-            return event.key;
+    const applyKeyEdit = (state, event) => {
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+        if (event.key === "Backspace") {
+            deleteBackward(state, "keydown");
+            // textInput reports inserted text but has no matching deletion
+            // event in Chromium. Mirror the same physical Backspace so this
+            // channel also represents effective text rather than raw inserts.
+            deleteBackward(state, "textInput");
+            return;
         }
-        return null;
+
+        if (event.key === "Enter" && event.shiftKey) {
+            appendChunk(state, "keydown", "\n");
+            return;
+        }
+
+        if (typeof event.key === "string" && event.key.length === 1) {
+            appendChunk(state, "keydown", event.key);
+        }
     };
 
     const bump = (state, kind, event) => {
@@ -65,11 +113,17 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
         }
 
         const state = {
-            before: [],
-            input: [],
-            textInput: [],
-            keydown: [],
+            before: "",
+            input: "",
+            textInput: "",
+            keydown: "",
             mutations: 0,
+            corrections: {
+                before: 0,
+                input: 0,
+                textInput: 0,
+                keydown: 0,
+            },
             trust: {trusted: 0, untrusted: 0},
             types: {
                 beforeinput: {},
@@ -81,22 +135,21 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
 
         const beforeHandler = event => {
             bump(state, "beforeinput", event);
-            const chunk = decodeInput(event);
-            if (chunk !== null) state.before.push(chunk);
+            applyInputEdit(state, "before", event);
         };
         const inputHandler = event => {
             bump(state, "input", event);
-            const chunk = decodeInput(event);
-            if (chunk !== null) state.input.push(chunk);
+            applyInputEdit(state, "input", event);
         };
         const textHandler = event => {
             bump(state, "textInput", event);
-            if (typeof event.data === "string") state.textInput.push(event.data);
+            if (typeof event.data === "string") {
+                appendChunk(state, "textInput", event.data);
+            }
         };
         const keyHandler = event => {
             bump(state, "keydown", event);
-            const chunk = decodeKey(event);
-            if (chunk !== null) state.keydown.push(chunk);
+            applyKeyEdit(state, event);
         };
         const observer = new MutationObserver(records => {
             state.mutations += records.length;
@@ -133,11 +186,12 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
         }
 
         const result = {
-            before: slot.state.before.join(""),
-            input: slot.state.input.join(""),
-            textInput: slot.state.textInput.join(""),
-            keydown: slot.state.keydown.join(""),
+            before: slot.state.before,
+            input: slot.state.input,
+            textInput: slot.state.textInput,
+            keydown: slot.state.keydown,
             mutations: slot.state.mutations,
+            corrections: slot.state.corrections,
             trust: slot.state.trust,
             types: slot.state.types,
         };
@@ -243,6 +297,7 @@ class InteractionGuard:
             await self.focus(locator, timeout_ms=self._timeout_ms)
 
             existing = ""
+            separator = ""
             if clear_existing:
                 await locator.press("Control+A")
                 await locator.press("Backspace")
@@ -252,14 +307,18 @@ class InteractionGuard:
                 ).replace("\r\n", "\n").replace("\r", "\n")
                 await locator.press("Control+End")
                 if existing and not existing.endswith((" ", "\n")):
-                    await self._page.keyboard.type(" ")
+                    separator = " "
 
-            expected = text.replace("\r\n", "\n").replace("\r", "\n")
+            expected_prompt = text.replace("\r\n", "\n").replace("\r", "\n")
+            expected_receipt = separator + expected_prompt
 
+            # Keep separator + prompt in one ordered keyboard stream. CloakBrowser
+            # humanization may defer actual key delivery, so a standalone space
+            # can otherwise arrive late and interleave with prompt characters.
             await locator.evaluate(_COMPOSER_INPUT_RECEIPT_JS, "start")
             receipt_started = True
 
-            for index, line in enumerate(expected.split("\n")):
+            for index, line in enumerate(expected_receipt.split("\n")):
                 if index:
                     await self._page.keyboard.press("Shift+Enter")
                 if line:
@@ -285,8 +344,14 @@ class InteractionGuard:
             # input/textInput are post-edit channels. beforeinput/keydown prove
             # the exact source reached the editor boundary, so require an
             # observed DOM mutation when using either as the fallback proof.
-            exact_post_edit = after == expected or text_input == expected
-            exact_pre_edit = before == expected or keydown == expected
+            exact_post_edit = (
+                after == expected_receipt
+                or text_input == expected_receipt
+            )
+            exact_pre_edit = (
+                before == expected_receipt
+                or keydown == expected_receipt
+            )
             mutated = isinstance(mutations, int) and mutations > 0
 
             if exact_post_edit or (exact_pre_edit and mutated):
@@ -295,16 +360,18 @@ class InteractionGuard:
             def first_mismatch(actual: object) -> int | None:
                 if not isinstance(actual, str):
                     return None
-                limit = min(len(expected), len(actual))
+                limit = min(len(expected_receipt), len(actual))
                 for index in range(limit):
-                    if expected[index] != actual[index]:
+                    if expected_receipt[index] != actual[index]:
                         return index
-                if len(expected) != len(actual):
+                if len(expected_receipt) != len(actual):
                     return limit
                 return None
 
             details = {
-                "expected_len": len(expected),
+                "prompt_len": len(expected_prompt),
+                "separator_len": len(separator),
+                "expected_receipt_len": len(expected_receipt),
                 "before_len": len(before) if isinstance(before, str) else None,
                 "input_len": len(after) if isinstance(after, str) else None,
                 "text_input_len": (
@@ -316,6 +383,7 @@ class InteractionGuard:
                 "text_input_mismatch": first_mismatch(text_input),
                 "keydown_mismatch": first_mismatch(keydown),
                 "mutations": mutations,
+                "corrections": receipt.get("corrections"),
                 "trust": receipt.get("trust"),
                 "types": receipt.get("types"),
             }

@@ -112,10 +112,18 @@ def validate_tunnels() -> None:
         if not isinstance(value, str) or not TUNNEL_ID.fullmatch(value):
             raise SystemExit(f"invalid/missing tunnel id for {app_id}")
 
+    workspace_tunnel = tunnels["code-workspace"]
+    browser_tunnel = tunnels["browser"]
+    if workspace_tunnel == browser_tunnel:
+        raise SystemExit(
+            "invalid tunnel state: code-workspace and browser must use "
+            "different tunnel IDs"
+        )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("core", "tools"))
+    parser.add_argument("mode", choices=("core", "doctor", "tools"))
     args = parser.parse_args()
 
     values = parse_env(ENV_PATH)
@@ -123,10 +131,12 @@ def main() -> int:
     os.chmod(ENV_PATH, 0o600)
     ensure_control_token()
 
+    if args.mode in ("doctor", "tools"):
+        validate_tunnels()
+
     if args.mode == "tools":
         if not values.get("CONTROL_PLANE_API_KEY"):
             raise SystemExit("CONTROL_PLANE_API_KEY is required in .env for make tools")
-        validate_tunnels()
 
     print(f"project state: {args.mode} ok")
     return 0

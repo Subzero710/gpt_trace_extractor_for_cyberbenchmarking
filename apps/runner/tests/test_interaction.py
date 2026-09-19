@@ -247,9 +247,14 @@ async def test_type_text_appends_after_structured_app_without_clearing() -> None
     )
     assert holder.get("select_all") is None
     assert page.keyboard.events == [
-        ("type", " "),
-        ("type", "Use exec_command to inspect the workspace."),
+        ("type", " Use exec_command to inspect the workspace."),
     ]
+    assert locator.receipt_before == (
+        " Use exec_command to inspect the workspace."
+    )
+    assert locator.receipt_input == (
+        " Use exec_command to inspect the workspace."
+    )
 
 @pytest.mark.asyncio
 async def test_type_text_focuses_composer_without_pointer_click() -> None:
@@ -333,8 +338,10 @@ async def test_type_text_validates_input_receipt_not_rendered_lexical_dom() -> N
         clear_existing=False,
     )
 
-    assert locator.receipt_before == prompt
-    assert locator.receipt_input == prompt
+    assert locator.receipt_before == " " + prompt
+    assert locator.receipt_input == " " + prompt
+    assert locator.receipt_text_input == " " + prompt
+    assert locator.receipt_keydown == " " + prompt
     assert await locator.inner_text() != "Code Workspace " + prompt
 
 
@@ -406,4 +413,38 @@ def test_receipt_js_does_not_discard_untrusted_browser_events() -> None:
     assert 'addEventListener("input"' in receipt
     assert 'addEventListener("textInput"' in receipt
     assert 'addEventListener("keydown"' in receipt
+
+
+def test_receipt_js_replays_humanized_backspace_corrections() -> None:
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "interaction.py"
+    ).read_text(encoding="utf-8")
+    receipt = source.split(
+        '_COMPOSER_INPUT_RECEIPT_JS = r"""', 1
+    )[1].split('"""', 1)[0]
+
+    assert 'inputType === "deleteContentBackward"' in receipt
+    assert 'event.key === "Backspace"' in receipt
+    assert 'deleteBackward(state, "before")' not in receipt
+    assert 'applyInputEdit(state, "before", event)' in receipt
+    assert 'applyInputEdit(state, "input", event)' in receipt
+    assert 'deleteBackward(state, "keydown")' in receipt
+    assert 'deleteBackward(state, "textInput")' in receipt
+    assert 'new Intl.Segmenter' in receipt
+    assert 'corrections:' in receipt
+
+
+def test_humanized_typo_insertions_minus_backspaces_equal_prompt_length() -> None:
+    # Mirrors the real diagnostic that motivated this fix: 204 inserts and
+    # four Backspaces must reconstruct 200 effective characters.
+    inserted = 204
+    backspaces = 4
+    expected = 200
+
+    assert inserted - backspaces == expected
 

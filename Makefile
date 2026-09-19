@@ -8,8 +8,9 @@ up:
 	docker compose up -d postgres storage browser workspace-gateway browser-gateway
 
 doctor:
-	python3 scripts/project_state.py core
-	docker compose run --rm runner doctor
+	python3 scripts/project_state.py doctor
+	# Doctor is observational: never start/recreate persistent dependencies.
+	docker compose run --rm --no-deps runner doctor
 
 tools:
 	python3 scripts/tools_flow.py
