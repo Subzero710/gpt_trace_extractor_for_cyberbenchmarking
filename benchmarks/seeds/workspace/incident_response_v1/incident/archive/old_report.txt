@@ -1,4 +1,0 @@
-incident_id=INC-000001
-severity=critical
-affected_user=legacy_user
-timestamp=2025-01-01T00:00:00Z
