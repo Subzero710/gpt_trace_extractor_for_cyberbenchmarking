@@ -10,7 +10,7 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_selection_types_one_validated_query_and_waits_before_enter() -> None:
+def test_app_selection_types_one_validated_query_then_enter() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
@@ -19,11 +19,9 @@ def test_app_selection_types_one_validated_query_and_waits_before_enter() -> Non
     assert "interaction.type_text(" in select
     assert "raw_mention," in select
     assert "clear_existing=False" in select
-    assert "await _wait_app_candidate_ready(" in select
     assert 'await page.keyboard.press("Enter")' in select
-    assert select.index("_wait_app_candidate_ready(") < select.index(
-        'page.keyboard.press("Enter")'
-    )
+    assert "_wait_app_candidate_ready" not in source
+    assert "_APP_PICKER_READY_JS" not in source
     assert 'page.keyboard.type("@")' not in select
     assert "page.keyboard.type(tool.name)" not in select
     assert "delay=20" not in source
@@ -40,9 +38,8 @@ def test_app_selection_waits_for_current_composer_transition() -> None:
     assert select.index('await page.keyboard.press("Enter")') < select.index(
         "await _wait_app_accepted("
     )
-    assert "_APP_PICKER_READY_JS" in source
-    assert "aria-activedescendant" in source
-    assert "Enter was not pressed" in source
+    assert "_APP_PICKER_READY_JS" not in source
+    assert "_wait_app_candidate_ready" not in source
     assert "page.expect_response(" not in source
     assert "client_prepare_source" not in source
     assert "asyncio.sleep" not in source
