@@ -19,7 +19,7 @@ from .docker_runtime import DockerRuntime
 from .exceptions import RecoveryIncomplete, StorageError
 from .journal import JournalStore
 from .lock import RunnerLock
-from .models import task_app_provenance, task_fingerprint
+from .models import BenchmarkTask, BenchmarkTool, task_app_provenance, task_fingerprint
 from .qwen import flatten_app_provenance
 from .registry import AppRegistry
 from .runner import BenchmarkRunner, RunOptions, abandon_recovery
@@ -81,6 +81,29 @@ def clipboard_health_url(settings: Settings) -> str:
     return urlunparse(parsed._replace(path="/healthz", query=""))
 
 
+def internal_local_apps_task(
+    registry: AppRegistry,
+    *,
+    task_id: str,
+    prompt: str,
+) -> BenchmarkTask:
+    tools: list[BenchmarkTool] = []
+    for app_id in ("code-workspace", "browser"):
+        resolved = registry.resolve_id(app_id)
+        if resolved.kind != "local_mcp":
+            raise RuntimeError(f"{app_id!r} must resolve to a local_mcp App")
+        tools.append(
+            BenchmarkTool(
+                type="app", app_id=resolved.app_id, ui_name=resolved.ui_name,
+                required=True, kind=resolved.kind, version=resolved.version,
+                manifest_sha256=resolved.manifest_sha256, tool_manifest=resolved.manifest,
+                mcp_endpoint=resolved.mcp_endpoint, control_endpoint=resolved.control_endpoint,
+                attachment_mode=resolved.attachment_mode,
+            )
+        )
+    return BenchmarkTask(task_id=task_id, prompt=prompt, attachments=(), tools=tuple(tools))
+
+
 async def ensure_no_running_storage(storage: StorageClient) -> None:
     data = await storage.stats()
     if int(data.get("running", 0)) > 0:
@@ -94,21 +117,16 @@ def ensure_no_pending_journal(settings: Settings) -> None:
 
 
 @app.command()
-def doctor(
-    benchmark: Path = typer.Option(
-        Path("/data/benchmarks/benchmark.jsonl"),
-        "--benchmark",
-        exists=True,
-        dir_okay=False,
-    ),
-) -> None:
+def doctor() -> None:
     async def main() -> None:
         settings = Settings()
         registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
+        tasks = (
+            internal_local_apps_task(
+                registry,
+                task_id="__doctor_local_apps__",
+                prompt="Internal doctor smoke task for local MCP validation.",
+            ),
         )
 
         storage = StorageClient(settings.storage_base_url)
@@ -433,36 +451,16 @@ def run_command(
 
 
 @app.command("register-apps")
-def register_apps(
-    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
-    task_id: str = typer.Option("smoke_isolation_001", "--task-id"),
-) -> None:
-    """Hold real local MCP backends open while ChatGPT Plugins are registered."""
-
+def register_apps() -> None:
+    # Operational lifecycle helper only; it deliberately does not load benchmark data.
     async def main() -> None:
         settings = Settings()
         registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
+        task = internal_local_apps_task(
+            registry,
+            task_id="__app_registration__",
+            prompt="Internal App registration lifecycle task.",
         )
-        matches = [task for task in tasks if task.task_id == task_id]
-        if len(matches) != 1:
-            raise typer.BadParameter(f"task_id {task_id!r} is not present exactly once")
-        task = matches[0]
-
-        local_ids = {
-            tool.app_id
-            for tool in task.tools
-            if tool.kind == "local_mcp"
-        }
-        required = {"code-workspace", "browser"}
-        if not required.issubset(local_ids):
-            raise typer.BadParameter(
-                f"registration task must contain both local Apps {sorted(required)!r}; "
-                f"got {sorted(local_ids)!r}"
-            )
 
         fingerprint = task_fingerprint(task)
         # Dedicated registration attempt identity; it is not written to storage.

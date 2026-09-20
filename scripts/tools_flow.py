@@ -260,9 +260,6 @@ def main() -> int:
         "--rm",
         "runner",
         "register-apps",
-        "/data/benchmarks/benchmark.jsonl",
-        "--task-id",
-        "smoke_isolation_001",
     ]
     print("+ " + " ".join(reg_cmd), flush=True)
     proc = subprocess.Popen(
