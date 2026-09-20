@@ -86,7 +86,7 @@ def create_app(manager,control_token,allowed_hosts=None):
    if hasattr(manager,'shutdown'):await manager.shutdown()
  app=Starlette(routes=[Route('/healthz',health),Route('/manifest',mani),Route('/control/state',state),Route('/control/seed',seed,methods=['POST']),Route('/control/{operation}',control,methods=['POST']),Mount('/mcp',app=mcp)],lifespan=life);return CORSMiddleware(app,allow_origins=['https://chatgpt.com'],allow_methods=['GET','POST','DELETE'],expose_headers=['Mcp-Session-Id'])
 def main():
- m=WorkspaceManagerV2(Path(os.environ.get('CODE_WORKSPACE_ROOT','/workspace')),Path(os.environ.get('CODE_WORKSPACE_STATE_ROOT','/state')),templates_root=Path(os.environ.get('CODE_WORKSPACE_TEMPLATES_ROOT','/app/templates')));verify(Path(os.environ.get('MCP_TOOL_MANIFEST','/app/tool-manifest.json')),m);hosts=[x.strip() for x in os.environ.get('MCP_ALLOWED_HOSTS','').split(',') if x.strip()]
+ m=WorkspaceManagerV2(Path(os.environ.get('CODE_WORKSPACE_ROOT','/workspace')),Path(os.environ.get('CODE_WORKSPACE_STATE_ROOT','/state')),sandbox_uid=0,sandbox_gid=0,templates_root=Path(os.environ.get('CODE_WORKSPACE_TEMPLATES_ROOT','/app/templates')));verify(Path(os.environ.get('MCP_TOOL_MANIFEST','/app/tool-manifest.json')),m);hosts=[x.strip() for x in os.environ.get('MCP_ALLOWED_HOSTS','').split(',') if x.strip()]
  if not hosts:raise RuntimeError('MCP_ALLOWED_HOSTS must contain at least one exact host[:port]')
  import uvicorn;uvicorn.run(create_app(m,token(Path(os.environ.get('APP_CONTROL_TOKEN_FILE','/run/secrets/app_control_token'))),hosts),host='0.0.0.0',port=8000)
 if __name__=='__main__':main()

@@ -700,7 +700,7 @@ class WorkspaceManager:
             raise WorkspaceError("cwd is not a directory")
         environment = {
             "PATH": "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(self.workspace_root),
+            "HOME": "/root" if self.sandbox_uid == 0 else str(self.workspace_root),
             "TMPDIR": "/tmp",
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",

@@ -232,6 +232,7 @@ class DockerRuntime:
             host_config: dict[str, Any] = {
                 "ReadonlyRootfs": False,
                 "Init": True,
+                "Privileged": False,
                 "CapDrop": ["AUDIT_WRITE", "MKNOD", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"],
                 "SecurityOpt": ["no-new-privileges"],
                 "PidsLimit": 160,
@@ -239,9 +240,9 @@ class DockerRuntime:
                 "NanoCpus": 2_000_000_000,
                 "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 1024}],
                 "Tmpfs": {
-                    "/workspace": "rw,nosuid,nodev,size=2147483648,mode=0770,uid=10002,gid=10002",
-                    "/state": "rw,nosuid,nodev,noexec,size=16777216,mode=0700,uid=10002,gid=10002",
-                    "/tmp": "rw,nosuid,nodev,noexec,size=268435456,mode=1777,uid=10002,gid=10002",
+                    "/workspace": "rw,nosuid,nodev,size=2147483648,mode=0770,uid=0,gid=0",
+                    "/state": "rw,nosuid,nodev,noexec,size=16777216,mode=0700,uid=0,gid=0",
+                    "/tmp": "rw,nosuid,nodev,noexec,size=268435456,mode=1777,uid=0,gid=0",
                 },
                 "NetworkMode": network_name,
             }
@@ -303,6 +304,8 @@ class DockerRuntime:
                 }
             },
         }
+        if app_id == "code-workspace":
+            config["User"] = "0:0"
         return config
 
     async def _inspect_container(self, name_or_id: str) -> dict[str, Any] | None:

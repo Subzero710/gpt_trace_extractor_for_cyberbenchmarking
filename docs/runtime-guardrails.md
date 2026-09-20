@@ -20,8 +20,8 @@ For every attempt requesting `code-workspace`, the runner creates a new containe
 - no PostgreSQL/storage credentials or teacher profile;
 - an internal-only task network and no internet route;
 - bounded memory, CPU, PIDs, file descriptors and tmpfs;
-- a read-only image root with writable `/workspace`, `/state` and `/tmp`;
-- shell commands executed as the sandbox UID with a minimal environment;
+- a writable container root filesystem plus bounded tmpfs for `/workspace`, `/state` and `/tmp`;
+- agent shell commands executed as uid/gid 0 inside the disposable container;
 - process-group termination on command timeout.
 
 The initial workspace is copied into the new container, not bind-mounted. Tool paths reject absolute paths, traversal and symlinks. At terminal cleanup the whole container is removed with `force=true&v=true`, so all remaining processes and mutable filesystem state disappear.
@@ -53,4 +53,4 @@ Browser/CDP failure, storage conflict, authentication loss, HTTP 403/429, ambigu
 
 
 ## MCP Stack V2
-Code-workspace now has outbound task-network access and a root control service for real apt installation; agent shells still drop to uid/gid 10002, filesystem tools enforce `/workspace`, no host bind/Docker socket is exposed, no-new-privileges remains enabled, and high-risk capabilities are dropped. Browser private-target URL policy remains enforced.
+Code-workspace now runs agent shells as uid/gid 0 inside the disposable task container. The runner explicitly keeps the container non-privileged, does not use host networking, exposes no host bind mount or Docker socket, keeps `no-new-privileges`, and drops AUDIT_WRITE, MKNOD, NET_RAW, SYS_ADMIN, and SYS_PTRACE. Root authority is therefore inside the task container, while host-facing escape surfaces remain excluded by the runtime configuration. Browser private-target URL policy remains enforced.

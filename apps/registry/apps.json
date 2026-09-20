@@ -8,7 +8,7 @@
       "id": "code-workspace",
       "kind": "local_mcp",
       "manifest_path_default": "../code-workspace/tool-manifest.json",
-      "manifest_sha256": "73da617114933ba1182447977e9a1df8dfa460e19d61b5e43b5021d98d923b35",
+      "manifest_sha256": "73e57b8948e0c810b6a348bdfd7f5af4c8a7050518746d1d8d69d4634a09b171",
       "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
       "version": "2.0.0"
     },
@@ -20,7 +20,7 @@
       "id": "browser",
       "kind": "local_mcp",
       "manifest_path_default": "../browser/tool-manifest.json",
-      "manifest_sha256": "5881fd1c80bffdaf47a5182ae2bd9d2e006486944c4c40d45dddfac040506680",
+      "manifest_sha256": "e6fd16dcb72a1e93cc53d991ce23830c3296281db0c3ff240d01dd264eb4a38f",
       "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
       "version": "2.0.0"
     },

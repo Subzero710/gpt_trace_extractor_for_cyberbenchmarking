@@ -224,13 +224,17 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
 
     assert mock.archives == {}
     assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is False
-    assert "User" not in workspace_cfg
+    assert workspace_cfg["User"] == "0:0"
+    assert workspace_cfg["HostConfig"]["Privileged"] is False
     assert workspace_cfg["HostConfig"]["CapDrop"] == ["AUDIT_WRITE", "MKNOD", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"]
     assert "CapAdd" not in workspace_cfg["HostConfig"]
-    assert "uid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
-    assert "gid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
-    assert "uid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
-    assert "gid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
+    assert workspace_cfg["HostConfig"]["SecurityOpt"] == ["no-new-privileges"]
+    assert "Binds" not in workspace_cfg["HostConfig"]
+    assert "/var/run/docker.sock" not in json.dumps(workspace_cfg)
+    assert "uid=0" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
+    assert "gid=0" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
+    assert "uid=0" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
+    assert "gid=0" in workspace_cfg["HostConfig"]["Tmpfs"]["/state"]
 
     assert attempt.resources["code-workspace"].image_id.startswith("sha256:")
     assert attempt.resources["browser"].image_id.startswith("sha256:")

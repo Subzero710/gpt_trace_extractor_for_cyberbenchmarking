@@ -6,7 +6,7 @@ class ShellError(RuntimeError):pass
 @dataclass(slots=True)
 class Terminal: id:str;proc:asyncio.subprocess.Process;cwd:Path;out:bytearray=field(default_factory=bytearray);err:bytearray=field(default_factory=bytearray);tasks:list=field(default_factory=list)
 class ShellService:
- def __init__(self,sandbox,uid,gid):self.sandbox=sandbox;self.uid=uid;self.gid=gid;self.env={'PATH':'/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin','HOME':str(sandbox.root),'TMPDIR':'/tmp','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'};self.terminals={}
+ def __init__(self,sandbox,uid,gid):self.sandbox=sandbox;self.uid=uid;self.gid=gid;self.env={'PATH':'/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin','HOME':'/root' if uid==0 else str(sandbox.root),'TMPDIR':'/tmp','LANG':'C.UTF-8','LC_ALL':'C.UTF-8'};self.terminals={}
  def preexec(self):
   os.setsid();resource.setrlimit(resource.RLIMIT_CORE,(0,0));resource.setrlimit(resource.RLIMIT_NOFILE,(256,256));os.umask(0o077)
   if os.geteuid()==0 and (self.uid or self.gid):os.setgroups([]);os.setgid(self.gid);os.setuid(self.uid)
