@@ -769,3 +769,79 @@ class BrowserRuntime:
             if name == "tabs":
                 return await self.tabs(arguments)
             raise BrowserAppError(f"unknown tool: {name}")
+
+# MCP Stack V2 orchestration extension.
+import uuid
+from pydantic import ValidationError
+from .contracts import MODELS
+from .navigation import NavigationService
+from .interaction import InteractionService
+from .dom import DomService
+from .storage import StorageService
+from .network import NetworkService
+from .contexts import ContextService
+from .device import DeviceService
+class BrowserRuntimeV2(BrowserRuntime):
+ def __init__(self,*a,**kw):super().__init__(*a,**kw);self.contexts={};self.context_ids={};self.pages={};self.page_ids={};self.navigation_v2=NavigationService(self);self.interaction_v2=InteractionService(self);self.dom_v2=DomService(self);self.storage_v2=StorageService(self);self.network_v2=NetworkService(self);self.context_v2=ContextService(self);self.device_v2=DeviceService(self)
+ error=BrowserAppError
+ def pid(self,p):
+  if id(p) not in self.page_ids:self.page_ids[id(p)]='page-'+uuid.uuid4().hex[:16];self.pages[self.page_ids[id(p)]]=p
+  return self.page_ids[id(p)]
+ def cid(self,c):return self.context_ids[id(c)]
+ def ctx(self,i):
+  if i not in self.contexts:raise BrowserAppError('unknown context_id')
+  return self.contexts[i]
+ def page_by(self,i):
+  if i not in self.pages:raise BrowserAppError('unknown page_id')
+  return self.pages[i]
+ def page_from(self,i):return self._ready_page() if i is None else self.page_by(i)
+ def register(self,p):self.pid(p);p.on('close',lambda _:self.unregister(p))
+ def unregister(self,p):
+  i=self.page_ids.pop(id(p),None)
+  if i:self.pages.pop(i,None)
+  if self.page is p:self.page=None
+ def ensure_page(self):
+  ps=[p for c in self.contexts.values() for p in c.pages if not p.is_closed()]
+  if ps:self.page=ps[-1];self.context=self.page.context
+ async def info(self,p=None):
+  p=p or self._ready_page();return {'page_id':self.pid(p),'context_id':self.cid(p.context),'url':p.url,'title':await p.title()}
+ async def configure_context(self,c,i):self.contexts[i]=c;self.context_ids[id(c)]=i;c.set_default_timeout(15000);c.set_default_navigation_timeout(45000);await c.route('**/*',self._route_guard);self.network_v2.attach(c,i);[self.register(p) for p in c.pages]
+ async def _launch(self,profile):
+  await super()._launch(profile);self.contexts.clear();self.context_ids.clear();self.pages.clear();self.page_ids.clear();await self.configure_context(self.context,'default');self.register(self.page)
+ async def call(self,name,args):
+  if name not in MODELS:return await super().call(name,args)
+  try:a=MODELS[name][0].model_validate(args).model_dump()
+  except ValidationError as e:raise BrowserAppError(str(e)) from e
+  if name=='go_back':r=await self.navigation_v2.back(a)
+  elif name=='go_forward':r=await self.navigation_v2.forward(a)
+  elif name=='reload':r=await self.navigation_v2.reload(a)
+  elif name=='new_page':r=await self.navigation_v2.new(a)
+  elif name=='close_page':r=await self.navigation_v2.close(a)
+  elif name=='switch_page':r=await self.navigation_v2.switch(a)
+  elif name=='hover':r=await self.interaction_v2.hover(a)
+  elif name=='drag':r=await self.interaction_v2.drag(a)
+  elif name=='select_option':r=await self.interaction_v2.select(a)
+  elif name=='upload_file':r=await self.interaction_v2.upload(a)
+  elif name=='download_file':r=await self.interaction_v2.download(a)
+  elif name=='inspect_dom':r=await self.dom_v2.inspect(a)
+  elif name=='query_selector':r=await self.dom_v2.query(a)
+  elif name=='get_html':r=await self.dom_v2.html(a)
+  elif name=='get_attribute':r=await self.dom_v2.attr(a)
+  elif name=='evaluate_javascript':r=await self.dom_v2.eval(a)
+  elif name=='get_cookies':r=await self.storage_v2.cookies(a)
+  elif name=='set_cookie':r=await self.storage_v2.set(a)
+  elif name=='clear_cookies':r=await self.storage_v2.clear(a)
+  elif name=='export_storage_state':r=await self.storage_v2.export(a)
+  elif name=='import_storage_state':r=await self.storage_v2.import_(a)
+  elif name=='create_context':r=await self.context_v2.create(a)
+  elif name=='destroy_context':r=await self.context_v2.destroy(a)
+  elif name=='get_console_logs':r=await self.network_v2.console_logs(a)
+  elif name=='get_network_logs':r=await self.network_v2.network_logs(a)
+  elif name=='get_request_details':r=await self.network_v2.details(a)
+  elif name=='get_response_body':r=await self.network_v2.body(a)
+  elif name=='performance_trace':r=await self.network_v2.trace(a)
+  elif name=='set_user_agent':r=await self.device_v2.ua(a)
+  elif name=='set_viewport':r=await self.device_v2.viewport(a)
+  elif name=='set_timezone':r=await self.device_v2.timezone(a)
+  elif name=='set_geolocation':r=await self.device_v2.geo(a)
+  return MODELS[name][1].model_validate(r).model_dump()

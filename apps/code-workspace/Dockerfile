@@ -36,6 +36,7 @@ WORKDIR /app
 COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src
 COPY tests /app/tests
+COPY templates /app/templates
 COPY tool-manifest.json /app/tool-manifest.json
 RUN pip install --no-cache-dir -e ".[test]"
 

@@ -201,7 +201,7 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert len(mock.containers) == 2
     assert attempt.network_name in mock.networks
     assert attempt.egress_network_name in mock.networks
-    assert mock.networks[attempt.network_name]["Internal"] is True
+    assert mock.networks[attempt.network_name]["Internal"] is False
     assert mock.networks[attempt.egress_network_name]["Internal"] is False
 
     workspace_name = rt._container_name("code-workspace", "env-w")
@@ -223,9 +223,9 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert (attempt.network_name, "gpt-trace-browser-gateway") in mock.gateway_connects
 
     assert mock.archives == {}
-    assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is True
-    assert workspace_cfg["User"] == "10002:10002"
-    assert workspace_cfg["HostConfig"]["CapDrop"] == ["ALL"]
+    assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is False
+    assert "User" not in workspace_cfg
+    assert workspace_cfg["HostConfig"]["CapDrop"] == ["AUDIT_WRITE", "MKNOD", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"]
     assert "CapAdd" not in workspace_cfg["HostConfig"]
     assert "uid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
     assert "gid=10002" in workspace_cfg["HostConfig"]["Tmpfs"]["/workspace"]
@@ -256,7 +256,7 @@ async def test_workspace_only_attempt_has_no_egress_network(tmp_path: Path) -> N
     attempt = await rt.create(task, environments, "e" * 64, attempt=1, control_token="s" * 40)
     assert attempt.egress_network_name is None
     assert len(mock.networks) == 1
-    assert next(iter(mock.networks.values()))["Internal"] is True
+    assert next(iter(mock.networks.values()))["Internal"] is False
 
 
 @pytest.mark.asyncio

@@ -50,3 +50,7 @@ The runtime records the configured image reference and Docker's resolved image I
 ## Batch circuit breakers
 
 Browser/CDP failure, storage conflict, authentication loss, HTTP 403/429, ambiguous submission, model drift, invalid manifests, gateway conflicts, Docker runtime identity mismatch and incomplete recovery stop the batch. A new task does not start while cleanup identity is uncertain.
+
+
+## MCP Stack V2
+Code-workspace now has outbound task-network access and a root control service for real apt installation; agent shells still drop to uid/gid 10002, filesystem tools enforce `/workspace`, no host bind/Docker socket is exposed, no-new-privileges remains enabled, and high-risk capabilities are dropped. Browser private-target URL policy remains enforced.

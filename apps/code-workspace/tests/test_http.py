@@ -49,7 +49,7 @@ def test_mcp_initialize_and_dns_rebinding_guard(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert response.json()["result"]["serverInfo"] == {
             "name": "code-workspace",
-            "version": "1.0.0",
+            "version": "2.0.0",
         }
         denied = client.post("/mcp", headers={**headers, "host": "attacker.example"}, json=payload)
         assert denied.status_code == 421

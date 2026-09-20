@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import BenchmarkError
-from .models import BenchmarkTask, BenchmarkTool
+from .models import BenchmarkTask, BenchmarkTool, WorkspaceTemplateProvenance
 from .registry import AppRegistry, ResolvedApp
 from .workspace_seed import snapshot as workspace_snapshot
 
@@ -96,6 +96,17 @@ def _parse_tool(value: Any, *, manifest: Path, line_number: int, registry: AppRe
     return _benchmark_tool(app, required=required)
 
 
+def _workspace_template(raw, tools, *, manifest, line_number):
+    code = next((t for t in tools if t.app_id == "code-workspace"), None)
+    if raw is None:
+        if code is None or not isinstance(code.tool_manifest.get("workspace_templates"), list): return None
+        raw = "empty"
+    if not isinstance(raw, str) or not raw: raise BenchmarkError(f"{manifest}:{line_number}: workspace_template must be a non-empty string")
+    if code is None: raise BenchmarkError(f"{manifest}:{line_number}: workspace_template requires code-workspace")
+    rows=[x for x in code.tool_manifest.get("workspace_templates",[]) if isinstance(x,dict) and x.get("id")==raw]
+    if len(rows)!=1: raise BenchmarkError(f"{manifest}:{line_number}: unknown workspace_template {raw!r}")
+    x=rows[0]; return WorkspaceTemplateProvenance(raw,x["version"],x["hash"])
+
 def load_benchmark(path: Path, *, tasks_root: Path | None = None, registry: AppRegistry | None = None) -> list[BenchmarkTask]:
     if not path.is_file():
         raise BenchmarkError(f"benchmark manifest not found: {path}")
@@ -150,6 +161,7 @@ def load_benchmark(path: Path, *, tasks_root: Path | None = None, registry: AppR
                 _parse_tool(value, manifest=path, line_number=line_number, registry=registry)
                 for value in raw_tools
             )
+            workspace_template = _workspace_template(item.get("workspace_template"), tools, manifest=path, line_number=line_number)
             task_root = (artifact_root / task_id).resolve()
             try:
                 task_root.relative_to(artifact_root)
@@ -182,6 +194,7 @@ def load_benchmark(path: Path, *, tasks_root: Path | None = None, registry: AppR
                     attachments=attachments,
                     tools=tools,
                     initial_workspace=initial_workspace,
+                    workspace_template=workspace_template,
                 )
             )
             seen.add(task_id)

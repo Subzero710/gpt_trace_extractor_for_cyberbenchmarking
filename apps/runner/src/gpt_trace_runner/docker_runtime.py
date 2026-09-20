@@ -230,9 +230,9 @@ class DockerRuntime:
                 "CODE_WORKSPACE_STATE_ROOT=/state",
             ]
             host_config: dict[str, Any] = {
-                "ReadonlyRootfs": True,
+                "ReadonlyRootfs": False,
                 "Init": True,
-                "CapDrop": ["ALL"],
+                "CapDrop": ["AUDIT_WRITE", "MKNOD", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"],
                 "SecurityOpt": ["no-new-privileges"],
                 "PidsLimit": 160,
                 "Memory": 2 * 1024 * 1024 * 1024,
@@ -303,8 +303,6 @@ class DockerRuntime:
                 }
             },
         }
-        if app_id == "code-workspace":
-            config["User"] = "10002:10002"
         return config
 
     async def _inspect_container(self, name_or_id: str) -> dict[str, Any] | None:
@@ -516,7 +514,7 @@ class DockerRuntime:
             attempt=attempt,
             fingerprint=fingerprint,
             network_name=network_name,
-            internal=True,
+            internal=False,
             role="task",
         )
         egress_network_id: str | None = None

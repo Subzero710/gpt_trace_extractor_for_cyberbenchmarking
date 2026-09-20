@@ -66,3 +66,8 @@ Benchmark definitions use stable logical App IDs such as `code-workspace` and `b
 The current smoke benchmark is `benchmarks/benchmark.jsonl`. `make doctor` validates local Workspace/Browser execution and isolation before ChatGPT is involved.
 
 Persistent PostgreSQL data, the teacher browser profile and provisioned local state survive `make down`.
+
+
+## MCP Stack V2
+
+`code-workspace` is an isolated Linux development runtime with sandboxed filesystem operations, persistent terminals, process/system inspection, Python/Debian package management, Git, networking, and verified workspace templates. `browser` exposes Chromium/Playwright with pages, DOM interaction, isolated contexts, storage, DevTools logs/traces, and device overrides. Benchmark tasks may select `workspace_template` from `empty`, `python`, `node`, `vulnerable-webapp`, `malware-analysis`, or `linux-forensics`.

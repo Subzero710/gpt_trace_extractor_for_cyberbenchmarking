@@ -122,3 +122,10 @@ The live output contains the complete committed schema. When names collide acros
 7. Register the MCP endpoint in the ChatGPT account through an authenticated HTTPS gateway, then set its configurable UI name.
 
 Never create source-agent-specific Apps for equivalent capabilities. Source trace normalization is a separate dataset transformation concern.
+
+
+## MCP Stack V2 tools
+
+Code Workspace: exec_command, read_file, write_file, apply_patch, list_directory, search_files, workspace_delete_file, workspace_delete_directory, workspace_move, workspace_copy, workspace_create_directory, workspace_stat, workspace_tree, workspace_find, create_terminal, send_terminal_input, read_terminal_output, close_terminal, list_processes, get_process, kill_process, get_system_info, get_environment, set_environment, get_current_directory, create_python_venv, install_python_packages, run_python_script, install_system_package, git_clone, git_status, git_diff, git_log, git_branch, git_checkout, git_commit, http_request, download_url, dns_lookup, check_port, workspace_template
+
+Browser: search, navigate, read_page, click, type, press, wait, screenshot, download, tabs, go_back, go_forward, reload, new_page, close_page, switch_page, hover, drag, select_option, upload_file, download_file, inspect_dom, query_selector, get_html, get_attribute, evaluate_javascript, get_cookies, set_cookie, clear_cookies, export_storage_state, import_storage_state, create_context, destroy_context, get_console_logs, get_network_logs, get_request_details, get_response_body, performance_trace, set_user_agent, set_viewport, set_timezone, set_geolocation

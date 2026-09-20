@@ -254,12 +254,15 @@ class AppLifecycle:
             "environment_id": environment_id,
             "task_fingerprint": fingerprint,
         }
+        if operation == "prepare" and tool.app_id == "code-workspace" and task.workspace_template is not None:
+            payload["workspace_template"] = task.workspace_template.as_dict()
         value = await self._post_gateway(tool, f"/control/{operation}", payload)
-        for key, expected in payload.items():
-            if value.get(key) != expected:
-                raise AppInfrastructureError(
-                    f"{tool.app_id} {operation} identity response mismatch"
-                )
+        for key in ("task_id", "environment_id", "task_fingerprint"):
+            if value.get(key) != payload[key]:
+                raise AppInfrastructureError(f"{tool.app_id} {operation} identity response mismatch")
+        if operation == "prepare" and tool.app_id == "code-workspace" and task.workspace_template is not None:
+            for key, expected in task.workspace_template.as_dict().items():
+                if value.get(key) != expected: raise AppInfrastructureError("code-workspace template provenance mismatch")
         return value
 
     async def prepare(
@@ -370,13 +373,9 @@ class AppLifecycle:
         *,
         attempt: int,
     ) -> dict[str, Any]:
-        return await self.runtime.snapshot(
-            task,
-            environments,
-            fingerprint,
-            attempt=attempt,
-            control_token=self._read_token(),
-        )
+        metadata = await self.runtime.snapshot(task, environments, fingerprint, attempt=attempt, control_token=self._read_token())
+        if task.workspace_template is not None: metadata["workspace_template"] = task.workspace_template.as_dict()
+        return metadata
 
     async def reset(
         self,

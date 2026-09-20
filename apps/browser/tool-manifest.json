@@ -1,56 +1,1236 @@
 {
   "app_id": "browser",
+  "schema_version": 2,
   "tools": [
     {
-      "description": "Search the public web through the isolated task browser and return ordered result links.",
-      "inputSchema": {"additionalProperties": false, "properties": {"max_results": {"default": 10, "maximum": 20, "minimum": 1, "type": "integer"}, "query": {"minLength": 1, "type": "string"}}, "required": ["query"], "type": "object"},
-      "name": "search"
+      "category": "navigation",
+      "description": "Search the public web.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Navigate the active browser tab to an HTTP or HTTPS URL allowed by the network policy.",
-      "inputSchema": {"additionalProperties": false, "properties": {"url": {"minLength": 1, "type": "string"}, "wait_until": {"default": "domcontentloaded", "enum": ["domcontentloaded", "load"], "type": "string"}}, "required": ["url"], "type": "object"},
-      "name": "navigate"
+      "category": "navigation",
+      "description": "Navigate active tab.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "navigate",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Read visible text and interactive element references from the active browser tab.",
-      "inputSchema": {"additionalProperties": false, "properties": {"include_elements": {"default": true, "type": "boolean"}, "max_chars": {"default": 50000, "maximum": 200000, "minimum": 1, "type": "integer"}, "max_elements": {"default": 200, "maximum": 500, "minimum": 1, "type": "integer"}}, "type": "object"},
-      "name": "read_page"
+      "category": "dom",
+      "description": "Read page text and refs.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "read_page",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Click an element reference returned by read_page in the active tab.",
-      "inputSchema": {"additionalProperties": false, "properties": {"ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}}, "required": ["ref"], "type": "object"},
-      "name": "click"
+      "category": "interaction",
+      "description": "Click element ref.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "click",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Enter text into an editable element reference and optionally submit with Enter.",
-      "inputSchema": {"additionalProperties": false, "properties": {"clear": {"default": true, "type": "boolean"}, "ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}, "submit": {"default": false, "type": "boolean"}, "text": {"type": "string"}}, "required": ["ref", "text"], "type": "object"},
-      "name": "type"
+      "category": "interaction",
+      "description": "Type into element ref.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "type",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Press one allowed navigation or editing key in the active tab or on a referenced element.",
-      "inputSchema": {"additionalProperties": false, "properties": {"key": {"enum": ["Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End", "Backspace", "Delete"], "type": "string"}, "ref": {"default": null, "pattern": "^e[1-9][0-9]*$", "type": ["string", "null"]}}, "required": ["key"], "type": "object"},
-      "name": "press"
+      "category": "interaction",
+      "description": "Press a key.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "press",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Wait for a bounded duration or until exact visible text appears in the active tab.",
-      "inputSchema": {"additionalProperties": false, "properties": {"seconds": {"default": 1, "maximum": 30, "minimum": 0, "type": "number"}, "text": {"default": null, "type": ["string", "null"]}}, "type": "object"},
-      "name": "wait"
+      "category": "interaction",
+      "description": "Wait.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "wait",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Capture a PNG screenshot of the active tab and return bounded base64 content.",
-      "inputSchema": {"additionalProperties": false, "properties": {"full_page": {"default": false, "type": "boolean"}}, "type": "object"},
-      "name": "screenshot"
+      "category": "dom",
+      "description": "Capture screenshot.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "screenshot",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Click a referenced download control and return a bounded downloaded file as base64 with integrity metadata.",
-      "inputSchema": {"additionalProperties": false, "properties": {"max_bytes": {"default": 5242880, "maximum": 10485760, "minimum": 1, "type": "integer"}, "ref": {"pattern": "^e[1-9][0-9]*$", "type": "string"}}, "required": ["ref"], "type": "object"},
-      "name": "download"
+      "category": "interaction",
+      "description": "Download by element ref.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "download",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "List, create, select, or close tabs in the isolated task browser.",
-      "inputSchema": {"additionalProperties": false, "properties": {"action": {"default": "list", "enum": ["list", "new", "select", "close"], "type": "string"}, "index": {"default": null, "minimum": 0, "type": ["integer", "null"]}, "url": {"default": null, "type": ["string", "null"]}}, "type": "object"},
-      "name": "tabs"
+      "category": "navigation",
+      "description": "Manage tabs.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "name": "tabs",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "Go back.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "name": "go_back",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "Go forward.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "name": "go_forward",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "Reload.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "wait_until": {
+            "default": "domcontentloaded",
+            "enum": [
+              "domcontentloaded",
+              "load"
+            ],
+            "title": "Wait Until",
+            "type": "string"
+          }
+        },
+        "title": "Reload",
+        "type": "object"
+      },
+      "name": "reload",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "New page.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "context_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Context Id"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Url"
+          }
+        },
+        "title": "New",
+        "type": "object"
+      },
+      "name": "new_page",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "Close page.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "name": "close_page",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "navigation",
+      "description": "Switch page.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id"
+        ],
+        "title": "Switch",
+        "type": "object"
+      },
+      "name": "switch_page",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "interaction",
+      "description": "Hover.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": 15000,
+            "maximum": 60000,
+            "minimum": 1,
+            "title": "Timeout Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Hover",
+        "type": "object"
+      },
+      "name": "hover",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "interaction",
+      "description": "Drag.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "source_selector": {
+            "title": "Source Selector",
+            "type": "string"
+          },
+          "target_selector": {
+            "title": "Target Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_selector",
+          "target_selector"
+        ],
+        "title": "Drag",
+        "type": "object"
+      },
+      "name": "drag",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "interaction",
+      "description": "Select option.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "selector",
+          "values"
+        ],
+        "title": "Select",
+        "type": "object"
+      },
+      "name": "select_option",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "interaction",
+      "description": "Upload file.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content_base64": {
+            "title": "Content Base64",
+            "type": "string"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Mime Type"
+          },
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "filename",
+          "content_base64"
+        ],
+        "title": "Upload",
+        "type": "object"
+      },
+      "name": "upload_file",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "interaction",
+      "description": "Download file.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "default": 10485760,
+            "maximum": 67108864,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Down",
+        "type": "object"
+      },
+      "name": "download_file",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "dom",
+      "description": "Inspect dom.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_chars": {
+            "default": 200000,
+            "maximum": 2000000,
+            "minimum": 1,
+            "title": "Max Chars",
+            "type": "integer"
+          },
+          "max_nodes": {
+            "default": 1000,
+            "maximum": 10000,
+            "minimum": 1,
+            "title": "Max Nodes",
+            "type": "integer"
+          },
+          "selector": {
+            "default": "html",
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "title": "Inspect",
+        "type": "object"
+      },
+      "name": "inspect_dom",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "dom",
+      "description": "Query selector.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Sel",
+        "type": "object"
+      },
+      "name": "query_selector",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "dom",
+      "description": "Get html.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_chars": {
+            "default": 1000000,
+            "maximum": 5000000,
+            "minimum": 1,
+            "title": "Max Chars",
+            "type": "integer"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Selector"
+          }
+        },
+        "title": "Html",
+        "type": "object"
+      },
+      "name": "get_html",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "dom",
+      "description": "Get attribute.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "selector": {
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "name"
+        ],
+        "title": "Attr",
+        "type": "object"
+      },
+      "name": "get_attribute",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "dom",
+      "description": "Evaluate javascript.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "argument": {
+            "default": null,
+            "title": "Argument"
+          },
+          "expression": {
+            "title": "Expression",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expression"
+        ],
+        "title": "Eval",
+        "type": "object"
+      },
+      "name": "evaluate_javascript",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "storage",
+      "description": "Get cookies.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "urls": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Urls",
+            "type": "array"
+          }
+        },
+        "title": "Cookies",
+        "type": "object"
+      },
+      "name": "get_cookies",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "storage",
+      "description": "Set cookie.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "domain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Domain"
+          },
+          "expires": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expires"
+          },
+          "http_only": {
+            "default": false,
+            "title": "Http Only",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "default": "/",
+            "title": "Path",
+            "type": "string"
+          },
+          "same_site": {
+            "default": "Lax",
+            "enum": [
+              "Strict",
+              "Lax",
+              "None"
+            ],
+            "title": "Same Site",
+            "type": "string"
+          },
+          "secure": {
+            "default": false,
+            "title": "Secure",
+            "type": "boolean"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Url"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "title": "Cookie",
+        "type": "object"
+      },
+      "name": "set_cookie",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "storage",
+      "description": "Clear cookies.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "clear_cookies",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "storage",
+      "description": "Export storage state.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "export_storage_state",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "storage",
+      "description": "Import storage state.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content_base64": {
+            "title": "Content Base64",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content_base64"
+        ],
+        "title": "State",
+        "type": "object"
+      },
+      "name": "import_storage_state",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "contexts",
+      "description": "Create context.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "locale": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Locale"
+          },
+          "timezone_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Timezone Id"
+          },
+          "user_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Agent"
+          },
+          "viewport_height": {
+            "default": 720,
+            "title": "Viewport Height",
+            "type": "integer"
+          },
+          "viewport_width": {
+            "default": 1280,
+            "title": "Viewport Width",
+            "type": "integer"
+          }
+        },
+        "title": "Ctx",
+        "type": "object"
+      },
+      "name": "create_context",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "contexts",
+      "description": "Destroy context.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "context_id": {
+            "title": "Context Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "context_id"
+        ],
+        "title": "CtxId",
+        "type": "object"
+      },
+      "name": "destroy_context",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Get console logs.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "clear": {
+            "default": false,
+            "title": "Clear",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 200,
+            "maximum": 5000,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Logs",
+        "type": "object"
+      },
+      "name": "get_console_logs",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Get network logs.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "clear": {
+            "default": false,
+            "title": "Clear",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 200,
+            "maximum": 5000,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Logs",
+        "type": "object"
+      },
+      "name": "get_network_logs",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Get request details.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "Req",
+        "type": "object"
+      },
+      "name": "get_request_details",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Get response body.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "default": 10485760,
+            "maximum": 67108864,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "Resp",
+        "type": "object"
+      },
+      "name": "get_response_body",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Performance trace.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "start",
+              "stop"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 33554432,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "screenshots": {
+            "default": true,
+            "title": "Screenshots",
+            "type": "boolean"
+          },
+          "snapshots": {
+            "default": true,
+            "title": "Snapshots",
+            "type": "boolean"
+          },
+          "sources": {
+            "default": false,
+            "title": "Sources",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "Trace",
+        "type": "object"
+      },
+      "name": "performance_trace",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "device",
+      "description": "Set user agent.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "user_agent": {
+            "title": "User Agent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_agent"
+        ],
+        "title": "UA",
+        "type": "object"
+      },
+      "name": "set_user_agent",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "device",
+      "description": "Set viewport.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "height": {
+            "maximum": 4320,
+            "minimum": 240,
+            "title": "Height",
+            "type": "integer"
+          },
+          "width": {
+            "maximum": 7680,
+            "minimum": 320,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height"
+        ],
+        "title": "VP",
+        "type": "object"
+      },
+      "name": "set_viewport",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "device",
+      "description": "Set timezone.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "timezone_id": {
+            "title": "Timezone Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timezone_id"
+        ],
+        "title": "TZ",
+        "type": "object"
+      },
+      "name": "set_timezone",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "device",
+      "description": "Set geolocation.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "accuracy": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Accuracy",
+            "type": "number"
+          },
+          "latitude": {
+            "maximum": 90,
+            "minimum": -90,
+            "title": "Latitude",
+            "type": "number"
+          },
+          "longitude": {
+            "maximum": 180,
+            "minimum": -180,
+            "title": "Longitude",
+            "type": "number"
+          }
+        },
+        "required": [
+          "latitude",
+          "longitude"
+        ],
+        "title": "Geo",
+        "type": "object"
+      },
+      "name": "set_geolocation",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "Out",
+        "type": "object"
+      }
     }
   ],
-  "version": "1.0.0"
+  "version": "2.0.0"
 }

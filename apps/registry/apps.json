@@ -1,39 +1,39 @@
 {
-  "schema_version": 1,
   "apps": [
     {
+      "aliases": [],
+      "attachment_mode": "copy",
+      "control_endpoint_default": "http://workspace-gateway:8000",
+      "display_name_default": "Code Workspace",
       "id": "code-workspace",
       "kind": "local_mcp",
-      "display_name_default": "Code Workspace",
-      "version": "1.0.0",
-      "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
-      "control_endpoint_default": "http://workspace-gateway:8000",
       "manifest_path_default": "../code-workspace/tool-manifest.json",
-      "manifest_sha256": "6b1fd0906b9b4ceaf189f77b24d8c3f547dd812f94e0f642b3aa65268aaea3ac",
-      "attachment_mode": "copy",
-      "aliases": []
+      "manifest_sha256": "73da617114933ba1182447977e9a1df8dfa460e19d61b5e43b5021d98d923b35",
+      "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
+      "version": "2.0.0"
     },
     {
+      "aliases": [],
+      "attachment_mode": "none",
+      "control_endpoint_default": "http://browser-gateway:8000",
+      "display_name_default": "Cloak Browser",
       "id": "browser",
       "kind": "local_mcp",
-      "display_name_default": "Cloak Browser",
-      "version": "1.0.0",
-      "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
-      "control_endpoint_default": "http://browser-gateway:8000",
       "manifest_path_default": "../browser/tool-manifest.json",
-      "manifest_sha256": "324ea8330f1d854c0c096fa1aa6e7f50a7718573455c884272690793d28761a6",
-      "attachment_mode": "none",
-      "aliases": []
+      "manifest_sha256": "5881fd1c80bffdaf47a5182ae2bd9d2e006486944c4c40d45dddfac040506680",
+      "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
+      "version": "2.0.0"
     },
     {
-      "id": "github",
-      "kind": "external_connector",
-      "display_name_env": "APP_GITHUB_UI_NAME",
-      "manifest_path_env": "APP_GITHUB_MANIFEST_PATH",
-      "attachment_mode": "none",
       "aliases": [
         "github-connector"
-      ]
+      ],
+      "attachment_mode": "none",
+      "display_name_env": "APP_GITHUB_UI_NAME",
+      "id": "github",
+      "kind": "external_connector",
+      "manifest_path_env": "APP_GITHUB_MANIFEST_PATH"
     }
-  ]
+  ],
+  "schema_version": 1
 }

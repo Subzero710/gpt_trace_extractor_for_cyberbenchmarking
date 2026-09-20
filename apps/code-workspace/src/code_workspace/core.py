@@ -771,3 +771,96 @@ def initialize_workspace_template(workspace_path: Path, template: str = "empty")
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+
+# MCP Stack V2 orchestration extension.
+from pydantic import ValidationError
+from .contracts import MODELS
+from .filesystem import WorkspaceSandbox, FilesystemError
+from .shell import ShellService, ShellError
+from .processes import ProcessService, ProcessError
+from .system import SystemService, SystemError
+from .runtime import RuntimeService, RuntimeErrorMCP
+from .git import GitService, GitError
+from .network import NetworkService, NetworkError
+from .templates import TemplateManager, TemplateError
+
+class WorkspaceManagerV2(WorkspaceManager):
+    def __init__(self,*args,templates_root=None,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.sandbox=WorkspaceSandbox(self.workspace_root,self.sandbox_uid,self.sandbox_gid,self.require_ready)
+        self.shell_v2=ShellService(self.sandbox,self.sandbox_uid,self.sandbox_gid)
+        self.fs_v2=self.sandbox
+        self.proc_v2=ProcessService(self.sandbox_uid,self.require_ready)
+        self.sys_v2=SystemService(self.workspace_root,self.shell_v2.env,self.require_ready)
+        self.runtime_v2=RuntimeService(self.sandbox,self.shell_v2)
+        self.git_v2=GitService(self.sandbox,self.shell_v2)
+        self.net_v2=NetworkService(self.sandbox)
+        self.templates_v2=TemplateManager(templates_root or Path('/app/templates'),self.workspace_root,self.sandbox_uid,self.sandbox_gid)
+        self.template_state=self.state_root/'template.json'
+    def template_entries(self):return self.templates_v2.entries()
+    def _template_marker(self):
+        if not self.template_state.exists():return None
+        try:return json.loads(self.template_state.read_text())
+        except Exception as e:raise WorkspaceError('workspace template state is unreadable') from e
+    async def prepare(self,payload):
+        requested=payload.get('workspace_template') or {'template_id':'empty'}
+        if not isinstance(requested,dict):raise WorkspaceError('workspace_template must be an object')
+        try:prov=self.templates_v2.verify(requested)
+        except TemplateError as e:raise WorkspaceError(str(e)) from e
+        result=await super().prepare({k:v for k,v in payload.items() if k!='workspace_template'})
+        marker=self._template_marker()
+        if marker is None:
+            try:self.templates_v2.apply(requested)
+            except TemplateError as e:raise WorkspaceError(str(e)) from e
+            self.template_state.write_text(json.dumps(prov,sort_keys=True,separators=(',',':')))
+        elif marker!=prov:raise WorkspaceError('ready workspace template provenance mismatch')
+        return {**result,**prov}
+    async def assert_resume(self,payload):
+        result=await super().assert_resume(payload);marker=self._template_marker()
+        if marker is None:raise WorkspaceError('workspace template provenance is missing')
+        return {**result,**marker}
+    async def reset(self,payload):
+        await self.shell_v2.close_all();result=await super().reset(payload);self.template_state.unlink(missing_ok=True);return result
+    async def shutdown(self):await self.shell_v2.close_all()
+    async def call_v2(self,name,args):
+        try:
+            if name in MODELS:args=MODELS[name][0].model_validate(args).model_dump()
+            if name=='workspace_delete_file':r=self.fs_v2.delete_file(args)
+            elif name=='workspace_delete_directory':r=self.fs_v2.delete_directory(args)
+            elif name=='workspace_move':r=self.fs_v2.move(args)
+            elif name=='workspace_copy':r=self.fs_v2.copy(args)
+            elif name=='workspace_create_directory':r=self.fs_v2.mkdir(args)
+            elif name=='workspace_stat':r=self.fs_v2.stat(args)
+            elif name=='workspace_tree':r=self.fs_v2.tree(args)
+            elif name=='workspace_find':r=self.fs_v2.find(args)
+            elif name=='create_terminal':r=await self.shell_v2.create(args)
+            elif name=='send_terminal_input':r=await self.shell_v2.send(args)
+            elif name=='read_terminal_output':r=await self.shell_v2.read(args)
+            elif name=='close_terminal':r=await self.shell_v2.close(args)
+            elif name=='list_processes':r=self.proc_v2.list(args)
+            elif name=='get_process':r=self.proc_v2.get(args)
+            elif name=='kill_process':r=self.proc_v2.kill(args)
+            elif name=='get_system_info':r=self.sys_v2.info(args)
+            elif name=='get_environment':r=self.sys_v2.get_env(args)
+            elif name=='set_environment':r=self.sys_v2.set_env(args)
+            elif name=='get_current_directory':r=self.sys_v2.cwd(args)
+            elif name=='create_python_venv':r=await self.runtime_v2.venv(args)
+            elif name=='install_python_packages':r=await self.runtime_v2.pip(args)
+            elif name=='run_python_script':r=await self.runtime_v2.python(args)
+            elif name=='install_system_package':r=await self.runtime_v2.apt(args)
+            elif name=='git_clone':r=await self.git_v2.clone(args)
+            elif name=='git_status':r=await self.git_v2.status(args)
+            elif name=='git_diff':r=await self.git_v2.diff(args)
+            elif name=='git_log':r=await self.git_v2.log(args)
+            elif name=='git_branch':r=await self.git_v2.branch(args)
+            elif name=='git_checkout':r=await self.git_v2.checkout(args)
+            elif name=='git_commit':r=await self.git_v2.commit(args)
+            elif name=='http_request':r=await self.net_v2.http(args)
+            elif name=='download_url':r=await self.net_v2.download(args)
+            elif name=='dns_lookup':r=await self.net_v2.dns(args)
+            elif name=='check_port':r=await self.net_v2.port(args)
+            elif name=='workspace_template':
+                marker=self._template_marker();p=self.templates_v2.provenance(args.get('template_id') or marker['template_id']);r={**p,'active':p==marker}
+            else:raise WorkspaceError(f'unknown V2 tool: {name}')
+            return MODELS[name][1].model_validate(r).model_dump()
+        except (ValidationError,FilesystemError,ShellError,ProcessError,SystemError,RuntimeErrorMCP,GitError,NetworkError,TemplateError) as e:raise WorkspaceError(str(e)) from e

@@ -41,35 +41,22 @@ def manifest_sha256(manifest: dict[str, Any]) -> str:
 
 
 def validate_manifest(value: Any, *, expected_app_id: str, expected_version: str | None = None) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise AppRegistryError("tool manifest must be a JSON object")
-    if set(value) != {"app_id", "version", "tools"}:
-        raise AppRegistryError("tool manifest must contain exactly app_id, version, and tools")
-    if value["app_id"] != expected_app_id:
-        raise AppRegistryError(f"tool manifest app_id does not match {expected_app_id!r}")
-    version = value["version"]
-    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
-        raise AppRegistryError(f"invalid semantic version for app {expected_app_id!r}")
-    if expected_version is not None and version != expected_version:
-        raise AppRegistryError(f"manifest version for {expected_app_id!r} differs from registry")
-    tools = value["tools"]
-    if not isinstance(tools, list):
-        raise AppRegistryError("tool manifest tools must be a list")
-    seen: set[str] = set()
-    for tool in tools:
-        if not isinstance(tool, dict) or set(tool) != {"name", "description", "inputSchema"}:
-            raise AppRegistryError("each canonical tool must contain exactly name, description, and inputSchema")
-        name = tool["name"]
-        if not isinstance(name, str) or not TOOL_NAME_RE.fullmatch(name):
-            raise AppRegistryError(f"invalid canonical tool name: {name!r}")
-        if name in seen:
-            raise AppRegistryError(f"duplicate tool name {name!r} in app {expected_app_id!r}")
-        seen.add(name)
-        if not isinstance(tool["description"], str) or not tool["description"].strip():
-            raise AppRegistryError(f"tool {name!r} must have a description")
-        schema = tool["inputSchema"]
-        if not isinstance(schema, dict) or schema.get("type") != "object":
-            raise AppRegistryError(f"tool {name!r} inputSchema must be an object schema")
+    if not isinstance(value, dict): raise AppRegistryError("tool manifest must be a JSON object")
+    v2=value.get("schema_version")==2
+    required={"schema_version","app_id","version","tools"} if v2 else {"app_id","version","tools"}
+    if not required.issubset(value): raise AppRegistryError("tool manifest has missing fields")
+    if value["app_id"] != expected_app_id: raise AppRegistryError(f"tool manifest app_id does not match {expected_app_id!r}")
+    version=value["version"]
+    if not isinstance(version,str) or not VERSION_RE.fullmatch(version): raise AppRegistryError("invalid semantic version")
+    if expected_version is not None and version != expected_version: raise AppRegistryError(f"manifest version for {expected_app_id!r} differs from registry")
+    seen=set()
+    for tool in value["tools"]:
+        need={"name","description","category","inputSchema","outputSchema"} if v2 else {"name","description","inputSchema"}
+        if not isinstance(tool,dict) or not need.issubset(tool): raise AppRegistryError("invalid tool manifest entry")
+        if tool["name"] in seen: raise AppRegistryError("duplicate tool name")
+        seen.add(tool["name"])
+        if not isinstance(tool["inputSchema"],dict) or tool["inputSchema"].get("type")!="object": raise AppRegistryError("inputSchema must be object")
+        if v2 and (not isinstance(tool["outputSchema"],dict) or tool["outputSchema"].get("type")!="object"): raise AppRegistryError("outputSchema must be object")
     return deepcopy(value)
 
 

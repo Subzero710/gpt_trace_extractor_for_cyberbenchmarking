@@ -20,7 +20,7 @@ from starlette.routing import Mount, Route
 from starlette.types import Receive, Scope, Send
 
 from .contracts import APP_ID, TOOLS, VERSION, canonical_bytes, manifest
-from .core import BrowserAppError, BrowserPolicy, BrowserRuntime
+from .core import BrowserAppError, BrowserPolicy, BrowserRuntimeV2
 
 MAX_CONTROL_BODY = 1024 * 1024
 
@@ -76,7 +76,7 @@ def create_app(
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return [types.Tool(**tool) for tool in TOOLS]
+        return [types.Tool(**{k: v for k, v in tool.items() if k != "category"}) for tool in TOOLS]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.ContentBlock]:
@@ -179,7 +179,7 @@ def build_runtime() -> BrowserRuntime:
         for item in os.environ.get("APP_BROWSER_BLOCKED_HOSTS", "").split(",")
         if item.strip()
     }
-    return BrowserRuntime(
+    return BrowserRuntimeV2(
         Path(os.environ.get("APP_BROWSER_STATE_ROOT", "/browser-state")),
         fingerprint_seed=seed,
         search_url_template=os.environ.get("APP_BROWSER_SEARCH_URL_TEMPLATE", "https://duckduckgo.com/?q={query}"),

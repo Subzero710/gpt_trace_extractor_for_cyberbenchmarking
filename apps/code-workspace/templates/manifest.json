@@ -1,9 +1,41 @@
 {
+  "schema_version": 1,
   "templates": [
     {
+      "description": "Empty workspace.",
+      "hash": "bc334309d2b0b15a8fc68df523577947c9693ae9bc08ffcca52a72d357970de5",
       "id": "empty",
-      "description": "Empty workspace",
-      "version": "1.0"
+      "version": "1.0.0"
+    },
+    {
+      "description": "Minimal Python project.",
+      "hash": "d4e81ce85528bb149ec14cceac3d71a68c80db55ad9f353d753f5b9ff6d90e8d",
+      "id": "python",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Minimal Node project.",
+      "hash": "08a4dc581ee09362ed635ad7efdfa35f76c908029ed346dc5f86dda8c3df2f81",
+      "id": "node",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Intentionally vulnerable local web app.",
+      "hash": "2ade99d941e46df2079ee1b033d1f50d781e458caeacc9343674690ea5fd659e",
+      "id": "vulnerable-webapp",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Static malware analysis workspace.",
+      "hash": "870ac7838e8ddff02f7131a5038d5d104f0b7bc500033f0edee575451b53b608",
+      "id": "malware-analysis",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Linux forensics workspace.",
+      "hash": "a7801d7ecd85b442902c0395dbf28d3906b3f58f64870b9e877b308c750fb2e5",
+      "id": "linux-forensics",
+      "version": "1.0.0"
     }
   ]
 }

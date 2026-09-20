@@ -1,107 +1,1639 @@
 {
   "app_id": "code-workspace",
+  "schema_version": 2,
   "tools": [
     {
-      "description": "Execute one shell command in the active task workspace and return bounded stdout, stderr, exit status, and timeout state.",
+      "category": "shell",
+      "description": "Execute one shell command in the active task workspace.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
-          "command": {"description": "Shell command to execute with /bin/bash.", "minLength": 1, "type": "string"},
-          "cwd": {"default": ".", "description": "Working directory relative to the task workspace.", "type": "string"},
-          "timeout_seconds": {"default": 120, "description": "Wall-clock timeout in seconds.", "maximum": 1800, "minimum": 1, "type": "integer"}
+          "command": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "cwd": {
+            "default": ".",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 120,
+            "maximum": 1800,
+            "minimum": 1,
+            "type": "integer"
+          }
         },
-        "required": ["command"],
+        "required": [
+          "command"
+        ],
         "type": "object"
       },
-      "name": "exec_command"
+      "name": "exec_command",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Read a UTF-8 text file inside the active task workspace without following paths outside it.",
+      "category": "filesystem",
+      "description": "Read a UTF-8 workspace file.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
-          "end_line": {"default": null, "minimum": 1, "type": ["integer", "null"]},
-          "max_bytes": {"default": 262144, "maximum": 1048576, "minimum": 1, "type": "integer"},
-          "path": {"description": "File path relative to the task workspace.", "minLength": 1, "type": "string"},
-          "start_line": {"default": 1, "minimum": 1, "type": "integer"}
+          "end_line": {
+            "default": null,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_bytes": {
+            "default": 262144,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "start_line": {
+            "default": 1,
+            "type": "integer"
+          }
         },
-        "required": ["path"],
+        "required": [
+          "path"
+        ],
         "type": "object"
       },
-      "name": "read_file"
+      "name": "read_file",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Create or replace one UTF-8 text file inside the active task workspace.",
+      "category": "filesystem",
+      "description": "Create or replace a UTF-8 workspace file.",
       "inputSchema": {
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
-          "content": {"description": "Complete UTF-8 file content.", "type": "string"},
-          "create_parents": {"default": true, "type": "boolean"},
-          "expected_sha256": {"default": null, "description": "When set, the existing file must have this SHA-256 before replacement.", "pattern": "^[0-9a-f]{64}$", "type": ["string", "null"]},
-          "overwrite": {"default": true, "type": "boolean"},
-          "path": {"description": "File path relative to the task workspace.", "minLength": 1, "type": "string"}
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
         },
-        "required": ["path", "content"],
+        "required": [
+          "path",
+          "content"
+        ],
         "type": "object"
       },
-      "name": "write_file"
+      "name": "write_file",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Apply ordered, exact text replacements to one workspace file after verifying its SHA-256.",
+      "category": "filesystem",
+      "description": "Apply exact text replacements after SHA verification.",
       "inputSchema": {
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
-          "expected_sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
-          "path": {"minLength": 1, "type": "string"},
+          "expected_sha256": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
           "replacements": {
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "expected_count": {"default": 1, "minimum": 1, "type": "integer"},
-                "new": {"type": "string"},
-                "old": {"minLength": 1, "type": "string"}
-              },
-              "required": ["old", "new"],
-              "type": "object"
-            },
-            "minItems": 1,
             "type": "array"
           }
         },
-        "required": ["path", "expected_sha256", "replacements"],
+        "required": [
+          "path",
+          "expected_sha256",
+          "replacements"
+        ],
         "type": "object"
       },
-      "name": "apply_patch"
+      "name": "apply_patch",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "List workspace entries in deterministic path order without following symlinks.",
+      "category": "filesystem",
+      "description": "List workspace entries.",
       "inputSchema": {
-        "additionalProperties": false,
+        "additionalProperties": true,
         "properties": {
-          "max_entries": {"default": 1000, "maximum": 10000, "minimum": 1, "type": "integer"},
-          "path": {"default": ".", "type": "string"},
-          "recursive": {"default": false, "type": "boolean"}
+          "path": {
+            "default": ".",
+            "type": "string"
+          }
         },
         "type": "object"
       },
-      "name": "list_directory"
+      "name": "list_directory",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
     },
     {
-      "description": "Search UTF-8 workspace files for a literal string and return deterministic structured matches.",
+      "category": "filesystem",
+      "description": "Search workspace text files.",
+      "inputSchema": {
+        "additionalProperties": true,
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_files",
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace delete file.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
-          "case_sensitive": {"default": false, "type": "boolean"},
-          "file_glob": {"default": "**/*", "type": "string"},
-          "max_results": {"default": 100, "maximum": 1000, "minimum": 1, "type": "integer"},
-          "path": {"default": ".", "type": "string"},
-          "query": {"minLength": 1, "type": "string"}
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
         },
-        "required": ["query"],
+        "required": [
+          "path"
+        ],
+        "title": "PathIn",
         "type": "object"
       },
-      "name": "search_files"
+      "name": "workspace_delete_file",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Destination"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace delete directory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "recursive": {
+            "default": false,
+            "title": "Recursive",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "DelDir",
+        "type": "object"
+      },
+      "name": "workspace_delete_directory",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Destination"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace move.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "title": "Destination",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "destination"
+        ],
+        "title": "Move",
+        "type": "object"
+      },
+      "name": "workspace_move",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Destination"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace copy.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "title": "Destination",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "destination"
+        ],
+        "title": "Move",
+        "type": "object"
+      },
+      "name": "workspace_copy",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Destination"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace create directory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "exist_ok": {
+            "default": true,
+            "title": "Exist Ok",
+            "type": "boolean"
+          },
+          "parents": {
+            "default": true,
+            "title": "Parents",
+            "type": "boolean"
+          },
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "Mk",
+        "type": "object"
+      },
+      "name": "workspace_create_directory",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Destination"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Path"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "title": "Out",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace stat.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "PathIn",
+        "type": "object"
+      },
+      "name": "workspace_stat",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace tree.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_depth": {
+            "default": 8,
+            "maximum": 64,
+            "minimum": 0,
+            "title": "Max Depth",
+            "type": "integer"
+          },
+          "max_entries": {
+            "default": 2000,
+            "maximum": 10000,
+            "minimum": 1,
+            "title": "Max Entries",
+            "type": "integer"
+          },
+          "path": {
+            "default": ".",
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "title": "Tree",
+        "type": "object"
+      },
+      "name": "workspace_tree",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "filesystem",
+      "description": "Workspace find.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "default": 1000,
+            "maximum": 10000,
+            "minimum": 1,
+            "title": "Max Results",
+            "type": "integer"
+          },
+          "name": {
+            "default": "*",
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "default": ".",
+            "title": "Path",
+            "type": "string"
+          },
+          "type": {
+            "default": "any",
+            "enum": [
+              "any",
+              "file",
+              "directory"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "title": "Find",
+        "type": "object"
+      },
+      "name": "workspace_find",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "shell",
+      "description": "Create terminal.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "environment": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Environment",
+            "type": "object"
+          }
+        },
+        "title": "TCreate",
+        "type": "object"
+      },
+      "name": "create_terminal",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "shell",
+      "description": "Send terminal input.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "title": "Input",
+            "type": "string"
+          },
+          "terminal_id": {
+            "title": "Terminal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "input"
+        ],
+        "title": "TSend",
+        "type": "object"
+      },
+      "name": "send_terminal_input",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "shell",
+      "description": "Read terminal output.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "default": 262144,
+            "maximum": 1048576,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "terminal_id": {
+            "title": "Terminal Id",
+            "type": "string"
+          },
+          "wait_seconds": {
+            "default": 0,
+            "maximum": 30,
+            "minimum": 0,
+            "title": "Wait Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "terminal_id"
+        ],
+        "title": "TRead",
+        "type": "object"
+      },
+      "name": "read_terminal_output",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "shell",
+      "description": "Close terminal.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "terminal_id": {
+            "title": "Terminal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id"
+        ],
+        "title": "TClose",
+        "type": "object"
+      },
+      "name": "close_terminal",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "process",
+      "description": "List processes.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "list_processes",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "process",
+      "description": "Get process.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "pid": {
+            "minimum": 1,
+            "title": "Pid",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid"
+        ],
+        "title": "Pid",
+        "type": "object"
+      },
+      "name": "get_process",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "process",
+      "description": "Kill process.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "pid": {
+            "minimum": 1,
+            "title": "Pid",
+            "type": "integer"
+          },
+          "signal": {
+            "default": "TERM",
+            "enum": [
+              "TERM",
+              "KILL",
+              "INT",
+              "HUP"
+            ],
+            "title": "Signal",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pid"
+        ],
+        "title": "Kill",
+        "type": "object"
+      },
+      "name": "kill_process",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "system",
+      "description": "Get system info.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "get_system_info",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "system",
+      "description": "Get environment.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "get_environment",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "system",
+      "description": "Set environment.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "unset": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unset",
+            "type": "array"
+          },
+          "values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "title": "EnvSet",
+        "type": "object"
+      },
+      "name": "set_environment",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "system",
+      "description": "Get current directory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "name": "get_current_directory",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "runtime",
+      "description": "Create python venv.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "default": ".venv",
+            "title": "Path",
+            "type": "string"
+          },
+          "with_pip": {
+            "default": true,
+            "title": "With Pip",
+            "type": "boolean"
+          }
+        },
+        "title": "Venv",
+        "type": "object"
+      },
+      "name": "create_python_venv",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "runtime",
+      "description": "Install python packages.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "packages": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Packages",
+            "type": "array"
+          },
+          "timeout_seconds": {
+            "default": 600,
+            "maximum": 1800,
+            "minimum": 1,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "upgrade": {
+            "default": false,
+            "title": "Upgrade",
+            "type": "boolean"
+          },
+          "venv_path": {
+            "default": ".venv",
+            "title": "Venv Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "packages"
+        ],
+        "title": "Pip",
+        "type": "object"
+      },
+      "name": "install_python_packages",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "runtime",
+      "description": "Run python script.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 120,
+            "maximum": 1800,
+            "minimum": 1,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "venv_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": ".venv",
+            "title": "Venv Path"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "Py",
+        "type": "object"
+      },
+      "name": "run_python_script",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "runtime",
+      "description": "Install system package.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "packages": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Packages",
+            "type": "array"
+          },
+          "timeout_seconds": {
+            "default": 900,
+            "maximum": 1800,
+            "minimum": 1,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "update_index": {
+            "default": true,
+            "title": "Update Index",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "packages"
+        ],
+        "title": "Apt",
+        "type": "object"
+      },
+      "name": "install_system_package",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git clone.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Branch"
+          },
+          "depth": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Depth"
+          },
+          "destination": {
+            "title": "Destination",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "destination"
+        ],
+        "title": "Clone",
+        "type": "object"
+      },
+      "name": "git_clone",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git status.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          }
+        },
+        "title": "GitCwd",
+        "type": "object"
+      },
+      "name": "git_status",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git diff.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "pathspec": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Pathspec",
+            "type": "array"
+          },
+          "staged": {
+            "default": false,
+            "title": "Staged",
+            "type": "boolean"
+          }
+        },
+        "title": "Diff",
+        "type": "object"
+      },
+      "name": "git_diff",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git log.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "max_count": {
+            "default": 20,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Max Count",
+            "type": "integer"
+          }
+        },
+        "title": "Log",
+        "type": "object"
+      },
+      "name": "git_log",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git branch.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "delete": {
+            "default": false,
+            "title": "Delete",
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          }
+        },
+        "title": "Branch",
+        "type": "object"
+      },
+      "name": "git_branch",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git checkout.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "create": {
+            "default": false,
+            "title": "Create",
+            "type": "boolean"
+          },
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "title": "Checkout",
+        "type": "object"
+      },
+      "name": "git_checkout",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "git",
+      "description": "Git commit.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "default": false,
+            "title": "All",
+            "type": "boolean"
+          },
+          "author_email": {
+            "default": "mcp-agent@localhost",
+            "title": "Author Email",
+            "type": "string"
+          },
+          "author_name": {
+            "default": "MCP Agent",
+            "title": "Author Name",
+            "type": "string"
+          },
+          "cwd": {
+            "default": ".",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "Commit",
+        "type": "object"
+      },
+      "name": "git_commit",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Http request.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Body"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Headers",
+            "type": "object"
+          },
+          "max_bytes": {
+            "default": 1048576,
+            "maximum": 16777216,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "method": {
+            "default": "GET",
+            "enum": [
+              "GET",
+              "HEAD",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE",
+              "OPTIONS"
+            ],
+            "title": "Method",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 30,
+            "exclusiveMinimum": 0,
+            "maximum": 120,
+            "title": "Timeout Seconds",
+            "type": "number"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "Http",
+        "type": "object"
+      },
+      "name": "http_request",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Download url.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes": {
+            "default": 16777216,
+            "maximum": 16777216,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 60,
+            "exclusiveMinimum": 0,
+            "maximum": 300,
+            "title": "Timeout Seconds",
+            "type": "number"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "path"
+        ],
+        "title": "Download",
+        "type": "object"
+      },
+      "name": "download_url",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Dns lookup.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "default": "any",
+            "enum": [
+              "any",
+              "ipv4",
+              "ipv6"
+            ],
+            "title": "Family",
+            "type": "string"
+          },
+          "hostname": {
+            "title": "Hostname",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "title": "Dns",
+        "type": "object"
+      },
+      "name": "dns_lookup",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "network",
+      "description": "Check port.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "port": {
+            "maximum": 65535,
+            "minimum": 1,
+            "title": "Port",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "default": 3,
+            "exclusiveMinimum": 0,
+            "maximum": 30,
+            "title": "Timeout Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "host",
+          "port"
+        ],
+        "title": "Port",
+        "type": "object"
+      },
+      "name": "check_port",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
+    },
+    {
+      "category": "templates",
+      "description": "Workspace template.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "template_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Template Id"
+          }
+        },
+        "title": "Template",
+        "type": "object"
+      },
+      "name": "workspace_template",
+      "outputSchema": {
+        "additionalProperties": true,
+        "properties": {},
+        "title": "AnyOut",
+        "type": "object"
+      }
     }
   ],
-  "version": "1.0.0"
+  "version": "2.0.0",
+  "workspace_templates": [
+    {
+      "description": "Empty workspace.",
+      "hash": "bc334309d2b0b15a8fc68df523577947c9693ae9bc08ffcca52a72d357970de5",
+      "id": "empty",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Minimal Python project.",
+      "hash": "d4e81ce85528bb149ec14cceac3d71a68c80db55ad9f353d753f5b9ff6d90e8d",
+      "id": "python",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Minimal Node project.",
+      "hash": "08a4dc581ee09362ed635ad7efdfa35f76c908029ed346dc5f86dda8c3df2f81",
+      "id": "node",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Intentionally vulnerable local web app.",
+      "hash": "2ade99d941e46df2079ee1b033d1f50d781e458caeacc9343674690ea5fd659e",
+      "id": "vulnerable-webapp",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Static malware analysis workspace.",
+      "hash": "870ac7838e8ddff02f7131a5038d5d104f0b7bc500033f0edee575451b53b608",
+      "id": "malware-analysis",
+      "version": "1.0.0"
+    },
+    {
+      "description": "Linux forensics workspace.",
+      "hash": "a7801d7ecd85b442902c0395dbf28d3906b3f58f64870b9e877b308c750fb2e5",
+      "id": "linux-forensics",
+      "version": "1.0.0"
+    }
+  ]
 }
