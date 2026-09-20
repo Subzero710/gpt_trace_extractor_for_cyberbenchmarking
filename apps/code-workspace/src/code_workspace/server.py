@@ -265,3 +265,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# Template initialization hook:
+# initialize_workspace_template(workspace_path, template)

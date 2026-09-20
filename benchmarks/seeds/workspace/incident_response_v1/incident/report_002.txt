@@ -1,0 +1,4 @@
+incident_id=INC-731992
+severity=medium
+affected_user=user_842
+timestamp=2026-09-20T10:04:44Z

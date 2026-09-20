@@ -142,3 +142,7 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
 
 def manifest_sha256() -> str:
     return hashlib.sha256(canonical_bytes(manifest())).hexdigest()
+
+
+class WorkspaceTemplate(BaseModel):
+    template: str = "empty"

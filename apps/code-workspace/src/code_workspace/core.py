@@ -746,3 +746,28 @@ class WorkspaceManager:
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
         }
+
+
+from pathlib import Path
+import shutil
+
+TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
+
+
+def initialize_workspace_template(workspace_path: Path, template: str = "empty"):
+    template_path = TEMPLATES_DIR / template
+
+    if not template_path.exists() or not template_path.is_dir():
+        raise ValueError(f"Unknown workspace template: {template}")
+
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    for source in template_path.rglob("*"):
+        relative = source.relative_to(template_path)
+        destination = workspace_path / relative
+
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)

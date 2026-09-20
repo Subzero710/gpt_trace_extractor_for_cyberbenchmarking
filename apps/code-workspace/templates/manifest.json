@@ -1,0 +1,9 @@
+{
+  "templates": [
+    {
+      "id": "empty",
+      "description": "Empty workspace",
+      "version": "1.0"
+    }
+  ]
+}

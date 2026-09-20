@@ -1,0 +1,4 @@
+incident_id=INC-592814
+severity=high
+affected_user=user_391
+timestamp=2026-09-20T09:31:12Z
