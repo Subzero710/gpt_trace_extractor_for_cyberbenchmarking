@@ -79,11 +79,16 @@ def create_app(
         return [types.Tool(**{k: v for k, v in tool.items() if k != "category"}) for tool in TOOLS]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.ContentBlock]:
+    async def call_tool(
+        name: str, arguments: dict[str, Any]
+    ) -> tuple[list[types.ContentBlock], dict[str, Any]]:
         if not isinstance(arguments, dict):
             raise BrowserAppError("tool arguments must be an object")
         result = await runtime.call(name, arguments)
-        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))]
+        return (
+            [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))],
+            result,
+        )
 
     session_manager = StreamableHTTPSessionManager(
         app=server,
