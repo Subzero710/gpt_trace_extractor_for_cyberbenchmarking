@@ -9,4 +9,4 @@ class NavigationService:
   return await self.r.info(p)
  async def switch(self,a):p=self.r.page_by(a['page_id']);self.r.page=p;self.r.context=p.context;await p.bring_to_front();return await self.r.info(p)
  async def close(self,a):
-  p=self.r.page_from(a.get('page_id'));await p.close();self.r.unregister(p);self.r.ensure_page();return {'active_page_id':self.r.pid(self.r.page),'pages':[await self.r.info(x) for x in self.r.pages.values() if not x.is_closed()]}
+  p=self.r.page_from(a.get('page_id'));await p.close();self.r.unregister(p);self.r.ensure_page();return {'active_page_id':self.r.pid(self.r.page) if self.r.page is not None else None,'pages':[await self.r.info(x) for x in self.r.pages.values() if x is not None and not x.is_closed()]}

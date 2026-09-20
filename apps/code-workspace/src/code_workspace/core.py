@@ -807,14 +807,36 @@ class WorkspaceManagerV2(WorkspaceManager):
         if not isinstance(requested,dict):raise WorkspaceError('workspace_template must be an object')
         try:prov=self.templates_v2.verify(requested)
         except TemplateError as e:raise WorkspaceError(str(e)) from e
-        result=await super().prepare({k:v for k,v in payload.items() if k!='workspace_template'})
-        marker=self._template_marker()
-        if marker is None:
-            try:self.templates_v2.apply(requested)
-            except TemplateError as e:raise WorkspaceError(str(e)) from e
-            self.template_state.write_text(json.dumps(prov,sort_keys=True,separators=(',',':')))
-        elif marker!=prov:raise WorkspaceError('ready workspace template provenance mismatch')
-        return {**result,**prov}
+        normalized={'task_id':_valid_identity(payload.get('task_id'),'task_id'),'environment_id':_valid_identity(payload.get('environment_id'),'environment_id'),'task_fingerprint':_valid_fingerprint(payload.get('task_fingerprint'))}
+        attachments=self._decode_attachments(payload.get('attachments',[]))
+        async with self.lock:
+            state=self.load_state();marker=self._template_marker()
+            if state is not None and not self._same_identity(state,normalized):raise WorkspaceError(f"workspace is owned by task {state.task_id!r} environment {state.environment_id!r}")
+            if state is not None and state.status=='ready':
+                if marker!=prov:raise WorkspaceError('ready workspace template provenance mismatch')
+                for relative,_,digest in attachments:
+                    path=self.safe_path(relative.as_posix(),must_exist=True)
+                    if not path.is_file() or _sha256(path.read_bytes())!=digest:raise WorkspaceError('ready workspace attachment integrity mismatch')
+                return {**asdict(state),'workspace':str(self.workspace_root),**prov}
+            self._write_state(ActiveWorkspace(**normalized,status='preparing'))
+            try:
+                if attachments:
+                    if any(self.workspace_root.iterdir()):raise WorkspaceError('legacy attachment payload cannot be combined with a Docker-seeded workspace')
+                    for relative,content,_ in attachments:self._atomic_write(self.safe_path(relative.as_posix()),content)
+                self._adopt_seeded_workspace()
+                if marker is None:
+                    self.templates_v2.apply(requested)
+                    self.template_state.write_text(json.dumps(prov,sort_keys=True,separators=(',',':')))
+                    self._fsync_dir(self.state_root)
+                elif marker!=prov:raise WorkspaceError('workspace template provenance mismatch')
+                ready=ActiveWorkspace(**normalized,status='ready');self._write_state(ready)
+                return {**asdict(ready),'workspace':str(self.workspace_root),**prov}
+            except (TemplateError,WorkspaceError) as e:
+                current=self.load_state()
+                if current is not None and current.status=='preparing':
+                    self.state_path.unlink(missing_ok=True);self._fsync_dir(self.state_root)
+                if isinstance(e,TemplateError):raise WorkspaceError(str(e)) from e
+                raise
     async def assert_resume(self,payload):
         result=await super().assert_resume(payload);marker=self._template_marker()
         if marker is None:raise WorkspaceError('workspace template provenance is missing')

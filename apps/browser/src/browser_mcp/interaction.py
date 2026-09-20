@@ -9,9 +9,11 @@ class InteractionService:
   try:d=base64.b64decode(a['content_base64'],validate=True)
   except Exception as e:raise self.r.error('invalid upload base64') from e
   if len(d)>64*1024*1024:raise self.r.error('upload exceeds 64 MiB')
-  fd,n=tempfile.mkstemp(dir=self.r.state_root);os.close(fd);p=Path(n)
-  try:p.write_bytes(d);await self.r.page.locator(a['selector']).first.set_input_files(str(p));return {'ok':True,**await self.r.info()}
-  finally:p.unlink(missing_ok=True)
+  filename=Path(a['filename']).name
+  if not filename or filename in {'.','..'}:raise self.r.error('invalid upload filename')
+  payload={'name':filename,'mimeType':a.get('mime_type') or 'application/octet-stream','buffer':d}
+  await self.r.page.locator(a['selector']).first.set_input_files(payload)
+  return {'ok':True,'filename':filename,'mime_type':payload['mimeType'],**await self.r.info()}
  async def download(self,a):
   async with self.r.page.expect_download() as x:await self.r.page.locator(a['selector']).first.click()
   item=await x.value;p=await item.path();d=Path(p).read_bytes();lim=a.get('max_bytes',10485760)

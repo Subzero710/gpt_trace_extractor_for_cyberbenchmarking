@@ -1,5 +1,5 @@
 from __future__ import annotations
-import contextlib,hmac,json,logging,os,tempfile
+import contextlib,hashlib,hmac,json,logging,os,tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,9 @@ def token(path):
  v=os.environ.get('APP_CONTROL_TOKEN','').strip() or path.read_text().strip()
  if len(v)<32:raise RuntimeError('control token is missing or too short')
  return v
-def payload(m):return manifest(m.template_entries())
+def payload(m):
+ entries=m.template_entries() if hasattr(m,'template_entries') else []
+ return manifest(entries)
 def verify(path,m):
  if canonical_bytes(json.loads(path.read_text()))!=canonical_bytes(payload(m)):raise RuntimeError('MCP implementation and tool-manifest.json differ')
 async def body(r):
@@ -51,13 +53,26 @@ def create_app(manager,control_token,allowed_hosts=None):
  async def state(r):return JSONResponse(manager.state_response()) if auth(r) else JSONResponse({'detail':'unauthorized'},status_code=401)
  async def seed(r):
   if not auth(r):return JSONResponse({'detail':'unauthorized'},status_code=401)
-  fd,n=tempfile.mkstemp(prefix='.seed-',suffix='.tar',dir=manager.workspace_root);os.close(fd);p=Path(n);total=0
-  try:
-   with p.open('wb') as h:
-    async for c in r.stream():total+=len(c);h.write(c)
-   x=manager.seed_archive(p);return JSONResponse({'status':'seeded','archive_bytes':total,**x})
-  except WorkspaceError as e:return JSONResponse({'detail':str(e)},status_code=409)
-  finally:p.unlink(missing_ok=True)
+  content_type=r.headers.get('content-type','').split(';',1)[0].strip().casefold()
+  if content_type!='application/x-tar':return JSONResponse({'detail':'seed content-type must be application/x-tar'},status_code=415)
+  declared=r.headers.get('content-length')
+  if declared is not None:
+   try:
+    if int(declared)>MAX:return JSONResponse({'detail':'seed archive is too large'},status_code=413)
+   except ValueError:return JSONResponse({'detail':'invalid content-length'},status_code=400)
+  async with manager.lock:
+   if manager.load_state() is not None or any(manager.workspace_root.iterdir()):return JSONResponse({'detail':'workspace is not empty before seed'},status_code=409)
+   fd,n=tempfile.mkstemp(prefix='.seed-',suffix='.tar',dir=manager.workspace_root);p=Path(n);total=0;digest=hashlib.sha256()
+   try:
+    with os.fdopen(fd,'wb') as h:
+     async for c in r.stream():
+      total+=len(c)
+      if total>MAX:raise WorkspaceError('seed archive is too large')
+      digest.update(c);h.write(c)
+     h.flush();os.fsync(h.fileno())
+    x=manager.seed_archive(p);return JSONResponse({'status':'seeded','archive_bytes':total,'sha256':digest.hexdigest(),**x})
+   except WorkspaceError as e:return JSONResponse({'detail':str(e)},status_code=409)
+   finally:p.unlink(missing_ok=True)
  async def control(r):
   if not auth(r):return JSONResponse({'detail':'unauthorized'},status_code=401)
   try:
@@ -67,7 +82,8 @@ def create_app(manager,control_token,allowed_hosts=None):
  async def life(app):
   try:
    async with sm.run():yield
-  finally:await manager.shutdown()
+  finally:
+   if hasattr(manager,'shutdown'):await manager.shutdown()
  app=Starlette(routes=[Route('/healthz',health),Route('/manifest',mani),Route('/control/state',state),Route('/control/seed',seed,methods=['POST']),Route('/control/{operation}',control,methods=['POST']),Mount('/mcp',app=mcp)],lifespan=life);return CORSMiddleware(app,allow_origins=['https://chatgpt.com'],allow_methods=['GET','POST','DELETE'],expose_headers=['Mcp-Session-Id'])
 def main():
  m=WorkspaceManagerV2(Path(os.environ.get('CODE_WORKSPACE_ROOT','/workspace')),Path(os.environ.get('CODE_WORKSPACE_STATE_ROOT','/state')),templates_root=Path(os.environ.get('CODE_WORKSPACE_TEMPLATES_ROOT','/app/templates')));verify(Path(os.environ.get('MCP_TOOL_MANIFEST','/app/tool-manifest.json')),m);hosts=[x.strip() for x in os.environ.get('MCP_ALLOWED_HOSTS','').split(',') if x.strip()]

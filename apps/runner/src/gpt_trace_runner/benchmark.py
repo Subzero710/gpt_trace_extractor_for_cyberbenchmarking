@@ -181,6 +181,8 @@ def load_benchmark(path: Path, *, tasks_root: Path | None = None, registry: AppR
                     raise BenchmarkError(f"{path}:{line_number}: invalid initial workspace: {exc}") from exc
             else:
                 initial_workspace = None
+            if workspace_template is not None and workspace_template.template_id != "empty" and (attachments or initial_workspace is not None):
+                raise BenchmarkError(f"{path}:{line_number}: non-empty workspace_template cannot be combined with attachments or initial_workspace")
             app_ids = [tool.app_id for tool in tools]
             if len(set(app_ids)) != len(app_ids):
                 raise BenchmarkError(f"{path}:{line_number}: duplicate logical App")

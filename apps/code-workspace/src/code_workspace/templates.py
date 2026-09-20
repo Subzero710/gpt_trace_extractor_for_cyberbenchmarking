@@ -31,14 +31,27 @@ class TemplateManager:
    if r.get(k) is not None and r[k]!=p[k]:raise TemplateError(f'workspace template {k} mismatch')
   return p
  def apply(self,r):
-  p=self.verify(r);src=self.root/p['template_id']
-  for base,dirs,files in os.walk(src,followlinks=False):
-   b=Path(base);dst=self.workspace/b.relative_to(src);dst.mkdir(parents=True,exist_ok=True);os.chmod(dst,0o770)
-   if os.geteuid()==0:os.chown(dst,self.uid,self.gid)
-   for n in files:
-    if n=='.gitkeep':continue
-    s=b/n;d=dst/n
-    if d.exists():raise TemplateError(f'template path collision: {d.relative_to(self.workspace)}')
-    shutil.copyfile(s,d);os.chmod(d,0o770 if s.stat().st_mode&0o111 else 0o660)
+  p=self.verify(r);src=self.root/p['template_id'];dirs=[];files=[]
+  for base,names,fnames in os.walk(src,followlinks=False):
+   b=Path(base);rel=b.relative_to(src)
+   for n in names:dirs.append((b/n,self.workspace/rel/n))
+   for n in fnames:
+    if n!='.gitkeep':files.append((b/n,self.workspace/rel/n))
+  collisions=[d for _,d in files if d.exists()]
+  if collisions:raise TemplateError(f'template path collision: {collisions[0].relative_to(self.workspace)}')
+  created_files=[];created_dirs=[]
+  try:
+   for _,d in sorted(dirs,key=lambda x:len(x[1].parts)):
+    if not d.exists():d.mkdir();created_dirs.append(d)
+    os.chmod(d,0o770)
     if os.geteuid()==0:os.chown(d,self.uid,self.gid)
+   for s,d in files:
+    d.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(s,d);created_files.append(d);os.chmod(d,0o770 if s.stat().st_mode&0o111 else 0o660)
+    if os.geteuid()==0:os.chown(d,self.uid,self.gid)
+  except Exception:
+   for d in reversed(created_files):d.unlink(missing_ok=True)
+   for d in sorted(created_dirs,key=lambda x:len(x.parts),reverse=True):
+    try:d.rmdir()
+    except OSError:pass
+   raise
   return p

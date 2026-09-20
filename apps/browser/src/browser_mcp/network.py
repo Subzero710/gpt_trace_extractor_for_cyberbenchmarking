@@ -26,5 +26,8 @@ class NetworkService:
   if a['action']=='start':await self.r.context.tracing.start(screenshots=a.get('screenshots',True),snapshots=a.get('snapshots',True),sources=a.get('sources',False));self.tracing.add(cid);return {'action':'start','active':True}
   if cid not in self.tracing:raise self.r.error('performance trace is not active')
   fd,n=tempfile.mkstemp(suffix='.zip',dir=self.r.state_root);os.close(fd);Path(n).unlink()
-  try:await self.r.context.tracing.stop(path=n);d=Path(n).read_bytes();return {'action':'stop','active':False,'size':len(d),'sha256':hashlib.sha256(d).hexdigest(),'content_base64':base64.b64encode(d).decode()}
+  try:
+   await self.r.context.tracing.stop(path=n);p=Path(n);size=p.stat().st_size;limit=a.get('max_bytes',33554432)
+   if size>limit:raise self.r.error('performance trace exceeds max_bytes')
+   d=p.read_bytes();return {'action':'stop','active':False,'size':size,'sha256':hashlib.sha256(d).hexdigest(),'content_base64':base64.b64encode(d).decode()}
   finally:self.tracing.discard(cid);Path(n).unlink(missing_ok=True)

@@ -1,7 +1,9 @@
 class DomService:
  def __init__(self,r):self.r=r
  async def inspect(self,a):
-  q=a.get('selector','html');rows=await self.r.page.locator(q).first.evaluate("""(el,lim)=>Array.from(el.querySelectorAll('*')).slice(0,lim).map((x,i)=>({tag:x.tagName.toLowerCase(),text:(x.childElementCount? '':x.textContent||'').trim().slice(0,1000),attributes:Object.fromEntries(Array.from(x.attributes).map(a=>[a.name,a.value.slice(0,1000)]))}))""",a.get('max_nodes',1000));return {'selector':q,'nodes':rows,'truncated':len(rows)>=a.get('max_nodes',1000)}
+  q=a.get('selector','html');lim=a.get('max_nodes',1000);cap=a.get('max_chars',200000);rows=await self.r.page.locator(q).first.evaluate("""(el,lim)=>Array.from(el.querySelectorAll('*')).slice(0,lim).map((x,i)=>({tag:x.tagName.toLowerCase(),text:(x.childElementCount? '':x.textContent||'').trim().slice(0,1000),attributes:Object.fromEntries(Array.from(x.attributes).map(a=>[a.name,a.value.slice(0,1000)]))}))""",lim);raw=__import__('json').dumps(rows,ensure_ascii=False,separators=(',',':'));tr=len(rows)>=lim or len(raw)>cap
+  while rows and len(__import__('json').dumps(rows,ensure_ascii=False,separators=(',',':')))>cap:rows.pop()
+  return {'selector':q,'nodes':rows,'truncated':tr}
  async def query(self,a):
   l=self.r.page.locator(a['selector']);n=await l.count();return {'selector':a['selector'],'count':n,'matches':[{'index':i,'visible':await l.nth(i).is_visible(),'text':(await l.nth(i).inner_text())[:2000]} for i in range(min(n,100))]}
  async def html(self,a):
