@@ -21,8 +21,17 @@ class AppProvenance(BaseModel):
 
     @model_validator(mode="after")
     def _manifest_identity_and_hash(self) -> "AppProvenance":
-        if set(self.tool_manifest) != {"app_id", "version", "tools"}:
-            raise ValueError("tool_manifest must contain exactly app_id, version, and tools")
+        schema_version = self.tool_manifest.get("schema_version")
+        is_v2 = schema_version == 2
+        required_manifest_fields = (
+            {"schema_version", "app_id", "version", "tools"}
+            if is_v2
+            else {"app_id", "version", "tools"}
+        )
+        if not required_manifest_fields.issubset(self.tool_manifest):
+            raise ValueError("tool_manifest has missing fields")
+        if schema_version is not None and not is_v2:
+            raise ValueError("unsupported tool_manifest schema_version")
         if self.tool_manifest.get("app_id") != self.app_id or self.tool_manifest.get("version") != self.version:
             raise ValueError("tool_manifest identity differs from App provenance")
         tools = self.tool_manifest.get("tools")
@@ -30,8 +39,13 @@ class AppProvenance(BaseModel):
             raise ValueError("tool_manifest.tools must be a list")
         names: set[str] = set()
         for tool in tools:
-            if not isinstance(tool, dict) or set(tool) != {"name", "description", "inputSchema"}:
-                raise ValueError("canonical tools require name, description, and inputSchema")
+            required_tool_fields = (
+                {"name", "description", "category", "inputSchema", "outputSchema"}
+                if is_v2
+                else {"name", "description", "inputSchema"}
+            )
+            if not isinstance(tool, dict) or not required_tool_fields.issubset(tool):
+                raise ValueError("invalid canonical tool manifest entry")
             name = tool.get("name")
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name):
                 raise ValueError("canonical tool name is invalid")
@@ -40,9 +54,13 @@ class AppProvenance(BaseModel):
             names.add(name)
             if not isinstance(tool.get("description"), str) or not tool["description"].strip():
                 raise ValueError("canonical tool description is missing")
-            schema = tool.get("inputSchema")
-            if not isinstance(schema, dict) or schema.get("type") != "object":
+            input_schema = tool.get("inputSchema")
+            if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
                 raise ValueError("canonical tool inputSchema must be an object schema")
+            if is_v2:
+                output_schema = tool.get("outputSchema")
+                if not isinstance(output_schema, dict) or output_schema.get("type") != "object":
+                    raise ValueError("canonical tool outputSchema must be an object schema")
         encoded = json.dumps(
             self.tool_manifest,
             ensure_ascii=False,

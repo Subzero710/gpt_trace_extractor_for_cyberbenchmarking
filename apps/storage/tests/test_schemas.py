@@ -52,6 +52,68 @@ def test_start_request_validates_manifest_hash_and_unique_apps() -> None:
         start_request(app_provenance=[item, item])
 
 
+def test_start_request_accepts_v2_manifest_and_preserves_hash() -> None:
+    import hashlib
+    import json
+
+    manifest = {
+        "schema_version": 2,
+        "app_id": "browser",
+        "version": "2.0.0",
+        "tools": [{
+            "name": "read_page",
+            "description": "Read the page.",
+            "category": "dom",
+            "inputSchema": {"type": "object", "properties": {}},
+            "outputSchema": {"type": "object", "additionalProperties": True},
+        }],
+    }
+    digest = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    item = {
+        "app_id": "browser",
+        "ui_name": "Cloak Browser",
+        "kind": "local_mcp",
+        "version": "2.0.0",
+        "tool_manifest_sha256": digest,
+        "tool_manifest": manifest,
+    }
+    request = start_request(app_provenance=[item])
+    assert request.app_provenance[0].tool_manifest["schema_version"] == 2
+
+
+def test_start_request_rejects_invalid_v2_output_schema() -> None:
+    import hashlib
+    import json
+
+    manifest = {
+        "schema_version": 2,
+        "app_id": "browser",
+        "version": "2.0.0",
+        "tools": [{
+            "name": "read_page",
+            "description": "Read the page.",
+            "category": "dom",
+            "inputSchema": {"type": "object", "properties": {}},
+            "outputSchema": {"type": "string"},
+        }],
+    }
+    digest = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    item = {
+        "app_id": "browser",
+        "ui_name": "Cloak Browser",
+        "kind": "local_mcp",
+        "version": "2.0.0",
+        "tool_manifest_sha256": digest,
+        "tool_manifest": manifest,
+    }
+    with pytest.raises(ValidationError, match="outputSchema"):
+        start_request(app_provenance=[item])
+
+
 def test_start_attempt_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         start_request(expected_attempt=0)
