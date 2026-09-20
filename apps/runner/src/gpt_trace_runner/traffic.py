@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Page, Response
 
-from .conversation import benchmark_text_matches
 from .exceptions import AuthenticationRequired
 
 
@@ -53,7 +52,7 @@ class TrafficMonitor:
         self._request_generation: dict[int, int] = {}
         self._task_403 = False
         self._sticky_429 = False
-        self._submitted_user_message: dict[str, Any] | None = None
+        self._submitted_user_messages: tuple[dict[str, Any], ...] = ()
         # HAR-observed authentication oracle. We retain only the Response
         # object/status required for validation; never auth headers or payloads.
         self._auth_me_response: Response | None = None
@@ -69,7 +68,7 @@ class TrafficMonitor:
         self._snapshots = {}
         self._snapshot_events = {}
         self._task_403 = False
-        self._submitted_user_message = None
+        self._submitted_user_messages = ()
         # sticky 429 intentionally survives task boundaries.
 
     def _is_chatgpt_host(self, url: str) -> bool:
@@ -210,13 +209,14 @@ class TrafficMonitor:
                         self._stats.submitted_timezone_offset_min = offset
                     messages = payload.get("messages")
                     if isinstance(messages, list):
+                        user_messages: list[dict[str, Any]] = []
                         for message in messages:
                             if not isinstance(message, dict):
                                 continue
                             author = message.get("author")
                             if isinstance(author, dict) and author.get("role") == "user":
-                                self._submitted_user_message = message
-                                break
+                                user_messages.append(message)
+                        self._submitted_user_messages = tuple(user_messages)
             except Exception:
                 pass
 
@@ -287,9 +287,20 @@ class TrafficMonitor:
     def submitted_timezone_offset_min(self) -> int | None:
         return self._stats.submitted_timezone_offset_min
 
-    def submitted_prompt_matches(self, prompt: str) -> bool:
-        message = self._submitted_user_message
-        return isinstance(message, dict) and benchmark_text_matches(message, prompt)
+    def submitted_user_message_id(self) -> str:
+        if len(self._submitted_user_messages) != 1:
+            from .exceptions import AmbiguousSubmission
+            raise AmbiguousSubmission(
+                "expected exactly one frontend user message in conversation POST; "
+                f"observed {len(self._submitted_user_messages)}"
+            )
+        message_id = self._submitted_user_messages[0].get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            from .exceptions import AmbiguousSubmission
+            raise AmbiguousSubmission(
+                "frontend conversation POST user message has no stable id"
+            )
+        return message_id.strip()
 
     @property
     def app_system_hints(self) -> tuple[str, ...]:

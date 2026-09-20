@@ -15,7 +15,7 @@ from .conversation import (
     conversation_id_from_url,
     extract_dataset_messages,
     invoked_app_names,
-    validate_task_conversation,
+    validate_conversation_identity,
 )
 from .exceptions import (
     AmbiguousSubmission,
@@ -54,13 +54,6 @@ ATTACH_BUTTON_SELECTORS = (
 UPLOAD_MENU_LABELS = (
     "Upload from computer", "Upload files", "Upload file", "Add photos & files",
 )
-NEW_CHAT_SELECTORS = (
-    'a[data-testid="create-new-chat-button"]',
-    'button[data-testid="create-new-chat-button"]',
-    'a[aria-label*="New chat"]',
-    'button[aria-label*="New chat"]',
-)
-
 
 @dataclass(slots=True)
 class PreparedTurn:
@@ -70,6 +63,7 @@ class PreparedTurn:
 @dataclass(slots=True)
 class SubmittedTurn:
     conversation_id: str
+    user_message_id: str
     stream: ConversationStream
     task: BenchmarkTask
 
@@ -266,31 +260,24 @@ class ChatGPTClient:
         )
 
     async def _new_chat_if_needed(self) -> None:
+        # Successful benchmark conversations are deleted explicitly after
+        # storage.complete(). If some conversation is still open here, never
+        # click the fragile New chat control and never delete an unknown chat:
+        # navigate to the clean home composer instead.
         old_id = conversation_id_from_url(self._page.url)
-        if old_id is None:
-            composer = await self._site.wait_ready()
-            try:
-                dirty = (await composer.inner_text()) != ""
-            except Exception as exc:
-                raise FatalUIState("could not inspect home composer state") from exc
-            if dirty:
-                await self.goto_home()
-                await self._site.wait_ready()
+        if old_id is not None:
+            await self.goto_home()
+            await self._site.wait_ready()
             return
 
-        button = await first_visible(self._page, NEW_CHAT_SELECTORS)
-        if button is None:
-            raise FatalUIState("visible New chat control was not found")
-        await self._interaction.click(button)
+        composer = await self._site.wait_ready()
         try:
-            await self._page.wait_for_function(
-                "old => !location.pathname.startsWith('/c/' + old)",
-                arg=old_id,
-                timeout=int(self._stream_start_timeout * 1000),
-            )
+            dirty = (await composer.inner_text()) != ""
         except Exception as exc:
-            raise FatalUIState("New chat did not leave the previous conversation") from exc
-        await self._site.wait_ready()
+            raise FatalUIState("could not inspect home composer state") from exc
+        if dirty:
+            await self.goto_home()
+            await self._site.wait_ready()
 
     async def _visible_exact_text(self, text: str, timeout_seconds: float) -> Locator | None:
         import asyncio
@@ -468,7 +455,13 @@ class ChatGPTClient:
                 f"browser offset {baseline_offset!r}"
             )
 
-    async def submit_task(self, prepared: PreparedTurn, *, before_send: Callable[[], None]) -> SubmittedTurn:
+    async def submit_task(
+        self,
+        prepared: PreparedTurn,
+        *,
+        before_send: Callable[[], None],
+        on_user_message_id: Callable[[str], None],
+    ) -> SubmittedTurn:
         try:
             async with self._page.expect_response(
                 is_conversation_stream_response,
@@ -489,13 +482,12 @@ class ChatGPTClient:
 
         self._traffic.validate_single_stream_request()
         self._validate_submitted_model()
-        if not self._traffic.submitted_prompt_matches(prepared.task.prompt):
-            raise AmbiguousSubmission(
-                "frontend conversation POST prompt differs from benchmark prompt"
-            )
+        user_message_id = self._traffic.submitted_user_message_id()
+        on_user_message_id(user_message_id)
         conversation_id = await self._wait_for_conversation_id()
         submitted = SubmittedTurn(
             conversation_id=conversation_id,
+            user_message_id=user_message_id,
             stream=ConversationStream(response, timeout_seconds=self._turn_timeout),
             task=prepared.task,
         )
@@ -526,9 +518,13 @@ class ChatGPTClient:
                 )
         return slugs
 
-    def _validated_messages(self, conversation: dict[str, Any], task: BenchmarkTask) -> list[dict]:
+    def _validated_messages(
+        self,
+        conversation: dict[str, Any],
+        user_message_id: str,
+    ) -> list[dict]:
         messages = extract_dataset_messages(conversation)
-        validate_task_conversation(messages, task.prompt)
+        validate_conversation_identity(messages, user_message_id)
         self._validate_message_models(messages)
         return messages
 
@@ -556,14 +552,14 @@ class ChatGPTClient:
             messages = None
             if conversation is not None:
                 try:
-                    messages = self._validated_messages(conversation, submitted.task)
+                    messages = self._validated_messages(conversation, submitted.user_message_id)
                     self._traffic.mark_natural_snapshot_used()
                 except Exception:
                     messages = None
             if messages is None:
                 self._traffic.mark_fallback_snapshot()
                 conversation = await self._conversation.fetch(submitted.conversation_id)
-                messages = self._validated_messages(conversation, submitted.task)
+                messages = self._validated_messages(conversation, submitted.user_message_id)
 
             used_apps = self._validate_required_tools(submitted.task, messages)
             metadata = stream_result.runtime_metadata()
@@ -577,12 +573,19 @@ class ChatGPTClient:
                     for t in submitted.task.tools
                 ],
                 "used_apps": sorted(used_apps),
+                "submitted_user_message_id": submitted.user_message_id,
             })
             return CapturedConversation(submitted.conversation_id, messages, metadata)
         finally:
             self._active_turn = None
 
-    async def recover(self, conversation_id: str, *, task: BenchmarkTask) -> CapturedConversation:
+    async def recover(
+        self,
+        conversation_id: str,
+        *,
+        task: BenchmarkTask,
+        user_message_id: str,
+    ) -> CapturedConversation:
         if self._active_turn is not None:
             raise ConcurrentTurnError("cannot recover while another turn is active")
         await self._navigate(f"{self._base_url}/c/{conversation_id}")
@@ -597,7 +600,7 @@ class ChatGPTClient:
                 "before starting a new attempt."
             ) from exc
         try:
-            messages = self._validated_messages(conversation, task)
+            messages = self._validated_messages(conversation, user_message_id)
         except Exception as exc:
             raise RecoveryIncomplete(
                 f"existing conversation cannot be safely recovered: {exc}"
@@ -616,13 +619,23 @@ class ChatGPTClient:
                     for t in task.tools
                 ],
                 "used_apps": sorted(used_apps),
+                "submitted_user_message_id": user_message_id,
             },
         )
 
-    async def recover_current_candidate(self, *, task: BenchmarkTask) -> CapturedConversation:
+    async def recover_current_candidate(
+        self,
+        *,
+        task: BenchmarkTask,
+        user_message_id: str,
+    ) -> CapturedConversation:
         conversation_id = conversation_id_from_url(self._page.url)
         if not conversation_id:
             raise RecoveryIncomplete(
                 "submission may have happened but current browser URL has no conversation ID"
             )
-        return await self.recover(conversation_id, task=task)
+        return await self.recover(
+            conversation_id,
+            task=task,
+            user_message_id=user_message_id,
+        )

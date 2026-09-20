@@ -2,20 +2,22 @@ import pytest
 
 from gpt_trace_runner.conversation import (
     assistant_model_slugs,
-    benchmark_text_matches,
-    conversation_matches_task,
-    message_plain_text,
-    validate_task_conversation,
+    validate_conversation_identity,
 )
 from gpt_trace_runner.exceptions import ConversationError
 
 
-def user_message(parts):
-    return {"author": {"role": "user"}, "content": {"parts": parts}}
+def user_message(message_id: str):
+    return {
+        "id": message_id,
+        "author": {"role": "user"},
+        "content": {"parts": ["frontend representation is intentionally irrelevant"]},
+    }
 
 
 def assistant(model="gpt-5-6-thinking", end=True):
     return {
+        "id": "assistant-1",
         "author": {"role": "assistant"},
         "content": {"parts": ["ok"]},
         "metadata": {"model_slug": model},
@@ -23,60 +25,48 @@ def assistant(model="gpt-5-6-thinking", end=True):
     }
 
 
-def test_ecosystem_mention_is_ignored_when_matching_prompt() -> None:
-    msg = user_message([{"type": "ecosystemMention", "name": "GitHub"}, "inspect this"])
-    assert message_plain_text(msg) == "inspect this"
-    assert conversation_matches_task([msg], "inspect this")
+def test_conversation_identity_uses_user_message_id_not_serialized_text() -> None:
+    messages = [
+        {
+            "id": "user-123",
+            "author": {"role": "user"},
+            "content": {
+                "parts": [
+                    {"type": "someFutureUiNode", "text": "anything"},
+                    " transformed frontend text",
+                ]
+            },
+            "metadata": {
+                "serialization_metadata": {
+                    "custom_symbol_offsets": [
+                        {"symbol": "futureUnknownSymbol", "startIndex": 0, "endIndex": 7}
+                    ]
+                }
+            },
+        },
+        assistant(),
+    ]
+    validate_conversation_identity(messages, "user-123")
 
 
-def test_prompt_match_is_exact_including_spaces() -> None:
-    messages = [user_message([" x "]), assistant()]
-    validate_task_conversation(messages, " x ")
-    with pytest.raises(ConversationError):
-        validate_task_conversation(messages, "x")
+def test_conversation_identity_rejects_wrong_or_missing_user_message_id() -> None:
+    messages = [user_message("user-123"), assistant()]
+    with pytest.raises(ConversationError, match="does not match"):
+        validate_conversation_identity(messages, "user-456")
+    with pytest.raises(ConversationError, match="expected user_message_id is missing"):
+        validate_conversation_identity(messages, "")
 
 
-def test_conversation_requires_final_assistant() -> None:
-    with pytest.raises(ConversationError):
-        validate_task_conversation([user_message(["x"])], "x")
+def test_conversation_identity_requires_exactly_one_user_message() -> None:
+    messages = [user_message("u1"), user_message("u2"), assistant()]
+    with pytest.raises(ConversationError, match="exactly one user message"):
+        validate_conversation_identity(messages, "u1")
+
+
+def test_conversation_identity_requires_final_assistant() -> None:
+    with pytest.raises(ConversationError, match="end_turn=true"):
+        validate_conversation_identity([user_message("u1")], "u1")
 
 
 def test_assistant_model_slugs_collect_all_observed() -> None:
     assert assistant_model_slugs([assistant("a"), assistant("b")]) == {"a", "b"}
-
-
-def test_ecosystem_mention_is_removed_only_by_declared_span() -> None:
-    message = {
-        "author": {"role": "user"},
-        "content": {"content_type": "text", "parts": ["@GitHub Connector inspect the repository"]},
-        "metadata": {
-            "serialization_metadata": {
-                "custom_symbol_offsets": [
-                    {
-                        "id": "plugin:test",
-                        "symbol": "ecosystemMention",
-                        "startIndex": 0,
-                        "endIndex": 17,
-                    }
-                ]
-            }
-        },
-    }
-    assert benchmark_text_matches(message, "inspect the repository") is True
-    assert benchmark_text_matches(message, " inspect the repository") is True
-    assert benchmark_text_matches(message, "inspect  the repository") is False
-
-
-def test_ecosystem_mention_does_not_hide_unrelated_prompt_whitespace_change() -> None:
-    message = {
-        "author": {"role": "user"},
-        "content": {"parts": ["hello  world @App"]},
-        "metadata": {
-            "serialization_metadata": {
-                "custom_symbol_offsets": [
-                    {"symbol": "ecosystemMention", "startIndex": 13, "endIndex": 17}
-                ]
-            }
-        },
-    }
-    assert benchmark_text_matches(message, "hello world") is False

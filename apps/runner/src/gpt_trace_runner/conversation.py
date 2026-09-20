@@ -41,127 +41,29 @@ def is_complete(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _part_text(part: Any) -> str:
-    if isinstance(part, str):
-        return part
-    if not isinstance(part, dict):
-        return ""
-    kind = str(part.get("type", ""))
-    if kind in {"ecosystemMention", "ecosystem_mention", "app_mention"}:
-        return ""
-    text = part.get("text")
-    if isinstance(text, str):
-        return text
-    content = part.get("content")
-    if isinstance(content, str):
-        return content
-    return ""
+def validate_conversation_identity(
+    messages: list[dict[str, Any]],
+    user_message_id: str,
+) -> None:
+    if not isinstance(user_message_id, str) or not user_message_id.strip():
+        raise ConversationError("expected user_message_id is missing")
 
-
-def message_plain_text(message: dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, dict):
-        return ""
-    parts = content.get("parts")
-    if isinstance(parts, list):
-        return "".join(_part_text(part) for part in parts)
-    text = content.get("text")
-    return text if isinstance(text, str) else ""
-
-
-def _mention_stripped_text(message: dict[str, Any]) -> tuple[str, set[int]]:
-    """Remove frontend-owned ecosystemMention spans and mark separator positions.
-
-    Returns the remaining text plus indexes of ASCII spaces that sit exactly at
-    a removed mention boundary.  Only those spaces may be ignored when matching
-    the original benchmark prompt.
-    """
-    text = message_plain_text(message)
-    metadata = message.get("metadata")
-    if not isinstance(metadata, dict):
-        return text, set()
-    serialization = metadata.get("serialization_metadata")
-    if not isinstance(serialization, dict):
-        return text, set()
-    offsets = serialization.get("custom_symbol_offsets")
-    if not isinstance(offsets, list):
-        return text, set()
-
-    spans: list[tuple[int, int]] = []
-    for item in offsets:
-        if not isinstance(item, dict) or item.get("symbol") != "ecosystemMention":
-            continue
-        start = item.get("startIndex")
-        end = item.get("endIndex")
-        if (
-            isinstance(start, int)
-            and isinstance(end, int)
-            and 0 <= start < end <= len(text)
-        ):
-            spans.append((start, end))
-    if not spans:
-        return text, set()
-
-    spans.sort()
-    for (_, previous_end), (next_start, _) in zip(spans, spans[1:]):
-        if next_start < previous_end:
-            raise ConversationError("overlapping ecosystemMention offsets")
-
-    pieces: list[str] = []
-    boundaries: list[int] = []
-    cursor = 0
-    output_len = 0
-    for start, end in spans:
-        piece = text[cursor:start]
-        pieces.append(piece)
-        output_len += len(piece)
-        boundaries.append(output_len)
-        cursor = end
-    pieces.append(text[cursor:])
-    candidate = "".join(pieces)
-
-    deletable: set[int] = set()
-    for boundary in boundaries:
-        if boundary < len(candidate) and candidate[boundary] == " ":
-            deletable.add(boundary)
-        if boundary > 0 and candidate[boundary - 1] == " ":
-            deletable.add(boundary - 1)
-    return candidate, deletable
-
-
-def message_benchmark_text(message: dict[str, Any]) -> str:
-    return _mention_stripped_text(message)[0]
-
-
-def benchmark_text_matches(message: dict[str, Any], prompt: str) -> bool:
-    candidate, deletable = _mention_stripped_text(message)
-    i = 0
-    j = 0
-    while i < len(candidate):
-        if j < len(prompt) and candidate[i] == prompt[j]:
-            i += 1
-            j += 1
-            continue
-        if i in deletable and candidate[i] == " ":
-            i += 1
-            continue
-        return False
-    return j == len(prompt)
-
-
-def conversation_matches_task(messages: list[dict[str, Any]], prompt: str) -> bool:
+    user_messages = []
     for message in messages:
         author = message.get("author")
         if isinstance(author, dict) and author.get("role") == "user":
-            return benchmark_text_matches(message, prompt)
-    return False
+            user_messages.append(message)
 
+    if len(user_messages) != 1:
+        raise ConversationError(
+            "conversation must contain exactly one user message for a benchmark task"
+        )
 
-def validate_task_conversation(messages: list[dict[str, Any]], prompt: str) -> None:
-    if not conversation_matches_task(messages, prompt):
-        raise ConversationError("conversation does not contain the exact benchmark prompt")
+    observed_id = user_messages[0].get("id")
+    if observed_id != user_message_id:
+        raise ConversationError(
+            "conversation user message ID does not match the submitted message ID"
+        )
     if not is_complete(messages):
         raise ConversationError("conversation has no assistant end_turn=true")
 

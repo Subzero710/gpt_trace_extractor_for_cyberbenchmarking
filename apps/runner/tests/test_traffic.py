@@ -114,7 +114,7 @@ def test_failed_request_is_cleaned_and_counted() -> None:
     assert monitor.runtime_metadata()["requests_failed"] == 1
 
 
-def test_conversation_post_prompt_with_configured_app_mention_matches_benchmark() -> None:
+def test_conversation_post_captures_user_message_id_without_parsing_ui_text() -> None:
     page = FakePage()
     monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
     monitor.begin_task()
@@ -127,12 +127,13 @@ def test_conversation_post_prompt_with_configured_app_mention_matches_benchmark(
             "timezone_offset_min": -120,
             "messages": [
                 {
+                    "id": "user-message-123",
                     "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": ["@GitHub Connector inspect repo"]},
+                    "content": {"content_type": "text", "parts": ["arbitrary serialized UI"]},
                     "metadata": {
                         "serialization_metadata": {
                             "custom_symbol_offsets": [
-                                {"symbol": "ecosystemMention", "startIndex": 0, "endIndex": 17}
+                                {"symbol": "futureUnknownSymbol", "startIndex": 0, "endIndex": 4}
                             ]
                         }
                     },
@@ -141,9 +142,40 @@ def test_conversation_post_prompt_with_configured_app_mention_matches_benchmark(
         },
     )
     page.handlers["request"](request)
-    assert monitor.submitted_prompt_matches("inspect repo") is True
-    assert monitor.submitted_prompt_matches("inspect  repo") is False
+    assert monitor.submitted_user_message_id() == "user-message-123"
     assert monitor.submitted_timezone_offset_min == -120
+
+
+def test_conversation_post_user_message_identity_is_fail_closed() -> None:
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+
+    monitor.begin_task()
+    page.handlers["request"](
+        FakeRequest(
+            "https://chatgpt.com/backend-api/f/conversation",
+            "POST",
+            {"messages": [{"author": {"role": "user"}, "content": {"parts": ["x"]}}]},
+        )
+    )
+    with pytest.raises(AmbiguousSubmission, match="no stable id"):
+        monitor.submitted_user_message_id()
+
+    monitor.begin_task()
+    page.handlers["request"](
+        FakeRequest(
+            "https://chatgpt.com/backend-api/f/conversation",
+            "POST",
+            {
+                "messages": [
+                    {"id": "u1", "author": {"role": "user"}},
+                    {"id": "u2", "author": {"role": "user"}},
+                ]
+            },
+        )
+    )
+    with pytest.raises(AmbiguousSubmission, match="exactly one frontend user message"):
+        monitor.submitted_user_message_id()
 
 
 @pytest.mark.asyncio

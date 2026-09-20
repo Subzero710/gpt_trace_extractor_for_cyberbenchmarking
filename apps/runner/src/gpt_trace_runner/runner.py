@@ -159,16 +159,18 @@ class BenchmarkRunner:
         fingerprint: str,
         environments: dict[str, str],
         conversation_id: str | None = None,
+        user_message_id: str | None = None,
     ) -> SubmissionJournal:
         return SubmissionJournal(
-            task.task_id,
-            runner_id,
-            attempt,
-            phase,
-            conversation_id,
-            fingerprint,
-            dict(environments),
-            self._names(task),
+            task_id=task.task_id,
+            runner_id=runner_id,
+            attempt=attempt,
+            phase=phase,
+            conversation_id=conversation_id,
+            task_fingerprint=fingerprint,
+            app_environments=dict(environments),
+            resolved_app_names=self._names(task),
+            user_message_id=user_message_id,
         )
 
     @staticmethod
@@ -187,6 +189,7 @@ class BenchmarkRunner:
         task: BenchmarkTask,
         existing: StoredRun,
         conversation_id: str,
+        user_message_id: str,
         environments: dict[str, str],
         fingerprint: str,
     ) -> None:
@@ -194,7 +197,11 @@ class BenchmarkRunner:
         await self.lifecycle.assert_resume(recovery_task, environments, fingerprint, attempt=existing.attempt)
         identity = existing.runner_id or self.runner_id
         try:
-            captured = await self.chatgpt.recover(conversation_id, task=recovery_task)
+            captured = await self.chatgpt.recover(
+                conversation_id,
+                task=recovery_task,
+                user_message_id=user_message_id,
+            )
         except RequiredToolNotUsed as exc:
             await self.storage.fail(
                 task.task_id, exc, attempt=existing.attempt, runner_id=identity
@@ -230,6 +237,7 @@ class BenchmarkRunner:
                 fingerprint=fingerprint,
                 environments=environments,
                 conversation_id=conversation_id,
+                user_message_id=user_message_id,
             )
         )
         await self.chatgpt.delete_completed_conversation(conversation_id)
@@ -301,13 +309,32 @@ class BenchmarkRunner:
             raise RecoveryIncomplete("submission journal attempt/runner does not match storage")
         conversation_id = entry.conversation_id or existing.conversation_id
         if conversation_id:
-            await self._complete_recovery(task, existing, conversation_id, expected_environments, fingerprint)
+            if not entry.user_message_id:
+                raise RecoveryIncomplete(
+                    "submitted conversation has no persisted user_message_id proof"
+                )
+            await self._complete_recovery(
+                task,
+                existing,
+                conversation_id,
+                entry.user_message_id,
+                expected_environments,
+                fingerprint,
+            )
             return
         if entry.phase != "submission_started":
             raise RecoveryIncomplete("conversation_known journal has no conversation_id")
+        if not entry.user_message_id:
+            raise RecoveryIncomplete(
+                "submission journal has no persisted user_message_id proof; "
+                "automatic recovery is disabled"
+            )
         await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
         try:
-            captured = await self.chatgpt.recover_current_candidate(task=recovery_task)
+            captured = await self.chatgpt.recover_current_candidate(
+                task=recovery_task,
+                user_message_id=entry.user_message_id,
+            )
         except RequiredToolNotUsed as exc:
             await self.storage.fail(
                 entry.task_id, exc, attempt=entry.attempt, runner_id=entry.runner_id
@@ -330,6 +357,7 @@ class BenchmarkRunner:
                 fingerprint=fingerprint,
                 environments=expected_environments,
                 conversation_id=conversation_id,
+                user_message_id=entry.user_message_id,
             )
         )
         await self.storage.set_conversation(entry.task_id, conversation_id, attempt=entry.attempt, runner_id=entry.runner_id)
@@ -355,6 +383,7 @@ class BenchmarkRunner:
                 fingerprint=fingerprint,
                 environments=expected_environments,
                 conversation_id=conversation_id,
+                user_message_id=entry.user_message_id,
             )
         )
         await self.chatgpt.delete_completed_conversation(conversation_id)
@@ -371,10 +400,10 @@ class BenchmarkRunner:
             raise RecoveryIncomplete(f"{task.task_id} is running without conversation_id or recoverable journal")
         if not self.recover_existing:
             raise RecoveryIncomplete("existing conversation recovery is disabled")
-        fingerprint = task_fingerprint(task)
-        environments = self.lifecycle.environment_ids(task, attempt=existing.attempt, fingerprint=fingerprint)
-        await self._complete_recovery(task, existing, existing.conversation_id, environments, fingerprint)
-        return True
+        raise RecoveryIncomplete(
+            f"{task.task_id} is running with conversation_id but no submission journal "
+            "user_message_id proof; automatic recovery is disabled"
+        )
 
     async def run_task(self, task: BenchmarkTask, resume: bool) -> None:
         fingerprint = task_fingerprint(task)
@@ -466,7 +495,24 @@ class BenchmarkRunner:
                     )
                 )
 
-            submitted = await self.chatgpt.submit_task(prepared, before_send=mark_submission_started)
+            def persist_user_message_id(user_message_id: str) -> None:
+                self.journal.write(
+                    self._entry(
+                        task,
+                        runner_id=self.runner_id,
+                        attempt=expected_attempt,
+                        phase="submission_started",
+                        fingerprint=fingerprint,
+                        environments=environments,
+                        user_message_id=user_message_id,
+                    )
+                )
+
+            submitted = await self.chatgpt.submit_task(
+                prepared,
+                before_send=mark_submission_started,
+                on_user_message_id=persist_user_message_id,
+            )
             phase = "conversation_known"
             self.journal.write(
                 self._entry(
@@ -477,6 +523,7 @@ class BenchmarkRunner:
                     fingerprint=fingerprint,
                     environments=environments,
                     conversation_id=submitted.conversation_id,
+                    user_message_id=submitted.user_message_id,
                 )
             )
             await self.storage.set_conversation(
@@ -510,6 +557,7 @@ class BenchmarkRunner:
                     fingerprint=fingerprint,
                     environments=environments,
                     conversation_id=submitted.conversation_id,
+                    user_message_id=submitted.user_message_id,
                 )
             )
             await self.chatgpt.delete_completed_conversation(submitted.conversation_id)

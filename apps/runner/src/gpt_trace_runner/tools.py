@@ -59,6 +59,112 @@ _COMPOSER_ACCEPTED_JS = r"""
 """
 
 
+_APP_PICKER_READY_JS = r"""
+([rawMention, appName]) => {
+    const editorSelectors = [
+        "#prompt-textarea",
+        '[contenteditable="true"][data-lexical-editor="true"]',
+    ];
+
+    const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none"
+        );
+    };
+
+    let editor = null;
+    for (const selector of editorSelectors) {
+        for (const el of document.querySelectorAll(selector)) {
+            if (visible(el)) {
+                editor = el;
+                break;
+            }
+        }
+        if (editor) break;
+    }
+    if (!editor) return false;
+
+    const tail = (editor.innerText || editor.textContent || "").trimEnd();
+    if (!tail.endsWith(rawMention)) return false;
+
+    const active = document.activeElement;
+    const activeId = active && active.getAttribute
+        ? active.getAttribute("aria-activedescendant")
+        : null;
+    if (activeId) {
+        const candidate = document.getElementById(activeId);
+        if (
+            visible(candidate) &&
+            !editor.contains(candidate) &&
+            (candidate.innerText || candidate.textContent || "").includes(appName)
+        ) {
+            return true;
+        }
+    }
+
+    const selector = [
+        '[role="option"]',
+        '[role="menuitem"]',
+        '[role="menuitemradio"]',
+        '[role="menuitemcheckbox"]',
+        'button',
+        '[tabindex]'
+    ].join(',');
+
+    const editorRect = editor.getBoundingClientRect();
+    for (const candidate of document.querySelectorAll(selector)) {
+        if (!visible(candidate) || editor.contains(candidate)) continue;
+
+        const text = (candidate.innerText || candidate.textContent || "").trim();
+        if (text !== appName && !text.startsWith(appName + "\\n")) continue;
+
+        const rect = candidate.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const horizontallyNear = (
+            centerX >= editorRect.left - 120 &&
+            centerX <= editorRect.right + 120
+        );
+        const verticalGap = Math.min(
+            Math.abs(rect.bottom - editorRect.top),
+            Math.abs(rect.top - editorRect.bottom)
+        );
+
+        if (horizontallyNear && verticalGap <= Math.max(520, innerHeight * 0.65)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+"""
+
+
+async def _wait_app_candidate_ready(
+    page: Page,
+    *,
+    tool: BenchmarkTool,
+    timeout_seconds: float,
+) -> None:
+    raw_mention = f"@{tool.name}"
+    try:
+        await page.wait_for_function(
+            _APP_PICKER_READY_JS,
+            arg=[raw_mention, tool.name],
+            timeout=int(timeout_seconds * 1000),
+        )
+    except PlaywrightTimeoutError as exc:
+        raise AppUnavailable(
+            f"ChatGPT app {tool.name!r} autocomplete did not expose a selectable "
+            "candidate; Enter was not pressed"
+        ) from exc
+
+
 async def _wait_app_accepted(
     page: Page,
     *,
@@ -128,42 +234,46 @@ async def _select_app_via_mention(
         raise FatalUIState(f"unsupported benchmark tool type at runtime: {tool.type}")
 
     editor = await get_editor()
+    raw_mention = f"@{tool.name}"
 
-    # Never pointer-click the composer here. Once an App mention exists, a
-    # generic click on the contenteditable can land on the structured App chip
-    # and open its link/details instead of placing the caret.
+    # Keep App selection keyboard-only; never pointer-click a structured chip.
     await interaction.focus(editor)
 
-    # Keyboard-only caret placement at the end of the current composer.
-    await editor.press("Control+End")
+    # Type the whole mention query through the same validated keyboard receipt
+    # used for benchmark prompts. This keeps CloakBrowser humanization ordered
+    # and proves the full query reached the composer before autocomplete use.
+    await interaction.type_text(
+        editor,
+        raw_mention,
+        clear_existing=False,
+    )
 
-    try:
-        before = await editor.inner_text()
-    except Exception:
-        before = ""
-
-    if before and not before.endswith((" ", "\n")):
-        await page.keyboard.type(" ")
-
-    raw_mention = f"@{tool.name}"
-    await page.keyboard.type("@")
-    await page.keyboard.type(tool.name)
-
-    typed_rendered = await editor.inner_text()
-    if not typed_rendered.rstrip().endswith(raw_mention):
-        raise AppUnavailable(
-            f"ChatGPT app mention query {raw_mention!r} was not reflected in the composer"
-        )
-
-    await page.keyboard.press("Enter")
-
-    # Enter may rebuild the Lexical composer. Do not keep reading the pre-Enter
-    # element. Wait against the live DOM, then resolve the current composer.
-    await _wait_app_accepted(
+    # Never press Enter merely because the raw query is visible. If ChatGPT's
+    # autocomplete has not exposed a selectable candidate yet, Enter is also the
+    # normal submit key and can create an unintended conversation.
+    await _wait_app_candidate_ready(
         page,
         tool=tool,
         timeout_seconds=timeout_seconds,
     )
+
+    before_enter_url = page.url
+    await page.keyboard.press("Enter")
+
+    try:
+        await _wait_app_accepted(
+            page,
+            tool=tool,
+            timeout_seconds=timeout_seconds,
+        )
+    except AppUnavailable as exc:
+        if page.url != before_enter_url and "/c/" in page.url:
+            raise FatalUIState(
+                f"App selection Enter unexpectedly submitted a conversation "
+                f"while selecting {tool.name!r}"
+            ) from exc
+        raise
+
     editor = await get_editor()
     rendered = await editor.inner_text()
     tail = rendered.rstrip()
@@ -260,12 +370,22 @@ async def select_apps(
     interaction: InteractionGuard,
     timeout_seconds: float,
 ) -> None:
-    """Append each App, resolving the current composer before every App."""
-    for tool in tools:
-        await _select_app_via_mention(
-            page,
-            get_editor=get_editor,
-            tool=tool,
-            interaction=interaction,
-            timeout_seconds=timeout_seconds,
-        )
+    """Append Apps, retrying once only while still safely pre-submission."""
+    for attempt in range(2):
+        try:
+            for tool in tools:
+                await _select_app_via_mention(
+                    page,
+                    get_editor=get_editor,
+                    tool=tool,
+                    interaction=interaction,
+                    timeout_seconds=timeout_seconds,
+                )
+            return
+        except AppUnavailable:
+            if attempt:
+                raise
+            try:
+                await page.keyboard.press("Escape")
+            finally:
+                await _clear_auth_editor(page, get_editor=get_editor)

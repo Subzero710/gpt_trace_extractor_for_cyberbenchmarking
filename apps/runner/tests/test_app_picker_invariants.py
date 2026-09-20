@@ -10,14 +10,22 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_selection_uses_keyboard_enter_not_popup_dom() -> None:
+def test_app_selection_types_one_validated_query_and_waits_before_enter() -> None:
     source = _source("tools.py")
-    assert 'await page.keyboard.type("@")' in source
-    assert "await page.keyboard.type(tool.name)" in source
-    assert 'await page.keyboard.press("Enter")' in source
-    assert "_find_mention_result" not in source
-    assert "_POPUP_ROOTS" not in source
-    assert "_MENTION_ITEMS" not in source
+    select = source.split("async def _select_app_via_mention", 1)[1].split(
+        "async def _composer_has_keyboard_focus", 1
+    )[0]
+
+    assert "interaction.type_text(" in select
+    assert "raw_mention," in select
+    assert "clear_existing=False" in select
+    assert "await _wait_app_candidate_ready(" in select
+    assert 'await page.keyboard.press("Enter")' in select
+    assert select.index("_wait_app_candidate_ready(") < select.index(
+        'page.keyboard.press("Enter")'
+    )
+    assert 'page.keyboard.type("@")' not in select
+    assert "page.keyboard.type(tool.name)" not in select
     assert "delay=20" not in source
 
 
@@ -32,8 +40,9 @@ def test_app_selection_waits_for_current_composer_transition() -> None:
     assert select.index('await page.keyboard.press("Enter")') < select.index(
         "await _wait_app_accepted("
     )
-    assert "page.wait_for_function(" in source
-    assert "_COMPOSER_ACCEPTED_JS" in source
+    assert "_APP_PICKER_READY_JS" in source
+    assert "aria-activedescendant" in source
+    assert "Enter was not pressed" in source
     assert "page.expect_response(" not in source
     assert "client_prepare_source" not in source
     assert "asyncio.sleep" not in source
@@ -93,7 +102,7 @@ def test_chatgpt_compose_selects_apps_before_appending_exact_benchmark_prompt() 
     assert "_prompt_for_chatgpt" not in source
 
 
-def test_chatgpt_uses_one_prompt_identity_for_transport_and_validation() -> None:
+def test_chatgpt_binds_input_receipt_to_transport_by_message_identity() -> None:
     source = _source("chatgpt.py")
     submit = source.split("async def submit_task", 1)[1].split(
         "def _validate_required_tools", 1
@@ -102,23 +111,29 @@ def test_chatgpt_uses_one_prompt_identity_for_transport_and_validation() -> None
         "async def wait_for_completion", 1
     )[0]
 
-    assert "submitted_prompt_matches(prepared.task.prompt)" in submit
-    assert "validate_task_conversation(messages, task.prompt)" in validated
+    assert "submitted_user_message_id()" in submit
+    assert "on_user_message_id(user_message_id)" in submit
+    assert "submitted_prompt_matches" not in source
+    assert "validate_conversation_identity(messages, user_message_id)" in validated
+    assert "validate_task_conversation" not in source
     assert "_prompt_for_chatgpt" not in source
-    prepared = source.split("class PreparedTurn", 1)[1].split(
-        "@dataclass(slots=True)\nclass SubmittedTurn", 1
+
+    submitted = source.split("class SubmittedTurn", 1)[1].split(
+        "class ChatGPTClient", 1
     )[0]
+    assert "user_message_id: str" in submitted
 
-    assert "submitted_prompt" not in prepared
 
-
-def test_new_chat_wait_for_function_uses_keyword_arg() -> None:
+def test_new_chat_never_pointer_clicks_or_uses_new_chat_control() -> None:
     source = _source("chatgpt.py")
     new_chat = source.split("async def _new_chat_if_needed", 1)[1].split(
         "async def _visible_exact_text", 1
     )[0]
-    assert "arg=old_id" in new_chat
-    assert "\n                old_id,\n" not in new_chat
+
+    assert "await self.goto_home()" in new_chat
+    assert "self._interaction.click" not in new_chat
+    assert "NEW_CHAT_SELECTORS" not in source
+    assert "create-new-chat-button" not in source
 
 def test_wait_for_function_payload_is_keyword_only() -> None:
     source = _source("tools.py")
@@ -151,5 +166,27 @@ def test_app_selection_focuses_composer_without_pointer_click() -> None:
 
     assert "await interaction.focus(editor)" in select
     assert "interaction.click(editor)" not in select
-    assert 'await editor.press("Control+End")' in select
+    assert "interaction.type_text(" in select
+    assert "clear_existing=False" in select
+
+def test_runtime_app_selection_retries_once_only_pre_submission() -> None:
+    source = _source("tools.py")
+    runtime = source.split("async def select_apps", 1)[1]
+
+    assert "for attempt in range(2):" in runtime
+    assert "except AppUnavailable:" in runtime
+    assert "if attempt:" in runtime
+    assert 'await page.keyboard.press("Escape")' in runtime
+    assert "await _clear_auth_editor(page, get_editor=get_editor)" in runtime
+
+
+def test_app_picker_guard_detects_accidental_enter_submission() -> None:
+    source = _source("tools.py")
+    select = source.split("async def _select_app_via_mention", 1)[1].split(
+        "async def _composer_has_keyboard_focus", 1
+    )[0]
+
+    assert "before_enter_url = page.url" in select
+    assert 'page.url != before_enter_url and "/c/" in page.url' in select
+    assert "App selection Enter unexpectedly submitted a conversation" in select
 

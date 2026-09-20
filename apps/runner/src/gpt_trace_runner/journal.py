@@ -28,6 +28,7 @@ class SubmissionJournal:
     task_fingerprint: str | None = None
     app_environments: dict[str, str] = field(default_factory=dict)
     resolved_app_names: dict[str, str] = field(default_factory=dict)
+    user_message_id: str | None = None
 
 
 class JournalStore:
