@@ -18,7 +18,7 @@ For every attempt requesting `code-workspace`, the runner creates a new containe
 
 - no Docker socket or sensitive host bind mounts;
 - no PostgreSQL/storage credentials or teacher profile;
-- an internal-only task network and no internet route;
+- a per-attempt task network; outbound connectivity is available when the benchmark requires it;
 - bounded memory, CPU, PIDs, file descriptors and tmpfs;
 - a writable container root filesystem plus bounded tmpfs for `/workspace`, `/state` and `/tmp`;
 - agent shell commands executed as uid/gid 0 inside the disposable container;
@@ -30,8 +30,8 @@ The initial workspace is copied into the new container, not bind-mounted. Tool p
 
 For every attempt requesting `browser`, the runner creates a new CloakBrowser container. Browser profile/state/tmp data live only in that container's writable tmpfs. The container joins:
 
-1. the internal task network used to reach its gateway; and
-2. a unique non-internal egress network used only by that Browser attempt.
+1. the per-attempt task network used to reach its gateway; and
+2. when required, a unique non-internal egress network used only by that Browser attempt.
 
 It never shares the teacher profile, Workspace filesystem or Docker socket. URL policy blocks non-web schemes, credentials, loopback, link-local, private, reserved and metadata-network targets unless an explicit controlled-test allowlist is configured.
 

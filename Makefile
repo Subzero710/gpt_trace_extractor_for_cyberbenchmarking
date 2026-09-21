@@ -40,10 +40,10 @@ export:
 	docker compose run --rm --no-deps \
 		--entrypoint python \
 		-e GPT_TRACE_EXPORT_URL=http://storage:8080/v1/export.jsonl \
-		-e GPT_TRACE_EXPORT_OUTPUT=/data/exports/messages.jsonl \
+		-e GPT_TRACE_EXPORT_OUTPUT=/data/exports/runs.jsonl \
 		-v "$(CURDIR)/scripts/export_messages.py:/tmp/export_messages.py:ro" \
 		runner /tmp/export_messages.py
-	@echo "host export: $(CURDIR)/exports/messages.jsonl"
+	@echo "host export: $(CURDIR)/exports/runs.jsonl"
 
 throw_volumes:
 	@echo "WARNING: permanently deletes benchmark database/state volumes (postgres_data and runner_state)."

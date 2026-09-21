@@ -7,11 +7,13 @@ import urllib.request
 from pathlib import Path
 
 URL = os.environ.get("GPT_TRACE_EXPORT_URL", "http://127.0.0.1:8080/v1/export.jsonl")
-OUTPUT = Path(os.environ.get("GPT_TRACE_EXPORT_OUTPUT", "exports/messages.jsonl"))
+OUTPUT = Path(os.environ.get("GPT_TRACE_EXPORT_OUTPUT", "exports/runs.jsonl"))
+
 
 def fail(message: str) -> None:
     print(f"export failed: {message}", file=sys.stderr)
     raise SystemExit(1)
+
 
 def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
@@ -29,23 +31,26 @@ def main() -> None:
                 if not raw.strip():
                     continue
                 try:
-                    run = json.loads(raw)
+                    text = raw.decode("utf-8")
+                    run = json.loads(text)
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     fail(f"invalid storage JSONL at line {line_no}: {exc}")
+                if not isinstance(run, dict):
+                    fail(f"storage row {line_no} is not an object")
                 entries = run.get("messages")
                 if not isinstance(entries, list):
                     fail(f"storage row {line_no} has non-list messages")
+                out.write(text.rstrip("\r\n"))
+                out.write("\n")
                 runs += 1
-                for message in entries:
-                    out.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
-                    out.write("\n")
-                    messages += 1
+                messages += len(entries)
         tmp_path.replace(OUTPUT)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
 
-    print(f"exported {messages} message(s) from {runs} completed run(s) to {OUTPUT}")
+    print(f"exported {runs} run(s) / {messages} message(s) to {OUTPUT}")
+
 
 if __name__ == "__main__":
     main()

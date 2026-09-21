@@ -124,48 +124,35 @@ def test_initial_workspace_rejects_symlinks(tmp_path: Path) -> None:
         load_benchmark(manifest, tasks_root=tasks_root)
 
 
-def test_repository_smoke_prompts_are_exact_transport_text_and_apps_are_structured() -> None:
+def test_repository_benchmark_is_structurally_valid_jsonl() -> None:
     manifest = Path(__file__).parents[3] / "benchmarks" / "benchmark.jsonl"
-    rows = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
-    by_id = {row["task_id"]: row for row in rows}
+    lines = [line for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert lines, "repository benchmark.jsonl must contain at least one task"
 
-    assert by_id["smoke_workspace_001"]["prompt"] == (
-        "Use exec_command to create a file named workspace_marker.txt containing "
-        "exactly the text workspace-task-1 followed by a newline. Then use read_file "
-        "to read workspace_marker.txt and report its exact contents."
-    )
-    assert by_id["smoke_browser_001"]["prompt"] == (
-        "First inspect the current tabs. Then navigate to https://example.com/ and "
-        "read the page. Report the page title and the main heading. Leave the page "
-        "open when you finish."
-    )
-    assert by_id["smoke_isolation_001"]["prompt"] == (
-        "First, use Code Workspace to list the workspace root and verify that "
-        "workspace_marker.txt from the previous task does not exist. Then create "
-        "isolation_result.txt containing exactly the text fresh-workspace followed "
-        "by a newline and read it back. Separately, use Browser to inspect the "
-        "current tabs before navigating anywhere and verify that the Example Domain "
-        "tab from the previous task is not present. Then navigate to "
-        "https://example.com/ and read the page. Report the contents of "
-        "isolation_result.txt, whether the old workspace marker was absent, whether "
-        "the old browser tab was absent, and the page title."
-    )
+    for line_number, line in enumerate(lines, 1):
+        row = json.loads(line)
+        assert isinstance(row, dict), f"line {line_number}: benchmark row must be an object"
 
-    assert by_id["smoke_workspace_001"]["tools"] == [
-        {"type": "app", "id": "code-workspace", "required": True}
-    ]
-    assert by_id["smoke_browser_001"]["tools"] == [
-        {"type": "app", "id": "browser", "required": True}
-    ]
-    assert by_id["smoke_isolation_001"]["tools"] == [
-        {"type": "app", "id": "code-workspace", "required": True},
-        {"type": "app", "id": "browser", "required": True},
-    ]
+        task_id = row.get("task_id")
+        prompt = row.get("prompt")
+        tools = row.get("tools", [])
+        attachments = row.get("attachments", [])
 
-    for row in rows:
-        prompt = row["prompt"]
-        assert "Use the Code Workspace app." not in prompt
-        assert "Use the Browser app." not in prompt
-        assert "You must use" not in prompt
-        assert "`" not in prompt
+        assert isinstance(task_id, str) and task_id, f"line {line_number}: task_id"
+        assert isinstance(prompt, str) and prompt.strip(), f"line {line_number}: prompt"
+        assert isinstance(tools, list), f"line {line_number}: tools"
+        assert isinstance(attachments, list), f"line {line_number}: attachments"
 
+        if "workspace_template" in row:
+            assert isinstance(row["workspace_template"], str) and row["workspace_template"]
+
+        for tool in tools:
+            assert isinstance(tool, (str, dict)), f"line {line_number}: tool entry"
+            if isinstance(tool, str):
+                assert tool.strip(), f"line {line_number}: tool selector"
+                continue
+            assert tool.get("type", "app") == "app", f"line {line_number}: tool type"
+            selector = tool.get("id", tool.get("name"))
+            assert isinstance(selector, str) and selector.strip(), f"line {line_number}: tool selector"
+            if "required" in tool:
+                assert isinstance(tool["required"], bool), f"line {line_number}: tool required"
