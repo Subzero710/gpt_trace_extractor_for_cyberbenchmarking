@@ -13,7 +13,7 @@ from ..storage_client import StorageClient
 from .catalog import SuperbenchCatalog
 from .models import run_task_id
 from .registry import AdapterRegistry
-from .service import campaign, start_metadata, to_benchmark_task
+from .service import campaign, storage_context, to_benchmark_task
 
 
 async def _record_pre_runner_failure(*, storage, settings, task, adapter, bt, camp, state, error):
@@ -24,7 +24,7 @@ async def _record_pre_runner_failure(*, storage, settings, task, adapter, bt, ca
         expected,
         task_fingerprint(bt),
         task_app_provenance(bt),
-        superbench=start_metadata(task, camp, adapter),
+        **storage_context(task, camp, adapter),
     )
     await storage.fail(
         bt.task_id,
@@ -110,7 +110,7 @@ async def _recover_pending_journal(
             recover_existing=settings.runner_recover_existing,
             console=console,
             journal=journal,
-            superbench_metadata={bt.task_id: start_metadata(task, camp, adapter)},
+            storage_context={bt.task_id: storage_context(task, camp, adapter)},
             evaluation_hooks={bt.task_id: evaluate},
         )
         try:
@@ -189,12 +189,9 @@ async def run_pending(
                 bt = to_benchmark_task(task, registry, camp.campaign_id)
                 state = await storage.get(bt.task_id)
                 if state is not None:
-                    run_status = getattr(state, "run_status", None)
                     if state.status == "completed":
                         # Completed trajectories may be evaluated or intentionally
                         # unevaluated when the upstream benchmark has no native oracle.
-                        continue
-                    if run_status == "unsupported":
                         continue
                     if state.status == "running":
                         # A running attempt is recoverable only through its durable
@@ -252,7 +249,7 @@ async def run_pending(
                         recover_existing=settings.runner_recover_existing,
                         console=console,
                         journal=journal,
-                        superbench_metadata={bt.task_id: start_metadata(task, camp, adapter)},
+                        storage_context={bt.task_id: storage_context(task, camp, adapter)},
                         evaluation_hooks={bt.task_id: evaluate},
                     )
                     runner_started = True

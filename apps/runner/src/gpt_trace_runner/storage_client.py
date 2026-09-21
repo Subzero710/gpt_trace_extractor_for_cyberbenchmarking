@@ -14,6 +14,7 @@ from .models import CapturedConversation, StoredRun
 def _stored_run(payload: dict[str, Any]) -> StoredRun:
     return StoredRun(
         task_id=payload["task_id"],
+        logical_task_id=payload["logical_task_id"],
         status=payload["status"],
         conversation_id=payload.get("conversation_id"),
         attempt=payload.get("attempt", 0),
@@ -23,8 +24,8 @@ def _stored_run(payload: dict[str, Any]) -> StoredRun:
         error_message=payload.get("error_message"),
         runtime_metadata=payload.get("runtime_metadata"),
         app_provenance=payload.get("app_provenance"),
-        canonical_task_id=payload.get("canonical_task_id"), campaign_id=payload.get("campaign_id"),
-        run_status=payload.get("run_status"), success=payload.get("success"), reward=payload.get("reward"), native_result=payload.get("native_result"),
+        dataset_metadata=payload.get("dataset_metadata") or {},
+        evaluation=payload.get("evaluation"),
     )
 
 
@@ -90,7 +91,8 @@ class StorageClient:
         expected_attempt: int,
         task_fingerprint: str,
         app_provenance: list[dict],
-        superbench: dict | None = None,
+        logical_task_id: str | None = None,
+        dataset_metadata: dict[str, Any] | None = None,
     ) -> StoredRun:
         response = await self._request(
             "POST",
@@ -101,7 +103,8 @@ class StorageClient:
                 "expected_attempt": expected_attempt,
                 "task_fingerprint": task_fingerprint,
                 "app_provenance": app_provenance,
-                "superbench": superbench,
+                "logical_task_id": logical_task_id,
+                "dataset_metadata": dataset_metadata or {},
             },
             safe_retry=True,
         )

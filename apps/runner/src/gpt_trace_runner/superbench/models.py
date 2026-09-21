@@ -67,9 +67,6 @@ class TaskSpec:
             raise ValueError("tool app id must not be empty")
 
 
-# Compatibility name for adapter packages written against the first Superbench
-# draft. The object itself is now the small TaskSpec above.
-CanonicalTask = TaskSpec
 
 
 @dataclass(frozen=True, slots=True)

@@ -34,6 +34,7 @@ EVALUATION = pa.struct([
     ("verdict", pa.string()),
     ("score", pa.float64()),
     ("details_json", pa.string()),
+    ("metadata_json", pa.string()),
 ])
 
 SCHEMA = pa.schema([
@@ -58,30 +59,40 @@ def _json(value) -> str:
 
 def _evaluation(raw: dict):
     value = raw.get("evaluation")
-    if isinstance(value, dict):
-        verdict = value.get("verdict")
-        if verdict not in {"pass", "fail"}:
-            return None
-        return {
-            "verdict": verdict,
-            "score": value.get("score"),
-            "details_json": _json(value.get("details") or {}),
-        }
-
-    # Backwards-compatible read of rows captured before the simplified wire format.
-    success = raw.get("success")
-    if isinstance(success, bool):
-        return {
-            "verdict": "pass" if success else "fail",
-            "score": raw.get("reward"),
-            "details_json": _json(raw.get("native_result") or {}),
-        }
-    return None
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("storage row evaluation must be an object or null")
+    verdict = value.get("verdict")
+    if verdict not in {"pass", "fail"}:
+        raise ValueError(f"invalid evaluation verdict: {verdict!r}")
+    score = value.get("score")
+    if score is not None and (
+        not isinstance(score, (int, float)) or isinstance(score, bool)
+    ):
+        raise ValueError("evaluation score must be numeric or null")
+    details = value.get("details", {})
+    metadata = value.get("metadata", {})
+    if not isinstance(details, dict) or not isinstance(metadata, dict):
+        raise ValueError("evaluation details/metadata must be objects")
+    return {
+        "verdict": verdict,
+        "score": float(score) if score is not None else None,
+        "details_json": _json(details),
+        "metadata_json": _json(metadata),
+    }
 
 
 def _row(raw: dict) -> dict:
     runtime = raw.get("runtime_metadata") or {}
     apps = raw.get("app_provenance") or []
+    logical_task_id = raw.get("logical_task_id")
+    if not isinstance(logical_task_id, str) or not logical_task_id:
+        raise ValueError("storage row is missing logical_task_id")
+    dataset_metadata = raw.get("dataset_metadata")
+    if not isinstance(dataset_metadata, dict):
+        raise ValueError("storage row dataset_metadata must be an object")
+
     messages = normalize_messages(
         raw.get("messages") or [],
         used_tool_calls=runtime.get("used_tool_calls") or [],
@@ -89,29 +100,16 @@ def _row(raw: dict) -> dict:
     )
     tools = tools_from_provenance(apps)
 
-    metadata = {
-        "task": raw.get("task_metadata") or raw.get("source_metadata") or {},
-        "teacher": raw.get("teacher_metadata") or {},
-        "adapter": raw.get("adapter") or {
-            "id": raw.get("adapter_id"),
-            "version": raw.get("adapter_version"),
-        },
-        "runtime": runtime,
-        "captured_at": raw.get("captured_at"),
-    }
-
-    logical_task_id = (
-        raw.get("logical_task_id")
-        or raw.get("canonical_task_id")
-        or raw.get("task_id")
-    )
+    metadata = dict(dataset_metadata)
+    metadata["runtime"] = runtime
+    metadata["captured_at"] = raw.get("captured_at")
 
     return {
         "trajectory_id": str(raw.get("task_id") or ""),
-        "task_id": str(logical_task_id or ""),
+        "task_id": logical_task_id,
         "messages": messages,
         "tools": tools,
-        "execution_status": str(raw.get("execution_status") or raw.get("status") or ""),
+        "execution_status": str(raw.get("status") or ""),
         "evaluation": _evaluation(raw),
         "metadata_json": _json(metadata),
     }

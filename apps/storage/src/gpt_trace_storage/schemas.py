@@ -74,11 +74,12 @@ class AppProvenance(BaseModel):
 
 class StartRunRequest(BaseModel):
     task_id: str = Field(min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._:-]+$")
+    logical_task_id: str | None = Field(default=None, min_length=1, max_length=255)
     runner_id: str = Field(min_length=1, max_length=255)
     expected_attempt: int = Field(ge=1)
     task_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     app_provenance: list[AppProvenance]
-    superbench: dict[str, Any] | None = None
+    dataset_metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("task_id")
     @classmethod
@@ -104,11 +105,20 @@ class ConversationRequest(MutationBase):
     conversation_id: str = Field(min_length=1, max_length=255)
 
 
+class EvaluationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal["pass", "fail"]
+    score: float | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class CompleteRunRequest(MutationBase):
     conversation_id: str = Field(min_length=1, max_length=255)
     messages: list[dict[str, Any]] = Field(min_length=2)
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
-    evaluation: dict[str, Any] | None = None
+    evaluation: EvaluationPayload | None = None
 
 
 class FailRunRequest(MutationBase):
@@ -122,7 +132,9 @@ class ResetRunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
     task_id: str
+    logical_task_id: str
     status: str
     runner_id: str | None = None
     attempt: int
@@ -130,12 +142,8 @@ class RunResponse(BaseModel):
     conversation_id: str | None = None
     runtime_metadata: dict[str, Any] | None = None
     app_provenance: list[dict[str, Any]] | None = None
-    canonical_task_id: str | None = None
-    campaign_id: str | None = None
-    run_status: str | None = None
-    success: bool | None = None
-    reward: float | None = None
-    native_result: dict[str, Any] | None = None
+    dataset_metadata: dict[str, Any]
+    evaluation: EvaluationPayload | None = None
     error_type: str | None = None
     error_message: str | None = None
     started_at: datetime | None = None

@@ -36,7 +36,8 @@ class StorageLike(Protocol):
         expected_attempt: int,
         task_fingerprint: str,
         app_provenance: list[dict],
-        superbench: dict | None = None,
+        logical_task_id: str | None = None,
+        dataset_metadata: dict[str, Any] | None = None,
     ) -> StoredRun: ...
     async def set_conversation(self, task_id: str, conversation_id: str, *, attempt: int, runner_id: str) -> StoredRun: ...
     async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str, evaluation: dict | None = None) -> StoredRun: ...
@@ -130,8 +131,11 @@ class BenchmarkRunner:
         recover_existing: bool,
         console: Console,
         journal: JournalStore,
-        superbench_metadata: dict[str, dict[str, Any]] | None = None,
-        evaluation_hooks: dict[str, Callable[[CapturedConversation], Awaitable[dict[str, Any]]]] | None = None,
+        storage_context: dict[str, dict[str, Any]] | None = None,
+        evaluation_hooks: dict[
+            str,
+            Callable[[CapturedConversation], Awaitable[dict[str, Any] | None]],
+        ] | None = None,
     ) -> None:
         self.chatgpt = chatgpt
         self.storage = storage
@@ -141,7 +145,7 @@ class BenchmarkRunner:
         self.console = console
         self.journal = journal
         self._session_prepared = False
-        self.superbench_metadata = superbench_metadata or {}
+        self.storage_context = storage_context or {}
         self.evaluation_hooks = evaluation_hooks or {}
 
     async def _ensure_session(self) -> None:
@@ -453,13 +457,15 @@ class BenchmarkRunner:
         started: StoredRun | None = None
         phase = "starting"
         try:
+            context = self.storage_context.get(task.task_id, {})
             started = await self.storage.start(
                 task.task_id,
                 self.runner_id,
                 expected_attempt,
                 fingerprint,
                 provenance,
-                **({"superbench": self.superbench_metadata[task.task_id]} if task.task_id in self.superbench_metadata else {}),
+                logical_task_id=context.get("logical_task_id"),
+                dataset_metadata=context.get("dataset_metadata"),
             )
             if started.attempt != expected_attempt or started.runner_id != self.runner_id:
                 raise StorageError("storage /start returned unexpected attempt identity")

@@ -596,12 +596,21 @@ def superbench_status(adapter: list[str] = typer.Option([], "--adapter")) -> Non
                     continue
                 if state.status == "completed":
                     completed += 1
-                    if state.success is None:
+                    evaluation = state.evaluation
+                    if evaluation is None:
                         unevaluated += 1
                     else:
-                        evaluated += 1
-                        passed += int(state.success is True)
-                        failed += int(state.success is False)
+                        verdict = evaluation.get("verdict")
+                        if verdict == "pass":
+                            evaluated += 1
+                            passed += 1
+                        elif verdict == "fail":
+                            evaluated += 1
+                            failed += 1
+                        else:
+                            raise RuntimeError(
+                                f"{state.task_id}: invalid evaluation verdict {verdict!r}"
+                            )
         finally:
             await storage.close()
         console.print(

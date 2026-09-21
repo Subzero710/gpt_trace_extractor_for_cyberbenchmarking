@@ -34,8 +34,9 @@ async def start(body: StartRunRequest, session: AsyncSession = Depends(get_sessi
             runner_id=body.runner_id,
             expected_attempt=body.expected_attempt,
             task_fingerprint=body.task_fingerprint,
+            logical_task_id=body.logical_task_id,
             app_provenance=[item.model_dump(mode="json") for item in body.app_provenance],
-            superbench=body.superbench,
+            dataset_metadata=body.dataset_metadata,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -77,7 +78,7 @@ async def complete(task_id: str, body: CompleteRunRequest, session: AsyncSession
             runtime_metadata=body.runtime_metadata,
             attempt=body.attempt,
             runner_id=body.runner_id,
-            evaluation=body.evaluation,
+            evaluation=body.evaluation.model_dump(mode="json") if body.evaluation else None,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -128,26 +129,16 @@ async def run_stats(session: AsyncSession = Depends(get_session)):
 
 
 def _export_item(run: Run) -> dict:
-    evaluation = None
-    if run.success is not None:
-        evaluation = {
-            "verdict": "pass" if run.success else "fail",
-            "score": run.reward,
-            "details": run.native_result or {},
-            "metadata": run.evaluator_metadata or {},
-        }
     return {
         "task_id": run.task_id,
-        "logical_task_id": run.canonical_task_id or run.task_id,
+        "logical_task_id": run.logical_task_id,
         "status": run.status,
         "conversation_id": run.conversation_id,
         "messages": run.messages,
         "runtime_metadata": run.runtime_metadata or {},
         "app_provenance": run.app_provenance or [],
-        "task_metadata": run.source_metadata or {},
-        "teacher_metadata": run.teacher_metadata or {},
-        "adapter": {"id": run.adapter_id, "version": run.adapter_version},
-        "evaluation": evaluation,
+        "dataset_metadata": run.dataset_metadata or {},
+        "evaluation": run.evaluation,
         "captured_at": run.completed_at.isoformat() if run.completed_at else None,
     }
 

@@ -51,18 +51,20 @@ def to_benchmark_task(task: TaskSpec, registry, campaign_id: str) -> BenchmarkTa
     )
 
 
-def start_metadata(task: TaskSpec, camp: TeacherCampaign, adapter) -> dict:
-    # Keep the storage wire format backwards-compatible while making task metadata
-    # intentionally opaque to the core.
+def storage_context(task: TaskSpec, camp: TeacherCampaign, adapter) -> dict:
     return {
-        "canonical_task_id": task.task_id,
-        "campaign_id": camp.campaign_id,
-        "source_metadata": dict(task.metadata),
-        "teacher_metadata": {
-            "expected_model": camp.expected_model,
-            "configuration": camp.teacher_configuration,
-            "runner_commit": camp.runner_commit,
+        "logical_task_id": task.task_id,
+        "dataset_metadata": {
+            "task": dict(task.metadata),
+            "teacher": {
+                "expected_model": camp.expected_model,
+                "configuration": camp.teacher_configuration,
+                "runner_commit": camp.runner_commit,
+            },
+            "adapter": {
+                "id": adapter.adapter_id,
+                "version": adapter.adapter_version,
+            },
+            "campaign_id": camp.campaign_id,
         },
-        "adapter_id": adapter.adapter_id,
-        "adapter_version": adapter.adapter_version,
     }

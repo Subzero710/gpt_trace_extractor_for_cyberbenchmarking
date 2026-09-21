@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -13,7 +14,12 @@ class RunConflict(RuntimeError):
     pass
 
 
-async def get_run(session: AsyncSession, task_id: str, *, for_update: bool = False) -> Run | None:
+async def get_run(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    for_update: bool = False,
+) -> Run | None:
     stmt = select(Run).where(Run.task_id == task_id)
     if for_update:
         stmt = stmt.with_for_update()
@@ -28,40 +34,87 @@ async def _check_identity(run: Run, *, attempt: int, runner_id: str) -> None:
         )
 
 
+def _validated_evaluation(evaluation: dict[str, Any] | None) -> dict[str, Any] | None:
+    if evaluation is None:
+        return None
+    if not isinstance(evaluation, dict):
+        raise RunConflict("evaluation must be an object or null")
+    unknown = set(evaluation) - {"verdict", "score", "details", "metadata"}
+    if unknown:
+        raise RunConflict(f"evaluation contains unsupported fields: {sorted(unknown)!r}")
+    verdict = evaluation.get("verdict")
+    if verdict not in {"pass", "fail"}:
+        raise RunConflict("evaluation.verdict must be 'pass' or 'fail'")
+    score = evaluation.get("score")
+    if score is not None and (
+        not isinstance(score, (int, float)) or isinstance(score, bool)
+    ):
+        raise RunConflict("evaluation.score must be numeric or null")
+    details = evaluation.get("details", {})
+    metadata = evaluation.get("metadata", {})
+    if not isinstance(details, dict) or not isinstance(metadata, dict):
+        raise RunConflict("evaluation details/metadata must be objects")
+    return {
+        "verdict": verdict,
+        "score": float(score) if score is not None else None,
+        "details": details,
+        "metadata": metadata,
+    }
+
+
 async def start_run(
     session: AsyncSession,
     *,
     task_id: str,
+    logical_task_id: str | None,
     runner_id: str,
     expected_attempt: int,
     task_fingerprint: str,
     app_provenance: list[dict],
-    superbench: dict | None = None,
+    dataset_metadata: dict[str, Any] | None = None,
 ) -> Run:
-    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))"))
-    other = await session.scalar(select(Run).where(Run.status == "running", Run.task_id != task_id).limit(1))
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))")
+    )
+    other = await session.scalar(
+        select(Run)
+        .where(Run.status == "running", Run.task_id != task_id)
+        .limit(1)
+    )
     if other is not None:
         raise RunConflict(f"another task is already running: {other.task_id}")
+
+    logical_id = logical_task_id or task_id
+    metadata = dict(dataset_metadata or {})
     run = await get_run(session, task_id, for_update=True)
     now = datetime.now(timezone.utc)
+
     if run is None:
         if expected_attempt != 1:
             raise RunConflict(f"new task must start at attempt 1, got {expected_attempt}")
         run = Run(
             task_id=task_id,
+            logical_task_id=logical_id,
             status="running",
             runner_id=runner_id,
             attempt=1,
             task_fingerprint=task_fingerprint,
             app_provenance=app_provenance,
+            dataset_metadata=metadata,
+            evaluation=None,
             started_at=now,
-            **({k: v for k, v in (superbench or {}).items() if k in {"canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version"}}),
         )
         session.add(run)
     elif run.task_fingerprint is None:
-        raise RunConflict("legacy run has no task fingerprint; migrate/reset it explicitly before resume")
+        raise RunConflict(
+            "stored run has no task fingerprint; migrate/reset it explicitly before resume"
+        )
     elif run.task_fingerprint != task_fingerprint:
         raise RunConflict("task specification changed for an existing task_id")
+    elif run.logical_task_id != logical_id:
+        raise RunConflict("logical_task_id changed for an existing task_id")
+    elif (run.dataset_metadata or {}) != metadata:
+        raise RunConflict("dataset_metadata changed for an existing task_id")
     elif run.status == "completed":
         raise RunConflict("completed run is immutable")
     elif run.status == "running":
@@ -71,10 +124,14 @@ async def start_run(
             await session.commit()
             await session.refresh(run)
             return run
-        raise RunConflict(f"task already running at attempt={run.attempt} runner={run.runner_id!r}")
+        raise RunConflict(
+            f"task already running at attempt={run.attempt} runner={run.runner_id!r}"
+        )
     else:
         if expected_attempt != run.attempt + 1:
-            raise RunConflict(f"expected next attempt {run.attempt + 1}, got {expected_attempt}")
+            raise RunConflict(
+                f"expected next attempt {run.attempt + 1}, got {expected_attempt}"
+            )
         run.status = "running"
         run.runner_id = runner_id
         run.attempt = expected_attempt
@@ -84,12 +141,10 @@ async def start_run(
         run.messages = None
         run.runtime_metadata = None
         run.app_provenance = app_provenance
+        run.evaluation = None
         run.error_type = None
         run.error_message = None
-        if superbench:
-            for k, v in superbench.items():
-                if k in {"canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version"}: setattr(run,k,v)
-        run.run_status = None; run.success = None; run.reward = None; run.native_result = None; run.evaluator_metadata = None
+
     await session.commit()
     await session.refresh(run)
     return run
@@ -120,54 +175,11 @@ async def set_conversation(
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise RunConflict("conversation_id is already assigned to another task") from exc
+        raise RunConflict(
+            "conversation_id is already assigned to another task"
+        ) from exc
     await session.refresh(run)
     return run
-
-
-def _normalize_evaluation(evaluation: dict | None) -> dict | None:
-    if evaluation is None:
-        return None
-    if not isinstance(evaluation, dict):
-        raise RunConflict("evaluation must be an object or null")
-
-    verdict = evaluation.get("verdict")
-    if verdict is None and isinstance(evaluation.get("success"), bool):
-        # Backwards-compatible wire input from the first Superbench draft.
-        verdict = "pass" if evaluation["success"] else "fail"
-        evaluation = {
-            "verdict": verdict,
-            "score": evaluation.get("reward"),
-            "details": evaluation.get("native_result") or {},
-            "metadata": evaluation.get("evaluator_metadata") or {},
-        }
-    if verdict not in {"pass", "fail"}:
-        raise RunConflict("evaluation.verdict must be 'pass' or 'fail'")
-
-    score = evaluation.get("score")
-    if score is not None and (not isinstance(score, (int, float)) or isinstance(score, bool)):
-        raise RunConflict("evaluation.score must be numeric or null")
-    details = evaluation.get("details") or {}
-    metadata = evaluation.get("metadata") or {}
-    if not isinstance(details, dict) or not isinstance(metadata, dict):
-        raise RunConflict("evaluation details/metadata must be objects")
-    return {
-        "verdict": verdict,
-        "score": float(score) if score is not None else None,
-        "details": details,
-        "metadata": metadata,
-    }
-
-
-def _stored_evaluation(run: Run) -> dict | None:
-    if run.success is None:
-        return None
-    return {
-        "verdict": "pass" if run.success else "fail",
-        "score": run.reward,
-        "details": run.native_result or {},
-        "metadata": run.evaluator_metadata or {},
-    }
 
 
 async def complete_run(
@@ -179,7 +191,7 @@ async def complete_run(
     runtime_metadata: dict,
     attempt: int,
     runner_id: str,
-    evaluation: dict | None = None,
+    evaluation: dict[str, Any] | None = None,
 ) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
     if run is None:
@@ -188,7 +200,7 @@ async def complete_run(
     if run.app_provenance is None:
         raise RunConflict("cannot complete a run without App provenance")
 
-    normalized_evaluation = _normalize_evaluation(evaluation)
+    normalized_evaluation = _validated_evaluation(evaluation)
 
     if run.status == "completed":
         if not (
@@ -197,40 +209,33 @@ async def complete_run(
             and (run.runtime_metadata or {}) == runtime_metadata
         ):
             raise RunConflict("completed run is immutable")
-        if _stored_evaluation(run) != normalized_evaluation:
+        if run.evaluation != normalized_evaluation:
             raise RunConflict("completed run evaluation differs from immutable label")
         return run
 
     if run.status != "running":
         raise RunConflict(f"cannot complete status={run.status}")
     if run.conversation_id and run.conversation_id != conversation_id:
-        raise RunConflict("completion conversation_id differs from running attempt")
+        raise RunConflict(
+            "completion conversation_id differs from running attempt"
+        )
 
     run.status = "completed"
     run.conversation_id = conversation_id
     run.messages = messages
     run.runtime_metadata = runtime_metadata
+    run.evaluation = normalized_evaluation
     run.error_type = None
     run.error_message = None
-    run.run_status = "completed"  # legacy compatibility; dataset uses status directly
-
-    if normalized_evaluation is None:
-        run.success = None
-        run.reward = None
-        run.native_result = None
-        run.evaluator_metadata = None
-    else:
-        run.success = normalized_evaluation["verdict"] == "pass"
-        run.reward = normalized_evaluation["score"]
-        run.native_result = normalized_evaluation["details"]
-        run.evaluator_metadata = normalized_evaluation["metadata"]
-
     run.completed_at = datetime.now(timezone.utc)
+
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise RunConflict("conversation_id is already assigned to another task") from exc
+        raise RunConflict(
+            "conversation_id is already assigned to another task"
+        ) from exc
     await session.refresh(run)
     return run
 
@@ -256,9 +261,9 @@ async def fail_run(
         raise RunConflict("failed run is immutable until a new attempt is started")
     if run.status != "running":
         raise RunConflict(f"cannot fail status={run.status}")
+
     run.status = "failed"
-    run.run_status = "infra_failed"
-    run.success = None
+    run.evaluation = None
     run.error_type = error_type
     run.error_message = error_message
     await session.commit()
@@ -281,14 +286,20 @@ async def reset_run(
     if run.task_fingerprint != expected_task_fingerprint:
         raise RunConflict("stale reset fingerprint differs from stored run")
     if run.status == "running":
-        raise RunConflict("running run cannot be reset; recover or stop it explicitly first")
+        raise RunConflict(
+            "running run cannot be reset; recover or stop it explicitly first"
+        )
     await session.delete(run)
     await session.commit()
     return True
 
 
 async def stats(session: AsyncSession) -> dict[str, int]:
-    rows = (await session.execute(select(Run.status, func.count(Run.id)).group_by(Run.status))).all()
+    rows = (
+        await session.execute(
+            select(Run.status, func.count(Run.id)).group_by(Run.status)
+        )
+    ).all()
     output = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
     for status, count in rows:
         if status in output:

@@ -60,6 +60,7 @@ class BenchmarkTask:
 @dataclass(frozen=True, slots=True)
 class StoredRun:
     task_id: str
+    logical_task_id: str
     status: str
     conversation_id: str | None = None
     attempt: int = 0
@@ -69,12 +70,8 @@ class StoredRun:
     error_message: str | None = None
     runtime_metadata: dict[str, Any] | None = None
     app_provenance: list[dict[str, Any]] | None = None
-    canonical_task_id: str | None = None
-    campaign_id: str | None = None
-    run_status: str | None = None
-    success: bool | None = None
-    reward: float | None = None
-    native_result: dict[str, Any] | None = None
+    dataset_metadata: dict[str, Any] = field(default_factory=dict)
+    evaluation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
