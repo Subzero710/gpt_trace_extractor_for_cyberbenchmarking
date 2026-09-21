@@ -16,7 +16,7 @@ from .registry import AdapterRegistry
 from .service import campaign, start_metadata, to_benchmark_task
 
 
-async def _record_pre_runner_failure(*, storage, settings, task, bt, camp, state, error):
+async def _record_pre_runner_failure(*, storage, settings, task, adapter, bt, camp, state, error):
     expected = (state.attempt + 1) if state is not None else 1
     started = await storage.start(
         bt.task_id,
@@ -24,7 +24,7 @@ async def _record_pre_runner_failure(*, storage, settings, task, bt, camp, state
         expected,
         task_fingerprint(bt),
         task_app_provenance(bt),
-        superbench=start_metadata(task, camp),
+        superbench=start_metadata(task, camp, adapter),
     )
     await storage.fail(
         bt.task_id,
@@ -73,7 +73,7 @@ async def _recover_pending_journal(
         (
             entry
             for entry in entries
-            if run_task_id(entry.task.canonical_task_id, camp.campaign_id) == pending.task_id
+            if run_task_id(entry.task.task_id, camp.campaign_id) == pending.task_id
         ),
         None,
     )
@@ -99,9 +99,8 @@ async def _recover_pending_journal(
         )
 
         async def evaluate(captured):
-            return (
-                await adapter.evaluate(task, prepared=prepared, captured=captured)
-            ).as_dict()
+            result = await adapter.evaluate(task, prepared=prepared, captured=captured)
+            return result.as_dict() if result is not None else None
 
         runner = BenchmarkRunner(
             chatgpt=chatgpt,
@@ -111,7 +110,7 @@ async def _recover_pending_journal(
             recover_existing=settings.runner_recover_existing,
             console=console,
             journal=journal,
-            superbench_metadata={bt.task_id: start_metadata(task, camp)},
+            superbench_metadata={bt.task_id: start_metadata(task, camp, adapter)},
             evaluation_hooks={bt.task_id: evaluate},
         )
         try:
@@ -192,11 +191,8 @@ async def run_pending(
                 if state is not None:
                     run_status = getattr(state, "run_status", None)
                     if state.status == "completed":
-                        if state.success is None:
-                            raise RuntimeError(
-                                f"{bt.task_id}: invalid Superbench state: "
-                                "completed run has success=None"
-                            )
+                        # Completed trajectories may be evaluated or intentionally
+                        # unevaluated when the upstream benchmark has no native oracle.
                         continue
                     if run_status == "unsupported":
                         continue
@@ -243,11 +239,10 @@ async def run_pending(
                     )
 
                     async def evaluate(captured):
-                        return (
-                            await adapter.evaluate(
-                                task, prepared=prepared, captured=captured
-                            )
-                        ).as_dict()
+                        result = await adapter.evaluate(
+                            task, prepared=prepared, captured=captured
+                        )
+                        return result.as_dict() if result is not None else None
 
                     runner = BenchmarkRunner(
                         chatgpt=chatgpt,
@@ -257,7 +252,7 @@ async def run_pending(
                         recover_existing=settings.runner_recover_existing,
                         console=console,
                         journal=journal,
-                        superbench_metadata={bt.task_id: start_metadata(task, camp)},
+                        superbench_metadata={bt.task_id: start_metadata(task, camp, adapter)},
                         evaluation_hooks={bt.task_id: evaluate},
                     )
                     runner_started = True
@@ -316,6 +311,7 @@ async def run_pending(
                                 storage=storage,
                                 settings=settings,
                                 task=task,
+                                adapter=adapter,
                                 bt=bt,
                                 camp=camp,
                                 state=latest,

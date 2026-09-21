@@ -125,41 +125,114 @@ async def set_conversation(
     return run
 
 
+def _normalize_evaluation(evaluation: dict | None) -> dict | None:
+    if evaluation is None:
+        return None
+    if not isinstance(evaluation, dict):
+        raise RunConflict("evaluation must be an object or null")
+
+    verdict = evaluation.get("verdict")
+    if verdict is None and isinstance(evaluation.get("success"), bool):
+        # Backwards-compatible wire input from the first Superbench draft.
+        verdict = "pass" if evaluation["success"] else "fail"
+        evaluation = {
+            "verdict": verdict,
+            "score": evaluation.get("reward"),
+            "details": evaluation.get("native_result") or {},
+            "metadata": evaluation.get("evaluator_metadata") or {},
+        }
+    if verdict not in {"pass", "fail"}:
+        raise RunConflict("evaluation.verdict must be 'pass' or 'fail'")
+
+    score = evaluation.get("score")
+    if score is not None and (not isinstance(score, (int, float)) or isinstance(score, bool)):
+        raise RunConflict("evaluation.score must be numeric or null")
+    details = evaluation.get("details") or {}
+    metadata = evaluation.get("metadata") or {}
+    if not isinstance(details, dict) or not isinstance(metadata, dict):
+        raise RunConflict("evaluation details/metadata must be objects")
+    return {
+        "verdict": verdict,
+        "score": float(score) if score is not None else None,
+        "details": details,
+        "metadata": metadata,
+    }
+
+
+def _stored_evaluation(run: Run) -> dict | None:
+    if run.success is None:
+        return None
+    return {
+        "verdict": "pass" if run.success else "fail",
+        "score": run.reward,
+        "details": run.native_result or {},
+        "metadata": run.evaluator_metadata or {},
+    }
+
+
 async def complete_run(
-    session: AsyncSession, *, task_id: str, conversation_id: str, messages: list[dict],
-    runtime_metadata: dict, attempt: int, runner_id: str, evaluation: dict | None = None,
+    session: AsyncSession,
+    *,
+    task_id: str,
+    conversation_id: str,
+    messages: list[dict],
+    runtime_metadata: dict,
+    attempt: int,
+    runner_id: str,
+    evaluation: dict | None = None,
 ) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
-    if run is None: return None
+    if run is None:
+        return None
     await _check_identity(run, attempt=attempt, runner_id=runner_id)
-    if run.app_provenance is None: raise RunConflict("cannot complete a run without App provenance")
-    if run.canonical_task_id is not None and evaluation is None:
-        raise RunConflict("Superbench completion requires an evaluation result")
-    if evaluation is not None and not isinstance(evaluation.get("success"), bool):
-        raise RunConflict("evaluated completion requires boolean success")
+    if run.app_provenance is None:
+        raise RunConflict("cannot complete a run without App provenance")
+
+    normalized_evaluation = _normalize_evaluation(evaluation)
+
     if run.status == "completed":
-        if not (run.conversation_id == conversation_id and run.messages == messages and (run.runtime_metadata or {}) == runtime_metadata):
-            raise RunConflict("completed run is immutable")
-        if evaluation is not None and not (
-            run.success is evaluation["success"] and run.reward == evaluation.get("reward")
-            and (run.native_result or {}) == (evaluation.get("native_result") or {})
-            and (run.evaluator_metadata or {}) == (evaluation.get("evaluator_metadata") or {})
+        if not (
+            run.conversation_id == conversation_id
+            and run.messages == messages
+            and (run.runtime_metadata or {}) == runtime_metadata
         ):
+            raise RunConflict("completed run is immutable")
+        if _stored_evaluation(run) != normalized_evaluation:
             raise RunConflict("completed run evaluation differs from immutable label")
         return run
-    if run.status != "running": raise RunConflict(f"cannot complete status={run.status}")
+
+    if run.status != "running":
+        raise RunConflict(f"cannot complete status={run.status}")
     if run.conversation_id and run.conversation_id != conversation_id:
         raise RunConflict("completion conversation_id differs from running attempt")
-    run.status="completed"; run.conversation_id=conversation_id; run.messages=messages; run.runtime_metadata=runtime_metadata
-    run.error_type=None; run.error_message=None; run.run_status="completed"
-    if evaluation is not None:
-        run.success=evaluation["success"]; run.reward=evaluation.get("reward")
-        run.native_result=evaluation.get("native_result") or {}; run.evaluator_metadata=evaluation.get("evaluator_metadata") or {}
-    run.completed_at=datetime.now(timezone.utc)
-    try: await session.commit()
+
+    run.status = "completed"
+    run.conversation_id = conversation_id
+    run.messages = messages
+    run.runtime_metadata = runtime_metadata
+    run.error_type = None
+    run.error_message = None
+    run.run_status = "completed"  # legacy compatibility; dataset uses status directly
+
+    if normalized_evaluation is None:
+        run.success = None
+        run.reward = None
+        run.native_result = None
+        run.evaluator_metadata = None
+    else:
+        run.success = normalized_evaluation["verdict"] == "pass"
+        run.reward = normalized_evaluation["score"]
+        run.native_result = normalized_evaluation["details"]
+        run.evaluator_metadata = normalized_evaluation["metadata"]
+
+    run.completed_at = datetime.now(timezone.utc)
+    try:
+        await session.commit()
     except IntegrityError as exc:
-        await session.rollback(); raise RunConflict("conversation_id is already assigned to another task") from exc
-    await session.refresh(run); return run
+        await session.rollback()
+        raise RunConflict("conversation_id is already assigned to another task") from exc
+    await session.refresh(run)
+    return run
 
 
 async def fail_run(

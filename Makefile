@@ -71,7 +71,7 @@ export-parquet:
 	@mkdir -p exports
 	docker compose run --rm --no-deps runner export-parquet /data/exports/corpus.parquet
 
-export-sft:
+export-sft: export-parquet
 	python3 scripts/project_state.py core
 	@mkdir -p exports
-	docker compose run --rm --no-deps runner export-sft /data/exports/sft.parquet
+	docker compose run --rm --no-deps runner export-sft /data/exports/corpus.parquet /data/exports/sft.parquet

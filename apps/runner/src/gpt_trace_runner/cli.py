@@ -574,37 +574,68 @@ def superbench_run(adapter: list[str] = typer.Option([], "--adapter"), limit: in
 def superbench_status(adapter: list[str] = typer.Option([], "--adapter")) -> None:
     from .superbench.catalog import SuperbenchCatalog
     from .superbench.registry import AdapterRegistry
-    from .superbench.service import campaign,to_benchmark_task
+    from .superbench.service import campaign, to_benchmark_task
+
     async def main():
-        settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); cat=SuperbenchCatalog(AdapterRegistry.discover()).discover(tuple(adapter)); camp=campaign(settings); storage=StorageClient(settings.storage_base_url)
-        attempted=evaluated=success=failure=infra=0
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        cat = SuperbenchCatalog(AdapterRegistry.discover()).discover(tuple(adapter))
+        camp = campaign(settings)
+        storage = StorageClient(settings.storage_base_url)
+        attempted = completed = evaluated = passed = failed = unevaluated = infra = 0
         try:
             for entry in cat:
-                state=await storage.get(to_benchmark_task(entry.task,registry,camp.campaign_id).task_id)
-                if state is None: continue
-                attempted+=1
-                if state.status=='failed': infra+=1
-                elif state.status=='completed' and state.success is not None:
-                    evaluated+=1; success+=int(state.success is True); failure+=int(state.success is False)
-        finally: await storage.close()
-        rate=(success/evaluated if evaluated else None); coverage=(evaluated/attempted if attempted else 0.0)
-        console.print(f"campaign={camp.campaign_id} catalog={len(cat)} attempted={attempted} evaluated={evaluated} success={success} failure={failure} infra_failed={infra} success_rate={rate if rate is not None else 'n/a'} evaluation_coverage={coverage:.3f}")
+                state = await storage.get(
+                    to_benchmark_task(entry.task, registry, camp.campaign_id).task_id
+                )
+                if state is None:
+                    continue
+                attempted += 1
+                if state.status == "failed":
+                    infra += 1
+                    continue
+                if state.status == "completed":
+                    completed += 1
+                    if state.success is None:
+                        unevaluated += 1
+                    else:
+                        evaluated += 1
+                        passed += int(state.success is True)
+                        failed += int(state.success is False)
+        finally:
+            await storage.close()
+        console.print(
+            f"campaign={camp.campaign_id} catalog={len(cat)} attempted={attempted} "
+            f"completed={completed} evaluated={evaluated} pass={passed} fail={failed} "
+            f"unevaluated={unevaluated} infra_failed={infra}"
+        )
+
     asyncio.run(main())
 
 @app.command("export-parquet")
-def export_parquet(output: Path = typer.Argument(Path("/data/exports/corpus.parquet"))) -> None:
-    from .superbench.exporter import write_parquet_stream
+def export_parquet(
+    output: Path = typer.Argument(Path("/data/exports/corpus.parquet")),
+) -> None:
+    from .superbench.exporter import write_corpus_stream
+
     async def main():
-        c=StorageClient(Settings().storage_base_url)
-        try: n=await write_parquet_stream(c.iter_export_rows(),output); console.print(f"wrote {n} rows to {output}")
-        finally: await c.close()
+        client = StorageClient(Settings().storage_base_url)
+        try:
+            count = await write_corpus_stream(client.iter_export_rows(), output)
+            console.print(f"wrote {count} corpus rows to {output}")
+        finally:
+            await client.close()
+
     asyncio.run(main())
 
+
 @app.command("export-sft")
-def export_sft(output: Path = typer.Argument(Path("/data/exports/sft.parquet"))) -> None:
-    from .superbench.exporter import write_parquet_stream
-    async def main():
-        c=StorageClient(Settings().storage_base_url)
-        try: n=await write_parquet_stream(c.iter_export_rows(),output,sft=True); console.print(f"wrote {n} rows to {output}")
-        finally: await c.close()
-    asyncio.run(main())
+def export_sft(
+    corpus: Path = typer.Argument(Path("/data/exports/corpus.parquet"), exists=True, dir_okay=False),
+    output: Path = typer.Argument(Path("/data/exports/sft.parquet")),
+    verdict: list[str] = typer.Option([], "--verdict", help="Optional pass/fail/unevaluated row filter; repeatable."),
+) -> None:
+    from .superbench.exporter import derive_sft
+
+    count = derive_sft(corpus, output, verdicts=verdict)
+    console.print(f"derived {count} SFT rows from {corpus} -> {output}")

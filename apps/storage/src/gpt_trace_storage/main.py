@@ -128,7 +128,28 @@ async def run_stats(session: AsyncSession = Depends(get_session)):
 
 
 def _export_item(run: Run) -> dict:
-    return {k: getattr(run, k) for k in ("task_id","task_fingerprint","conversation_id","status","run_status","canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version","evaluator_metadata","success","reward","native_result","app_provenance","runtime_metadata","messages")} | {"captured_at": run.completed_at.isoformat() if run.completed_at else None}
+    evaluation = None
+    if run.success is not None:
+        evaluation = {
+            "verdict": "pass" if run.success else "fail",
+            "score": run.reward,
+            "details": run.native_result or {},
+            "metadata": run.evaluator_metadata or {},
+        }
+    return {
+        "task_id": run.task_id,
+        "logical_task_id": run.canonical_task_id or run.task_id,
+        "status": run.status,
+        "conversation_id": run.conversation_id,
+        "messages": run.messages,
+        "runtime_metadata": run.runtime_metadata or {},
+        "app_provenance": run.app_provenance or [],
+        "task_metadata": run.source_metadata or {},
+        "teacher_metadata": run.teacher_metadata or {},
+        "adapter": {"id": run.adapter_id, "version": run.adapter_version},
+        "evaluation": evaluation,
+        "captured_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
 
 
 @app.get("/v1/export.jsonl")

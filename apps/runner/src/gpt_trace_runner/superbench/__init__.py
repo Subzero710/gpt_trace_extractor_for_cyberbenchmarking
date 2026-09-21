@@ -1,4 +1,12 @@
-from .models import CanonicalTask, EvaluationResult, TaskBudgets, TeacherCampaign
+from .models import CanonicalTask, EvaluationResult, TaskSpec, TeacherCampaign
 from .catalog import SuperbenchCatalog
 from .registry import AdapterRegistry
-__all__ = ["CanonicalTask", "EvaluationResult", "TaskBudgets", "TeacherCampaign", "SuperbenchCatalog", "AdapterRegistry"]
+
+__all__ = [
+    "TaskSpec",
+    "CanonicalTask",
+    "EvaluationResult",
+    "TeacherCampaign",
+    "SuperbenchCatalog",
+    "AdapterRegistry",
+]

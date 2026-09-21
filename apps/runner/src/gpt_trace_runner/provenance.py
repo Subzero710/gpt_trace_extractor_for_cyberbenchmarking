@@ -229,7 +229,11 @@ def invoked_tool_calls(
         if explicit_link not in (None, ""):
             link = str(explicit_link)
             for call in reversed(pending):
-                if call.get("call_id") == link or call.get("call_message_id") == link:
+                if (
+                    call.get("result_message_id") is None
+                    and (call.get("call_id") == link or call.get("call_message_id") == link)
+                    and _compatible(call, observation)
+                ):
                     matched = call
                     break
         if matched is None:
