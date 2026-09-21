@@ -15,3 +15,7 @@ To add a benchmark: implement `BenchmarkAdapter`, map upstream records to `Canon
 SFT use contaminates those source tasks for later evaluation. Use `dedup_group`/upstream origin to group related challenges, projects or vulnerability families; do not split near-duplicates independently. License metadata is provenance for later policy/filtering, not legal advice.
 
 V2 uses `/data/state/superbench/staging` for writable staging, requires `GPT_TRACE_RUNNER_BUILD_ID` for campaign identity, evaluates recovery captures through the same task evaluator hook as the happy path, and streams JSONL into bounded Parquet row groups.
+
+Recovery is journal-first: a pending journal is reconciled against its own canonical Superbench task before completed rows are skipped or new tasks are scheduled. Stateful adapters may override `BenchmarkAdapter.recover()` to reconnect evaluator-side state without provisioning a fresh environment. A running storage row without a matching journal is treated as an explicit recovery error rather than a retryable task.
+
+`export-sft` is fail-closed for tool-use structure: every tool call must name a declared globally stable tool, call IDs must be unique, tool results must reference prior calls exactly once, and every call must have a result. The runtime `used_tool_calls` provenance is call-level and joins ChatGPT recipients to canonical App/tool identities.
