@@ -1,4 +1,4 @@
-.PHONY: build up doctor tools auth reset-recovery reset-stale run export down throw_volumes
+.PHONY: build up doctor tools auth reset-recovery reset-stale run export superbench-run superbench-status export-parquet export-sft down throw_volumes
 
 build:
 	python3 scripts/build.py
@@ -56,3 +56,22 @@ throw_volumes:
 
 down:
 	python3 scripts/down.py
+
+
+superbench-run:
+	python3 scripts/project_state.py core
+	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-run
+
+superbench-status:
+	python3 scripts/project_state.py core
+	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-status
+
+export-parquet:
+	python3 scripts/project_state.py core
+	@mkdir -p exports
+	docker compose run --rm --no-deps runner export-parquet /data/exports/corpus.parquet
+
+export-sft:
+	python3 scripts/project_state.py core
+	@mkdir -p exports
+	docker compose run --rm --no-deps runner export-sft /data/exports/sft.parquet

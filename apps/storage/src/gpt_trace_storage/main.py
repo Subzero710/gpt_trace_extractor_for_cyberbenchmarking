@@ -35,6 +35,7 @@ async def start(body: StartRunRequest, session: AsyncSession = Depends(get_sessi
             expected_attempt=body.expected_attempt,
             task_fingerprint=body.task_fingerprint,
             app_provenance=[item.model_dump(mode="json") for item in body.app_provenance],
+            superbench=body.superbench,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -76,6 +77,7 @@ async def complete(task_id: str, body: CompleteRunRequest, session: AsyncSession
             runtime_metadata=body.runtime_metadata,
             attempt=body.attempt,
             runner_id=body.runner_id,
+            evaluation=body.evaluation,
         )
     except RunConflict as exc:
         raise conflict(exc) from exc
@@ -124,6 +126,11 @@ async def run_stats(session: AsyncSession = Depends(get_session)):
     return await stats(session)
 
 
+
+def _export_item(run: Run) -> dict:
+    return {k: getattr(run, k) for k in ("task_id","task_fingerprint","conversation_id","status","run_status","canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version","evaluator_metadata","success","reward","native_result","app_provenance","runtime_metadata","messages")} | {"captured_at": run.completed_at.isoformat() if run.completed_at else None}
+
+
 @app.get("/v1/export.jsonl")
 async def export_jsonl():
     async with SessionFactory() as check_session:
@@ -145,15 +152,7 @@ async def export_jsonl():
         async with SessionFactory() as session:
             result = await session.stream_scalars(select(Run).where(Run.status == "completed").order_by(Run.task_id))
             async for run in result:
-                item = {
-                    "task_id": run.task_id,
-                    "task_fingerprint": run.task_fingerprint,
-                    "conversation_id": run.conversation_id,
-                    "captured_at": run.completed_at.isoformat() if run.completed_at else None,
-                    "app_provenance": run.app_provenance,
-                    "runtime_metadata": run.runtime_metadata or {},
-                    "messages": run.messages or [],
-                }
+                item = _export_item(run)
                 yield json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
     return StreamingResponse(
         rows(),

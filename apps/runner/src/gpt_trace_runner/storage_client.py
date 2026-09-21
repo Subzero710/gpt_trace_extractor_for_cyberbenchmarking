@@ -23,6 +23,8 @@ def _stored_run(payload: dict[str, Any]) -> StoredRun:
         error_message=payload.get("error_message"),
         runtime_metadata=payload.get("runtime_metadata"),
         app_provenance=payload.get("app_provenance"),
+        canonical_task_id=payload.get("canonical_task_id"), campaign_id=payload.get("campaign_id"),
+        run_status=payload.get("run_status"), success=payload.get("success"), reward=payload.get("reward"), native_result=payload.get("native_result"),
     )
 
 
@@ -88,6 +90,7 @@ class StorageClient:
         expected_attempt: int,
         task_fingerprint: str,
         app_provenance: list[dict],
+        superbench: dict | None = None,
     ) -> StoredRun:
         response = await self._request(
             "POST",
@@ -98,6 +101,7 @@ class StorageClient:
                 "expected_attempt": expected_attempt,
                 "task_fingerprint": task_fingerprint,
                 "app_provenance": app_provenance,
+                "superbench": superbench,
             },
             safe_retry=True,
         )
@@ -112,7 +116,7 @@ class StorageClient:
         )
         return _stored_run(response.json())
 
-    async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str) -> StoredRun:
+    async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str, evaluation: dict | None = None) -> StoredRun:
         response = await self._request(
             "POST",
             f"/v1/runs/{task_id}/complete",
@@ -122,6 +126,7 @@ class StorageClient:
                 "runtime_metadata": captured.runtime_metadata,
                 "attempt": attempt,
                 "runner_id": runner_id,
+                "evaluation": evaluation,
             },
             safe_retry=True,
         )
@@ -198,3 +203,14 @@ class StorageClient:
         finally:
             os.close(dir_fd)
         return count
+
+    async def iter_export_rows(self):
+        import json
+        try:
+            async with self._client.stream("GET", "/v1/export.jsonl") as response:
+                if response.is_error:
+                    body=(await response.aread()).decode("utf-8",errors="replace"); raise StorageError(f"export failed: {response.status_code} {body}")
+                async for line in response.aiter_lines():
+                    if line.strip(): yield json.loads(line)
+        except httpx.HTTPError as exc:
+            raise StorageError(f"export transport failed: {exc}") from exc

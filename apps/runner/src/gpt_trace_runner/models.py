@@ -69,6 +69,12 @@ class StoredRun:
     error_message: str | None = None
     runtime_metadata: dict[str, Any] | None = None
     app_provenance: list[dict[str, Any]] | None = None
+    canonical_task_id: str | None = None
+    campaign_id: str | None = None
+    run_status: str | None = None
+    success: bool | None = None
+    reward: float | None = None
+    native_result: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

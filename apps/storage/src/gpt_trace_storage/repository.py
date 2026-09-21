@@ -36,6 +36,7 @@ async def start_run(
     expected_attempt: int,
     task_fingerprint: str,
     app_provenance: list[dict],
+    superbench: dict | None = None,
 ) -> Run:
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))"))
     other = await session.scalar(select(Run).where(Run.status == "running", Run.task_id != task_id).limit(1))
@@ -54,6 +55,7 @@ async def start_run(
             task_fingerprint=task_fingerprint,
             app_provenance=app_provenance,
             started_at=now,
+            **({k: v for k, v in (superbench or {}).items() if k in {"canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version"}}),
         )
         session.add(run)
     elif run.task_fingerprint is None:
@@ -84,6 +86,10 @@ async def start_run(
         run.app_provenance = app_provenance
         run.error_type = None
         run.error_message = None
+        if superbench:
+            for k, v in superbench.items():
+                if k in {"canonical_task_id","campaign_id","source_benchmark","source_benchmark_version","source_task_id","upstream_repository","upstream_commit","source_license","source_metadata","teacher_metadata","adapter_id","adapter_version"}: setattr(run,k,v)
+        run.run_status = None; run.success = None; run.reward = None; run.native_result = None; run.evaluator_metadata = None
     await session.commit()
     await session.refresh(run)
     return run
@@ -128,6 +134,7 @@ async def complete_run(
     runtime_metadata: dict,
     attempt: int,
     runner_id: str,
+    evaluation: dict | None = None,
 ) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
     if run is None:
@@ -149,6 +156,12 @@ async def complete_run(
     run.runtime_metadata = runtime_metadata
     run.error_type = None
     run.error_message = None
+    run.run_status = "completed"
+    if evaluation is not None:
+        run.success = evaluation.get("success")
+        run.reward = evaluation.get("reward")
+        run.native_result = evaluation.get("native_result") or {}
+        run.evaluator_metadata = evaluation.get("evaluator_metadata") or {}
     run.completed_at = datetime.now(timezone.utc)
     try:
         await session.commit()
@@ -181,6 +194,8 @@ async def fail_run(
     if run.status != "running":
         raise RunConflict(f"cannot fail status={run.status}")
     run.status = "failed"
+    run.run_status = "infra_failed"
+    run.success = None
     run.error_type = error_type
     run.error_message = error_message
     await session.commit()

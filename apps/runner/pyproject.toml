@@ -11,6 +11,7 @@ dependencies = [
   "mcp>=1.28,<2",
   "cloakbrowser>=0.5,<1",
   "playwright>=1.53,<2",
+  "pyarrow>=21,<22",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "rich>=13.9,<15",

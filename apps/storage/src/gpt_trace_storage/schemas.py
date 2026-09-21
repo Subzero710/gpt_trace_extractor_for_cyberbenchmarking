@@ -78,6 +78,7 @@ class StartRunRequest(BaseModel):
     expected_attempt: int = Field(ge=1)
     task_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     app_provenance: list[AppProvenance]
+    superbench: dict[str, Any] | None = None
 
     @field_validator("task_id")
     @classmethod
@@ -107,6 +108,7 @@ class CompleteRunRequest(MutationBase):
     conversation_id: str = Field(min_length=1, max_length=255)
     messages: list[dict[str, Any]] = Field(min_length=2)
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
+    evaluation: dict[str, Any] | None = None
 
 
 class FailRunRequest(MutationBase):
@@ -128,6 +130,12 @@ class RunResponse(BaseModel):
     conversation_id: str | None = None
     runtime_metadata: dict[str, Any] | None = None
     app_provenance: list[dict[str, Any]] | None = None
+    canonical_task_id: str | None = None
+    campaign_id: str | None = None
+    run_status: str | None = None
+    success: bool | None = None
+    reward: float | None = None
+    native_result: dict[str, Any] | None = None
     error_type: str | None = None
     error_message: str | None = None
     started_at: datetime | None = None

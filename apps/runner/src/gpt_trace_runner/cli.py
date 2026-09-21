@@ -561,3 +561,50 @@ def export_command(output: Path = typer.Argument(..., dir_okay=False)) -> None:
             await storage.close()
         console.print(f"[green]exported {count} runs -> {output}[/]")
     asyncio.run(main())
+
+
+@app.command("superbench-run")
+def superbench_run(adapter: list[str] = typer.Option([], "--adapter"), limit: int | None = typer.Option(None, min=1)) -> None:
+    from .superbench.execution import run_pending
+    async def main():
+        settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); n,cid=await run_pending(settings=settings,registry=registry,make_lifecycle=make_lifecycle,make_chatgpt=make_chatgpt,console=console,adapter_ids=tuple(adapter),limit=limit); console.print(f"campaign={cid} attempted={n}")
+    asyncio.run(main())
+
+@app.command("superbench-status")
+def superbench_status(adapter: list[str] = typer.Option([], "--adapter")) -> None:
+    from .superbench.catalog import SuperbenchCatalog
+    from .superbench.registry import AdapterRegistry
+    from .superbench.service import campaign,to_benchmark_task
+    async def main():
+        settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); cat=SuperbenchCatalog(AdapterRegistry.discover()).discover(tuple(adapter)); camp=campaign(settings); storage=StorageClient(settings.storage_base_url)
+        attempted=evaluated=success=failure=infra=0
+        try:
+            for entry in cat:
+                state=await storage.get(to_benchmark_task(entry.task,registry,camp.campaign_id).task_id)
+                if state is None: continue
+                attempted+=1
+                if state.status=='failed': infra+=1
+                elif state.status=='completed' and state.success is not None:
+                    evaluated+=1; success+=int(state.success is True); failure+=int(state.success is False)
+        finally: await storage.close()
+        rate=(success/evaluated if evaluated else None); coverage=(evaluated/attempted if attempted else 0.0)
+        console.print(f"campaign={camp.campaign_id} catalog={len(cat)} attempted={attempted} evaluated={evaluated} success={success} failure={failure} infra_failed={infra} success_rate={rate if rate is not None else 'n/a'} evaluation_coverage={coverage:.3f}")
+    asyncio.run(main())
+
+@app.command("export-parquet")
+def export_parquet(output: Path = typer.Argument(Path("/data/exports/corpus.parquet"))) -> None:
+    from .superbench.exporter import write_parquet_stream
+    async def main():
+        c=StorageClient(Settings().storage_base_url)
+        try: n=await write_parquet_stream(c.iter_export_rows(),output); console.print(f"wrote {n} rows to {output}")
+        finally: await c.close()
+    asyncio.run(main())
+
+@app.command("export-sft")
+def export_sft(output: Path = typer.Argument(Path("/data/exports/sft.parquet"))) -> None:
+    from .superbench.exporter import write_parquet_stream
+    async def main():
+        c=StorageClient(Settings().storage_base_url)
+        try: n=await write_parquet_stream(c.iter_export_rows(),output,sft=True); console.print(f"wrote {n} rows to {output}")
+        finally: await c.close()
+    asyncio.run(main())

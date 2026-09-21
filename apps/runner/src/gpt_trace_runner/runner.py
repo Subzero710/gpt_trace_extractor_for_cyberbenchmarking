@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from rich.console import Console
 
@@ -36,9 +36,10 @@ class StorageLike(Protocol):
         expected_attempt: int,
         task_fingerprint: str,
         app_provenance: list[dict],
+        superbench: dict | None = None,
     ) -> StoredRun: ...
     async def set_conversation(self, task_id: str, conversation_id: str, *, attempt: int, runner_id: str) -> StoredRun: ...
-    async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str) -> StoredRun: ...
+    async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str, evaluation: dict | None = None) -> StoredRun: ...
     async def fail(self, task_id: str, error: Exception, *, attempt: int, runner_id: str) -> StoredRun: ...
 
 
@@ -129,6 +130,8 @@ class BenchmarkRunner:
         recover_existing: bool,
         console: Console,
         journal: JournalStore,
+        superbench_metadata: dict[str, dict[str, Any]] | None = None,
+        evaluation_hooks: dict[str, Callable[[CapturedConversation], Awaitable[dict[str, Any]]]] | None = None,
     ) -> None:
         self.chatgpt = chatgpt
         self.storage = storage
@@ -138,6 +141,8 @@ class BenchmarkRunner:
         self.console = console
         self.journal = journal
         self._session_prepared = False
+        self.superbench_metadata = superbench_metadata or {}
+        self.evaluation_hooks = evaluation_hooks or {}
 
     async def _ensure_session(self) -> None:
         if self._session_prepared:
@@ -227,7 +232,9 @@ class BenchmarkRunner:
             app_runtime=app_runtime,
         )
         await self.storage.set_conversation(task.task_id, conversation_id, attempt=existing.attempt, runner_id=identity)
-        await self.storage.complete(task.task_id, captured, attempt=existing.attempt, runner_id=identity)
+        evaluation_hook = self.evaluation_hooks.get(task.task_id)
+        evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
+        await self.storage.complete(task.task_id, captured, attempt=existing.attempt, runner_id=identity, **({"evaluation": evaluation} if evaluation is not None else {}))
         self.journal.write(
             self._entry(
                 recovery_task,
@@ -373,7 +380,9 @@ class BenchmarkRunner:
             app_environments=expected_environments,
             app_runtime=app_runtime,
         )
-        await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id)
+        evaluation_hook = self.evaluation_hooks.get(entry.task_id)
+        evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
+        await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id, **({"evaluation": evaluation} if evaluation is not None else {}))
         self.journal.write(
             self._entry(
                 recovery_task,
@@ -450,6 +459,7 @@ class BenchmarkRunner:
                 expected_attempt,
                 fingerprint,
                 provenance,
+                **({"superbench": self.superbench_metadata[task.task_id]} if task.task_id in self.superbench_metadata else {}),
             )
             if started.attempt != expected_attempt or started.runner_id != self.runner_id:
                 raise StorageError("storage /start returned unexpected attempt identity")
@@ -546,7 +556,9 @@ class BenchmarkRunner:
                 app_environments=environments,
                 app_runtime=app_runtime,
             )
-            await self.storage.complete(task.task_id, captured, attempt=expected_attempt, runner_id=self.runner_id)
+            evaluation_hook = self.evaluation_hooks.get(task.task_id)
+            evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
+            await self.storage.complete(task.task_id, captured, attempt=expected_attempt, runner_id=self.runner_id, **({"evaluation": evaluation} if evaluation is not None else {}))
             phase = "cleanup_pending"
             self.journal.write(
                 self._entry(
