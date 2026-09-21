@@ -20,7 +20,7 @@ class TaskBudgets:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationResult:
-    success: bool|None
+    success: bool
     reward: float|None=None
     native_result: dict[str,Any]=field(default_factory=dict)
     evaluator_metadata: dict[str,Any]=field(default_factory=dict)

@@ -181,3 +181,9 @@ async def test_reset_run_refuses_running_or_changed_identity(monkeypatch) -> Non
             StartSession(), task_id="t", expected_task_fingerprint="b" * 64
         )
 
+
+
+@pytest.mark.asyncio
+async def test_completed_superbench_retry_requires_identical_evaluation(monkeypatch):
+ item=run("completed",conversation_id="c"); item.canonical_task_id="canonical:t"; item.messages=[{"id":"m"}]; item.runtime_metadata={"x":1}; item.success=True; item.reward=1.0; item.native_result={"flag":"ok"}; item.evaluator_metadata={"v":1}; monkeypatch.setattr(repository,"get_run",AsyncMock(return_value=item)); same={"success":True,"reward":1.0,"native_result":{"flag":"ok"},"evaluator_metadata":{"v":1}}; assert await repository.complete_run(FakeSession(),task_id="t",conversation_id="c",messages=[{"id":"m"}],runtime_metadata={"x":1},attempt=2,runner_id="r",evaluation=same) is item; changed=dict(same); changed["success"]=False
+ with pytest.raises(repository.RunConflict,match="evaluation differs"): await repository.complete_run(FakeSession(),task_id="t",conversation_id="c",messages=[{"id":"m"}],runtime_metadata={"x":1},attempt=2,runner_id="r",evaluation=changed)

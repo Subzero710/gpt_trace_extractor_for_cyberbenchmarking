@@ -1,5 +1,5 @@
 from __future__ import annotations
-import hashlib,json
+import json
 from copy import deepcopy
 from typing import Any,Literal
 from pydantic import BaseModel,ConfigDict,Field
@@ -74,4 +74,3 @@ def cat(n):
 TOOLS=OLD+tuple(t(n,n.replace('_',' ').capitalize()+'.',cat(n),a.model_json_schema(),b.model_json_schema()) for n,(a,b) in MODELS.items())
 def canonical_bytes(v):return json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
 def manifest(workspace_templates=None):return {'schema_version':2,'app_id':APP_ID,'version':VERSION,'tools':deepcopy(list(TOOLS)),'workspace_templates':deepcopy(workspace_templates or [])}
-def manifest_sha256(v):return hashlib.sha256(canonical_bytes(v)).hexdigest()

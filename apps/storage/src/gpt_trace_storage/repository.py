@@ -126,50 +126,40 @@ async def set_conversation(
 
 
 async def complete_run(
-    session: AsyncSession,
-    *,
-    task_id: str,
-    conversation_id: str,
-    messages: list[dict],
-    runtime_metadata: dict,
-    attempt: int,
-    runner_id: str,
-    evaluation: dict | None = None,
+    session: AsyncSession, *, task_id: str, conversation_id: str, messages: list[dict],
+    runtime_metadata: dict, attempt: int, runner_id: str, evaluation: dict | None = None,
 ) -> Run | None:
     run = await get_run(session, task_id, for_update=True)
-    if run is None:
-        return None
+    if run is None: return None
     await _check_identity(run, attempt=attempt, runner_id=runner_id)
-    if run.app_provenance is None:
-        raise RunConflict("cannot complete a run without App provenance")
+    if run.app_provenance is None: raise RunConflict("cannot complete a run without App provenance")
+    if run.canonical_task_id is not None and evaluation is None:
+        raise RunConflict("Superbench completion requires an evaluation result")
+    if evaluation is not None and not isinstance(evaluation.get("success"), bool):
+        raise RunConflict("evaluated completion requires boolean success")
     if run.status == "completed":
-        if run.conversation_id == conversation_id and run.messages == messages and (run.runtime_metadata or {}) == runtime_metadata:
-            return run
-        raise RunConflict("completed run is immutable")
-    if run.status != "running":
-        raise RunConflict(f"cannot complete status={run.status}")
+        if not (run.conversation_id == conversation_id and run.messages == messages and (run.runtime_metadata or {}) == runtime_metadata):
+            raise RunConflict("completed run is immutable")
+        if evaluation is not None and not (
+            run.success is evaluation["success"] and run.reward == evaluation.get("reward")
+            and (run.native_result or {}) == (evaluation.get("native_result") or {})
+            and (run.evaluator_metadata or {}) == (evaluation.get("evaluator_metadata") or {})
+        ):
+            raise RunConflict("completed run evaluation differs from immutable label")
+        return run
+    if run.status != "running": raise RunConflict(f"cannot complete status={run.status}")
     if run.conversation_id and run.conversation_id != conversation_id:
         raise RunConflict("completion conversation_id differs from running attempt")
-    run.status = "completed"
-    run.conversation_id = conversation_id
-    run.messages = messages
-    run.runtime_metadata = runtime_metadata
-    run.error_type = None
-    run.error_message = None
-    run.run_status = "completed"
+    run.status="completed"; run.conversation_id=conversation_id; run.messages=messages; run.runtime_metadata=runtime_metadata
+    run.error_type=None; run.error_message=None; run.run_status="completed"
     if evaluation is not None:
-        run.success = evaluation.get("success")
-        run.reward = evaluation.get("reward")
-        run.native_result = evaluation.get("native_result") or {}
-        run.evaluator_metadata = evaluation.get("evaluator_metadata") or {}
-    run.completed_at = datetime.now(timezone.utc)
-    try:
-        await session.commit()
+        run.success=evaluation["success"]; run.reward=evaluation.get("reward")
+        run.native_result=evaluation.get("native_result") or {}; run.evaluator_metadata=evaluation.get("evaluator_metadata") or {}
+    run.completed_at=datetime.now(timezone.utc)
+    try: await session.commit()
     except IntegrityError as exc:
-        await session.rollback()
-        raise RunConflict("conversation_id is already assigned to another task") from exc
-    await session.refresh(run)
-    return run
+        await session.rollback(); raise RunConflict("conversation_id is already assigned to another task") from exc
+    await session.refresh(run); return run
 
 
 async def fail_run(
