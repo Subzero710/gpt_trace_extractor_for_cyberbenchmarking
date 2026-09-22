@@ -16,6 +16,13 @@ app_control_token_file = "/run/secrets/app_control_token"
 docker_socket_path = "/var/run/docker.sock"
 app_code_workspace_image = "gpt-trace-code-workspace:latest"
 app_browser_image = "gpt-trace-browser:latest"
+app_file_relay_image = "gpt-trace-file-relay:latest"
+file_transfer_max_file_bytes = 134217728
+file_transfer_max_total_bytes = 268435456
+file_transfer_max_objects = 32
+file_transfer_max_concurrent_uploads = 2
+file_transfer_max_concurrent_downloads = 2
+file_transfer_ttl_seconds = 1800
 workspace_gateway_container = "gpt-trace-workspace-gateway"
 browser_gateway_container = "gpt-trace-browser-gateway"
 app_browser_search_url_template = "https://duckduckgo.com/?q={query}"

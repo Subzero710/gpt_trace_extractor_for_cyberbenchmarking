@@ -46,7 +46,12 @@ def create_app(manager,control_token,allowed_hosts=None):
   else:raise WorkspaceError(f'unknown tool: {name}')
   return ([types.TextContent(type='text',text=json.dumps(r,sort_keys=True,separators=(',',':')))],r)
  sm=StreamableHTTPSessionManager(app=server,event_store=None,json_response=True,stateless=True,security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=True,allowed_hosts=allowed_hosts or []))
- async def mcp(scope,receive,send):await sm.handle_request(scope,receive,send)
+ async def mcp(scope,receive,send):
+  headers={key.decode('latin1').casefold():value.decode('latin1') for key,value in scope.get('headers',[])}
+  if not hmac.compare_digest(headers.get('authorization',''),f'Bearer {control_token}'):
+   response=JSONResponse({'error':{'code':'MCP_BACKEND_UNAUTHORIZED','message':'backend authentication required'}},status_code=401)
+   await response(scope,receive,send);return
+  await sm.handle_request(scope,receive,send)
  def auth(r):return hmac.compare_digest(r.headers.get('authorization',''),f'Bearer {control_token}')
  async def health(r):return JSONResponse({'status':'ok','app_id':APP_ID})
  async def mani(r):return JSONResponse(payload(manager))

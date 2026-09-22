@@ -101,3 +101,7 @@ Storage keeps raw captured messages plus exact App manifests/hashes, resolved UI
 
 ## MCP Stack V2
 Code-workspace business logic is split into filesystem, shell, processes, system, runtime, git, network, and templates modules; core orchestrates lifecycle/services and server remains transport. Browser business logic is split into navigation, interaction, DOM, storage, network/DevTools, contexts, and device modules. Both continue through the existing stateless Streamable HTTP MCP gateway.
+
+## File transfer
+
+Ephemeral Browser ↔ Workspace binary transfer is documented in `docs/file-transfer.md`. The File Relay is data-plane only and is not exposed as an MCP tool.

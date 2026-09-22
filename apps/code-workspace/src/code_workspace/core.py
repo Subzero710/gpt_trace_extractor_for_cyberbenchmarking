@@ -26,6 +26,7 @@ from .runtime import RuntimeService, RuntimeErrorMCP
 from .git import GitService, GitError
 from .network import NetworkService, NetworkError
 from .templates import TemplateManager, TemplateError
+from .transfer import RelayClient, TransferError, secure_open_export, secure_import_target, commit_import
 
 MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -773,6 +774,7 @@ class WorkspaceManagerV2(WorkspaceManager):
         self.net_v2=NetworkService(self.sandbox)
         self.templates_v2=TemplateManager(templates_root or Path('/app/templates'),self.workspace_root,self.sandbox_uid,self.sandbox_gid)
         self.template_state=self.state_root/'template.json'
+        self.transfer_v2=RelayClient()
     def template_entries(self):return self.templates_v2.entries()
     def _template_marker(self):
         if not self.template_state.exists():return None
@@ -859,6 +861,33 @@ class WorkspaceManagerV2(WorkspaceManager):
             elif name=='check_port':r=await self.net_v2.port(args)
             elif name=='workspace_template':
                 marker=self._template_marker();p=self.templates_v2.provenance(args.get('template_id') or marker['template_id']);r={**p,'active':p==marker}
+            elif name=='export_file':
+                import mimetypes, os, stat, hashlib
+                self.require_ready(); fd,display_name=secure_open_export(self.workspace_root,args['path']);p=Path(args['path'])
+                try:
+                    st=os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):raise FilesystemError('FILE_NOT_REGULAR')
+                    if st.st_size>self.transfer_v2.max_file:raise FilesystemError('FILE_TOO_LARGE')
+                    digest=await __import__('code_workspace.transfer',fromlist=['sha256_fd']).sha256_fd(fd)
+                    media=args.get('media_type') or mimetypes.guess_type(p.name)[0] or 'application/octet-stream'
+                    r=await self.transfer_v2.publish_fd(fd,size=st.st_size,sha256=digest,name=display_name,media_type=media,target='browser')
+                finally:os.close(fd)
+            elif name=='import_file':
+                import os, tempfile
+                self.require_ready();dirfd,dest_name=secure_import_target(self.workspace_root,args['path'],self.sandbox_uid,self.sandbox_gid);tmp_name='.relay-'+__import__('secrets').token_hex(16)+'.partial';fd=-1
+                try:
+                    fd=os.open(tmp_name,os.O_CREAT|os.O_EXCL|os.O_RDWR|os.O_CLOEXEC,0o600,dir_fd=dirfd)
+                    meta=await self.transfer_v2.fetch_to_fd(args['file_id'],fd);os.fsync(fd);os.close(fd);fd=-1
+                    if os.geteuid()==0:os.chown(tmp_name,self.sandbox_uid,self.sandbox_gid,dir_fd=dirfd,follow_symlinks=False)
+                    os.chmod(tmp_name,0o660,dir_fd=dirfd,follow_symlinks=False);commit_import(dirfd,tmp_name,dest_name,args.get('overwrite',False));os.fsync(dirfd)
+                    try:await self.transfer_v2.ack(args['file_id'])
+                    except TransferError:pass
+                    r={'ok':True,'path':Path(args['path']).as_posix(),'file_id':args['file_id'],'size':meta['size'],'sha256':meta['sha256']}
+                finally:
+                    if fd>=0:os.close(fd)
+                    try:os.unlink(tmp_name,dir_fd=dirfd)
+                    except FileNotFoundError:pass
+                    os.close(dirfd)
             else:raise WorkspaceError(f'unknown V2 tool: {name}')
             return MODELS[name][1].model_validate(r).model_dump()
-        except (ValidationError,FilesystemError,ShellError,ProcessError,SystemError,RuntimeErrorMCP,GitError,NetworkError,TemplateError) as e:raise WorkspaceError(str(e)) from e
+        except (ValidationError,FilesystemError,ShellError,ProcessError,SystemError,RuntimeErrorMCP,GitError,NetworkError,TemplateError,TransferError) as e:raise WorkspaceError(str(e)) from e
