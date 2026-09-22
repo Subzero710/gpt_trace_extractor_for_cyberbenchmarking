@@ -65,7 +65,6 @@ def test_discover_exposes_both_apps_without_leaking_labels(tmp_path, monkeypatch
     assert len(tasks) == 2
     assert all(task.tools == ("browser", "code-workspace") for task in tasks)
     assert all(task.metadata["source_revision"] == GAIA_REVISION for task in tasks)
-    assert all(task.metadata["training_eligible"] is False for task in tasks)
     assert all("Final answer" not in task.metadata for task in tasks)
     assert all("FINAL ANSWER:" in task.prompt for task in tasks)
 

@@ -250,10 +250,6 @@ class GAIAAdapter(BenchmarkAdapter):
                         "paper": GAIA_PAPER,
                         "license": "not_declared",
                         "access": "gated",
-                        "training_eligible": False,
-                        "training_restriction": (
-                            "GAIA validation data is benchmark-only and must not be used for training."
-                        ),
                         "file_path": file_path,
                     },
                 )

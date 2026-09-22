@@ -20,14 +20,11 @@ The `gaia` adapter is intentionally benchmark-specific: it pins the official GAI
 
 For GAIA, obtain upstream dataset access, set `BENCHMARK_SOURCE_TOKEN` to the source token for the fetch process, then run `make superbench-fetch ADAPTER=gaia`. A short run is `make superbench-run ADAPTER=gaia LIMIT=3`; inspect it with `make superbench-status ADAPTER=gaia`.
 
-GAIA validation trajectories are marked `training_eligible=false`; keep them benchmark-only and exclude them from training exports.
-
-
 Benchmark-specific source URLs, revisions, splits, credential semantics and native evaluators belong inside adapters. Core Superbench orchestration remains benchmark-agnostic. The built-in `gaia` adapter pins GAIA 2023 Level-1 validation. InterCode-CTF remains unregistered because its CTF tasks derive from picoCTF. Third-party adapters remain available through the `gpt_trace_runner.benchmark_adapters` entry-point group.
 
 To add a benchmark: implement `BenchmarkAdapter`, map upstream records to `CanonicalTask`, preserve upstream repository/commit/license metadata, implement native `evaluate`, add tests, and expose it through the adapter entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
 
-SFT use contaminates those source tasks for later evaluation. Use `dedup_group`/upstream origin to group related challenges, projects or vulnerability families; do not split near-duplicates independently. License metadata is provenance for later policy/filtering, not legal advice.
+Use `dedup_group`/upstream origin to group related challenges, projects or vulnerability families; do not split near-duplicates independently. License metadata is provenance for later filtering/auditing, not legal advice.
 
 V2 uses `/data/state/superbench/staging` for writable staging, requires `GPT_TRACE_RUNNER_BUILD_ID` for campaign identity, evaluates recovery captures through the same task evaluator hook as the happy path, and streams JSONL into bounded Parquet row groups.
 
