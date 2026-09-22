@@ -126,6 +126,20 @@ async def test_direct_upload_without_relay(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_direct_upload_is_rejected_when_relay_is_available(tmp_path, monkeypatch):
+    service, page, _data = _service(tmp_path, monkeypatch)
+    service.relay = FakeRelay()
+    with pytest.raises(RuntimeError, match="direct upload is unavailable when file relay is configured"):
+        await service.upload({
+            "selector":"#file",
+            "filename":"x.bin",
+            "content_base64":base64.b64encode(b"x").decode(),
+            "mime_type":None,
+        })
+    assert page.input_value is None
+
+
+@pytest.mark.asyncio
 async def test_relay_upload_by_file_id(tmp_path, monkeypatch):
     service, page, _data = _service(tmp_path, monkeypatch)
     relay = FakeRelay()

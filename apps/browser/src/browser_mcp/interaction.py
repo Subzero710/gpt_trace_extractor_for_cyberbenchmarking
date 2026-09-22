@@ -14,6 +14,7 @@ class InteractionService:
  async def upload(self,a):
   if a.get('file_id'):
    async with self.upload_lock:return await self._upload_relay(a)
+  if self.relay.enabled:raise self.r.error('direct upload is unavailable when file relay is configured')
   return await self._upload_inline(a)
  async def _upload_relay(self,a):
   before=self._upload_usage()
