@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,20 @@ class PreparedBenchmarkContext:
 class BenchmarkAdapter(ABC):
     adapter_id: str
     adapter_version: str
+
+    @property
+    def source_root(self) -> Path:
+        base = Path(
+            os.environ.get(
+                "GPT_TRACE_SUPERBENCH_SOURCE_ROOT",
+                "/data/state/superbench/sources",
+            )
+        )
+        return base / self.adapter_id
+
+    def fetch(self) -> None:
+        """Fetch/pin upstream source material required by this adapter, if any."""
+        return None
 
     @abstractmethod
     def discover_tasks(self) -> list[TaskSpec]: ...

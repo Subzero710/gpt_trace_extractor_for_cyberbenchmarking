@@ -563,6 +563,27 @@ def export_command(output: Path = typer.Argument(..., dir_okay=False)) -> None:
     asyncio.run(main())
 
 
+@app.command("superbench-fetch")
+def superbench_fetch(adapter: list[str] = typer.Option([], "--adapter")) -> None:
+    from .superbench.registry import AdapterRegistry
+
+    if not adapter:
+        raise typer.BadParameter("at least one --adapter is required")
+
+    registry = AdapterRegistry.discover()
+    for adapter_id in adapter:
+        try:
+            benchmark_adapter = registry.get(adapter_id)
+        except KeyError as exc:
+            available = ", ".join(sorted(registry.adapters)) or "<none>"
+            raise typer.BadParameter(
+                f"unknown adapter {adapter_id!r}; available: {available}"
+            ) from exc
+        console.print(f"fetching benchmark source: {adapter_id}")
+        benchmark_adapter.fetch()
+        console.print(f"[green]fetched benchmark source: {adapter_id}[/]")
+
+
 @app.command("superbench-run")
 def superbench_run(adapter: list[str] = typer.Option([], "--adapter"), limit: int | None = typer.Option(None, min=1)) -> None:
     from .superbench.execution import run_pending

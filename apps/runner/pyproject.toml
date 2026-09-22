@@ -24,6 +24,9 @@ test = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1"]
 [project.scripts]
 gpt-trace = "gpt_trace_runner.cli:app"
 
+[project.entry-points."gpt_trace_runner.benchmark_adapters"]
+gaia = "gpt_trace_runner.superbench.adapters.gaia:GAIAAdapter"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

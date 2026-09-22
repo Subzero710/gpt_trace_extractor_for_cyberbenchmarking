@@ -1,4 +1,4 @@
-.PHONY: build up doctor tools auth reset-recovery reset-stale run export superbench-run superbench-status export-parquet export-sft down throw_volumes
+.PHONY: build up doctor tools auth reset-recovery reset-stale run export superbench-fetch superbench-run superbench-status export-parquet export-sft down throw_volumes
 
 build:
 	python3 scripts/build.py
@@ -58,13 +58,17 @@ down:
 	python3 scripts/down.py
 
 
+superbench-fetch:
+	@test -n "$(ADAPTER)" || (echo "usage: make superbench-fetch ADAPTER=<adapter_id>" >&2; exit 2)
+	docker compose run --rm --no-deps benchmark-fetch --adapter "$(ADAPTER)"
+
 superbench-run:
 	python3 scripts/project_state.py core
-	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-run
+	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-run $(if $(ADAPTER),--adapter $(ADAPTER),) $(if $(LIMIT),--limit $(LIMIT),)
 
 superbench-status:
 	python3 scripts/project_state.py core
-	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-status
+	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-status $(if $(ADAPTER),--adapter $(ADAPTER),)
 
 export-parquet:
 	python3 scripts/project_state.py core
