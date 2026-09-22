@@ -50,8 +50,8 @@ class InteractionService:
   fd=os.open(p,os.O_RDONLY|getattr(os,'O_CLOEXEC',0)|getattr(os,'O_NOFOLLOW',0))
   try:
    digest=await __import__('browser_mcp.transfer',fromlist=['sha256_fd']).sha256_fd(fd)
-   if a.get('legacy_inline'):
-    if st.st_size>64*1024*1024:raise self.r.error('legacy inline download exceeds 64 MiB')
+   if not self.relay.enabled:
+    if st.st_size>64*1024*1024:raise self.r.error('direct download exceeds 64 MiB')
     def read_all():
      os.lseek(fd,0,os.SEEK_SET);parts=[]
      while True:

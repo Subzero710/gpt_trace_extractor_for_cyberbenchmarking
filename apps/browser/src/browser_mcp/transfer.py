@@ -10,6 +10,17 @@ from pathlib import Path
 
 class TransferError(RuntimeError): pass
 
+
+def _write_all(fd: int, data: bytes, writer=None) -> None:
+    write = os.write if writer is None else writer
+    view = memoryview(data)
+    while view:
+        written = write(fd, view)
+        if not isinstance(written, int) or written <= 0 or written > len(view):
+            raise TransferError("FILE_TRANSFER_WRITE_ERROR")
+        view = view[written:]
+
+
 async def sha256_fd(fd:int)->str:
     def work():
         os.lseek(fd,0,os.SEEK_SET);h=hashlib.sha256()
@@ -81,7 +92,7 @@ class RelayClient:
                 if not chunk:break
                 size+=len(chunk)
                 if size>self.max_file:raise TransferError("FILE_TOO_LARGE")
-                h.update(chunk);os.write(fd,chunk)
+                h.update(chunk);_write_all(fd,chunk)
             if size!=expected_size or h.hexdigest()!=expected:raise TransferError("FILE_TRANSFER_INTEGRITY_ERROR")
             import base64,json
             raw=r.getheader("x-file-metadata","");pad="="*((4-len(raw)%4)%4);meta=json.loads(base64.urlsafe_b64decode(raw+pad))

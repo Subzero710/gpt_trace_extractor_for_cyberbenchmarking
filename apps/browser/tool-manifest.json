@@ -1068,11 +1068,6 @@
             "title": "Max Bytes",
             "type": "integer"
           },
-          "legacy_inline": {
-            "default": false,
-            "title": "Legacy Inline",
-            "type": "boolean"
-          },
           "media_type": {
             "default": "application/octet-stream",
             "title": "Media Type",

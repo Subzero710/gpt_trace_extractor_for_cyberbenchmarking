@@ -549,7 +549,7 @@ class DockerRuntime:
         local_tools=[t for t in task.tools if t.kind=="local_mcp"]
         if not local_tools:return AttemptRuntime(None,None,None,None,{})
         await self.ping()
-        ids={t.app_id for t in local_tools}; has_browser="browser" in ids; transfer=ids=={"browser","code-workspace"}
+        ids={t.app_id for t in local_tools}; has_browser="browser" in ids; transfer={"browser","code-workspace"}<=ids
         workspace_net=self._network_name(task,attempt,fingerprint)
         browser_net=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
         egress=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
@@ -634,7 +634,7 @@ class DockerRuntime:
     async def discover(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int,control_token:str)->AttemptRuntime:
         local=[t for t in task.tools if t.kind=="local_mcp"]
         if not local:return AttemptRuntime(None,None,None,None,{})
-        await self.ping();ids={t.app_id for t in local};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"}
+        await self.ping();ids={t.app_id for t in local};has_browser="browser" in ids;transfer={"browser","code-workspace"}<=ids
         wn=self._network_name(task,attempt,fingerprint);bn=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
         en=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
         rw=self._relay_network_name("workspace",task,attempt,fingerprint) if transfer else None;rb=self._relay_network_name("browser",task,attempt,fingerprint) if transfer else None
@@ -671,7 +671,7 @@ class DockerRuntime:
         return AttemptRuntime(wn,wid,en,eid,resources,bn,bid,rw,rwid,rb,rbid,relay_meta)
 
     async def assert_absent(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int)->None:
-        residue=[];ids={t.app_id for t in task.tools if t.kind=="local_mcp"};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"}
+        residue=[];ids={t.app_id for t in task.tools if t.kind=="local_mcp"};has_browser="browser" in ids;transfer={"browser","code-workspace"}<=ids
         nets=[self._network_name(task,attempt,fingerprint)]
         if has_browser:nets += [self._browser_control_network_name(task,attempt,fingerprint),self._egress_network_name(task,attempt,fingerprint)]
         if transfer:nets += [self._relay_network_name("workspace",task,attempt,fingerprint),self._relay_network_name("browser",task,attempt,fingerprint)]
@@ -707,7 +707,7 @@ class DockerRuntime:
     async def destroy(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int)->None:
         local=[t for t in task.tools if t.kind=="local_mcp"]
         if not local:return
-        ids={t.app_id for t in local};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"};errors=[]
+        ids={t.app_id for t in local};has_browser="browser" in ids;transfer={"browser","code-workspace"}<=ids;errors=[]
         wn=self._network_name(task,attempt,fingerprint);bn=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
         en=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
         rw=self._relay_network_name("workspace",task,attempt,fingerprint) if transfer else None;rb=self._relay_network_name("browser",task,attempt,fingerprint) if transfer else None

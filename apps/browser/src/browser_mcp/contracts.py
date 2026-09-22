@@ -19,9 +19,9 @@ class Upload(Sel):
  @model_validator(mode="after")
  def one_source(self):
   if (self.file_id is None)==(self.content_base64 is None):raise ValueError("provide exactly one of file_id or content_base64")
-  if self.content_base64 is not None and not self.filename:raise ValueError("legacy inline upload requires filename")
+  if self.content_base64 is not None and not self.filename:raise ValueError("direct upload requires filename")
   return self
-class Down(Sel):max_bytes:int=Field(134217728,ge=1,le=268435456);legacy_inline:bool=False;media_type:str='application/octet-stream'
+class Down(Sel):max_bytes:int=Field(134217728,ge=1,le=268435456);media_type:str='application/octet-stream'
 class Inspect(M):selector:str='html';max_nodes:int=Field(1000,ge=1,le=10000);max_chars:int=Field(200000,ge=1,le=2000000)
 class Html(M):selector:str|None=None;max_chars:int=Field(1000000,ge=1,le=5000000)
 class Attr(Sel):name:str
@@ -47,7 +47,7 @@ class DownloadOut(M):
  file_id:str|None=None;name:str|None=None;filename:str|None=None;size:int;sha256:str;media_type:str|None=None;content_base64:str|None=None
  @model_validator(mode="after")
  def one_payload(self):
-  if (self.file_id is None)==(self.content_base64 is None):raise ValueError("download result must contain file_id or legacy content_base64")
+  if (self.file_id is None)==(self.content_base64 is None):raise ValueError("download result must contain exactly one of file_id or content_base64")
   return self
 class InspectOut(M):selector:str;nodes:list[dict[str,Any]];truncated:bool
 class QueryOut(M):selector:str;count:int;matches:list[dict[str,Any]]

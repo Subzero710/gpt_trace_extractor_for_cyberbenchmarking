@@ -2,7 +2,9 @@
 
 Browser and Code Workspace remain separate filesystem security domains. They do
 not share a writable volume and neither runtime can mount or inspect the other
-runtime's files. Binary payloads do not transit MCP JSON or the model context.
+runtime's files. Binary payloads transferred between Browser and Code Workspace
+do not transit MCP JSON or the model context. Browser-only file I/O uses the
+Browser MCP direct base64 representation because no cross-App relay is required.
 
 For attempts containing both local Apps, the runner creates an ephemeral File
 Relay plus two internal transfer networks:
@@ -13,9 +15,10 @@ workspace -- relay-workspace-net --+
 browser   -- relay-browser-net -----+
 ```
 
-The relay is not an MCP server. The model sees only `export_file`,
-`import_file`, `upload_file`, and `download_file`; tool results contain an
-opaque non-secret `file_id`, size, SHA-256 and display metadata.
+The relay is not an MCP server. For cross-App transfer, the model sees only
+`export_file`, `import_file`, `upload_file`, and `download_file`; relay-backed
+tool results contain an opaque non-secret `file_id`, size, SHA-256 and display
+metadata.
 
 The relay is push/pull only. It has no Docker socket, host mount, runtime
 filesystem mount, or Internet-facing network. Its root filesystem is read-only
@@ -41,9 +44,12 @@ Configured limits cover per-file bytes, total attempt bytes, object count,
 concurrent uploads/downloads, TTL and filename length. Docker additionally
 bounds memory, CPU and PIDs.
 
-The legacy Browser base64 upload/download contract remains available only when
-explicitly requested. Relay-backed transfer is the normal path when the relay
-is configured.
+Browser transport selection is automatic. When the relay is configured,
+`download_file` publishes the downloaded bytes to the relay and returns a
+`file_id`; `upload_file` can consume a relay `file_id`. In Browser-only attempts,
+where no relay is created, direct uploads use `filename` plus `content_base64`
+and downloads return `content_base64`. There is no caller-selectable transport
+flag.
 
 This mechanism protects filesystem and transport boundaries; it is not a DLP
 or policy engine. If an authorized agent deliberately copies readable secret
