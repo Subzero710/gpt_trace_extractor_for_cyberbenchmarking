@@ -16,6 +16,32 @@ from .registry import AdapterRegistry
 from .service import campaign, storage_context, to_benchmark_task
 
 
+def _ordered_entries(entries, limit: int | None):
+    """Keep normal order, but front-load required-App coverage for short runs."""
+    if limit is None:
+        return list(entries)
+
+    remaining = list(entries)
+    selected = []
+    covered: set[str] = set()
+
+    while remaining:
+        gains = [
+            len(set(entry.task.required_tools) - covered)
+            for entry in remaining
+        ]
+        best_gain = max(gains) if gains else 0
+        if best_gain <= 0:
+            break
+        index = gains.index(best_gain)
+        entry = remaining.pop(index)
+        selected.append(entry)
+        covered.update(entry.task.required_tools)
+
+    selected.extend(remaining)
+    return selected
+
+
 async def _record_pre_runner_failure(*, storage, settings, task, adapter, bt, camp, state, error):
     expected = (state.attempt + 1) if state is not None else 1
     started = await storage.start(
@@ -73,7 +99,12 @@ async def _recover_pending_journal(
         (
             entry
             for entry in entries
-            if run_task_id(entry.task.task_id, camp.campaign_id) == pending.task_id
+            if run_task_id(
+                entry.task.task_id,
+                camp.campaign_id,
+                entry.adapter_id,
+                adapters.get(entry.adapter_id).adapter_version,
+            ) == pending.task_id
         ),
         None,
     )
@@ -85,7 +116,7 @@ async def _recover_pending_journal(
 
     adapter = adapters.get(catalog_entry.adapter_id)
     task = adapter.materialize_task(catalog_entry.task, staging)
-    bt = to_benchmark_task(task, registry, camp.campaign_id)
+    bt = to_benchmark_task(task, registry, camp, adapter)
     prepared = await adapter.recover(
         task,
         attempt=pending.attempt,
@@ -154,6 +185,7 @@ async def run_pending(
     adapters = adapters or AdapterRegistry.discover()
     entries = SuperbenchCatalog(adapters).discover(adapter_ids)
     camp = campaign(settings)
+    selected_entries = _ordered_entries(entries, limit)
     owned_storage = storage is None
     storage = storage or StorageClient(settings.storage_base_url)
     staging = Path("/data/state/superbench/staging")
@@ -180,13 +212,13 @@ async def run_pending(
                     staging=staging,
                 )
 
-            for entry in entries:
+            for entry in selected_entries:
                 if limit is not None and attempted >= limit:
                     break
 
                 adapter = adapters.get(entry.adapter_id)
                 task = adapter.materialize_task(entry.task, staging)
-                bt = to_benchmark_task(task, registry, camp.campaign_id)
+                bt = to_benchmark_task(task, registry, camp, adapter)
                 state = await storage.get(bt.task_id)
                 if state is not None:
                     if state.status == "completed":

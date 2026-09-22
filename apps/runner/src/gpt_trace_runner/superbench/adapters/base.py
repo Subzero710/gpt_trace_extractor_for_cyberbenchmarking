@@ -70,6 +70,3 @@ class BenchmarkAdapter(ABC):
         prepared: PreparedBenchmarkContext,
     ) -> None:
         return None
-
-    def validate_environment(self) -> None:
-        return None

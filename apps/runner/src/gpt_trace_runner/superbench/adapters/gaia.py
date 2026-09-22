@@ -125,7 +125,7 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "2"
+    adapter_version = "3"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}
@@ -199,9 +199,6 @@ class GAIAAdapter(BenchmarkAdapter):
             if file_path:
                 self._fetch_file(file_path)
 
-    def validate_environment(self) -> None:
-        self._require_file(GAIA_METADATA_FILE)
-
     def discover_tasks(self) -> list[TaskSpec]:
         rows = pq.read_table(self._require_file(GAIA_METADATA_FILE)).to_pylist()
         tasks: list[TaskSpec] = []
@@ -233,11 +230,21 @@ class GAIAAdapter(BenchmarkAdapter):
                 raise ValueError(f"duplicate GAIA task id {logical_id!r}")
 
             answers[logical_id] = str(ground_truth)
+            if file_path:
+                required_tools = ("code-workspace",)
+                tool_instruction = (
+                    "Use Code Workspace to inspect the benchmark file under "
+                    "/workspace/attachments/ before answering."
+                )
+            else:
+                required_tools = ("browser",)
+                tool_instruction = "Use Browser to research and verify the answer before responding."
             tasks.append(
                 TaskSpec(
                     task_id=logical_id,
-                    prompt=f"{question}\n\n{ANSWER_INSTRUCTION}",
+                    prompt=f"{question}\n\n{tool_instruction}\n{ANSWER_INSTRUCTION}",
                     tools=("browser", "code-workspace"),
+                    required_tools=required_tools,
                     metadata={
                         "benchmark": "GAIA",
                         "year": GAIA_YEAR,
@@ -255,6 +262,18 @@ class GAIAAdapter(BenchmarkAdapter):
                 )
             )
 
+        required_apps = {
+            app_id
+            for task in tasks
+            for app_id in task.required_tools
+        }
+        expected_apps = {"browser", "code-workspace"}
+        if required_apps != expected_apps:
+            raise RuntimeError(
+                "pinned GAIA smoke split no longer exercises both required MCP Apps: "
+                f"found {sorted(required_apps)!r}"
+            )
+
         self._answers = answers
         return tasks
 
@@ -269,18 +288,20 @@ class GAIAAdapter(BenchmarkAdapter):
             / self.adapter_id
             / hashlib.sha256(task.task_id.encode("utf-8")).hexdigest()[:20]
         )
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        destination = destination_dir / Path(file_path).name
+        workspace = destination_dir / "workspace"
+        attachment_dir = workspace / "attachments"
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        destination = attachment_dir / Path(file_path).name
         shutil.copy2(source, destination)
 
         return TaskSpec(
             task_id=task.task_id,
             prompt=task.prompt,
             tools=task.tools,
-            attachments=(destination,),
-            initial_workspace=task.initial_workspace,
+            required_tools=task.required_tools,
+            attachments=(),
+            initial_workspace=workspace,
             metadata=dict(task.metadata),
-            environment_spec=dict(task.environment_spec),
         )
 
     async def evaluate(

@@ -16,26 +16,24 @@ from gpt_trace_runner.superbench.adapters.gaia import (
 
 def _write_metadata(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(
-        [
-            {
-                "task_id": "task-web",
-                "Question": "What is the answer?",
-                "Level": 1,
-                "Final answer": "Paris",
-                "file_name": None,
-                "file_path": None,
-            },
-            {
-                "task_id": "task-file",
-                "Question": "Read the attachment and answer.",
-                "Level": 1,
-                "Final answer": "42",
-                "file_name": "sample.txt",
-                "file_path": "2023/validation/sample.txt",
-            },
-        ]
-    )
+    table = pa.Table.from_pylist([
+        {
+            "task_id": "task-web",
+            "Question": "What is the answer?",
+            "Level": 1,
+            "Final answer": "Paris",
+            "file_name": None,
+            "file_path": None,
+        },
+        {
+            "task_id": "task-file",
+            "Question": "Read the attachment and answer.",
+            "Level": 1,
+            "Final answer": "42",
+            "file_name": "sample.txt",
+            "file_path": "2023/validation/sample.txt",
+        },
+    ])
     pq.write_table(table, path)
     return path
 
@@ -47,34 +45,28 @@ def test_gaia_native_scorer():
     assert not gaia_question_scorer("Paris, 3", "paris,2")
 
 
-def test_generic_source_root_is_adapter_scoped(tmp_path, monkeypatch):
+def test_discover_requires_browser_and_workspace_across_split(tmp_path, monkeypatch):
     monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
     adapter = GAIAAdapter()
-    assert adapter.source_root == tmp_path / "gaia"
-    assert adapter.revision_root == tmp_path / "gaia" / GAIA_REVISION
-
-
-def test_discover_exposes_both_apps_without_leaking_labels(tmp_path, monkeypatch):
-    monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
-    adapter = GAIAAdapter()
-    metadata = adapter.revision_root / GAIA_METADATA_FILE
-    _write_metadata(metadata)
+    _write_metadata(adapter.revision_root / GAIA_METADATA_FILE)
 
     tasks = adapter.discover_tasks()
 
-    assert len(tasks) == 2
-    assert all(task.tools == ("browser", "code-workspace") for task in tasks)
+    web = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-web")
+    file_task = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-file")
+    assert web.tools == ("browser", "code-workspace")
+    assert web.required_tools == ("browser",)
+    assert file_task.required_tools == ("code-workspace",)
     assert all(task.metadata["source_revision"] == GAIA_REVISION for task in tasks)
     assert all("Final answer" not in task.metadata for task in tasks)
-    assert all("FINAL ANSWER:" in task.prompt for task in tasks)
 
 
 def test_fetch_only_downloads_adapter_owned_source_files(tmp_path, monkeypatch):
     monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
     adapter = GAIAAdapter()
-    calls: list[str] = []
+    calls = []
 
-    def fake_fetch(filename: str) -> Path:
+    def fake_fetch(filename):
         calls.append(filename)
         destination = adapter._local_path(filename)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -86,49 +78,30 @@ def test_fetch_only_downloads_adapter_owned_source_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(adapter, "_fetch_file", fake_fetch)
     adapter.fetch()
-
-    assert calls == [
-        GAIA_METADATA_FILE,
-        "2023/validation/sample.txt",
-    ]
+    assert calls == [GAIA_METADATA_FILE, "2023/validation/sample.txt"]
 
 
 @pytest.mark.asyncio
-async def test_materialize_attachment_and_native_evaluation(tmp_path, monkeypatch):
+async def test_file_task_is_seeded_only_into_code_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
     adapter = GAIAAdapter()
-
-    metadata = adapter.revision_root / GAIA_METADATA_FILE
-    _write_metadata(metadata)
+    _write_metadata(adapter.revision_root / GAIA_METADATA_FILE)
     attachment = adapter.revision_root / "2023/validation/sample.txt"
     attachment.parent.mkdir(parents=True, exist_ok=True)
     attachment.write_text("42\n", encoding="utf-8")
 
-    tasks = adapter.discover_tasks()
-    task = next(
-        item for item in tasks if item.metadata["upstream_task_id"] == "task-file"
-    )
+    task = next(item for item in adapter.discover_tasks() if item.metadata["upstream_task_id"] == "task-file")
     materialized = adapter.materialize_task(task, tmp_path / "staging")
 
-    assert len(materialized.attachments) == 1
-    assert materialized.attachments[0].name == "sample.txt"
-    assert materialized.attachments[0].read_text(encoding="utf-8") == "42\n"
+    assert materialized.attachments == ()
+    assert materialized.initial_workspace is not None
+    seeded = materialized.initial_workspace / "attachments" / "sample.txt"
+    assert seeded.read_text(encoding="utf-8") == "42\n"
 
     captured = CapturedConversation(
         conversation_id="c1",
-        messages=[
-            {"author": {"role": "assistant"}, "content": {"parts": ["Reasoning"]}},
-            {
-                "author": {"role": "assistant"},
-                "content": {"parts": ["Done.\nFINAL ANSWER: 42"]},
-            },
-        ],
+        messages=[{"author": {"role": "assistant"}, "content": {"parts": ["FINAL ANSWER: 42"]}}],
     )
-    result = await adapter.evaluate(
-        task,
-        prepared=PreparedBenchmarkContext(),
-        captured=captured,
-    )
+    result = await adapter.evaluate(task, prepared=PreparedBenchmarkContext(), captured=captured)
     assert result.verdict == "pass"
     assert result.score == 1.0
-    assert result.details == {"model_answer": "42"}

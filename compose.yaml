@@ -240,9 +240,9 @@ services:
       BENCHMARK_SOURCE_TOKEN: ${BENCHMARK_SOURCE_TOKEN:-}
       GPT_TRACE_SUPERBENCH_SOURCE_ROOT: /data/state/superbench/sources
     volumes:
-      - runner_state:/data/state
+      - benchmark_sources:/data/state/superbench/sources
     networks:
-      - ui_egress
+      - benchmark_source_egress
     entrypoint: ["gpt-trace", "superbench-fetch"]
     restart: "no"
 
@@ -265,6 +265,7 @@ services:
       - ./config:/data/config:ro
       - browser_profile:/browser-profile:ro
       - runner_state:/data/state
+      - benchmark_sources:/data/state/superbench/sources:ro
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - core_internal
@@ -286,6 +287,7 @@ volumes:
   postgres_data:
   browser_profile:
   runner_state:
+  benchmark_sources:
 
 networks:
   core_internal:
@@ -293,6 +295,7 @@ networks:
   app_control:
     internal: true
   mcp_tunnel_egress:
+  benchmark_source_egress:
   ui_egress:
 
 secrets:

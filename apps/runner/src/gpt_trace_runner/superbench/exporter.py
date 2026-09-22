@@ -156,7 +156,7 @@ async def write_corpus_stream(
 
 def _selected(row: dict, verdicts: set[str]) -> bool:
     if not verdicts:
-        return True
+        verdicts = {"pass"}
     evaluation = row.get("evaluation")
     verdict = evaluation.get("verdict") if isinstance(evaluation, dict) else None
     key = verdict if verdict in {"pass", "fail"} else "unevaluated"

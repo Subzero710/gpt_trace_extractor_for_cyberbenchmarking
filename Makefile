@@ -46,13 +46,14 @@ export:
 	@echo "host export: $(CURDIR)/exports/runs.jsonl"
 
 throw_volumes:
-	@echo "WARNING: permanently deletes benchmark database/state volumes (postgres_data and runner_state)."
+	@echo "WARNING: permanently deletes benchmark database/state volumes (postgres_data, runner_state and benchmark_sources)."
 	@printf "Type THROW to continue: "; read answer; test "$$answer" = "THROW"
 	docker compose stop storage postgres
 	docker compose rm -f storage postgres
 	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=postgres_data)" 2>/dev/null || true
 	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=runner_state)" 2>/dev/null || true
-	@echo "postgres_data + runner_state removed; browser_profile preserved."
+	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=benchmark_sources)" 2>/dev/null || true
+	@echo "postgres_data + runner_state + benchmark_sources removed; browser_profile preserved."
 
 down:
 	python3 scripts/down.py

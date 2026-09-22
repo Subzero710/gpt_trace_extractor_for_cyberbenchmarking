@@ -18,12 +18,7 @@ def _stable(value: Any) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationResult:
-    """Optional benchmark verdict.
-
-    A task that has no reliable native evaluator simply returns ``None`` from the
-    adapter. When an evaluator exists it returns pass/fail plus optional native
-    score/details. Superbench does not invent a verdict.
-    """
+    """Optional native benchmark verdict."""
 
     verdict: Literal["pass", "fail"]
     score: float | None = None
@@ -41,20 +36,15 @@ class EvaluationResult:
 
 @dataclass(frozen=True, slots=True)
 class TaskSpec:
-    """Minimal runtime-facing task contract.
-
-    ``metadata`` is deliberately opaque. It may contain benchmark/source
-    provenance for later filtering/auditing, but neither the runner nor the
-    training conversation depends on a benchmark-specific metadata schema.
-    """
+    """Runtime-facing task contract exposed by benchmark adapters."""
 
     task_id: str
     prompt: str
     tools: tuple[str, ...] = ()
+    required_tools: tuple[str, ...] = ()
     attachments: tuple[Path, ...] = ()
     initial_workspace: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    environment_spec: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.task_id.strip() or len(self.task_id) > 255:
@@ -63,37 +53,49 @@ class TaskSpec:
             raise ValueError("prompt must not be empty")
         if len(set(self.tools)) != len(self.tools):
             raise ValueError("duplicate tool app")
+        if len(set(self.required_tools)) != len(self.required_tools):
+            raise ValueError("duplicate required tool app")
         if any(not str(app_id).strip() for app_id in self.tools):
             raise ValueError("tool app id must not be empty")
-
-
+        if any(not str(app_id).strip() for app_id in self.required_tools):
+            raise ValueError("required tool app id must not be empty")
+        missing = set(self.required_tools) - set(self.tools)
+        if missing:
+            raise ValueError(f"required tools are not declared in tools: {sorted(missing)!r}")
 
 
 @dataclass(frozen=True, slots=True)
 class TeacherCampaign:
     expected_model: str
     teacher_configuration: dict[str, Any]
-    runner_commit: str
+    runner_commit: str = ""
 
     def __post_init__(self) -> None:
-        if not self.expected_model.strip() or not self.runner_commit.strip():
-            raise ValueError("campaign identity is incomplete")
+        if not self.expected_model.strip():
+            raise ValueError("expected_model must not be empty")
 
     @property
     def campaign_id(self) -> str:
+        # Runtime timeouts, fetch limits and the runner git SHA are provenance,
+        # not dataset identity. They must not duplicate the same source task.
         return hashlib.sha256(
-            _stable(
-                {
-                    "expected_model": self.expected_model,
-                    "teacher_configuration": self.teacher_configuration,
-                    "runner_commit": self.runner_commit,
-                }
-            )
+            _stable({"expected_model": self.expected_model})
         ).hexdigest()
 
 
-def run_task_id(task_id: str, campaign_id: str) -> str:
-    return (
-        f"sb:{campaign_id[:16]}:"
-        f"{hashlib.sha256(task_id.encode('utf-8')).hexdigest()[:32]}"
-    )
+def run_task_id(
+    task_id: str,
+    campaign_id: str,
+    adapter_id: str,
+    adapter_version: str,
+) -> str:
+    source = hashlib.sha256(
+        _stable(
+            {
+                "task_id": task_id,
+                "adapter_id": adapter_id,
+                "adapter_version": adapter_version,
+            }
+        )
+    ).hexdigest()[:32]
+    return f"sb:{campaign_id[:16]}:{source}"

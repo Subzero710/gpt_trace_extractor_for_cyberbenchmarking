@@ -113,11 +113,13 @@ async def start_run(
         raise RunConflict("task specification changed for an existing task_id")
     elif run.logical_task_id != logical_id:
         raise RunConflict("logical_task_id changed for an existing task_id")
-    elif (run.dataset_metadata or {}) != metadata:
-        raise RunConflict("dataset_metadata changed for an existing task_id")
     elif run.status == "completed":
+        if (run.dataset_metadata or {}) != metadata:
+            raise RunConflict("completed run dataset_metadata is immutable")
         raise RunConflict("completed run is immutable")
     elif run.status == "running":
+        if (run.dataset_metadata or {}) != metadata:
+            raise RunConflict("idempotent start dataset_metadata differs")
         if run.attempt == expected_attempt and run.runner_id == runner_id:
             if run.app_provenance is None or run.app_provenance != app_provenance:
                 raise RunConflict("idempotent start App provenance differs")
@@ -127,7 +129,7 @@ async def start_run(
         raise RunConflict(
             f"task already running at attempt={run.attempt} runner={run.runner_id!r}"
         )
-    else:
+    elif run.status == "failed":
         if expected_attempt != run.attempt + 1:
             raise RunConflict(
                 f"expected next attempt {run.attempt + 1}, got {expected_attempt}"
@@ -141,9 +143,12 @@ async def start_run(
         run.messages = None
         run.runtime_metadata = None
         run.app_provenance = app_provenance
+        run.dataset_metadata = metadata
         run.evaluation = None
         run.error_type = None
         run.error_message = None
+    else:
+        raise RunConflict(f"cannot start run from status={run.status!r}")
 
     await session.commit()
     await session.refresh(run)

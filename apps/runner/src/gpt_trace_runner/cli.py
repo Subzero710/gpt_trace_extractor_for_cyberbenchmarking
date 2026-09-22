@@ -609,14 +609,16 @@ def superbench_status(adapter: list[str] = typer.Option([], "--adapter")) -> Non
     async def main():
         settings = Settings()
         registry = AppRegistry.load(settings.app_registry_path)
-        cat = SuperbenchCatalog(AdapterRegistry.discover()).discover(tuple(adapter))
+        adapters = AdapterRegistry.discover()
+        cat = SuperbenchCatalog(adapters).discover(tuple(adapter))
         camp = campaign(settings)
         storage = StorageClient(settings.storage_base_url)
         attempted = completed = evaluated = passed = failed = unevaluated = infra = 0
         try:
             for entry in cat:
+                benchmark_adapter = adapters.get(entry.adapter_id)
                 state = await storage.get(
-                    to_benchmark_task(entry.task, registry, camp.campaign_id).task_id
+                    to_benchmark_task(entry.task, registry, camp, benchmark_adapter).task_id
                 )
                 if state is None:
                     continue
@@ -672,7 +674,7 @@ def export_parquet(
 def export_sft(
     corpus: Path = typer.Argument(Path("/data/exports/corpus.parquet"), exists=True, dir_okay=False),
     output: Path = typer.Argument(Path("/data/exports/sft.parquet")),
-    verdict: list[str] = typer.Option([], "--verdict", help="Optional pass/fail/unevaluated row filter; repeatable."),
+    verdict: list[str] = typer.Option([], "--verdict", help="Optional pass/fail/unevaluated row filter; repeatable. Defaults to pass."),
 ) -> None:
     from .superbench.exporter import derive_sft
 
