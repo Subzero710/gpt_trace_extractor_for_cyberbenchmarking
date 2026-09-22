@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     docker_socket_path: Path = Path("/var/run/docker.sock")
     app_code_workspace_image: str = "gpt-trace-code-workspace:latest"
     app_browser_image: str = "gpt-trace-browser:latest"
+    app_file_relay_image: str = "gpt-trace-file-relay:latest"
+    file_transfer_max_file_bytes: int = Field(default=134217728, ge=1)
+    file_transfer_max_total_bytes: int = Field(default=268435456, ge=1)
+    file_transfer_max_objects: int = Field(default=32, ge=1, le=10000)
+    file_transfer_max_concurrent_uploads: int = Field(default=2, ge=1, le=64)
+    file_transfer_max_concurrent_downloads: int = Field(default=2, ge=1, le=64)
+    file_transfer_ttl_seconds: int = Field(default=1800, ge=30, le=86400)
     workspace_gateway_container: str = "gpt-trace-workspace-gateway"
     browser_gateway_container: str = "gpt-trace-browser-gateway"
 

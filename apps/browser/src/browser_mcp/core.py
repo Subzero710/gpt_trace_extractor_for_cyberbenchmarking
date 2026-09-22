@@ -776,6 +776,7 @@ from pydantic import ValidationError
 from .contracts import MODELS
 from .navigation import NavigationService
 from .interaction import InteractionService
+from .transfer import TransferError
 from .dom import DomService
 from .storage import StorageService
 from .network import NetworkService
@@ -808,7 +809,7 @@ class BrowserRuntimeV2(BrowserRuntime):
  async def configure_context(self,c,i):self.contexts[i]=c;self.context_ids[id(c)]=i;c.set_default_timeout(15000);c.set_default_navigation_timeout(45000);await c.route('**/*',self._route_guard);self.network_v2.attach(c,i);[self.register(p) for p in c.pages]
  async def _launch(self,profile):
   await super()._launch(profile);self.contexts.clear();self.context_ids.clear();self.pages.clear();self.page_ids.clear();await self.configure_context(self.context,'default');self.register(self.page)
- async def call(self,name,args):
+ async def _call_without_transfer_boundary(self,name,args):
   if name not in MODELS:return await super().call(name,args)
   try:a=MODELS[name][0].model_validate(args).model_dump()
   except ValidationError as e:raise BrowserAppError(str(e)) from e
@@ -845,3 +846,7 @@ class BrowserRuntimeV2(BrowserRuntime):
   elif name=='set_timezone':r=await self.device_v2.timezone(a)
   elif name=='set_geolocation':r=await self.device_v2.geo(a)
   return MODELS[name][1].model_validate(r).model_dump()
+ async def call(self,name,args):
+  try:return await self._call_without_transfer_boundary(name,args)
+  except TransferError as e:raise BrowserAppError(str(e)) from e
+

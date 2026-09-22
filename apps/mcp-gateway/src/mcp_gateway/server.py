@@ -364,6 +364,7 @@ def create_app(state: GatewayState) -> Starlette:
             for key, value in request.headers.items()
             if key.casefold() not in HOP_BY_HOP
         }
+        headers["authorization"] = f"Bearer {active.backend_token}"
 
         # When the trusted backend is reached through its Docker-inspected
         # private IP, the MCP transport's DNS-rebinding protection would reject

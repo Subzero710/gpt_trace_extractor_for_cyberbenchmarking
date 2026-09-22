@@ -103,6 +103,11 @@ def create_app(
     )
 
     async def mcp_http(scope: Scope, receive: Receive, send: Send) -> None:
+        headers = {key.decode("latin1").casefold(): value.decode("latin1") for key, value in scope.get("headers", [])}
+        if not hmac.compare_digest(headers.get("authorization", ""), f"Bearer {control_token}"):
+            response = JSONResponse({"error":{"code":"MCP_BACKEND_UNAUTHORIZED","message":"backend authentication required"}}, status_code=401)
+            await response(scope, receive, send)
+            return
         await session_manager.handle_request(scope, receive, send)
 
     def authorized(request: Request) -> bool:

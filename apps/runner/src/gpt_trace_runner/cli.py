@@ -63,6 +63,15 @@ def make_lifecycle(
         settings.docker_socket_path,
         workspace_image=settings.app_code_workspace_image,
         browser_image=settings.app_browser_image,
+        file_relay_image=settings.app_file_relay_image,
+        file_transfer_limits={
+            "max_file_bytes": settings.file_transfer_max_file_bytes,
+            "max_total_bytes": settings.file_transfer_max_total_bytes,
+            "max_objects": settings.file_transfer_max_objects,
+            "max_concurrent_uploads": settings.file_transfer_max_concurrent_uploads,
+            "max_concurrent_downloads": settings.file_transfer_max_concurrent_downloads,
+            "ttl_seconds": settings.file_transfer_ttl_seconds,
+        },
         workspace_gateway_container=settings.workspace_gateway_container,
         browser_gateway_container=settings.browser_gateway_container,
         browser_environment=(

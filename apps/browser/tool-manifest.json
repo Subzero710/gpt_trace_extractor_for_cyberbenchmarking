@@ -935,13 +935,42 @@
             "title": "Selector",
             "type": "string"
           },
+          "file_id": {
+            "anyOf": [
+              {
+                "pattern": "^f_[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Id"
+          },
           "filename": {
-            "title": "Filename",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Filename"
           },
           "content_base64": {
-            "title": "Content Base64",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content Base64"
           },
           "mime_type": {
             "anyOf": [
@@ -957,9 +986,7 @@
           }
         },
         "required": [
-          "selector",
-          "filename",
-          "content_base64"
+          "selector"
         ],
         "title": "Upload",
         "type": "object"
@@ -1035,11 +1062,16 @@
             "type": "string"
           },
           "max_bytes": {
-            "default": 10485760,
-            "maximum": 67108864,
+            "default": 134217728,
+            "maximum": 268435456,
             "minimum": 1,
             "title": "Max Bytes",
             "type": "integer"
+          },
+          "media_type": {
+            "default": "application/octet-stream",
+            "title": "Media Type",
+            "type": "string"
           }
         },
         "required": [
@@ -1051,9 +1083,41 @@
       "outputSchema": {
         "additionalProperties": false,
         "properties": {
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          },
           "filename": {
-            "title": "Filename",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Filename"
           },
           "size": {
             "title": "Size",
@@ -1063,16 +1127,34 @@
             "title": "Sha256",
             "type": "string"
           },
+          "media_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Media Type"
+          },
           "content_base64": {
-            "title": "Content Base64",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content Base64"
           }
         },
         "required": [
-          "filename",
           "size",
-          "sha256",
-          "content_base64"
+          "sha256"
         ],
         "title": "DownloadOut",
         "type": "object"

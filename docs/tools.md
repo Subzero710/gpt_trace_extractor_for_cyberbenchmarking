@@ -51,6 +51,8 @@ All paths are relative to the owned task workspace. Absolute paths, `..`, symlin
 | `apply_patch` | Applies ordered exact replacements only when the file hash and occurrence counts match. |
 | `list_directory` | Returns typed entries in deterministic path order. |
 | `search_files` | Performs literal UTF-8 content search with deterministic file/line/column ordering. |
+| `export_file` | Streams one regular workspace file to the per-attempt File Relay and returns an opaque `file_id` plus integrity metadata. |
+| `import_file` | Fetches one relay `file_id`, verifies size/SHA-256, and atomically materializes it at a workspace-relative path. |
 
 For each attempt the runner creates a fresh Workspace container. `tasks/<task_id>/initial_workspace/` is copied to `/workspace` before the gateway is bound; attachments are copied to `/workspace/attachments/<basename>`. Neither source tree is mounted into the container. The container is destroyed at terminal cleanup.
 
@@ -68,6 +70,8 @@ Every Browser attempt owns a newly created CloakBrowser container and profile. `
 | `screenshot` | Returns a bounded PNG as base64 with size and SHA-256. |
 | `download` | Returns one bounded download as base64 with filename, size and SHA-256. |
 | `tabs` | Lists, opens, selects or closes tabs in the task context. |
+| `upload_file` | Uploads direct `content_base64` in Browser-only attempts or consumes a relay `file_id` for cross-App transfer. |
+| `download_file` | Uses the File Relay automatically when configured; otherwise returns bounded direct base64 content for Browser-only attempts. |
 
 Navigation and subresources reject non-web schemes, URL credentials, localhost, link-local, private, reserved and metadata-network addresses. DNS answers are checked. `APP_BROWSER_ALLOWED_PRIVATE_HOSTS` is an explicit exact-host exception intended only for controlled integration fixtures.
 
@@ -126,6 +130,6 @@ Never create source-agent-specific Apps for equivalent capabilities. Source trac
 
 ## MCP Stack V2 tools
 
-Code Workspace: exec_command, read_file, write_file, apply_patch, list_directory, search_files, workspace_delete_file, workspace_delete_directory, workspace_move, workspace_copy, workspace_create_directory, workspace_stat, workspace_tree, workspace_find, create_terminal, send_terminal_input, read_terminal_output, close_terminal, list_processes, get_process, kill_process, get_system_info, get_environment, set_environment, get_current_directory, create_python_venv, install_python_packages, run_python_script, install_system_package, git_clone, git_status, git_diff, git_log, git_branch, git_checkout, git_commit, http_request, download_url, dns_lookup, check_port, workspace_template
+Code Workspace: exec_command, read_file, write_file, apply_patch, list_directory, search_files, workspace_delete_file, workspace_delete_directory, workspace_move, workspace_copy, workspace_create_directory, workspace_stat, workspace_tree, workspace_find, create_terminal, send_terminal_input, read_terminal_output, close_terminal, list_processes, get_process, kill_process, get_system_info, get_environment, set_environment, get_current_directory, create_python_venv, install_python_packages, run_python_script, install_system_package, git_clone, git_status, git_diff, git_log, git_branch, git_checkout, git_commit, http_request, download_url, dns_lookup, check_port, workspace_template, export_file, import_file
 
 Browser: search, navigate, read_page, click, type, press, wait, screenshot, download, tabs, go_back, go_forward, reload, new_page, close_page, switch_page, hover, drag, select_option, upload_file, download_file, inspect_dom, query_selector, get_html, get_attribute, evaluate_javascript, get_cookies, set_cookie, clear_cookies, export_storage_state, import_storage_state, create_context, destroy_context, get_console_logs, get_network_logs, get_request_details, get_response_body, performance_trace, set_user_agent, set_viewport, set_timezone, set_geolocation
