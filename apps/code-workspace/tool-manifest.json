@@ -2939,6 +2939,135 @@
         "title": "TemplateOut",
         "type": "object"
       }
+    },
+    {
+      "name": "export_file",
+      "description": "Export file.",
+      "category": "filesystem",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target": {
+            "const": "browser",
+            "default": "browser",
+            "title": "Target",
+            "type": "string"
+          },
+          "media_type": {
+            "default": "application/octet-stream",
+            "title": "Media Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "ExportFile",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "title": "File Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "size": {
+            "minimum": 0,
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_id",
+          "name",
+          "size",
+          "sha256",
+          "media_type"
+        ],
+        "title": "FileRef",
+        "type": "object"
+      }
+    },
+    {
+      "name": "import_file",
+      "description": "Import file.",
+      "category": "filesystem",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "pattern": "^f_[0-9a-f]{64}$",
+            "title": "File Id",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_id",
+          "path"
+        ],
+        "title": "ImportFile",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "file_id": {
+            "title": "File Id",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "file_id",
+          "size",
+          "sha256"
+        ],
+        "title": "ImportOut",
+        "type": "object"
+      }
     }
   ],
   "workspace_templates": [

@@ -93,7 +93,7 @@ class DockerMock:
                 "Id": cid,
                 "Image": f"sha256:{name}",
                 "Config": {"Image": config["Image"], "Labels": config["Labels"]},
-                "State": {"Running": False},
+                "State": {"Running": False, "Health": {"Status": "healthy"}},
                 "NetworkSettings": {
                     "Networks": {primary: {"IPAddress": address}}
                 },
@@ -173,6 +173,8 @@ def runtime(
         Path("/var/run/docker.sock"),
         workspace_image="gpt-trace-code-workspace:latest",
         browser_image="gpt-trace-browser:latest",
+        file_relay_image="gpt-trace-file-relay:latest",
+        file_transfer_limits={"max_file_bytes": 1048576, "max_total_bytes": 2097152, "max_objects": 8, "max_concurrent_uploads": 2, "max_concurrent_downloads": 2, "ttl_seconds": 60},
         workspace_gateway_container="gpt-trace-workspace-gateway",
         browser_gateway_container="gpt-trace-browser-gateway",
         browser_environment={},
@@ -198,10 +200,15 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
 
     attempt = await rt.create(task, environments, fp, attempt=1, control_token="s" * 40)
 
-    assert len(mock.containers) == 2
+    assert len(mock.containers) == 3
     assert attempt.network_name in mock.networks
     assert attempt.egress_network_name in mock.networks
-    assert mock.networks[attempt.network_name]["Internal"] is False
+    assert mock.networks[attempt.browser_control_network_name]["Internal"] is True
+    assert attempt.browser_control_network_name in mock.networks
+    assert attempt.relay_workspace_network_name in mock.networks
+    assert attempt.relay_browser_network_name in mock.networks
+    assert mock.networks[attempt.relay_workspace_network_name]["Internal"] is True
+    assert mock.networks[attempt.relay_browser_network_name]["Internal"] is True
     assert mock.networks[attempt.egress_network_name]["Internal"] is False
 
     workspace_name = rt._container_name("code-workspace", "env-w")
@@ -210,8 +217,8 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     browser_cfg = mock.created_configs[browser_name]
     assert workspace_cfg["HostConfig"]["NetworkMode"] == attempt.network_name
     assert browser_cfg["HostConfig"]["NetworkMode"] == attempt.egress_network_name
-    assert attempt.network_name in mock.containers[browser_name]["NetworkSettings"]["Networks"]
-    browser_task_endpoint = mock.containers[browser_name]["NetworkSettings"]["Networks"][attempt.network_name]
+    assert attempt.relay_browser_network_name in mock.containers[browser_name]["NetworkSettings"]["Networks"]
+    browser_task_endpoint = mock.containers[browser_name]["NetworkSettings"]["Networks"][attempt.browser_control_network_name]
     assert browser_name in browser_task_endpoint["Aliases"]
     assert mock.containers[browser_name]["State"]["Running"] is True
     assert "Binds" not in workspace_cfg["HostConfig"]
@@ -220,7 +227,7 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert "/var/run/docker.sock" not in json.dumps(browser_cfg)
 
     assert (attempt.network_name, "gpt-trace-workspace-gateway") in mock.gateway_connects
-    assert (attempt.network_name, "gpt-trace-browser-gateway") in mock.gateway_connects
+    assert (attempt.browser_control_network_name, "gpt-trace-browser-gateway") in mock.gateway_connects
 
     assert mock.archives == {}
     assert workspace_cfg["HostConfig"]["ReadonlyRootfs"] is False
@@ -247,7 +254,7 @@ async def test_attempt_creates_fresh_containers_and_private_networks_then_destro
     assert mock.containers == {}
     assert attempt.network_name not in mock.networks
     assert attempt.egress_network_name not in mock.networks
-    assert len(mock.deleted_containers) == 2
+    assert len(mock.deleted_containers) == 3
     assert all("force=true" in query and "v=true" in query for _, query in mock.deleted_containers)
 
 
@@ -290,6 +297,6 @@ async def test_browser_blocked_hosts_are_injected(tmp_path: Path) -> None:
     browser_name = rt._container_name("browser", "env-b")
     env = mock.created_configs[browser_name]["Env"]
     assert "APP_BROWSER_BLOCKED_HOSTS=chatgpt.com" in env
-    endpoint = mock.containers[browser_name]["NetworkSettings"]["Networks"][attempt.network_name]
+    endpoint = mock.containers[browser_name]["NetworkSettings"]["Networks"][attempt.browser_control_network_name]
     assert browser_name in endpoint["Aliases"]
     await rt.destroy(task, environments, "a" * 64, attempt=1)

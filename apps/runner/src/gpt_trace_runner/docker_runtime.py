@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import hmac
@@ -20,6 +21,7 @@ ATTEMPT_LABEL = "gpttrace.attempt"
 APP_LABEL = "gpttrace.app_id"
 ENVIRONMENT_LABEL = "gpttrace.environment_id"
 FINGERPRINT_LABEL = "gpttrace.task_fingerprint"
+ROLE_LABEL = "gpttrace.role"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,13 @@ class AttemptRuntime:
     egress_network_name: str | None
     egress_network_id: str | None
     resources: dict[str, RuntimeResource]
+    browser_control_network_name: str | None = None
+    browser_control_network_id: str | None = None
+    relay_workspace_network_name: str | None = None
+    relay_workspace_network_id: str | None = None
+    relay_browser_network_name: str | None = None
+    relay_browser_network_id: str | None = None
+    relay: dict[str, Any] | None = None
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -63,6 +72,10 @@ class AttemptRuntime:
                 if self.egress_network_name is not None
                 else None
             ),
+            "browser_control_network": ({"name": self.browser_control_network_name, "id": self.browser_control_network_id} if self.browser_control_network_name else None),
+            "relay_workspace_network": ({"name": self.relay_workspace_network_name, "id": self.relay_workspace_network_id} if self.relay_workspace_network_name else None),
+            "relay_browser_network": ({"name": self.relay_browser_network_name, "id": self.relay_browser_network_id} if self.relay_browser_network_name else None),
+            "relay": self.relay,
             "apps": {
                 app_id: resource.metadata()
                 for app_id, resource in sorted(self.resources.items())
@@ -79,6 +92,8 @@ class DockerRuntime:
         *,
         workspace_image: str,
         browser_image: str,
+        file_relay_image: str = "gpt-trace-file-relay:latest",
+        file_transfer_limits: dict[str, int] | None = None,
         workspace_gateway_container: str,
         browser_gateway_container: str,
         browser_environment: dict[str, str],
@@ -88,6 +103,8 @@ class DockerRuntime:
         self.socket_path = socket_path
         self.workspace_image = workspace_image
         self.browser_image = browser_image
+        self.file_relay_image = file_relay_image
+        self.file_transfer_limits = dict(file_transfer_limits or {})
         self.workspace_gateway_container = workspace_gateway_container
         self.browser_gateway_container = browser_gateway_container
         self.browser_environment = dict(browser_environment)
@@ -160,6 +177,23 @@ class DockerRuntime:
         raw = f"egress\0{task.task_id}\0{attempt}\0{fingerprint}"
         return f"gpt-trace-egress-{cls._suffix(raw)}"
 
+    @classmethod
+    def _browser_control_network_name(cls, task: BenchmarkTask, attempt: int, fingerprint: str) -> str:
+        return f"gpt-trace-browser-control-{cls._suffix(f'browser-control{chr(0)}{task.task_id}{chr(0)}{attempt}{chr(0)}{fingerprint}')}"
+
+    @classmethod
+    def _relay_network_name(cls, side: str, task: BenchmarkTask, attempt: int, fingerprint: str) -> str:
+        return f"gpt-trace-relay-{side}-{cls._suffix(f'relay{chr(0)}{side}{chr(0)}{task.task_id}{chr(0)}{attempt}{chr(0)}{fingerprint}')}"
+
+    @classmethod
+    def _relay_container_name(cls, task: BenchmarkTask, attempt: int, fingerprint: str) -> str:
+        return f"gpt-trace-file-relay-{cls._suffix(f'relay{chr(0)}{task.task_id}{chr(0)}{attempt}{chr(0)}{fingerprint}')}"
+
+    @staticmethod
+    def relay_token(control_token: str, task: BenchmarkTask, attempt: int, fingerprint: str, app_id: str, environment_id: str) -> str:
+        message=f"file-relay\0{task.task_id}\0{attempt}\0{fingerprint}\0{app_id}\0{environment_id}".encode()
+        return hmac.new(control_token.encode(),message,hashlib.sha256).hexdigest()
+
     @staticmethod
     def backend_token(control_token: str, app_id: str, environment_id: str) -> str:
         message = f"backend\0{app_id}\0{environment_id}".encode("utf-8")
@@ -219,11 +253,15 @@ class DockerRuntime:
         egress_network_name: str | None,
         backend_token: str,
         container_name: str,
+        relay_url: str | None = None,
+        relay_token: str | None = None,
     ) -> dict[str, Any]:
         env = [
             f"APP_CONTROL_TOKEN={backend_token}",
             f"MCP_ALLOWED_HOSTS={container_name}:8000,localhost:8000",
         ]
+        if relay_url and relay_token:
+            env += [f"FILE_RELAY_URL={relay_url}",f"FILE_RELAY_TOKEN={relay_token}",f"FILE_RELAY_APP_ID={app_id}",f"FILE_RELAY_MAX_FILE_BYTES={self.file_transfer_limits.get('max_file_bytes',134217728)}"]
         if app_id == "code-workspace":
             env += [
                 "CODE_WORKSPACE_ROOT=/workspace",
@@ -492,292 +530,161 @@ class DockerRuntime:
         if not isinstance(labels, dict) or any(labels.get(k) != v for k, v in expected.items()):
             raise AppInfrastructureError(f"Docker runtime identity mismatch for {app_id}")
 
+    async def _wait_healthy(self, container: str, timeout_seconds: float = 25.0) -> None:
+        deadline=asyncio.get_running_loop().time()+timeout_seconds
+        while True:
+            info=await self._inspect_container(container)
+            if info is None or not info.get("State",{}).get("Running"):
+                raise AppInfrastructureError("file relay exited during readiness")
+            status=info.get("State",{}).get("Health",{}).get("Status")
+            if status=="healthy":return
+            if status=="unhealthy":raise AppInfrastructureError("file relay healthcheck failed")
+            if asyncio.get_running_loop().time()>=deadline:raise AppInfrastructureError("file relay readiness timed out")
+            await asyncio.sleep(.25)
+
     async def create(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-        control_token: str,
+        self, task: BenchmarkTask, environments: dict[str,str], fingerprint: str, *,
+        attempt: int, control_token: str,
     ) -> AttemptRuntime:
-        local_tools = [tool for tool in task.tools if tool.kind == "local_mcp"]
-        if not local_tools:
-            return AttemptRuntime(None, None, None, None, {})
+        local_tools=[t for t in task.tools if t.kind=="local_mcp"]
+        if not local_tools:return AttemptRuntime(None,None,None,None,{})
         await self.ping()
-        has_browser = any(tool.app_id == "browser" for tool in local_tools)
-        network_name = self._network_name(task, attempt, fingerprint)
-        egress_network_name = (
-            self._egress_network_name(task, attempt, fingerprint) if has_browser else None
-        )
-        if await self._inspect_network(network_name) is not None:
-            raise AppInfrastructureError(f"task network already exists before prepare: {network_name}")
-        network_id = await self._create_network(
-            task,
-            attempt=attempt,
-            fingerprint=fingerprint,
-            network_name=network_name,
-            internal=False,
-            role="task",
-        )
-        egress_network_id: str | None = None
-        if egress_network_name is not None:
-            if await self._inspect_network(egress_network_name) is not None:
-                await self._remove_network(network_name)
-                raise AppInfrastructureError(
-                    f"task egress network already exists before prepare: {egress_network_name}"
-                )
-            egress_network_id = await self._create_network(
-                task,
-                attempt=attempt,
-                fingerprint=fingerprint,
-                network_name=egress_network_name,
-                internal=False,
-                role="egress",
-            )
-        resources: dict[str, RuntimeResource] = {}
-        connected_gateways: list[str] = []
-        created_containers: list[str] = []
+        ids={t.app_id for t in local_tools}; has_browser="browser" in ids; transfer=ids=={"browser","code-workspace"}
+        workspace_net=self._network_name(task,attempt,fingerprint)
+        browser_net=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
+        egress=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
+        relay_w=self._relay_network_name("workspace",task,attempt,fingerprint) if transfer else None
+        relay_b=self._relay_network_name("browser",task,attempt,fingerprint) if transfer else None
+        names=[n for n in (workspace_net,browser_net,egress,relay_w,relay_b) if n]
+        for n in names:
+            if await self._inspect_network(n) is not None:raise AppInfrastructureError(f"attempt network already exists before prepare: {n}")
+        made=[]; connected=[]; containers=[]
+        async def mk(name,internal,role):
+            nid=await self._create_network(task,attempt=attempt,fingerprint=fingerprint,network_name=name,internal=internal,role=role);made.append(name);return nid
         try:
+            workspace_id=await mk(workspace_net,False,"workspace-control")
+            browser_id=await mk(browser_net,True,"browser-control") if browser_net else None
+            egress_id=await mk(egress,False,"egress") if egress else None
+            relay_w_id=await mk(relay_w,True,"relay-workspace") if relay_w else None
+            relay_b_id=await mk(relay_b,True,"relay-browser") if relay_b else None
+            relay_meta=None
+            if transfer:
+                relay_name=self._relay_container_name(task,attempt,fingerprint)
+                wt=self.relay_token(control_token,task,attempt,fingerprint,"code-workspace",environments["code-workspace"])
+                bt=self.relay_token(control_token,task,attempt,fingerprint,"browser",environments["browser"])
+                env=[f"FILE_RELAY_TASK_ID={task.task_id}",f"FILE_RELAY_ATTEMPT={attempt}",
+                     f"FILE_RELAY_WORKSPACE_TOKEN={wt}",f"FILE_RELAY_BROWSER_TOKEN={bt}"]
+                mapping={"max_file_bytes":"MAX_FILE_BYTES","max_total_bytes":"MAX_TOTAL_BYTES","max_objects":"MAX_OBJECTS",
+                         "max_concurrent_uploads":"MAX_CONCURRENT_UPLOADS","max_concurrent_downloads":"MAX_CONCURRENT_DOWNLOADS","ttl_seconds":"TTL_SECONDS"}
+                for k,suffix in mapping.items():
+                    if k in self.file_transfer_limits:env.append(f"FILE_RELAY_{suffix}={self.file_transfer_limits[k]}")
+                relay_quota=int(self.file_transfer_limits.get("max_total_bytes",268435456))
+                relay_tmpfs=relay_quota+67108864
+                relay_memory=relay_tmpfs+268435456
+                cfg={"Image":self.file_relay_image,"User":"65532:65532","Env":env,
+                     "Labels":{MANAGED_LABEL:"true",TASK_LABEL:task.task_id,ATTEMPT_LABEL:str(attempt),FINGERPRINT_LABEL:fingerprint,ROLE_LABEL:"file-relay"},
+                     "ExposedPorts":{"8080/tcp":{}},"HostConfig":{"ReadonlyRootfs":True,"Init":True,"CapDrop":["ALL"],
+                       "SecurityOpt":["no-new-privileges"],"PidsLimit":64,"Memory":relay_memory,"NanoCpus":500000000,
+                       "Ulimits":[{"Name":"nofile","Soft":256,"Hard":256}],
+                       "Tmpfs":{"/data":f"rw,nosuid,nodev,noexec,size={relay_tmpfs},mode=0700,uid=65532,gid=65532",
+                                "/tmp":"rw,nosuid,nodev,noexec,size=16777216,mode=1777"},
+                       "NetworkMode":relay_w},
+                     "NetworkingConfig":{"EndpointsConfig":{relay_w:{"Aliases":["file-relay"]}}}}
+                resp=await self._request("POST",f"/containers/create?name={quote(relay_name,safe='')}",expected={201},json_body=cfg)
+                rid=resp.json().get("Id");containers.append(relay_name)
+                await self._request("POST",f"/containers/{quote(rid,safe='')}/start",expected={204,304})
+                await self._connect(relay_b,relay_name,aliases=["file-relay"],gw_priority=0)
+                await self._wait_healthy(relay_name)
+                ri=await self._inspect_container(relay_name)
+                relay_meta={"container_name":relay_name,"container_id":rid,"image":self.file_relay_image,"image_id":ri.get("Image") if ri else None}
+            resources={}
             for tool in local_tools:
-                environment_id = environments[tool.app_id]
-                container_name = self._container_name(tool.app_id, environment_id)
-                if await self._inspect_container(container_name) is not None:
-                    raise AppInfrastructureError(
-                        f"task container already exists before prepare: {container_name}"
-                    )
-                backend_token = self.backend_token(control_token, tool.app_id, environment_id)
-                config = self._container_config(
-                    task,
-                    app_id=tool.app_id,
-                    attempt=attempt,
-                    environment_id=environment_id,
-                    fingerprint=fingerprint,
-                    network_name=network_name,
-                    egress_network_name=egress_network_name,
-                    backend_token=backend_token,
-                    container_name=container_name,
-                )
-                response = await self._request(
-                    "POST",
-                    f"/containers/create?name={quote(container_name, safe='')}",
-                    expected={201},
-                    json_body=config,
-                )
-                value = response.json()
-                container_id = value.get("Id") if isinstance(value, dict) else None
-                if not isinstance(container_id, str) or not container_id:
-                    raise AppInfrastructureError("Docker container create returned no id")
-                created_containers.append(container_name)
-                await self._request(
-                    "POST",
-                    f"/containers/{quote(container_id, safe='')}/start",
-                    expected={204, 304},
-                )
-                if tool.app_id == "browser":
-                    # A browser starts on its dedicated egress network. Attach
-                    # its task network only after the container is running so
-                    # Docker registers the secondary-network DNS endpoint
-                    # immediately and consistently.
-                    await self._connect(
-                        network_name,
-                        container_name,
-                        aliases=[container_name],
-                        gw_priority=0,
-                    )
-                    attached = await self._inspect_container(container_name)
-                    if attached is None:
-                        raise AppInfrastructureError(
-                            f"browser container disappeared after task-network attach: {container_name}"
-                        )
-                    networks = attached.get("NetworkSettings", {}).get("Networks", {})
-                    endpoint = networks.get(network_name) if isinstance(networks, dict) else None
-                    aliases = endpoint.get("Aliases") if isinstance(endpoint, dict) else None
-                    if (
-                        not isinstance(aliases, list)
-                        or container_name not in aliases
-                    ):
-                        raise AppInfrastructureError(
-                            "browser task-network DNS alias was not installed: "
-                            f"{container_name} on {network_name}"
-                        )
-                gateway = self._gateway_container(tool.app_id)
-                await self._connect(network_name, gateway)
-                connected_gateways.append(gateway)
-                inspected = await self._inspect_container(container_id)
-                if inspected is None:
-                    raise AppInfrastructureError(f"created container disappeared: {container_name}")
-                image_id = inspected.get("Image")
-                config_inspect = inspected.get("Config")
-                image = config_inspect.get("Image") if isinstance(config_inspect, dict) else None
-                if not isinstance(image_id, str) or not isinstance(image, str):
-                    raise AppInfrastructureError("Docker inspect omitted image provenance")
-                backend_url = self._backend_url_from_inspect(
-                    inspected,
-                    network_name=network_name,
-                    container_name=container_name,
-                )
-                resources[tool.app_id] = RuntimeResource(
-                    tool.app_id,
-                    environment_id,
-                    container_name,
-                    container_id,
-                    image,
-                    image_id,
-                    backend_url,
-                    backend_token,
-                )
-            return AttemptRuntime(
-                network_name,
-                network_id,
-                egress_network_name,
-                egress_network_id,
-                resources,
-            )
+                app=tool.app_id; env_id=environments[app]; cname=self._container_name(app,env_id)
+                if await self._inspect_container(cname) is not None:raise AppInfrastructureError(f"task container already exists before prepare: {cname}")
+                app_net=browser_net if app=="browser" else workspace_net
+                token=self.backend_token(control_token,app,env_id)
+                relay_url="http://file-relay:8080" if transfer else None
+                rtok=self.relay_token(control_token,task,attempt,fingerprint,app,env_id) if transfer else None
+                cfg=self._container_config(task,app_id=app,attempt=attempt,environment_id=env_id,fingerprint=fingerprint,
+                    network_name=app_net,egress_network_name=egress if app=="browser" else None,backend_token=token,container_name=cname,
+                    relay_url=relay_url,relay_token=rtok)
+                resp=await self._request("POST",f"/containers/create?name={quote(cname,safe='')}",expected={201},json_body=cfg)
+                cid=resp.json().get("Id");containers.append(cname)
+                await self._request("POST",f"/containers/{quote(cid,safe='')}/start",expected={204,304})
+                if app=="browser":await self._connect(browser_net,cname,aliases=[cname],gw_priority=0)
+                if transfer:await self._connect(relay_b if app=="browser" else relay_w,cname,gw_priority=0)
+                gateway=self._gateway_container(app);await self._connect(app_net,gateway);connected.append((app_net,gateway))
+                inspected=await self._inspect_container(cid)
+                image_id=inspected.get("Image"); image=inspected.get("Config",{}).get("Image")
+                backend=self._backend_url_from_inspect(inspected,network_name=app_net,container_name=cname)
+                resources[app]=RuntimeResource(app,env_id,cname,cid,image,image_id,backend,token)
+            return AttemptRuntime(workspace_net,workspace_id,egress,egress_id,resources,browser_net,browser_id,relay_w,relay_w_id,relay_b,relay_b_id,relay_meta)
         except Exception:
-            for container in reversed(created_containers):
-                try:
-                    await self._remove_container(container)
-                except Exception:
-                    pass
-            for gateway in reversed(connected_gateways):
-                try:
-                    await self._disconnect(network_name, gateway)
-                except Exception:
-                    pass
-            try:
-                await self._remove_network(network_name)
-            except Exception:
-                pass
-            if egress_network_name is not None:
-                try:
-                    await self._remove_network(egress_network_name)
-                except Exception:
-                    pass
+            for c in reversed(containers):
+                try:await self._remove_container(c)
+                except Exception:pass
+            for n,g in reversed(connected):
+                try:await self._disconnect(n,g)
+                except Exception:pass
+            for n in reversed(made):
+                try:await self._remove_network(n)
+                except Exception:pass
             raise
 
-    async def discover(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-        control_token: str,
-    ) -> AttemptRuntime:
-        local_tools = [tool for tool in task.tools if tool.kind == "local_mcp"]
-        if not local_tools:
-            return AttemptRuntime(None, None, None, None, {})
-        await self.ping()
-        has_browser = any(tool.app_id == "browser" for tool in local_tools)
-        network_name = self._network_name(task, attempt, fingerprint)
-        egress_network_name = (
-            self._egress_network_name(task, attempt, fingerprint) if has_browser else None
-        )
-        network = await self._inspect_network(network_name)
-        if network is None:
-            raise AppInfrastructureError("the exact task network is unavailable for recovery")
-        network_id = network.get("Id")
-        if not isinstance(network_id, str) or not network_id:
-            raise AppInfrastructureError("Docker network inspect omitted id")
-        egress_network_id: str | None = None
-        if egress_network_name is not None:
-            egress_network = await self._inspect_network(egress_network_name)
-            if egress_network is None:
-                raise AppInfrastructureError(
-                    "the exact task egress network is unavailable for recovery"
-                )
-            value = egress_network.get("Id")
-            if not isinstance(value, str) or not value:
-                raise AppInfrastructureError("Docker egress network inspect omitted id")
-            egress_network_id = value
-        resources: dict[str, RuntimeResource] = {}
-        for tool in local_tools:
-            environment_id = environments[tool.app_id]
-            container_name = self._container_name(tool.app_id, environment_id)
-            inspected = await self._inspect_container(container_name)
-            if inspected is None:
-                raise AppInfrastructureError(
-                    f"the exact {tool.app_id} container is unavailable for recovery"
-                )
-            self._verify_labels(
-                inspected,
-                task=task,
-                app_id=tool.app_id,
-                attempt=attempt,
-                environment_id=environment_id,
-                fingerprint=fingerprint,
-            )
-            state = inspected.get("State")
-            if not isinstance(state, dict) or not state.get("Running"):
-                raise AppInfrastructureError(f"recovery container is not running: {container_name}")
-            networks = inspected.get("NetworkSettings", {}).get("Networks", {})
-            if not isinstance(networks, dict) or network_name not in networks:
-                raise AppInfrastructureError(f"recovery container is detached from task network: {container_name}")
-            if (
-                tool.app_id == "browser"
-                and (egress_network_name is None or egress_network_name not in networks)
-            ):
-                raise AppInfrastructureError("recovery browser container lost its task egress network")
-            await self._connect(network_name, self._gateway_container(tool.app_id))
-            image_id = inspected.get("Image")
-            config_inspect = inspected.get("Config")
-            image = config_inspect.get("Image") if isinstance(config_inspect, dict) else None
-            if not isinstance(image_id, str) or not isinstance(image, str):
-                raise AppInfrastructureError("Docker inspect omitted image provenance")
-            backend_url = self._backend_url_from_inspect(
-                inspected,
-                network_name=network_name,
-                container_name=container_name,
-            )
-            resources[tool.app_id] = RuntimeResource(
-                tool.app_id,
-                environment_id,
-                container_name,
-                str(inspected.get("Id", container_name)),
-                image,
-                image_id,
-                backend_url,
-                self.backend_token(control_token, tool.app_id, environment_id),
-            )
-        return AttemptRuntime(
-            network_name,
-            network_id,
-            egress_network_name,
-            egress_network_id,
-            resources,
-        )
+    async def discover(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int,control_token:str)->AttemptRuntime:
+        local=[t for t in task.tools if t.kind=="local_mcp"]
+        if not local:return AttemptRuntime(None,None,None,None,{})
+        await self.ping();ids={t.app_id for t in local};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"}
+        wn=self._network_name(task,attempt,fingerprint);bn=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
+        en=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
+        rw=self._relay_network_name("workspace",task,attempt,fingerprint) if transfer else None;rb=self._relay_network_name("browser",task,attempt,fingerprint) if transfer else None
+        async def net(name):
+            if not name:return None,None
+            x=await self._inspect_network(name)
+            if x is None:raise AppInfrastructureError(f"recovery network unavailable: {name}")
+            return name,x.get("Id")
+        _,wid=await net(wn);_,bid=await net(bn);_,eid=await net(en);_,rwid=await net(rw);_,rbid=await net(rb)
+        relay_meta=None
+        if transfer:
+            rn=self._relay_container_name(task,attempt,fingerprint);ri=await self._inspect_container(rn)
+            if ri is None or not ri.get("State",{}).get("Running"):raise AppInfrastructureError("recovery file relay is unavailable")
+            if ri.get("State",{}).get("Health",{}).get("Status")!="healthy":raise AppInfrastructureError("recovery file relay is unhealthy")
+            labels=ri.get("Config",{}).get("Labels",{})
+            expected={MANAGED_LABEL:"true",TASK_LABEL:task.task_id,ATTEMPT_LABEL:str(attempt),FINGERPRINT_LABEL:fingerprint,ROLE_LABEL:"file-relay"}
+            if any(labels.get(k)!=v for k,v in expected.items()):raise AppInfrastructureError("file relay identity mismatch")
+            nets=ri.get("NetworkSettings",{}).get("Networks",{})
+            if rw not in nets or rb not in nets:raise AppInfrastructureError("file relay lost transfer network")
+            relay_meta={"container_name":rn,"container_id":ri.get("Id"),"image":ri.get("Config",{}).get("Image"),"image_id":ri.get("Image")}
+        resources={}
+        for tool in local:
+            app=tool.app_id;env_id=environments[app];cname=self._container_name(app,env_id);ins=await self._inspect_container(cname)
+            if ins is None:raise AppInfrastructureError(f"the exact {app} container is unavailable for recovery")
+            self._verify_labels(ins,task=task,app_id=app,attempt=attempt,environment_id=env_id,fingerprint=fingerprint)
+            if not ins.get("State",{}).get("Running"):raise AppInfrastructureError(f"recovery container is not running: {cname}")
+            appnet=bn if app=="browser" else wn;nets=ins.get("NetworkSettings",{}).get("Networks",{})
+            if appnet not in nets:raise AppInfrastructureError(f"recovery container lost control network: {cname}")
+            if app=="browser" and en not in nets:raise AppInfrastructureError("recovery browser lost egress network")
+            if transfer and (rb if app=="browser" else rw) not in nets:raise AppInfrastructureError("recovery runtime lost relay network")
+            await self._connect(appnet,self._gateway_container(app))
+            resources[app]=RuntimeResource(app,env_id,cname,str(ins.get("Id",cname)),ins.get("Config",{}).get("Image"),ins.get("Image"),
+              self._backend_url_from_inspect(ins,network_name=appnet,container_name=cname),self.backend_token(control_token,app,env_id))
+        return AttemptRuntime(wn,wid,en,eid,resources,bn,bid,rw,rwid,rb,rbid,relay_meta)
 
-    async def assert_absent(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-    ) -> None:
-        residue: list[str] = []
-        network_name = self._network_name(task, attempt, fingerprint)
-        if await self._inspect_network(network_name) is not None:
-            residue.append(f"network:{network_name}")
-        has_browser = any(
-            tool.kind == "local_mcp" and tool.app_id == "browser"
-            for tool in task.tools
-        )
-        if has_browser:
-            egress = self._egress_network_name(task, attempt, fingerprint)
-            if await self._inspect_network(egress) is not None:
-                residue.append(f"network:{egress}")
-        for tool in task.tools:
-            if tool.kind != "local_mcp":
-                continue
-            name = self._container_name(tool.app_id, environments[tool.app_id])
-            if await self._inspect_container(name) is not None:
-                residue.append(f"container:{name}")
-        if residue:
-            raise AppInfrastructureError(
-                "runtime cleanup residue remains after reset: " + ", ".join(residue)
-            )
+    async def assert_absent(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int)->None:
+        residue=[];ids={t.app_id for t in task.tools if t.kind=="local_mcp"};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"}
+        nets=[self._network_name(task,attempt,fingerprint)]
+        if has_browser:nets += [self._browser_control_network_name(task,attempt,fingerprint),self._egress_network_name(task,attempt,fingerprint)]
+        if transfer:nets += [self._relay_network_name("workspace",task,attempt,fingerprint),self._relay_network_name("browser",task,attempt,fingerprint)]
+        for n in nets:
+            if await self._inspect_network(n) is not None:residue.append("network:"+n)
+        for t in task.tools:
+            if t.kind=="local_mcp":
+                n=self._container_name(t.app_id,environments[t.app_id])
+                if await self._inspect_container(n) is not None:residue.append("container:"+n)
+        if transfer:
+            n=self._relay_container_name(task,attempt,fingerprint)
+            if await self._inspect_container(n) is not None:residue.append("container:"+n)
+        if residue:raise AppInfrastructureError("runtime cleanup residue remains after reset: "+", ".join(residue))
 
     async def snapshot(
         self,
@@ -797,42 +704,24 @@ class DockerRuntime:
         )
         return runtime.metadata()
 
-    async def destroy(
-        self,
-        task: BenchmarkTask,
-        environments: dict[str, str],
-        fingerprint: str,
-        *,
-        attempt: int,
-    ) -> None:
-        local_tools = [tool for tool in task.tools if tool.kind == "local_mcp"]
-        if not local_tools:
-            return
-        network_name = self._network_name(task, attempt, fingerprint)
-        has_browser = any(tool.app_id == "browser" for tool in local_tools)
-        egress_network_name = (
-            self._egress_network_name(task, attempt, fingerprint) if has_browser else None
-        )
-        errors: list[str] = []
-        for tool in reversed(local_tools):
-            container_name = self._container_name(tool.app_id, environments[tool.app_id])
-            try:
-                await self._remove_container(container_name)
-            except AppInfrastructureError as exc:
-                errors.append(str(exc))
-        for tool in reversed(local_tools):
-            try:
-                await self._disconnect(network_name, self._gateway_container(tool.app_id))
-            except AppInfrastructureError as exc:
-                errors.append(str(exc))
-        try:
-            await self._remove_network(network_name)
-        except AppInfrastructureError as exc:
-            errors.append(str(exc))
-        if egress_network_name is not None:
-            try:
-                await self._remove_network(egress_network_name)
-            except AppInfrastructureError as exc:
-                errors.append(str(exc))
-        if errors:
-            raise AppInfrastructureError("; ".join(errors))
+    async def destroy(self,task:BenchmarkTask,environments:dict[str,str],fingerprint:str,*,attempt:int)->None:
+        local=[t for t in task.tools if t.kind=="local_mcp"]
+        if not local:return
+        ids={t.app_id for t in local};has_browser="browser" in ids;transfer=ids=={"browser","code-workspace"};errors=[]
+        wn=self._network_name(task,attempt,fingerprint);bn=self._browser_control_network_name(task,attempt,fingerprint) if has_browser else None
+        en=self._egress_network_name(task,attempt,fingerprint) if has_browser else None
+        rw=self._relay_network_name("workspace",task,attempt,fingerprint) if transfer else None;rb=self._relay_network_name("browser",task,attempt,fingerprint) if transfer else None
+        for t in reversed(local):
+            try:await self._remove_container(self._container_name(t.app_id,environments[t.app_id]))
+            except AppInfrastructureError as e:errors.append(str(e))
+        if transfer:
+            try:await self._remove_container(self._relay_container_name(task,attempt,fingerprint))
+            except AppInfrastructureError as e:errors.append(str(e))
+        for t in reversed(local):
+            try:await self._disconnect(bn if t.app_id=="browser" else wn,self._gateway_container(t.app_id))
+            except AppInfrastructureError as e:errors.append(str(e))
+        for n in (rw,rb,bn,wn,en):
+            if n:
+                try:await self._remove_network(n)
+                except AppInfrastructureError as e:errors.append(str(e))
+        if errors:raise AppInfrastructureError("; ".join(errors))

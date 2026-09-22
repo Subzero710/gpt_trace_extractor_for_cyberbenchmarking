@@ -2,7 +2,7 @@ from __future__ import annotations
 import hashlib,json
 from copy import deepcopy
 from typing import Any,Literal
-from pydantic import BaseModel,ConfigDict,Field
+from pydantic import BaseModel,ConfigDict,Field,model_validator
 APP_ID='browser';VERSION='2.0.0';SCHEMA_VERSION=2
 class M(BaseModel):model_config=ConfigDict(extra='forbid',strict=True)
 class Empty(M):pass
@@ -14,8 +14,14 @@ class Sel(M):selector:str
 class Hover(Sel):timeout_ms:int=Field(15000,ge=1,le=60000)
 class Drag(M):source_selector:str;target_selector:str
 class Select(Sel):values:list[str]=Field(min_length=1)
-class Upload(Sel):filename:str;content_base64:str;mime_type:str|None=None
-class Down(Sel):max_bytes:int=Field(10485760,ge=1,le=67108864)
+class Upload(Sel):
+ file_id:str|None=Field(default=None,pattern=r"^f_[0-9a-f]{64}$");filename:str|None=None;content_base64:str|None=None;mime_type:str|None=None
+ @model_validator(mode="after")
+ def one_source(self):
+  if (self.file_id is None)==(self.content_base64 is None):raise ValueError("provide exactly one of file_id or content_base64")
+  if self.content_base64 is not None and not self.filename:raise ValueError("legacy inline upload requires filename")
+  return self
+class Down(Sel):max_bytes:int=Field(134217728,ge=1,le=268435456);legacy_inline:bool=False;media_type:str='application/octet-stream'
 class Inspect(M):selector:str='html';max_nodes:int=Field(1000,ge=1,le=10000);max_chars:int=Field(200000,ge=1,le=2000000)
 class Html(M):selector:str|None=None;max_chars:int=Field(1000000,ge=1,le=5000000)
 class Attr(Sel):name:str
@@ -36,7 +42,13 @@ class Geo(M):latitude:float=Field(ge=-90,le=90);longitude:float=Field(ge=-180,le
 class PageInfo(M):page_id:str;context_id:str;url:str;title:str
 class OkPage(PageInfo):ok:bool=True;filename:str|None=None;mime_type:str|None=None
 class CloseOut(M):active_page_id:str|None;pages:list[PageInfo]
-class DownloadOut(M):filename:str;size:int;sha256:str;content_base64:str
+class FileRef(M):file_id:str;name:str;size:int;sha256:str;media_type:str
+class DownloadOut(M):
+ file_id:str|None=None;name:str|None=None;filename:str|None=None;size:int;sha256:str;media_type:str|None=None;content_base64:str|None=None
+ @model_validator(mode="after")
+ def one_payload(self):
+  if (self.file_id is None)==(self.content_base64 is None):raise ValueError("download result must contain file_id or legacy content_base64")
+  return self
 class InspectOut(M):selector:str;nodes:list[dict[str,Any]];truncated:bool
 class QueryOut(M):selector:str;count:int;matches:list[dict[str,Any]]
 class HtmlOut(M):html:str;truncated:bool
