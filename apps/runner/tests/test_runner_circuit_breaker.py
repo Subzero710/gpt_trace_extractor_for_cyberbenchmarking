@@ -29,14 +29,18 @@ class FakeChatGPT:
 class FakeStorage:
     def __init__(self): self.failed = []
     async def get(self, task_id): return None
-    async def start(self, task_id, runner_id, expected_attempt, task_fingerprint, app_provenance):
+    async def start(
+        self, task_id, runner_id, expected_attempt, task_fingerprint, app_provenance,
+        logical_task_id=None, dataset_metadata=None,
+    ):
         return StoredRun(
-            task_id, "running", attempt=expected_attempt, runner_id=runner_id,
-            task_fingerprint=task_fingerprint, app_provenance=app_provenance,
+            task_id=task_id, logical_task_id=logical_task_id or task_id, status="running",
+            attempt=expected_attempt, runner_id=runner_id, task_fingerprint=task_fingerprint,
+            app_provenance=app_provenance, dataset_metadata=dataset_metadata or {},
         )
     async def fail(self, task_id, error, *, attempt, runner_id):
         self.failed.append(task_id)
-        return StoredRun(task_id, "failed", attempt=attempt, runner_id=runner_id)
+        return StoredRun(task_id=task_id, logical_task_id=task_id, status="failed", attempt=attempt, runner_id=runner_id)
 
 
 def make_runner(chatgpt, storage, lifecycle, path):

@@ -49,6 +49,9 @@ def test_discover_requires_browser_and_workspace_across_split(tmp_path, monkeypa
     monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
     adapter = GAIAAdapter()
     _write_metadata(adapter.revision_root / GAIA_METADATA_FILE)
+    attachment = adapter.revision_root / "2023/validation/sample.txt"
+    attachment.parent.mkdir(parents=True, exist_ok=True)
+    attachment.write_text("42\n", encoding="utf-8")
 
     tasks = adapter.discover_tasks()
 
@@ -58,6 +61,8 @@ def test_discover_requires_browser_and_workspace_across_split(tmp_path, monkeypa
     assert web.required_tools == ("browser",)
     assert file_task.required_tools == ("code-workspace",)
     assert all(task.metadata["source_revision"] == GAIA_REVISION for task in tasks)
+    assert file_task.metadata["source_file_sha256"]
+    assert web.metadata["source_file_sha256"] is None
     assert all("Final answer" not in task.metadata for task in tasks)
 
 
@@ -102,6 +107,11 @@ async def test_file_task_is_seeded_only_into_code_workspace(tmp_path, monkeypatc
         conversation_id="c1",
         messages=[{"author": {"role": "assistant"}, "content": {"parts": ["FINAL ANSWER: 42"]}}],
     )
-    result = await adapter.evaluate(task, prepared=PreparedBenchmarkContext(), captured=captured)
+    prepared = PreparedBenchmarkContext()
+    result = await adapter.evaluate(task, prepared=prepared, captured=captured)
     assert result.verdict == "pass"
     assert result.score == 1.0
+
+    materialized_root = materialized.initial_workspace.parent
+    await adapter.cleanup(materialized, prepared=prepared)
+    assert not materialized_root.exists()

@@ -20,7 +20,7 @@ from .exceptions import RecoveryIncomplete, StorageError
 from .journal import JournalStore
 from .lock import RunnerLock
 from .models import BenchmarkTask, BenchmarkTool, task_app_provenance, task_fingerprint
-from .qwen import flatten_app_provenance
+from .tool_identity import flatten_app_provenance
 from .registry import AppRegistry
 from .runner import BenchmarkRunner, RunOptions, abandon_recovery
 from .runtime_preflight import preflight_tasks
@@ -538,7 +538,7 @@ def inspect_tools(
         "task_id": task.task_id,
         "task_fingerprint": task_fingerprint(task),
         "apps": task_app_provenance(task),
-        "qwen": flatten_app_provenance(task_app_provenance(task)),
+        "canonical_tools": flatten_app_provenance(task_app_provenance(task)),
     }
     console.print_json(json.dumps(value, ensure_ascii=False, sort_keys=True))
 

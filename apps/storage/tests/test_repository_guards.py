@@ -16,6 +16,7 @@ class FakeSession:
 def run(status="running", *, attempt=2, runner_id="r", conversation_id=None):
     return Run(
         task_id="t",
+        logical_task_id="t",
         status=status,
         attempt=attempt,
         runner_id=runner_id,
@@ -89,10 +90,10 @@ class StartSession(FakeSession):
 @pytest.mark.asyncio
 async def test_start_refuses_another_running_task(monkeypatch) -> None:
     monkeypatch.setattr(repository, "get_run", AsyncMock(return_value=None))
-    session = StartSession(other=Run(task_id="other", status="running", attempt=1, runner_id="x", task_fingerprint="a" * 64))
+    session = StartSession(other=Run(task_id="other", logical_task_id="other", status="running", attempt=1, runner_id="x", task_fingerprint="a" * 64))
     with pytest.raises(repository.RunConflict, match="another task"):
         await repository.start_run(
-            session, task_id="t", runner_id="r", expected_attempt=1,
+            session, task_id="t", logical_task_id="t", runner_id="r", expected_attempt=1,
             task_fingerprint="b" * 64, app_provenance=[],
         )
 
@@ -100,30 +101,30 @@ async def test_start_refuses_another_running_task(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_start_retry_requires_exact_provenance(monkeypatch) -> None:
     item = Run(
-        task_id="t", status="running", attempt=2, runner_id="r",
+        task_id="t", logical_task_id="t", status="running", attempt=2, runner_id="r",
         task_fingerprint="a" * 64, app_provenance=[{"app_id": "browser"}],
     )
     monkeypatch.setattr(repository, "get_run", AsyncMock(return_value=item))
     session = StartSession(other=None)
     result = await repository.start_run(
-        session, task_id="t", runner_id="r", expected_attempt=2,
+        session, task_id="t", logical_task_id="t", runner_id="r", expected_attempt=2,
         task_fingerprint="a" * 64, app_provenance=[{"app_id": "browser"}],
     )
     assert result is item
     with pytest.raises(repository.RunConflict, match="provenance differs"):
         await repository.start_run(
-            session, task_id="t", runner_id="r", expected_attempt=2,
+            session, task_id="t", logical_task_id="t", runner_id="r", expected_attempt=2,
             task_fingerprint="a" * 64, app_provenance=[],
         )
 
 
 @pytest.mark.asyncio
 async def test_start_rejects_changed_task_spec(monkeypatch) -> None:
-    item = Run(task_id="t", status="failed", attempt=1, runner_id="old", task_fingerprint="a" * 64)
+    item = Run(task_id="t", logical_task_id="t", status="failed", attempt=1, runner_id="old", task_fingerprint="a" * 64)
     monkeypatch.setattr(repository, "get_run", AsyncMock(return_value=item))
     with pytest.raises(repository.RunConflict, match="specification changed"):
         await repository.start_run(
-            StartSession(), task_id="t", runner_id="r", expected_attempt=2,
+            StartSession(), task_id="t", logical_task_id="t", runner_id="r", expected_attempt=2,
             task_fingerprint="b" * 64, app_provenance=[],
         )
 

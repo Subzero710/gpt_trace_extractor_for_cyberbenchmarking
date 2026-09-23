@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
 
 from ..models import EvaluationResult, TaskSpec
 from ...models import CapturedConversation
@@ -12,9 +11,9 @@ from ...models import CapturedConversation
 
 @dataclass(frozen=True, slots=True)
 class PreparedBenchmarkContext:
-    workspace: Path | None = None
-    environment: dict[str, Any] = field(default_factory=dict)
-    evaluator_state: dict[str, Any] = field(default_factory=dict)
+    """Opaque marker for adapter-owned preparation state."""
+
+    pass
 
 
 class BenchmarkAdapter(ABC):
@@ -42,7 +41,7 @@ class BenchmarkAdapter(ABC):
         return task
 
     async def prepare(self, task: TaskSpec) -> PreparedBenchmarkContext:
-        return PreparedBenchmarkContext(workspace=task.initial_workspace)
+        return PreparedBenchmarkContext()
 
     async def recover(
         self,
@@ -67,6 +66,6 @@ class BenchmarkAdapter(ABC):
         self,
         task: TaskSpec,
         *,
-        prepared: PreparedBenchmarkContext,
+        prepared: PreparedBenchmarkContext | None,
     ) -> None:
         return None

@@ -42,21 +42,33 @@ def _ordered_entries(entries, limit: int | None):
     return selected
 
 
-async def _record_pre_runner_failure(*, storage, settings, task, adapter, bt, camp, state, error):
+async def _record_pre_runner_failure(
+    *,
+    storage,
+    settings,
+    source_task,
+    adapter,
+    bt,
+    camp,
+    registry,
+    state,
+    error,
+):
     expected = (state.attempt + 1) if state is not None else 1
+    runner_id = settings.effective_runner_id()
     started = await storage.start(
         bt.task_id,
-        settings.effective_runner_id(),
+        runner_id,
         expected,
         task_fingerprint(bt),
         task_app_provenance(bt),
-        **storage_context(task, camp, adapter),
+        **storage_context(source_task, camp, adapter, registry),
     )
     await storage.fail(
         bt.task_id,
         error,
         attempt=started.attempt,
-        runner_id=settings.effective_runner_id(),
+        runner_id=runner_id,
     )
 
 
@@ -141,7 +153,7 @@ async def _recover_pending_journal(
             recover_existing=settings.runner_recover_existing,
             console=console,
             journal=journal,
-            storage_context={bt.task_id: storage_context(task, camp, adapter)},
+            storage_context={bt.task_id: storage_context(catalog_entry.task, camp, adapter, registry)},
             evaluation_hooks={bt.task_id: evaluate},
         )
         try:
@@ -217,26 +229,50 @@ async def run_pending(
                     break
 
                 adapter = adapters.get(entry.adapter_id)
-                task = adapter.materialize_task(entry.task, staging)
-                bt = to_benchmark_task(task, registry, camp, adapter)
-                state = await storage.get(bt.task_id)
+                run_id = run_task_id(
+                    entry.task.task_id,
+                    camp.campaign_id,
+                    entry.adapter_id,
+                    adapter.adapter_version,
+                )
+                state = await storage.get(run_id)
                 if state is not None:
                     if state.status == "completed":
-                        # Completed trajectories may be evaluated or intentionally
-                        # unevaluated when the upstream benchmark has no native oracle.
+                        current_context = storage_context(
+                            entry.task, camp, adapter, registry
+                        )["dataset_metadata"]
+                        stored_contract = (state.dataset_metadata or {}).get(
+                            "task_contract_fingerprint"
+                        )
+                        current_contract = current_context["task_contract_fingerprint"]
+                        if stored_contract is None:
+                            raise RecoveryIncomplete(
+                                f"{run_id}: completed Superbench row predates task-contract "
+                                "fingerprints; reset/recollect it explicitly"
+                            )
+                        if stored_contract != current_contract:
+                            raise RecoveryIncomplete(
+                                f"{run_id}: completed Superbench task contract changed; "
+                                "refusing to silently skip stale data"
+                            )
                         continue
                     if state.status == "running":
                         # A running attempt is recoverable only through its durable
                         # journal, which was reconciled before entering this loop.
                         raise RecoveryIncomplete(
-                            f"{bt.task_id}: running Superbench attempt has no "
+                            f"{run_id}: running Superbench attempt has no "
                             "recovery journal; explicit reset/recovery is required"
                         )
                     if state.status != "failed":
                         raise RuntimeError(
-                            f"{bt.task_id}: Superbench scheduler cannot handle "
+                            f"{run_id}: Superbench scheduler cannot handle "
                             f"status={state.status!r}"
                         )
+
+                task = adapter.materialize_task(entry.task, staging)
+                bt = to_benchmark_task(task, registry, camp, adapter)
+                if bt.task_id != run_id:
+                    raise RuntimeError("Superbench run identity changed during materialization")
 
                 if executor is not None:
                     try:
@@ -248,6 +284,8 @@ async def run_pending(
                             console.print(
                                 f"[red]{bt.task_id}: {type(exc).__name__}: {exc}[/]"
                             )
+                    finally:
+                        await adapter.cleanup(task, prepared=None)
                     attempted += 1
                     continue
 
@@ -281,7 +319,7 @@ async def run_pending(
                         recover_existing=settings.runner_recover_existing,
                         console=console,
                         journal=journal,
-                        storage_context={bt.task_id: storage_context(task, camp, adapter)},
+                        storage_context={bt.task_id: storage_context(entry.task, camp, adapter, registry)},
                         evaluation_hooks={bt.task_id: evaluate},
                     )
                     runner_started = True
@@ -339,10 +377,11 @@ async def run_pending(
                             await _record_pre_runner_failure(
                                 storage=storage,
                                 settings=settings,
-                                task=task,
+                                source_task=entry.task,
                                 adapter=adapter,
                                 bt=bt,
                                 camp=camp,
+                                registry=registry,
                                 state=latest,
                                 error=exc,
                             )
@@ -357,7 +396,7 @@ async def run_pending(
                     attempted += 1
                     if session is not None:
                         await session.disconnect()
-                    if prepared is not None and not recovery_required:
+                    if not recovery_required:
                         try:
                             await adapter.cleanup(task, prepared=prepared)
                         except (KeyboardInterrupt, BatchCircuitBreaker):

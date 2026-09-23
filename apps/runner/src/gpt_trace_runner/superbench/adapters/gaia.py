@@ -32,6 +32,14 @@ ANSWER_INSTRUCTION = (
 )
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _normalize_number(value: str) -> float:
     for char in ("$", "%", ","):
         value = value.replace(char, "")
@@ -125,10 +133,11 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "3"
+    adapter_version = "4"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}
+        self._materialized_roots: dict[str, Path] = {}
 
     @property
     def revision_root(self) -> Path:
@@ -215,6 +224,9 @@ class GAIAAdapter(BenchmarkAdapter):
                 if file_path_value is not None and str(file_path_value).strip()
                 else None
             )
+            source_file_sha256 = (
+                _sha256_file(self._require_file(file_path)) if file_path else None
+            )
 
             if not upstream_id or not question:
                 raise ValueError("GAIA row has an empty task_id or Question")
@@ -258,6 +270,7 @@ class GAIAAdapter(BenchmarkAdapter):
                         "license": "not_declared",
                         "access": "gated",
                         "file_path": file_path,
+                        "source_file_sha256": source_file_sha256,
                     },
                 )
             )
@@ -293,6 +306,7 @@ class GAIAAdapter(BenchmarkAdapter):
         attachment_dir.mkdir(parents=True, exist_ok=True)
         destination = attachment_dir / Path(file_path).name
         shutil.copy2(source, destination)
+        self._materialized_roots[task.task_id] = destination_dir
 
         return TaskSpec(
             task_id=task.task_id,
@@ -303,6 +317,16 @@ class GAIAAdapter(BenchmarkAdapter):
             initial_workspace=workspace,
             metadata=dict(task.metadata),
         )
+
+    async def cleanup(
+        self,
+        task: TaskSpec,
+        *,
+        prepared: PreparedBenchmarkContext | None,
+    ) -> None:
+        root = self._materialized_roots.pop(task.task_id, None)
+        if root is not None and root.exists():
+            shutil.rmtree(root)
 
     async def evaluate(
         self,

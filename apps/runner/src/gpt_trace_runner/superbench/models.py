@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
+from ..workspace_seed import snapshot as workspace_snapshot
+
 
 def _stable(value: Any) -> bytes:
     return json.dumps(
@@ -62,6 +64,37 @@ class TaskSpec:
         missing = set(self.required_tools) - set(self.tools)
         if missing:
             raise ValueError(f"required tools are not declared in tools: {sorted(missing)!r}")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def task_spec_fingerprint(task: "TaskSpec") -> str:
+    """Hash the adapter-visible source task before runtime materialization."""
+    attachments = [
+        {"name": path.name, "sha256": _file_sha256(path)}
+        for path in task.attachments
+    ]
+    workspace = workspace_snapshot(task.initial_workspace)
+    payload = {
+        "task_id": task.task_id,
+        "prompt": task.prompt,
+        "tools": list(task.tools),
+        "required_tools": list(task.required_tools),
+        "attachments": attachments,
+        "initial_workspace": {
+            "sha256": workspace.sha256,
+            "files": workspace.files,
+            "bytes": workspace.bytes,
+        },
+        "metadata": task.metadata,
+    }
+    return hashlib.sha256(_stable(payload)).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

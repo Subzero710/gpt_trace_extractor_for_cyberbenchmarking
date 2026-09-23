@@ -38,6 +38,6 @@ To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, pres
 
 `TaskSpec.tools` lists Apps available to the task. `TaskSpec.required_tools` is the subset that must actually be invoked; the captured ChatGPT conversation is checked against that requirement. Attachments intended for Code Workspace can be materialized through `initial_workspace` instead of being uploaded to the teacher conversation.
 
-Recovery remains journal-first. A pending journal is reconciled against its exact source task, adapter version and teacher campaign before new work is scheduled. Completed rows are immutable; failed infrastructure attempts may be retried.
+Recovery remains journal-first. A pending journal is reconciled against its exact source task, adapter version and teacher campaign before new work is scheduled. Completed rows are immutable and are skipped only when the current pre-materialization task contract fingerprint still matches; this check includes prompt/source metadata, direct source artifacts/workspaces and current App contracts. Failed infrastructure attempts may be retried.
 
 `export-sft` is fail-closed for tool-use structure: tool calls must name declared stable tools, call IDs must be unique, tool results must reference prior calls exactly once, and every call must have a result.

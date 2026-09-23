@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 
-from .models import TaskSpec, TeacherCampaign, run_task_id
-from ..models import BenchmarkTask, BenchmarkTool
+from .models import TaskSpec, TeacherCampaign, run_task_id, task_spec_fingerprint
+from ..models import BenchmarkTask, BenchmarkTool, task_fingerprint
 
 
 def campaign(settings) -> TeacherCampaign:
@@ -56,10 +57,15 @@ def to_benchmark_task(task: TaskSpec, registry, camp: TeacherCampaign, adapter) 
     )
 
 
-def storage_context(task: TaskSpec, camp: TeacherCampaign, adapter) -> dict:
+def storage_context(task: TaskSpec, camp: TeacherCampaign, adapter, registry) -> dict:
+    preview = to_benchmark_task(task, registry, camp, adapter)
+    contract_fingerprint = hashlib.sha256(
+        (task_spec_fingerprint(task) + ":" + task_fingerprint(preview)).encode("ascii")
+    ).hexdigest()
     return {
         "logical_task_id": task.task_id,
         "dataset_metadata": {
+            "task_contract_fingerprint": contract_fingerprint,
             "task": dict(task.metadata),
             "teacher": {
                 "expected_model": camp.expected_model,

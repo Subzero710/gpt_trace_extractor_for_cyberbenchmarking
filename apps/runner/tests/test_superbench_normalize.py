@@ -1,3 +1,4 @@
+from gpt_trace_runner.tool_identity import stable_tool_name
 from gpt_trace_runner.superbench.normalize import normalize_messages, tools_from_provenance
 
 
@@ -51,3 +52,8 @@ def test_global_tool_identity_and_multi_call_pairing():
     assert [call["name"] for call in messages[0]["tool_calls"]] == ["code_workspace__read_file", "code_workspace__read_file"]
     assert messages[1]["tool_call_id"] == "a"
     assert messages[2]["tool_call_id"] == "b"
+
+
+def test_exported_tool_name_uses_shared_global_identity():
+    apps = [{"app_id": "code-workspace", "tool_manifest": {"tools": [{"name": "read_file"}]}}]
+    assert tools_from_provenance(apps)[0]["name"] == stable_tool_name("code-workspace", "read_file")

@@ -26,7 +26,7 @@ def test_normal_task_path_uses_new_chat_ui_not_home_reload() -> None:
     assert "_new_chat_if_needed()" in prepare
 
 
-def test_app_selection_happens_after_prompt_paste() -> None:
+def test_app_selection_happens_before_prompt_typing() -> None:
     text = (SRC / "chatgpt.py").read_text()
     compose = text.split("async def _compose", 1)[1].split("async def prepare_task", 1)[0]
-    assert compose.index("paste_text") < compose.index("select_apps")
+    assert compose.index("select_apps") < compose.index("type_text")

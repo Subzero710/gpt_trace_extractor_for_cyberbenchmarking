@@ -32,6 +32,9 @@ def test_capture_maps_observed_runtime_tool_to_canonical_identity() -> None:
     )
     result = enrich_capture(captured, task=task, app_environments={"browser": "env"})
     assert result.runtime_metadata["used_tool_calls"] == [{
+        "call_id": "observed:0",
+        "call_message_id": None,
+        "result_message_id": None,
         "app_id": "browser",
         "canonical_tool_name": "navigate",
         "ui_app_name": "Configured Browser",

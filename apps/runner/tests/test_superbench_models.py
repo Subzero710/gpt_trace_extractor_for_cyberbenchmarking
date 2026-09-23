@@ -1,6 +1,6 @@
 import pytest
 
-from gpt_trace_runner.superbench.models import TaskSpec, TeacherCampaign, run_task_id
+from gpt_trace_runner.superbench.models import TaskSpec, TeacherCampaign, run_task_id, task_spec_fingerprint
 
 
 def test_campaign_identity_ignores_runtime_tuning_and_runner_commit():
@@ -19,3 +19,16 @@ def test_required_tools_must_be_declared():
     TaskSpec("x", "prompt", tools=("browser",), required_tools=("browser",))
     with pytest.raises(ValueError, match="required tools"):
         TaskSpec("x", "prompt", tools=("browser",), required_tools=("code-workspace",))
+
+
+def test_task_spec_fingerprint_covers_metadata_and_source_files(tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_text("one", encoding="utf-8")
+    first = TaskSpec("x", "prompt", attachments=(source,), metadata={"revision": "1"})
+    digest = task_spec_fingerprint(first)
+    source.write_text("two", encoding="utf-8")
+    assert task_spec_fingerprint(first) != digest
+    second = TaskSpec("x", "prompt", attachments=(source,), metadata={"revision": "2"})
+    assert task_spec_fingerprint(second) != task_spec_fingerprint(
+        TaskSpec("x", "prompt", attachments=(source,), metadata={"revision": "1"})
+    )

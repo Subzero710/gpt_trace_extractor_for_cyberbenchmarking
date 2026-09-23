@@ -24,3 +24,13 @@ class B(A):
 def test_duplicate_task_ids_across_adapters_are_rejected():
     with pytest.raises(ValueError, match="duplicate task_id"):
         SuperbenchCatalog(AdapterRegistry([A(), B()])).discover()
+
+
+def test_unknown_adapter_filter_is_rejected():
+    with pytest.raises(ValueError, match="unknown benchmark adapter"):
+        SuperbenchCatalog(AdapterRegistry([A()])).discover(("missing",))
+
+
+def test_duplicate_adapter_filter_is_rejected():
+    with pytest.raises(ValueError, match="duplicate benchmark adapter"):
+        SuperbenchCatalog(AdapterRegistry([A()])).discover(("a", "a"))
