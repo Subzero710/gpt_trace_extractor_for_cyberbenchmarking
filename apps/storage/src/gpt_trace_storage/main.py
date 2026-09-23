@@ -7,12 +7,13 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import __version__
 from .db import SessionFactory, get_session
 from .models import Run
 from .repository import RunConflict, complete_run, fail_run, get_run, reset_run, set_conversation, start_run, stats
 from .schemas import CompleteRunRequest, ConversationRequest, FailRunRequest, ResetRunRequest, RunResponse, StartRunRequest, StatsResponse
 
-app = FastAPI(title="GPT Trace Storage", version="0.4.0")
+app = FastAPI(title="GPT Trace Storage", version=__version__)
 
 
 def conflict(exc: RunConflict) -> HTTPException:
