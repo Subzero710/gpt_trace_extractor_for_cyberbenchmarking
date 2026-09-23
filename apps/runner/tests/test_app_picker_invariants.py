@@ -10,7 +10,7 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_selection_types_one_validated_query_then_enter() -> None:
+def test_app_selection_types_query_and_clicks_visible_candidate() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
@@ -19,31 +19,32 @@ def test_app_selection_types_one_validated_query_then_enter() -> None:
     assert "interaction.type_text(" in select
     assert "raw_mention," in select
     assert "clear_existing=False" in select
-    assert 'await page.keyboard.press("Enter")' in select
-    assert "_wait_app_candidate_ready" not in source
-    assert "_APP_PICKER_READY_JS" not in source
+    assert "candidate = await _find_app_candidate(" in select
+    assert "await interaction.click(candidate)" in select
+    assert 'page.keyboard.press("Enter")' not in select
     assert 'page.keyboard.type("@")' not in select
     assert "page.keyboard.type(tool.name)" not in select
     assert "delay=20" not in source
 
-
-def test_app_selection_waits_for_current_composer_transition() -> None:
+def test_app_selection_waits_for_candidate_click_then_acceptance() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
     )[0]
 
-    assert 'await page.keyboard.press("Enter")' in select
+    assert "candidate = await _find_app_candidate(" in select
+    assert "await interaction.click(candidate)" in select
     assert "await _wait_app_accepted(" in select
-    assert select.index('await page.keyboard.press("Enter")') < select.index(
+    assert select.index("interaction.click(candidate)") < select.index(
         "await _wait_app_accepted("
     )
+    assert "_APP_CANDIDATE_VISIBLE_JS" in source
+    assert "page.get_by_text(tool.name, exact=True)" in source
     assert "_APP_PICKER_READY_JS" not in source
     assert "_wait_app_candidate_ready" not in source
     assert "page.expect_response(" not in source
     assert "client_prepare_source" not in source
     assert "asyncio.sleep" not in source
-
 
 def test_auth_cleanup_reacquires_composer_and_uses_backspace_only() -> None:
     source = _source("tools.py")
@@ -177,13 +178,14 @@ def test_runtime_app_selection_retries_once_only_pre_submission() -> None:
     assert "await _clear_auth_editor(page, get_editor=get_editor)" in runtime
 
 
-def test_app_picker_guard_detects_accidental_enter_submission() -> None:
+def test_app_picker_selection_never_uses_submit_enter() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
     )[0]
 
-    assert "before_enter_url = page.url" in select
-    assert 'page.url != before_enter_url and "/c/" in page.url' in select
-    assert "App selection Enter unexpectedly submitted a conversation" in select
+    assert "candidate = await _find_app_candidate(" in select
+    assert "await interaction.click(candidate)" in select
+    assert 'page.keyboard.press("Enter")' not in select
+    assert "before_enter_url" not in select
 
