@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 from ..browser import BrowserClient
@@ -193,11 +194,26 @@ async def run_pending(
     adapters=None,
     storage=None,
     executor=None,
+    selected_run_task_ids: tuple[str, ...] | None = None,
+    control_store=None,
+    runner_lock_held: bool = False,
+    pause_probe=None,
 ):
     adapters = adapters or AdapterRegistry.discover()
     entries = SuperbenchCatalog(adapters).discover(adapter_ids)
     camp = campaign(settings)
     selected_entries = _ordered_entries(entries, limit)
+    if selected_run_task_ids is not None:
+        by_id = {}
+        for item in entries:
+            a = adapters.get(item.adapter_id)
+            rid = run_task_id(item.task.task_id, camp.campaign_id, item.adapter_id, a.adapter_version)
+            by_id[rid] = item
+        missing = set(selected_run_task_ids) - set(by_id)
+        if missing:
+            raise RecoveryIncomplete(f"frozen selection missing from catalog: {sorted(missing)!r}")
+        selected_entries = [by_id[rid] for rid in selected_run_task_ids]
+        limit = None
     owned_storage = storage is None
     storage = storage or StorageClient(settings.storage_base_url)
     staging = Path("/data/state/superbench/staging")
@@ -206,11 +222,22 @@ async def run_pending(
 
     try:
         await storage.health()
-        with RunnerLock(settings.runner_lock_path):
+        lock_context = nullcontext() if runner_lock_held else RunnerLock(settings.runner_lock_path)
+        with lock_context:
+            if control_store is not None and pause_probe is not None and pause_probe():
+                control_store.request_pause()
+                control_store.pause_if_requested()
+                return attempted, camp.campaign_id
             # Production runs reconcile the one durable crash journal before any
             # completed-run skip or new task scheduling. This prevents a stale
             # cleanup_pending journal from poisoning the next task.
             if executor is None:
+                if selected_run_task_ids is not None:
+                    pending = JournalStore(settings.journal_path).load()
+                    if pending is not None and pending.task_id not in set(selected_run_task_ids):
+                        raise RecoveryIncomplete(
+                            f"pending journal task {pending.task_id!r} is outside frozen active-run selection"
+                        )
                 await _recover_pending_journal(
                     settings=settings,
                     registry=registry,
@@ -223,8 +250,20 @@ async def run_pending(
                     storage=storage,
                     staging=staging,
                 )
+            if control_store is not None:
+                active = control_store.confirm_running()
+                if active.status == "pause_requested":
+                    control_store.pause_if_requested()
+                    return attempted, camp.campaign_id
 
             for entry in selected_entries:
+                if control_store is not None and pause_probe is not None and pause_probe():
+                    control_store.request_pause()
+                if control_store is not None:
+                    active = control_store.load()
+                    if active.status == "pause_requested":
+                        control_store.pause_if_requested()
+                        break
                 if limit is not None and attempted >= limit:
                     break
 
@@ -235,6 +274,14 @@ async def run_pending(
                     entry.adapter_id,
                     adapter.adapter_version,
                 )
+                if control_store is not None:
+                    active = control_store.load()
+                    if run_id in active.completed_run_task_ids:
+                        continue
+                    control_store.start_task(run_id)
+                    if control_store.load().status == "pause_requested":
+                        control_store.pause_if_requested()
+                        break
                 state = await storage.get(run_id)
                 if state is not None:
                     if state.status == "completed":
@@ -255,6 +302,8 @@ async def run_pending(
                                 f"{run_id}: completed Superbench task contract changed; "
                                 "refusing to silently skip stale data"
                             )
+                        if control_store is not None:
+                            control_store.finish_task(run_id)
                         continue
                     if state.status == "running":
                         # A running attempt is recoverable only through its durable
@@ -279,14 +328,15 @@ async def run_pending(
                         await executor(adapter, task, bt, camp, storage)
                     except (KeyboardInterrupt, BatchCircuitBreaker):
                         raise
-                    except Exception as exc:
-                        if console is not None:
-                            console.print(
-                                f"[red]{bt.task_id}: {type(exc).__name__}: {exc}[/]"
-                            )
+                    except Exception:
+                        raise
                     finally:
                         await adapter.cleanup(task, prepared=None)
                     attempted += 1
+                    if control_store is not None:
+                        latest = await storage.get(run_id)
+                        if latest is not None and latest.status == "completed":
+                            control_store.finish_task(run_id)
                     continue
 
                 prepared = None
@@ -357,6 +407,9 @@ async def run_pending(
                         if isinstance(exc, (KeyboardInterrupt, BatchCircuitBreaker)):
                             raise
                         # The task is durably completed and cleanup is now done.
+                        if control_store is not None:
+                            control_store.finish_task(run_id)
+                        raise exc
 
                     elif (
                         (latest is not None and latest.status == "running")
@@ -391,6 +444,7 @@ async def run_pending(
                             console.print(
                                 f"[red]{bt.task_id}: {type(exc).__name__}: {exc}[/]"
                             )
+                        raise
 
                 finally:
                     attempted += 1
@@ -409,6 +463,15 @@ async def run_pending(
                                 )
                     if lifecycle is not None:
                         await lifecycle.close()
+                if control_store is not None:
+                    if pause_probe is not None and pause_probe():
+                        control_store.request_pause()
+                    latest = await storage.get(run_id)
+                    if latest is not None and latest.status == "completed":
+                        control_store.finish_task(run_id)
+                    if control_store.load().status == "pause_requested":
+                        control_store.pause_if_requested()
+                        break
     finally:
         if owned_storage:
             await storage.close()

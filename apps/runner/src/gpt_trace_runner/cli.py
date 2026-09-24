@@ -180,285 +180,6 @@ def doctor() -> None:
     asyncio.run(main())
 
 
-@app.command()
-def auth(
-    timeout_minutes: int = typer.Option(30, min=1),
-    benchmark: Path = typer.Option(
-        Path("/data/benchmarks/benchmark.jsonl"),
-        "--benchmark",
-        exists=True,
-        dir_okay=False,
-    ),
-) -> None:
-    async def main() -> None:
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
-        )
-        storage = StorageClient(settings.storage_base_url)
-        try:
-            await storage.health()
-            await ensure_no_running_storage(storage)
-        finally:
-            await storage.close()
-        ensure_no_pending_journal(settings)
-        with RunnerLock(settings.runner_lock_path):
-            session = await BrowserClient(
-                settings.effective_browser_cdp_url(),
-                humanize=settings.browser_humanize,
-                humanize_preset=settings.browser_humanize_preset,
-            ).connect()
-            try:
-                chatgpt = make_chatgpt(settings, session.page)
-                # noVNC is the operator surface for headed CloakBrowser. Show
-                # it before navigation so login/challenge transitions are
-                # observable while the auth waiter runs.
-                console.print(f"Open noVNC and log in:\n[bold]{settings.browser_novnc_url}[/]")
-                await chatgpt.wait_until_authenticated(timeout_minutes * 60)
-                console.print("[green]authentication detected via /backend-api/me[/]")
-                await chatgpt.verify_apps_available(
-                    tuple(tool for task in tasks for tool in task.tools)
-                )
-                console.print("[green]ChatGPT benchmark Apps: ok[/]")
-            finally:
-                await session.disconnect()
-    asyncio.run(main())
-
-
-@app.command("reset-recovery")
-def reset_recovery_command(
-    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
-    task_id: str = typer.Argument(...),
-    yes: bool = typer.Option(False, "--yes", help="Confirm abandonment of this recovery attempt."),
-) -> None:
-    """Abandon one unrecoverable running attempt and preserve browser authentication."""
-
-    async def main() -> None:
-        if not yes:
-            raise typer.BadParameter("reset-recovery requires --yes")
-
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
-        )
-        by_id = {task.task_id: task for task in tasks}
-        task = by_id.get(task_id)
-        if task is None:
-            raise typer.BadParameter(f"unknown benchmark task_id: {task_id}")
-
-        storage = StorageClient(settings.storage_base_url)
-        lifecycle = make_lifecycle(settings, [task])
-        journal_store = JournalStore(settings.journal_path)
-        try:
-            await storage.health()
-            with RunnerLock(settings.runner_lock_path):
-                await abandon_recovery(
-                    task,
-                    storage=storage,
-                    lifecycle=lifecycle,
-                    journal=journal_store,
-                )
-                console.print(
-                    f"[yellow]abandoned recovery[/] {task.task_id}; "
-                    "next --resume run will start a new attempt"
-                )
-        finally:
-            await lifecycle.close()
-            await storage.close()
-
-    asyncio.run(main())
-
-
-@app.command("reset-stale")
-def reset_stale_command(
-    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
-    yes: bool = typer.Option(False, "--yes", help="Confirm deletion of stale benchmark state."),
-) -> None:
-    """Delete only stored runs whose fingerprint no longer matches the benchmark."""
-
-    async def main() -> None:
-        if not yes:
-            raise typer.BadParameter("reset-stale requires --yes")
-
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(
-            benchmark,
-            tasks_root=settings.tasks_root,
-            registry=registry,
-        )
-        by_id = {task.task_id: task for task in tasks}
-        storage = StorageClient(settings.storage_base_url)
-        journal_store = JournalStore(settings.journal_path)
-        try:
-            await storage.health()
-            with RunnerLock(settings.runner_lock_path):
-                journal = journal_store.load()
-                if journal is not None:
-                    journal_task = by_id.get(journal.task_id)
-                    if journal_task is None:
-                        raise RecoveryIncomplete(
-                            f"pending journal task {journal.task_id!r} is not in benchmark; "
-                            "refusing automatic deletion"
-                        )
-                    current = task_fingerprint(journal_task)
-                    if journal.task_fingerprint == current:
-                        raise RecoveryIncomplete(
-                            "pending journal matches current benchmark; resume it instead of resetting"
-                        )
-
-                stale: list[tuple[object, object, str]] = []
-                for task in tasks:
-                    state = await storage.get(task.task_id)
-                    if state is None:
-                        continue
-                    current = task_fingerprint(task)
-                    if state.task_fingerprint == current:
-                        continue
-                    if state.status == "running":
-                        raise RecoveryIncomplete(
-                            f"stale run {task.task_id} is marked running; "
-                            "refusing reset until that run is explicitly recovered/stopped"
-                        )
-                    if not state.task_fingerprint:
-                        raise StorageError(
-                            f"{task.task_id} has no stored fingerprint; refusing blind reset"
-                        )
-                    stale.append((task, state, current))
-
-                if not stale and journal is None:
-                    console.print("[green]no stale benchmark state[/]")
-                    return
-
-                for task, state, current in stale:
-                    removed = await storage.reset_stale(
-                        task.task_id,
-                        expected_task_fingerprint=state.task_fingerprint,
-                    )
-                    if removed:
-                        console.print(
-                            f"[yellow]reset stale run[/] {task.task_id}: "
-                            f"{state.task_fingerprint[:12]} -> {current[:12]}"
-                        )
-
-                if journal is not None:
-                    journal_store.clear()
-                    console.print(
-                        f"[yellow]cleared stale submission journal[/] {journal.task_id}"
-                    )
-        finally:
-            await storage.close()
-
-    asyncio.run(main())
-
-
-@app.command("run")
-def run_command(
-    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
-    resume: bool = typer.Option(False, "--resume"),
-    stop_on_error: bool = typer.Option(False, "--stop-on-error"),
-    limit: int | None = typer.Option(None, min=1),
-) -> None:
-    async def main() -> None:
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root, registry=registry)
-        selected = tasks[:limit] if limit else tasks
-        storage = StorageClient(settings.storage_base_url)
-        lifecycle = make_lifecycle(settings, selected)
-        try:
-            await storage.health()
-
-            journal = JournalStore(settings.journal_path).load()
-            selected_by_id = {task.task_id: task for task in selected}
-            if journal is not None:
-                journal_task = selected_by_id.get(journal.task_id)
-                if journal_task is None:
-                    raise RecoveryIncomplete(f"pending journal task {journal.task_id!r} is not in the selected benchmark")
-                if journal.task_fingerprint != task_fingerprint(journal_task):
-                    raise RecoveryIncomplete("pending journal fingerprint differs from benchmark")
-            states = [await storage.get(task.task_id) for task in selected]
-            for task, state in zip(selected, states, strict=True):
-                if state is not None and state.task_fingerprint != task_fingerprint(task):
-                    raise StorageError(f"{task.task_id} stored task fingerprint differs from benchmark")
-            if resume and journal is None and states and all(state and state.status == "completed" for state in states):
-                console.print("[green]all selected tasks already completed[/]")
-                return
-            recovery_active = resume and (
-                journal is not None
-                or any(
-                    state is not None and state.status == "running"
-                    for state in states
-                )
-            )
-
-            with RunnerLock(settings.runner_lock_path):
-                if not recovery_active:
-                    await preflight_tasks(lifecycle, selected, console=console)
-                    console.print("[green]pre-auth runtime preflight: ok[/]")
-                else:
-                    console.print(
-                        "[yellow]runtime preflight skipped: recovery is active[/]"
-                    )
-
-                browser_client = BrowserClient(
-                    settings.effective_browser_cdp_url(),
-                    humanize=settings.browser_humanize,
-                    humanize_preset=settings.browser_humanize_preset,
-                )
-
-                # --resume means the persistent teacher browser is an input to
-                # recovery, never a dependency that may be recreated.
-                if resume:
-                    await browser_client.assert_existing_process()
-
-                session = await browser_client.connect(
-                    require_existing_page=recovery_active,
-                )
-                try:
-                    chatgpt = make_chatgpt(settings, session.page)
-                    if recovery_active:
-                        # Do not pre-classify auth through /backend-api/me here.
-                        # Recovery's conversation fetch is authoritative for the
-                        # operation we actually need: HTTP 401 means auth expired,
-                        # while HTTP 404 means the conversation no longer exists.
-                        console.print(
-                            "[yellow]ChatGPT auth/App preflight skipped during recovery; "
-                            "conversation fetch will classify 401 vs 404[/]"
-                        )
-                    else:
-                        await chatgpt.wait_until_authenticated(
-                            settings.chatgpt_site_ready_timeout_seconds
-                        )
-                        console.print("[green]ChatGPT backend session: ok[/]")
-                        await chatgpt.verify_apps_available(
-                            tuple(tool for task in selected for tool in task.tools)
-                        )
-                        console.print("[green]ChatGPT benchmark Apps: ok[/]")
-                    runner = BenchmarkRunner(
-                        chatgpt=chatgpt,
-                        storage=storage,
-                        lifecycle=lifecycle,
-                        runner_id=settings.effective_runner_id(),
-                        recover_existing=settings.runner_recover_existing,
-                        console=console,
-                        journal=JournalStore(settings.journal_path),
-                    )
-                    await runner.run(tasks, RunOptions(resume=resume, stop_on_error=stop_on_error, limit=limit))
-                finally:
-                    await session.disconnect()
-        finally:
-            await lifecycle.close()
-            await storage.close()
-    asyncio.run(main())
-
-
 @app.command("register-apps")
 def register_apps() -> None:
     # Operational lifecycle helper only; it deliberately does not load benchmark data.
@@ -543,22 +264,6 @@ def inspect_tools(
     console.print_json(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
-@app.command()
-def status() -> None:
-    async def main() -> None:
-        settings = Settings()
-        storage = StorageClient(settings.storage_base_url)
-        try:
-            data = await storage.stats()
-        finally:
-            await storage.close()
-        table = Table("status", "count")
-        for key in ("pending", "running", "completed", "failed", "total"):
-            table.add_row(key, str(data.get(key, 0)))
-        console.print(table)
-    asyncio.run(main())
-
-
 @app.command("export")
 def export_command(output: Path = typer.Argument(..., dir_okay=False)) -> None:
     async def main() -> None:
@@ -595,9 +300,9 @@ def superbench_fetch(adapter: list[str] = typer.Option([], "--adapter")) -> None
 
 @app.command("superbench-run")
 def superbench_run(adapter: list[str] = typer.Option([], "--adapter"), limit: int | None = typer.Option(None, min=1)) -> None:
-    from .superbench.execution import run_pending
+    from .superbench.lifecycle import execute_active
     async def main():
-        settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); n,cid=await run_pending(settings=settings,registry=registry,make_lifecycle=make_lifecycle,make_chatgpt=make_chatgpt,console=console,adapter_ids=tuple(adapter),limit=limit); console.print(f"campaign={cid} attempted={n}")
+        settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); n,cid=await execute_active(settings=settings,registry=registry,make_lifecycle=make_lifecycle,make_chatgpt=make_chatgpt,console=console,adapter_ids=tuple(adapter),limit=limit,resume=False); console.print(f"campaign={cid} attempted={n}")
     asyncio.run(main())
 
 @app.command("superbench-status")
@@ -680,3 +385,73 @@ def export_sft(
 
     count = derive_sft(corpus, output, verdicts=verdict)
     console.print(f"derived {count} SFT rows from {corpus} -> {output}")
+
+@app.command("superbench-pause")
+def superbench_pause():
+ from .superbench.run_control import RunControlStore
+ st=RunControlStore(Settings().superbench_active_run_path).request_pause(); console.print(f"run={st.run_id} status={st.status}")
+@app.command("superbench-resume-active")
+def superbench_resume_active():
+ from .superbench.lifecycle import execute_active
+ async def main():
+  settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); n,cid=await execute_active(settings=settings,registry=registry,make_lifecycle=make_lifecycle,make_chatgpt=make_chatgpt,console=console,resume=True); console.print(f"campaign={cid} attempted={n}")
+ asyncio.run(main())
+@app.command("superbench-active-status")
+def superbench_active_status():
+ from .superbench.lifecycle import status_payload
+ async def main():
+  console.print_json(json.dumps(await status_payload(Settings()),sort_keys=True))
+ asyncio.run(main())
+@app.command("superbench-auth")
+def superbench_auth(timeout_minutes:int=typer.Option(30,min=1)):
+ async def main():
+  settings=Settings()
+  from .superbench.run_control import RunControlStore
+  with RunnerLock(settings.runner_lock_path):
+   active=RunControlStore(settings.superbench_active_run_path).load()
+   if active is not None and active.status!="completed": raise RecoveryIncomplete(f"auth refused while active Superbench run {active.run_id} is {active.status}; resolve via noVNC then make resume")
+   storage=StorageClient(settings.storage_base_url)
+   try: await storage.health(); await ensure_no_running_storage(storage)
+   finally: await storage.close()
+   ensure_no_pending_journal(settings); registry=AppRegistry.load(settings.app_registry_path); task=internal_local_apps_task(registry,task_id="__superbench_auth__",prompt="Internal Superbench auth/App validation."); session=await BrowserClient(settings.effective_browser_cdp_url(),humanize=settings.browser_humanize,humanize_preset=settings.browser_humanize_preset).connect()
+   try: chatgpt=make_chatgpt(settings,session.page); console.print(f"Open noVNC and log in:\n [bold]{settings.browser_novnc_url}[/]"); await chatgpt.wait_until_authenticated(timeout_minutes*60); await chatgpt.verify_apps_available(task.tools)
+   finally: await session.disconnect()
+  asyncio.run(main())
+
+@app.command("superbench-reset-recovery")
+def superbench_reset_recovery(task_id: str = typer.Argument(...), yes: bool = typer.Option(False, "--yes")):
+ from .superbench.catalog import SuperbenchCatalog
+ from .superbench.registry import AdapterRegistry
+ from .superbench.run_control import RunControlStore
+ from .superbench.service import campaign, to_benchmark_task
+ async def main():
+  if not yes: raise typer.BadParameter("superbench-reset-recovery requires --yes")
+  settings=Settings(); control=RunControlStore(settings.superbench_active_run_path); active=control.load()
+  if active is None or active.status=="completed": raise RecoveryIncomplete("no unfinished active Superbench run")
+  frozen=next((x for x in active.selected_tasks if x.run_task_id==task_id),None)
+  if frozen is None: raise RecoveryIncomplete("TASK is outside frozen active-run selection")
+  registry=AppRegistry.load(settings.app_registry_path); adapters=AdapterRegistry.discover(); from .superbench.lifecycle import validate_frozen; validate_frozen(active,settings,registry,adapters); camp=campaign(settings)
+  if camp.campaign_id!=active.campaign_id: raise RecoveryIncomplete("active-run campaign drift")
+  entries=SuperbenchCatalog(adapters).discover(tuple(sorted({x.adapter_id for x in active.selected_tasks})))
+  entry=next((e for e in entries if e.adapter_id==frozen.adapter_id and e.task.task_id==frozen.logical_task_id),None)
+  if entry is None: raise RecoveryIncomplete("frozen task disappeared")
+  adapter=adapters.get(entry.adapter_id)
+  if adapter.adapter_version!=frozen.adapter_version: raise RecoveryIncomplete("frozen adapter version drift")
+  staging=Path("/data/state/superbench/staging"); task=adapter.materialize_task(entry.task,staging); bt=to_benchmark_task(task,registry,camp,adapter)
+  if bt.task_id!=task_id: raise RecoveryIncomplete("frozen task identity drift")
+  journal=JournalStore(settings.journal_path); pending=journal.load()
+  if pending is None or pending.task_id!=task_id: raise RecoveryIncomplete("matching pending recovery journal required")
+  storage=StorageClient(settings.storage_base_url); lifecycle=make_lifecycle(settings,[bt])
+  try:
+   with RunnerLock(settings.runner_lock_path):
+    prepared=await adapter.recover(task,attempt=pending.attempt,app_environments=dict(pending.app_environments))
+    await storage.health()
+    row=await storage.get(task_id)
+    if row is None or row.status!='running': raise RecoveryIncomplete('reset-recovery requires matching running storage attempt')
+    await abandon_recovery(bt,storage=storage,lifecycle=lifecycle,journal=journal)
+    await adapter.cleanup(task,prepared=prepared)
+    control.paused_error('recovery','RecoveryReset','operator abandoned recovery; resume retries same frozen task')
+  finally:
+   await lifecycle.close(); await storage.close()
+  console.print(f"[yellow]recovery reset[/] {task_id}; run sudo make resume")
+ asyncio.run(main())

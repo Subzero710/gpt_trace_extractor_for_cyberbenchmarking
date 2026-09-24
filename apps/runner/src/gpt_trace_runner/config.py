@@ -266,3 +266,7 @@ class Settings(BaseSettings):
     @property
     def journal_path(self) -> Path:
         return self.runner_state_root / "submission.json"
+
+    @property
+    def superbench_active_run_path(self) -> Path:
+        return self.runner_state_root / "superbench" / "active-run.json"

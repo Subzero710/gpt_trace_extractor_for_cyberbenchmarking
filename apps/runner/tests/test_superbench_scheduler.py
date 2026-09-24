@@ -141,21 +141,20 @@ class PerTaskStorage(Storage):
 
 
 @pytest.mark.asyncio
-async def test_run_pending_continues_after_task_local_failure():
+async def test_run_pending_stops_after_task_local_technical_failure():
     seen = []
 
     async def execute(adapter, task, *args):
         seen.append(task.task_id)
-        if len(seen) == 1:
-            raise ValueError("task-local")
+        raise ValueError("task-local")
 
-    n, _ = await run_pending(
-        settings=Settings(), registry=Registry(), make_lifecycle=None, make_chatgpt=None,
-        console=None, adapters=AdapterRegistry([TwoTaskAdapter()]), storage=PerTaskStorage(None),
-        executor=execute,
-    )
-    assert n == 2
-    assert seen == ["a:1", "a:2"]
+    with pytest.raises(ValueError, match="task-local"):
+        await run_pending(
+            settings=Settings(), registry=Registry(), make_lifecycle=None, make_chatgpt=None,
+            console=None, adapters=AdapterRegistry([TwoTaskAdapter()]), storage=PerTaskStorage(None),
+            executor=execute,
+        )
+    assert seen == ["a:1"]
 
 
 @pytest.mark.asyncio
