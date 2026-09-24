@@ -9,7 +9,6 @@ from ..journal import JournalStore
 from ..lock import RunnerLock
 from ..models import task_app_provenance, task_fingerprint
 from ..runner import BenchmarkRunner
-from ..runtime_preflight import preflight_tasks
 from ..storage_client import StorageClient
 from .catalog import SuperbenchCatalog
 from .models import run_task_id
@@ -385,7 +384,6 @@ async def run_pending(
                 try:
                     prepared = await adapter.prepare(task)
                     lifecycle = make_lifecycle(settings, [bt])
-                    await preflight_tasks(lifecycle, [bt], console=console)
                     session, chatgpt = await _connect_chatgpt(
                         settings=settings, make_chatgpt=make_chatgpt, bt=bt
                     )

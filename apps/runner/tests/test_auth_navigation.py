@@ -173,6 +173,22 @@ def test_make_run_and_resume_use_no_deps_superbench_commands() -> None:
     assert "runner superbench-resume-active" in resume_block
 
 
+def test_superbench_run_does_not_invoke_doctor_preflight_per_task() -> None:
+    from pathlib import Path
+
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    execution = (
+        package / "superbench" / "execution.py"
+    ).read_text(encoding="utf-8")
+    cli = (package / "cli.py").read_text(encoding="utf-8")
+    doctor = cli.split("def doctor()", 1)[1].split(
+        '@app.command("register-apps")', 1
+    )[0]
+
+    assert "preflight_tasks(" not in execution
+    assert "await preflight_tasks(" in doctor
+
+
 def test_superbench_recovery_is_centralized_in_execution_path() -> None:
     from pathlib import Path
 
