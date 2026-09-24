@@ -403,20 +403,49 @@ def superbench_active_status():
   console.print_json(json.dumps(await status_payload(Settings()),sort_keys=True))
  asyncio.run(main())
 @app.command("superbench-auth")
-def superbench_auth(timeout_minutes:int=typer.Option(30,min=1)):
- async def main():
-  settings=Settings()
-  from .superbench.run_control import RunControlStore
-  with RunnerLock(settings.runner_lock_path):
-   active=RunControlStore(settings.superbench_active_run_path).load()
-   if active is not None and active.status!="completed": raise RecoveryIncomplete(f"auth refused while active Superbench run {active.run_id} is {active.status}; resolve via noVNC then make resume")
-   storage=StorageClient(settings.storage_base_url)
-   try: await storage.health(); await ensure_no_running_storage(storage)
-   finally: await storage.close()
-   ensure_no_pending_journal(settings); registry=AppRegistry.load(settings.app_registry_path); task=internal_local_apps_task(registry,task_id="__superbench_auth__",prompt="Internal Superbench auth/App validation."); session=await BrowserClient(settings.effective_browser_cdp_url(),humanize=settings.browser_humanize,humanize_preset=settings.browser_humanize_preset).connect()
-   try: chatgpt=make_chatgpt(settings,session.page); console.print(f"Open noVNC and log in:\n [bold]{settings.browser_novnc_url}[/]"); await chatgpt.wait_until_authenticated(timeout_minutes*60); await chatgpt.verify_apps_available(task.tools)
-   finally: await session.disconnect()
-  asyncio.run(main())
+def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
+    async def main() -> None:
+        settings = Settings()
+        from .superbench.run_control import RunControlStore
+
+        with RunnerLock(settings.runner_lock_path):
+            active = RunControlStore(settings.superbench_active_run_path).load()
+            if active is not None and active.status != "completed":
+                raise RecoveryIncomplete(
+                    f"auth refused while active Superbench run {active.run_id} is "
+                    f"{active.status}; resolve via noVNC then make resume"
+                )
+
+            storage = StorageClient(settings.storage_base_url)
+            try:
+                await storage.health()
+                await ensure_no_running_storage(storage)
+            finally:
+                await storage.close()
+
+            ensure_no_pending_journal(settings)
+            registry = AppRegistry.load(settings.app_registry_path)
+            task = internal_local_apps_task(
+                registry,
+                task_id="__superbench_auth__",
+                prompt="Internal Superbench auth/App validation.",
+            )
+            session = await BrowserClient(
+                settings.effective_browser_cdp_url(),
+                humanize=settings.browser_humanize,
+                humanize_preset=settings.browser_humanize_preset,
+            ).connect()
+            try:
+                chatgpt = make_chatgpt(settings, session.page)
+                console.print(
+                    f"Open noVNC and log in:\n [bold]{settings.browser_novnc_url}[/]"
+                )
+                await chatgpt.wait_until_authenticated(timeout_minutes * 60)
+                await chatgpt.verify_apps_available(task.tools)
+            finally:
+                await session.disconnect()
+
+    asyncio.run(main())
 
 @app.command("superbench-reset-recovery")
 def superbench_reset_recovery(task_id: str = typer.Argument(...), yes: bool = typer.Option(False, "--yes")):

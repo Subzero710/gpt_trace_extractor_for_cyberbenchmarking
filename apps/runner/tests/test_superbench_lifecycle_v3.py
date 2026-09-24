@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -300,6 +301,69 @@ def test_auth_refuses_while_an_unfinished_active_run_exists(
         match="auth refused while active Superbench run",
     ):
         cli_module.superbench_auth()
+
+
+@pytest.mark.asyncio
+async def test_first_sigint_during_final_storage_proof_pauses_instead_of_completing(
+    tmp_path,
+    monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    store = RunControlStore(settings.superbench_active_run_path)
+    state = ActiveRun(
+        schema_version=3,
+        run_id="run",
+        campaign_id="campaign",
+        status="running",
+        selected_tasks=(
+            PlannedTask("x", "logical", "a", "1", "spec", "contract"),
+        ),
+        expected_model="m",
+        configuration_fingerprint="config",
+        completed_run_task_ids=("x",),
+    )
+    store.create(state)
+
+    handlers = {}
+    monkeypatch.setattr(
+        lifecycle_module.signal,
+        "getsignal",
+        lambda _sig: object(),
+    )
+    monkeypatch.setattr(
+        lifecycle_module.signal,
+        "signal",
+        lambda sig, handler: handlers.__setitem__(sig, handler),
+    )
+
+    async def fake_run_pending(**_kwargs):
+        return 1, "campaign"
+
+    async def fake_storage_completed(_settings, _state):
+        handlers[signal.SIGINT](signal.SIGINT, None)
+        return frozenset({"x"})
+
+    monkeypatch.setattr(lifecycle_module, "run_pending", fake_run_pending)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_storage_completed_run_task_ids",
+        fake_storage_completed,
+    )
+
+    attempted, campaign_id = await lifecycle_module._execute_locked(
+        settings,
+        EmptyRegistry(),
+        AdapterRegistry([]),
+        store,
+        ("x",),
+        None,
+        None,
+        None,
+    )
+
+    assert attempted == 1
+    assert campaign_id == "campaign"
+    assert store.load().status == "paused"
 
 
 class EvalLifecycle:

@@ -230,6 +230,7 @@ async def test_recovery_technical_failure_stops_even_if_journal_was_cleared(
 
     class RecoverySettings(Settings):
         journal_path = tmp_path / "submission.json"
+        runner_recover_existing = True
 
         def effective_runner_id(self):
             return "runner-test"

@@ -311,26 +311,40 @@ async def _execute_locked(
                 pause_probe=lambda: sigint.pause_requested,
             )
 
-        state = store.load()
-        if state.status == "pause_requested":
-            store.pause_if_requested()
-        elif state.status in {"running", "resuming"}:
-            selected = {
-                task.run_task_id
-                for task in state.selected_tasks
-            }
-            if not selected <= set(state.completed_run_task_ids):
-                raise RecoveryIncomplete(
-                    "runner exited without pause/error but frozen tasks "
-                    "remain incomplete"
+            # Keep the first/second Ctrl+C contract active through the final
+            # storage proof and active-run transition, not only run_pending().
+            state = store.load()
+            if state.status == "pause_requested":
+                store.pause_if_requested()
+            elif state.status in {"running", "resuming"}:
+                selected = {
+                    task.run_task_id
+                    for task in state.selected_tasks
+                }
+                if not selected <= set(state.completed_run_task_ids):
+                    raise RecoveryIncomplete(
+                        "runner exited without pause/error but frozen tasks "
+                        "remain incomplete"
+                    )
+                storage_completed = await _storage_completed_run_task_ids(
+                    settings,
+                    state,
                 )
-            storage_completed = await _storage_completed_run_task_ids(
-                settings,
-                state,
-            )
-            store.complete(storage_completed)
 
-        return attempted, campaign_id
+                # SIGINT may have arrived while the final storage proof was in
+                # progress. Re-read durable control state before committing the
+                # terminal completed transition so a cooperative pause wins.
+                state = store.load()
+                if state.status == "pause_requested":
+                    store.pause_if_requested()
+                elif state.status in {"running", "resuming"}:
+                    store.complete(storage_completed)
+                elif state.status != "completed":
+                    raise RecoveryIncomplete(
+                        "active-run changed unexpectedly during completion"
+                    )
+
+            return attempted, campaign_id
 
     except KeyboardInterrupt:
         raise

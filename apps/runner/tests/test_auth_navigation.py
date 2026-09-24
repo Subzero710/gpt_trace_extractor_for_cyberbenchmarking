@@ -64,18 +64,17 @@ def test_navigation_never_bypasses_cloakbrowser_page_wrapper() -> None:
     assert 'wait_until="commit"' in source
 
 
-def test_auth_and_run_validate_benchmark_apps_before_task_execution() -> None:
+def test_auth_and_superbench_execution_validate_apps_before_task_execution() -> None:
     from pathlib import Path
 
-    source = (
-        Path(__file__).parents[1]
-        / "src"
-        / "gpt_trace_runner"
-        / "cli.py"
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    cli_source = (package / "cli.py").read_text(encoding="utf-8")
+    execution_source = (
+        package / "superbench" / "execution.py"
     ).read_text(encoding="utf-8")
 
-    assert source.count("await chatgpt.verify_apps_available(") == 2
-    assert "ChatGPT benchmark Apps: ok" in source
+    assert "await chatgpt.verify_apps_available(task.tools)" in cli_source
+    assert "await chatgpt.verify_apps_available(bt.tools)" in execution_source
 
 
 class AuthTrafficDouble:
@@ -161,32 +160,39 @@ async def test_resume_auth_check_rejects_missing_session_without_reload() -> Non
     page.reload.assert_not_awaited()
 
 
-def test_make_run_never_starts_dependencies_during_resume() -> None:
+def test_make_run_and_resume_use_no_deps_superbench_commands() -> None:
     from pathlib import Path
 
     makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
-    run_block = makefile.split("run:", 1)[1].split("down:", 1)[0]
-    assert "docker compose run --rm --no-deps runner run" in run_block
-    assert "--resume" in run_block
+    run_block = makefile.split("run:", 1)[1].split("pause:", 1)[0]
+    resume_block = makefile.split("resume:", 1)[1].split("status:", 1)[0]
+
+    assert "docker compose run --rm --no-deps" in run_block
+    assert "runner superbench-run" in run_block
+    assert "docker compose run --rm --no-deps" in resume_block
+    assert "runner superbench-resume-active" in resume_block
 
 
-def test_run_recovery_skips_mutating_chatgpt_preflight() -> None:
+def test_superbench_recovery_is_centralized_in_execution_path() -> None:
     from pathlib import Path
 
     source = (
-        Path(__file__).parents[1] / "src" / "gpt_trace_runner" / "cli.py"
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "superbench"
+        / "execution.py"
     ).read_text(encoding="utf-8")
-    run = source.split("def run_command(", 1)[1].split(
-        '@app.command("register-apps")', 1
+
+    recovery = source.split("async def _recover_pending_journal", 1)[1].split(
+        "async def run_pending", 1
     )[0]
-    assert "recovery_active = resume and" in run
-    assert "await browser_client.assert_existing_process()" in run
-    assert "require_existing_page=recovery_active" in run
-    recovery = run.split("if recovery_active:", 1)[1].split("else:", 1)[0]
-    assert "assert_authenticated_current_page" not in recovery
-    assert "wait_until_authenticated" not in recovery
-    assert "verify_apps_available" not in recovery
-    assert "conversation fetch will classify 401 vs 404" in recovery
+    scheduler = source.split("async def run_pending", 1)[1]
+
+    assert "await _connect_chatgpt(" in recovery
+    assert "await runner.reconcile_journal([bt])" in recovery
+    assert "await _recover_pending_journal(" in scheduler
+    assert "pending.task_id not in set(selected_run_task_ids)" in scheduler
 
 @pytest.mark.asyncio
 async def test_wait_for_conversation_id_ignores_transient_web_route() -> None:
