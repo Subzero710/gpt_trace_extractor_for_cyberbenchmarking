@@ -43,7 +43,6 @@ class Settings(BaseSettings):
     browser_humanize_preset: Literal["default", "careful"] = "default"
     browser_clipboard_url: str = "http://browser:8765/clipboard"
 
-    tasks_root: Path = Path("/data/tasks")
     runner_state_root: Path = Path("/data/state")
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
     app_control_token_file: Path = Path("/run/secrets/app_control_token")

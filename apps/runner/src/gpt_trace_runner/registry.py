@@ -122,8 +122,10 @@ class AppDefinition:
             raise AppRegistryError(f"{label} is required for app {self.app_id!r}")
         return None
 
-    def display_name(self, *, required: bool = True) -> str | None:
-        return self._configured("display_name", required=required)
+    def display_name(self) -> str:
+        value = self._configured("display_name", required=True)
+        assert value is not None
+        return value
 
     def _manifest_path(self) -> Path:
         configured = self._configured("manifest_path", required=True)
@@ -132,8 +134,7 @@ class AppDefinition:
         return path if path.is_absolute() else (self.registry_dir / path).resolve()
 
     def resolve(self) -> ResolvedApp:
-        ui_name = self.display_name(required=True)
-        assert ui_name is not None
+        ui_name = self.display_name()
         path = self._manifest_path()
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -230,21 +231,3 @@ class AppRegistry:
             raise AppRegistryError(f"unknown logical App id {app_id!r}")
         return definition.resolve()
 
-    def resolve_name(self, name: str) -> ResolvedApp:
-        folded = name.casefold()
-        logical = [
-            definition
-            for definition in self.definitions
-            if folded == definition.app_id.casefold()
-            or folded in {alias.casefold() for alias in definition.aliases}
-        ]
-        if not logical:
-            for definition in self.definitions:
-                display = definition.display_name(required=False)
-                if display is not None and display.casefold() == folded:
-                    logical.append(definition)
-        if len(logical) != 1:
-            if not logical:
-                raise AppRegistryError(f"unknown App name or id {name!r}")
-            raise AppRegistryError(f"ambiguous App name {name!r}")
-        return logical[0].resolve()

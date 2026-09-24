@@ -1,4 +1,4 @@
-.PHONY: build up doctor tools auth run pause resume status reset-recovery reset-stale export superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
 
 build:
 	python3 scripts/build.py
@@ -40,45 +40,3 @@ reset-recovery:
 	python3 scripts/project_state.py core
 	docker compose run --rm --no-deps runner superbench-reset-recovery "$(TASK)" --yes
 
-reset-stale:
-	@echo "legacy reset-stale is not part of the production Superbench lifecycle" >&2
-	@exit 2
-
-export:
-	python3 scripts/project_state.py core
-	@mkdir -p exports
-	docker compose run --rm --no-deps \
-		--entrypoint python \
-		-e GPT_TRACE_EXPORT_URL=http://storage:8080/v1/export.jsonl \
-		-e GPT_TRACE_EXPORT_OUTPUT=/data/exports/runs.jsonl \
-		-v "$(CURDIR)/scripts/export_messages.py:/tmp/export_messages.py:ro" \
-		runner /tmp/export_messages.py
-	@echo "host export: $(CURDIR)/exports/runs.jsonl"
-
-throw_volumes:
-	@echo "WARNING: permanently deletes benchmark database/state volumes (postgres_data, runner_state and benchmark_sources)."
-	@printf "Type THROW to continue: "; read answer; test "$$answer" = "THROW"
-	docker compose stop storage postgres
-	docker compose rm -f storage postgres
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=postgres_data)" 2>/dev/null || true
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=runner_state)" 2>/dev/null || true
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=benchmark_sources)" 2>/dev/null || true
-	@echo "postgres_data + runner_state + benchmark_sources removed; browser_profile preserved."
-
-down:
-	python3 scripts/down.py
-
-
-superbench-fetch:
-	@test -n "$(ADAPTER)" || (echo "usage: make superbench-fetch ADAPTER=<adapter_id>" >&2; exit 2)
-	docker compose run --rm --no-deps benchmark-fetch --adapter "$(ADAPTER)"
-
-export-parquet:
-	python3 scripts/project_state.py core
-	@mkdir -p exports
-	docker compose run --rm --no-deps runner export-parquet /data/exports/corpus.parquet
-
-export-sft: export-parquet
-	python3 scripts/project_state.py core
-	@mkdir -p exports
-	docker compose run --rm --no-deps runner export-sft /data/exports/corpus.parquet /data/exports/sft.parquet

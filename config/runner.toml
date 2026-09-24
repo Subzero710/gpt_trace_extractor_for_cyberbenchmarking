@@ -9,7 +9,6 @@ browser_novnc_url = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
 browser_humanize = true
 browser_humanize_preset = "default"
 browser_clipboard_url = "http://browser:8765/clipboard"
-tasks_root = "/data/tasks"
 runner_state_root = "/data/state"
 app_registry_path = "/data/apps/registry/apps.json"
 app_control_token_file = "/run/secrets/app_control_token"

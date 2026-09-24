@@ -28,10 +28,6 @@ def test_seed_rejects_wrong_content_type(tmp_path):
         r=c.post("/control/seed",content=b"x",headers={"Authorization":f"Bearer {TOKEN}","Content-Type":"application/octet-stream"})
         assert r.status_code==415
 
-def test_create_app_remains_compatible_with_v1_manager(tmp_path):
-    m=WorkspaceManager(tmp_path/"workspace",tmp_path/"state")
-    with TestClient(create_app(m,TOKEN)) as c:
-        assert c.get("/manifest").status_code==200
 
 def test_template_collision_is_preflighted_without_partial_copy(tmp_path):
     templates=tmp_path/"templates"; src=templates/"sample"; src.mkdir(parents=True)
@@ -44,7 +40,7 @@ def test_template_collision_is_preflighted_without_partial_copy(tmp_path):
     assert not (workspace/"a.txt").exists()
     assert (workspace/"z.txt").read_text()=="existing"
 
-def test_v1_input_schemas_are_preserved_exactly():
+def test_core_input_schemas_remain_strict():
     from code_workspace.contracts import TOOLS
     by={x["name"]:x["inputSchema"] for x in TOOLS}
     assert by["exec_command"]["additionalProperties"] is False

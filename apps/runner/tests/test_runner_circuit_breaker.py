@@ -6,7 +6,7 @@ from rich.console import Console
 from gpt_trace_runner.exceptions import RateLimited, StorageConflict
 from gpt_trace_runner.journal import JournalStore
 from gpt_trace_runner.models import BenchmarkTask, StoredRun
-from gpt_trace_runner.runner import BenchmarkRunner, RunOptions
+from gpt_trace_runner.runner import BenchmarkRunner
 
 
 class Lifecycle:
@@ -52,14 +52,13 @@ def make_runner(chatgpt, storage, lifecycle, path):
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_cleans_pre_submit_state_and_never_advances(tmp_path: Path) -> None:
+async def test_rate_limit_cleans_pre_submit_state_and_raises(tmp_path: Path) -> None:
     chatgpt = FakeChatGPT()
     storage = FakeStorage()
     lifecycle = Lifecycle()
     runner = make_runner(chatgpt, storage, lifecycle, tmp_path / "submission.json")
-    tasks = [BenchmarkTask("one", "x", ()), BenchmarkTask("two", "y", ())]
     with pytest.raises(RateLimited):
-        await runner.run(tasks, RunOptions(stop_on_error=False))
+        await runner.run_task(BenchmarkTask("one", "x", ()), False)
     assert chatgpt.prepared == ["one"]
     assert storage.failed == ["one"]
     assert lifecycle.calls == ["prepare", "reset"]
@@ -74,6 +73,6 @@ async def test_storage_start_conflict_does_not_touch_apps_or_chatgpt(tmp_path: P
     lifecycle = Lifecycle()
     runner = make_runner(chatgpt, ConflictStorage(), lifecycle, tmp_path / "submission.json")
     with pytest.raises(StorageConflict):
-        await runner.run([BenchmarkTask("one", "x", ())], RunOptions())
+        await runner.run_task(BenchmarkTask("one", "x", ()), False)
     assert chatgpt.prepared == []
     assert lifecycle.calls == []

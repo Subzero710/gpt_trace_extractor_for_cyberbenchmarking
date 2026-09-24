@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -149,63 +147,8 @@ class StorageClient:
         )
         return _stored_run(response.json())
 
-    async def reset_stale(
-        self,
-        task_id: str,
-        *,
-        expected_task_fingerprint: str,
-    ) -> bool:
-        response = await self._request(
-            "POST",
-            f"/v1/runs/{task_id}/reset",
-            json={"expected_task_fingerprint": expected_task_fingerprint},
-            safe_retry=True,
-        )
-        payload = response.json()
-        return bool(payload.get("reset"))
-
     async def stats(self) -> dict[str, Any]:
         return (await self._request("GET", "/v1/stats")).json()
-
-    async def export(self, output: Path) -> int:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        tmp = output.with_suffix(output.suffix + ".tmp")
-        count = 0
-        pending = b""
-        try:
-            async with self._client.stream("GET", "/v1/export.jsonl") as response:
-                if response.status_code == 409:
-                    body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise StorageConflict(f"storage export conflict: {body}")
-                if response.is_error:
-                    body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise StorageError(f"export failed: {response.status_code} {body}")
-                with tmp.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        handle.write(chunk)
-                        data = pending + chunk
-                        lines = data.split(b"\n")
-                        pending = lines.pop()
-                        count += sum(bool(line.strip()) for line in lines)
-                    if pending.strip():
-                        count += 1
-                    handle.flush()
-                    os.fsync(handle.fileno())
-        except (StorageError, StorageConflict):
-            if tmp.exists():
-                tmp.unlink()
-            raise
-        except httpx.HTTPError as exc:
-            if tmp.exists():
-                tmp.unlink()
-            raise StorageError(f"export transport failed: {exc}") from exc
-        os.replace(tmp, output)
-        dir_fd = os.open(output.parent, os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        return count
 
     async def iter_export_rows(self):
         import json

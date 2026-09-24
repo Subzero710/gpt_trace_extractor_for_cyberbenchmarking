@@ -19,7 +19,7 @@ from gpt_trace_runner.models import (
     CapturedConversation,
     StoredRun,
 )
-from gpt_trace_runner.runner import BenchmarkRunner, RunOptions
+from gpt_trace_runner.runner import BenchmarkRunner
 from gpt_trace_runner.superbench.adapters.base import BenchmarkAdapter
 from gpt_trace_runner.superbench.models import TaskSpec
 from gpt_trace_runner.superbench.registry import AdapterRegistry
@@ -536,13 +536,8 @@ async def test_evaluator_fail_is_completed_and_batch_continues(tmp_path):
         },
     )
 
-    await runner.run(
-        [
-            BenchmarkTask("one", "p1", ()),
-            BenchmarkTask("two", "p2", ()),
-        ],
-        RunOptions(stop_on_error=True),
-    )
+    await runner.run_task(BenchmarkTask("one", "p1", ()), False)
+    await runner.run_task(BenchmarkTask("two", "p2", ()), False)
 
     assert chatgpt.prepared == ["one", "two"]
     assert storage.rows["one"].status == "completed"

@@ -44,7 +44,7 @@ if "--no-sandbox" in args:
     raise SystemExit("CloakBrowser still injects --no-sandbox; refusing to launch")
 PY
 
-# The persistent profile owns the teacher-browser identity. Existing legacy
+# The persistent profile owns the teacher-browser identity. Existing identity
 # markers are canonicalized in-place (not replaced with config from .env).
 python /usr/local/bin/browser-identity ensure "$profile_dir"
 

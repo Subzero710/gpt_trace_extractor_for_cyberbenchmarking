@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from . import __version__
 from .db import SessionFactory, get_session
 from .models import Run
-from .repository import RunConflict, complete_run, fail_run, get_run, reset_run, set_conversation, start_run, stats
-from .schemas import CompleteRunRequest, ConversationRequest, FailRunRequest, ResetRunRequest, RunResponse, StartRunRequest, StatsResponse
+from .repository import RunConflict, complete_run, fail_run, get_run, set_conversation, start_run, stats
+from .schemas import CompleteRunRequest, ConversationRequest, FailRunRequest, RunResponse, StartRunRequest, StatsResponse
 
 app = FastAPI(title="GPT Trace Storage", version=__version__)
 
@@ -105,22 +105,6 @@ async def fail(task_id: str, body: FailRunRequest, session: AsyncSession = Depen
         raise HTTPException(404, "run not found")
     return run
 
-
-@app.post("/v1/runs/{task_id}/reset")
-async def reset(
-    task_id: str,
-    body: ResetRunRequest,
-    session: AsyncSession = Depends(get_session),
-) -> dict[str, bool]:
-    try:
-        removed = await reset_run(
-            session,
-            task_id=task_id,
-            expected_task_fingerprint=body.expected_task_fingerprint,
-        )
-    except RunConflict as exc:
-        raise conflict(exc) from exc
-    return {"reset": removed}
 
 
 @app.get("/v1/stats", response_model=StatsResponse)

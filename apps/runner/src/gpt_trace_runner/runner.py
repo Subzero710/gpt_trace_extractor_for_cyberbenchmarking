@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
 from rich.console import Console
@@ -8,7 +7,6 @@ from rich.console import Console
 from .app_lifecycle import AppLifecycle
 from .chatgpt import ChatGPTClient
 from .exceptions import (
-    BatchCircuitBreaker,
     FatalUIState,
     RecoveryIncomplete,
     RequiredToolNotUsed,
@@ -43,12 +41,6 @@ class StorageLike(Protocol):
     async def complete(self, task_id: str, captured: CapturedConversation, *, attempt: int, runner_id: str, evaluation: dict | None = None) -> StoredRun: ...
     async def fail(self, task_id: str, error: Exception, *, attempt: int, runner_id: str) -> StoredRun: ...
 
-
-@dataclass(frozen=True, slots=True)
-class RunOptions:
-    resume: bool = False
-    stop_on_error: bool = False
-    limit: int | None = None
 
 
 async def abandon_recovery(
@@ -424,7 +416,7 @@ class BenchmarkRunner:
         existing = await self.storage.get(task.task_id)
         if existing is not None:
             if existing.task_fingerprint is None:
-                raise StorageError(f"{task.task_id} is a legacy row without task_fingerprint; reset/migrate it explicitly")
+                raise StorageError(f"{task.task_id} storage row has no task_fingerprint; migrate or delete it before reuse")
             if existing.task_fingerprint != fingerprint:
                 raise StorageError(f"{task.task_id} benchmark specification changed since the stored attempt")
         if existing and existing.status == "completed":
@@ -433,14 +425,14 @@ class BenchmarkRunner:
                     await self.chatgpt.delete_completed_conversation(existing.conversation_id)
                 self.console.print(f"[dim]{task.task_id}: completed, skip[/]")
                 return
-            raise RuntimeError(f"{task.task_id} already completed; use --resume")
+            raise RuntimeError(f"{task.task_id} already completed; resume the active Superbench run")
         if existing and existing.status == "running":
             if not resume:
-                raise RecoveryIncomplete(f"{task.task_id} is already running; use --resume")
+                raise RecoveryIncomplete(f"{task.task_id} is already running; resume the active Superbench run")
             if await self._recover_existing(task, existing):
                 return
         if existing and existing.status == "failed" and not resume:
-            raise RuntimeError(f"{task.task_id} previously failed; use --resume for a new attempt")
+            raise RuntimeError(f"{task.task_id} previously failed; resume the active Superbench run for a new attempt")
 
         expected_attempt = existing.attempt + 1 if existing else 1
         environments = self.lifecycle.environment_ids(task, attempt=expected_attempt, fingerprint=fingerprint)
@@ -595,21 +587,3 @@ class BenchmarkRunner:
                 self.journal.clear()
             raise
 
-    async def run(self, tasks: list[BenchmarkTask], options: RunOptions) -> None:
-        selected = tasks[: options.limit] if options.limit else tasks
-        if not selected:
-            raise RuntimeError("benchmark selection is empty")
-        await self.reconcile_journal(selected)
-        for index, task in enumerate(selected, 1):
-            self.console.rule(f"{index}/{len(selected)} {task.task_id}")
-            try:
-                await self.run_task(task, options.resume)
-            except KeyboardInterrupt:
-                raise
-            except BatchCircuitBreaker as exc:
-                self.console.print(f"[bold red]batch paused after {task.task_id}: {type(exc).__name__}: {exc}[/]")
-                raise
-            except Exception as exc:
-                self.console.print(f"[red]{task.task_id}: {type(exc).__name__}: {exc}[/]")
-                if options.stop_on_error:
-                    raise

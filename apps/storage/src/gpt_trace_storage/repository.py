@@ -107,7 +107,7 @@ async def start_run(
         session.add(run)
     elif run.task_fingerprint is None:
         raise RunConflict(
-            "stored run has no task fingerprint; migrate/reset it explicitly before resume"
+            "stored run has no task fingerprint; migrate or delete it explicitly before resume"
         )
     elif run.task_fingerprint != task_fingerprint:
         raise RunConflict("task specification changed for an existing task_id")
@@ -275,28 +275,6 @@ async def fail_run(
     await session.refresh(run)
     return run
 
-
-async def reset_run(
-    session: AsyncSession,
-    *,
-    task_id: str,
-    expected_task_fingerprint: str,
-) -> bool:
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext('gpt_trace_single_runner'))")
-    )
-    run = await get_run(session, task_id, for_update=True)
-    if run is None:
-        return False
-    if run.task_fingerprint != expected_task_fingerprint:
-        raise RunConflict("stale reset fingerprint differs from stored run")
-    if run.status == "running":
-        raise RunConflict(
-            "running run cannot be reset; recover or stop it explicitly first"
-        )
-    await session.delete(run)
-    await session.commit()
-    return True
 
 
 async def stats(session: AsyncSession) -> dict[str, int]:

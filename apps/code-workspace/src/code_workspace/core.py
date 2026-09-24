@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import fnmatch
 import hashlib
 import json
@@ -28,7 +27,6 @@ from .network import NetworkService, NetworkError
 from .templates import TemplateManager, TemplateError
 from .transfer import RelayClient, TransferError, secure_open_export, secure_import_target, commit_import
 
-MAX_ATTACHMENT_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -328,47 +326,12 @@ class WorkspaceManager:
             if tmp.exists():
                 tmp.unlink()
 
-    def _decode_attachments(self, value: object) -> list[tuple[Path, bytes, str]]:
-        if not isinstance(value, list):
-            raise WorkspaceError("attachments must be a list")
-        decoded: list[tuple[Path, bytes, str]] = []
-        seen: set[str] = set()
-        total = 0
-        for item in value:
-            if not isinstance(item, dict):
-                raise WorkspaceError("attachment entry must be an object")
-            relative = self._relative_path(item.get("path"))
-            normalized = relative.as_posix()
-            if normalized in seen:
-                raise WorkspaceError("duplicate attachment path")
-            encoded = item.get("content_base64")
-            if not isinstance(encoded, str):
-                raise WorkspaceError(f"attachment content_base64 must be a string: {normalized}")
-            try:
-                content = base64.b64decode(encoded, validate=True)
-            except Exception as exc:
-                raise WorkspaceError(f"invalid base64 attachment: {normalized}") from exc
-            declared_size = item.get("size")
-            if isinstance(declared_size, bool) or not isinstance(declared_size, int) or declared_size != len(content):
-                raise WorkspaceError(f"attachment size mismatch: {normalized}")
-            digest = _valid_fingerprint(item.get("sha256"))
-            if _sha256(content) != digest:
-                raise WorkspaceError(f"attachment SHA-256 mismatch: {normalized}")
-            total += len(content)
-            if total > MAX_ATTACHMENT_BYTES:
-                raise WorkspaceError("task attachments exceed workspace limit")
-            decoded.append((relative, content, digest))
-            seen.add(normalized)
-        decoded.sort(key=lambda item: item[0].as_posix())
-        return decoded
-
     async def prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = {
             "task_id": _valid_identity(payload.get("task_id"), "task_id"),
             "environment_id": _valid_identity(payload.get("environment_id"), "environment_id"),
             "task_fingerprint": _valid_fingerprint(payload.get("task_fingerprint")),
         }
-        attachments = self._decode_attachments(payload.get("attachments", []))
         async with self.lock:
             state = self.load_state()
             if state is not None and not self._same_identity(state, normalized):
@@ -376,22 +339,10 @@ class WorkspaceManager:
                     f"workspace is owned by task {state.task_id!r} environment {state.environment_id!r}"
                 )
             if state is not None and state.status == "ready":
-                for relative, _, digest in attachments:
-                    path = self.safe_path(relative.as_posix(), must_exist=True)
-                    if not path.is_file() or _sha256(path.read_bytes()) != digest:
-                        raise WorkspaceError("ready workspace attachment integrity mismatch")
                 return {**asdict(state), "workspace": str(self.workspace_root)}
 
             preparing = ActiveWorkspace(**normalized, status="preparing")
             self._write_state(preparing)
-            if attachments:
-                if any(self.workspace_root.iterdir()):
-                    raise WorkspaceError(
-                        "legacy attachment payload cannot be combined with a Docker-seeded workspace"
-                    )
-                for relative, content, _ in attachments:
-                    path = self.safe_path(relative.as_posix())
-                    self._atomic_write(path, content)
             self._adopt_seeded_workspace()
             ready = ActiveWorkspace(**normalized, status="ready")
             self._write_state(ready)
@@ -786,21 +737,14 @@ class WorkspaceManagerV2(WorkspaceManager):
         try:prov=self.templates_v2.verify(requested)
         except TemplateError as e:raise WorkspaceError(str(e)) from e
         normalized={'task_id':_valid_identity(payload.get('task_id'),'task_id'),'environment_id':_valid_identity(payload.get('environment_id'),'environment_id'),'task_fingerprint':_valid_fingerprint(payload.get('task_fingerprint'))}
-        attachments=self._decode_attachments(payload.get('attachments',[]))
         async with self.lock:
             state=self.load_state();marker=self._template_marker()
             if state is not None and not self._same_identity(state,normalized):raise WorkspaceError(f"workspace is owned by task {state.task_id!r} environment {state.environment_id!r}")
             if state is not None and state.status=='ready':
                 if marker!=prov:raise WorkspaceError('ready workspace template provenance mismatch')
-                for relative,_,digest in attachments:
-                    path=self.safe_path(relative.as_posix(),must_exist=True)
-                    if not path.is_file() or _sha256(path.read_bytes())!=digest:raise WorkspaceError('ready workspace attachment integrity mismatch')
                 return {**asdict(state),'workspace':str(self.workspace_root),**prov}
             self._write_state(ActiveWorkspace(**normalized,status='preparing'))
             try:
-                if attachments:
-                    if any(self.workspace_root.iterdir()):raise WorkspaceError('legacy attachment payload cannot be combined with a Docker-seeded workspace')
-                    for relative,content,_ in attachments:self._atomic_write(self.safe_path(relative.as_posix()),content)
                 self._adopt_seeded_workspace()
                 if marker is None:
                     self.templates_v2.apply(requested)

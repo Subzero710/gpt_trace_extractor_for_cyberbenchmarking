@@ -11,8 +11,7 @@ from registry_helpers import make_registry
 def test_stable_ids_resolve_to_configured_ui_names(tmp_path: Path) -> None:
     registry = make_registry(tmp_path, github_ui="Renamed GitHub")
     logical = registry.resolve_id("github")
-    legacy = registry.resolve_name("Renamed GitHub")
-    assert logical.app_id == legacy.app_id == "github"
+    assert logical.app_id == "github"
     assert logical.ui_name == "Renamed GitHub"
     assert logical.version == "2.1.0"
     assert logical.manifest_sha256 == manifest_sha256(logical.manifest)

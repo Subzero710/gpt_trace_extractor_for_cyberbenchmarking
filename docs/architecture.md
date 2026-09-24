@@ -24,7 +24,7 @@ The gateways are stable MCP endpoints. They contain no benchmark workspace, brow
 
 | Layer | Stable identity | Mutable/runtime data |
 |---|---|---|
-| Benchmark | logical `app_id` | optional legacy name selector |
+| Benchmark | logical `app_id` | adapter/runtime metadata |
 | Canonical tool | `(app_id, tool_name)` | none |
 | Contract | semantic version + canonical manifest SHA-256 | none |
 | ChatGPT UI | resolved visible App name | configurable |
@@ -58,7 +58,7 @@ A task requesting only GitHub creates no local execution container. Workspace-on
 
 ## Initial workspace
 
-`tasks/<task_id>/initial_workspace/` is only a host-side source tree read by the runner. It is never mounted into the execution container. Before the Workspace backend is exposed through the gateway, the runner copies that tree into `/workspace`. Attachments are copied separately under `/workspace/attachments/`.
+An adapter may materialize an `initial_workspace` in runner state. That source tree is never mounted into the execution container. Before the Workspace backend is exposed through the gateway, the runner copies the materialized workspace into `/workspace`; direct task attachments are copied separately under `/workspace/attachments/`.
 
 The initial workspace hash participates in the task fingerprint. Symlinks and special files are rejected.
 

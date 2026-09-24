@@ -40,12 +40,6 @@ class BenchmarkTool:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class WorkspaceTemplateProvenance:
-    template_id: str
-    template_version: str
-    template_hash: str
-    def as_dict(self): return {"template_id": self.template_id, "template_version": self.template_version, "template_hash": self.template_hash}
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkTask:
@@ -54,7 +48,6 @@ class BenchmarkTask:
     attachments: tuple[Path, ...]
     tools: tuple[BenchmarkTool, ...] = ()
     initial_workspace: Path | None = None
-    workspace_template: WorkspaceTemplateProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +101,7 @@ def task_fingerprint(task: BenchmarkTask) -> str:
             "files": workspace.files,
             "bytes": workspace.bytes,
         },
-        "workspace_template": task.workspace_template.as_dict() if task.workspace_template else None,
+        "workspace_template": None,
         "apps": [
             {
                 "type": tool.type,

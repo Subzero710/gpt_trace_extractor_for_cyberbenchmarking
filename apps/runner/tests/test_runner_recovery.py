@@ -6,7 +6,7 @@ from rich.console import Console
 from gpt_trace_runner.exceptions import AmbiguousSubmission, RecoveryIncomplete, RequiredToolNotUsed
 from gpt_trace_runner.journal import JournalStore, SubmissionJournal
 from gpt_trace_runner.models import BenchmarkTask, CapturedConversation, StoredRun, task_fingerprint
-from gpt_trace_runner.runner import BenchmarkRunner, RunOptions, abandon_recovery
+from gpt_trace_runner.runner import BenchmarkRunner, abandon_recovery
 
 
 TASK = BenchmarkTask("t", "p", ())
@@ -108,7 +108,7 @@ async def test_ambiguous_after_send_preserves_running_journal_and_environment(tm
     storage = Storage()
     lifecycle = Lifecycle()
     with pytest.raises(AmbiguousSubmission):
-        await runner(AmbiguousChatGPT(), storage, store, lifecycle).run([TASK], RunOptions())
+        await runner(AmbiguousChatGPT(), storage, store, lifecycle).run_task(TASK, False)
     assert storage.failed == []
     assert storage.existing.status == "running"
     assert store.load().phase == "submission_started"
@@ -248,7 +248,7 @@ async def test_running_conversation_without_message_identity_proof_is_not_auto_r
         )
     )
     with pytest.raises(RecoveryIncomplete, match="no submission journal user_message_id proof"):
-        await runner(RecoveryChatGPT(), storage, store).run([TASK], RunOptions(resume=True))
+        await runner(RecoveryChatGPT(), storage, store).run_task(TASK, True)
 
 
 def test_submission_journal_persists_user_message_identity(tmp_path: Path) -> None:
@@ -262,7 +262,7 @@ def test_submission_journal_persists_user_message_identity(tmp_path: Path) -> No
 
 def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None:
     makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
-    block = makefile.split("reset-recovery:", 1)[1].split("reset-stale:", 1)[0]
+    block = makefile.split("reset-recovery:", 1)[1].split("throw_volumes:", 1)[0]
     assert 'test -n "$(TASK)"' in block
     assert "docker compose run --rm --no-deps runner superbench-reset-recovery" in block
     assert '"$(TASK)" --yes' in block
@@ -275,7 +275,7 @@ def test_runner_deletes_completed_remote_conversation_before_app_reset() -> None
         / "gpt_trace_runner"
         / "runner.py"
     ).read_text(encoding="utf-8")
-    run_task = source.split("async def run_task", 1)[1].split("async def run(", 1)[0]
+    run_task = source.split("async def run_task", 1)[1]
 
     delete_call = "await self.chatgpt.delete_completed_conversation(submitted.conversation_id)"
     reset_call = "await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)"

@@ -21,24 +21,20 @@ Every entry records ownership, resolution settings, version, manifest path, endp
 
 ## Benchmark selection
 
-Prefer stable IDs:
+Superbench adapters declare logical App IDs directly through `TaskSpec.tools` and `TaskSpec.required_tools`. Runtime resolution is ID-only; mutable ChatGPT display names are deployment metadata and never benchmark identities.
 
-```json
-{
-  "task_id": "incident_reconstruction_001",
-  "prompt": "Inspect the repository and corroborate the incident timeline.",
-  "attachments": ["incident_reconstruction_001/repo.zip"],
-  "tools": [
-    {"type": "app", "id": "code-workspace", "required": true},
-    {"type": "app", "id": "browser", "required": true},
-    {"type": "app", "id": "github", "required": true}
-  ]
-}
+For example, an adapter task that requires both local Apps uses:
+
+```python
+TaskSpec(
+    task_id="incident_reconstruction_001",
+    prompt="Inspect the repository and corroborate the incident timeline.",
+    tools=("code-workspace", "browser"),
+    required_tools=("code-workspace", "browser"),
+)
 ```
 
-For compatibility, `{"type":"app","name":"browser"}`, `{"type":"app","name":"Browser"}`, and string shorthand `"browser"` resolve through the registry. A mutable display name remains valid only while it equals the configured name. Unknown and duplicate logical Apps fail during benchmark loading, before ChatGPT is touched.
-
-`required` defaults to `false`. For a required App, the completed raw conversation must contain a matching `metadata.invoked_resource.app_name`; selection alone is not sufficient.
+Unknown logical App IDs fail when the Superbench task is materialized, before ChatGPT is touched. Required Apps must appear in the captured tool provenance; selection alone is not sufficient.
 
 ## Code Workspace contract
 
@@ -55,7 +51,7 @@ All paths are relative to the owned task workspace. Absolute paths, `..`, symlin
 | `export_file` | Streams one regular workspace file to the per-attempt File Relay and returns an opaque `file_id` plus integrity metadata. |
 | `import_file` | Fetches one relay `file_id`, verifies size/SHA-256, and atomically materializes it at a workspace-relative path. |
 
-For each attempt the runner creates a fresh Workspace container. `tasks/<task_id>/initial_workspace/` is copied to `/workspace` before the gateway is bound; attachments are copied to `/workspace/attachments/<basename>`. Neither source tree is mounted into the container. The container is destroyed at terminal cleanup.
+For each attempt the runner creates a fresh Workspace container. Adapter-materialized `initial_workspace` content is copied to `/workspace` before the gateway is bound; direct task attachments are copied under `/workspace/attachments/<basename>`. Benchmark source volumes are never mounted into the execution container. The container is destroyed at terminal cleanup.
 
 ## Browser contract
 
@@ -92,29 +88,6 @@ The file must be an authoritative manifest with exactly this outer shape:
 ```
 
 The example shows structure only; do not use it as an operational manifest. Obtain the exact version, descriptions and schemas from the installed connector owner or source. The runner computes its SHA-256 at load time and stores the complete validated manifest. A missing manifest is a hard error.
-
-## Inspect canonical tool identities
-
-```bash
-docker compose run --rm --no-deps runner \
-  inspect-tools /data/benchmarks/benchmark.jsonl \
-  --task-id incident_reconstruction_001
-```
-
-The command prints the task fingerprint, resolved App provenance, and provider-independent canonical function definitions:
-
-```json
-{
-  "type": "function",
-  "function": {
-    "name": "code_workspace__exec_command",
-    "description": "Execute one shell command in the active task workspace and return bounded stdout, stderr, exit status, and timeout state.",
-    "parameters": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}}, "required": ["command"]}
-  }
-}
-```
-
-The live output contains the complete committed schema. Every function uses `<normalized_app_id>__<tool_name>` and `tool_identity` records map it back to the canonical pair and manifest hash. The same naming function is used by Superbench normalization, so inspection and exported trajectories cannot disagree.
 
 ## Add or change a local App
 

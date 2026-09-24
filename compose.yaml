@@ -258,8 +258,6 @@ services:
       - source: app_control_token
         target: app_control_token
     volumes:
-      - ./benchmarks:/data/benchmarks:ro
-      - ./tasks:/data/tasks:ro
       - ./exports:/data/exports
       - ./apps:/data/apps:ro
       - ./config:/data/config:ro

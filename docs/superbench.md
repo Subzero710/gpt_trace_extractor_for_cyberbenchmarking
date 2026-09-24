@@ -6,7 +6,7 @@ A source task is identified by its adapter task ID. A stored trajectory ID is de
 
 Native evaluation happens after the teacher trajectory/runtime provenance is captured and before App reset. `EvaluationResult` contains `verdict` (`pass`/`fail`), optional score, details and evaluator metadata. Infrastructure failure remains separate in the run status.
 
-PostgreSQL is authoritative. `make export` emits the raw JSONL storage export. `make export-parquet` produces the canonical typed corpus. `make export-sft` derives a tool-validated training view and, by default, keeps only native `pass` trajectories; `--verdict` can explicitly select another evaluation class for analysis.
+PostgreSQL is authoritative. `make export-parquet` produces the canonical typed corpus. `make export-sft` derives a tool-validated training view and, by default, keeps only native `pass` trajectories; `--verdict` can explicitly select another evaluation class for analysis. The storage JSONL stream remains an internal transport used by the canonical exporter.
 
 ## Benchmark source fetching
 
@@ -26,8 +26,8 @@ After obtaining upstream GAIA access, set `BENCHMARK_SOURCE_TOKEN` and run:
 
 ```bash
 make superbench-fetch ADAPTER=gaia
-make superbench-run ADAPTER=gaia LIMIT=3
-make superbench-status ADAPTER=gaia
+make run ADAPTER=gaia LIMIT=3
+make status
 ```
 
 The pinned split is validated to contain tasks requiring both Browser and Code Workspace. Ground-truth answers remain evaluator-side and are not copied into task metadata or prompts.

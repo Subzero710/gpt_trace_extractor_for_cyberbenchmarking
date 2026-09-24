@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from gpt_trace_storage.schemas import CompleteRunRequest, ResetRunRequest, StartRunRequest
+from gpt_trace_storage.schemas import CompleteRunRequest, StartRunRequest
 
 
 def provenance(app_id="browser"):
@@ -137,10 +137,3 @@ def test_complete_rejects_empty_dataset_messages() -> None:
 def test_reserved_dot_task_id_is_rejected() -> None:
     with pytest.raises(ValidationError):
         start_request(task_id="..")
-
-def test_reset_request_requires_exact_sha256_fingerprint() -> None:
-    request = ResetRunRequest(expected_task_fingerprint="a" * 64)
-    assert request.expected_task_fingerprint == "a" * 64
-    with pytest.raises(ValidationError):
-        ResetRunRequest(expected_task_fingerprint="not-a-fingerprint")
-

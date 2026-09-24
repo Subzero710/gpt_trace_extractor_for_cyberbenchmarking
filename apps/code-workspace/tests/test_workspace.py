@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import os
 from pathlib import Path
 
@@ -10,14 +8,6 @@ import pytest_asyncio
 
 from code_workspace.core import WorkspaceError, WorkspaceManager
 
-
-def attachment(path: str, content: bytes) -> dict:
-    return {
-        "path": path,
-        "content_base64": base64.b64encode(content).decode("ascii"),
-        "size": len(content),
-        "sha256": hashlib.sha256(content).hexdigest(),
-    }
 
 
 def identity(task: str = "task", environment: str = "env") -> dict:
@@ -36,16 +26,21 @@ async def manager(tmp_path: Path) -> WorkspaceManager:
         sandbox_uid=os.getuid(),
         sandbox_gid=os.getgid(),
     )
-    await item.prepare({**identity(), "attachments": [attachment("fixtures/a.txt", b"hello\nworld\n")]})
+    fixture = item.workspace_root / "fixtures" / "a.txt"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"hello
+world
+")
+    await item.prepare(identity())
     return item
 
 
 @pytest.mark.asyncio
 async def test_prepare_is_idempotent_and_reset_is_owned(tmp_path: Path) -> None:
     manager = WorkspaceManager(tmp_path / "workspace", tmp_path / "state", sandbox_uid=os.getuid(), sandbox_gid=os.getgid())
-    payload = {**identity(), "attachments": [attachment("repo.txt", b"x")]}
-    first = await manager.prepare(payload)
-    second = await manager.prepare(payload)
+    (manager.workspace_root / "repo.txt").write_bytes(b"x")
+    first = await manager.prepare(identity())
+    second = await manager.prepare(identity())
     assert first["status"] == second["status"] == "ready"
     with pytest.raises(WorkspaceError, match="does not own"):
         await manager.reset({**identity(environment="different")})

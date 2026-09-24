@@ -11,18 +11,16 @@ from rich.console import Console
 from rich.table import Table
 
 from .app_lifecycle import AppLifecycle
-from .benchmark import load_benchmark
 from .browser import BrowserClient
 from .chatgpt import ChatGPTClient
 from .config import Settings
 from .docker_runtime import DockerRuntime
-from .exceptions import RecoveryIncomplete, StorageError
+from .exceptions import RecoveryIncomplete
 from .journal import JournalStore
 from .lock import RunnerLock
-from .models import BenchmarkTask, BenchmarkTool, task_app_provenance, task_fingerprint
-from .tool_identity import flatten_app_provenance
+from .models import BenchmarkTask, BenchmarkTool, task_fingerprint
 from .registry import AppRegistry
-from .runner import BenchmarkRunner, RunOptions, abandon_recovery
+from .runner import abandon_recovery
 from .runtime_preflight import preflight_tasks
 from .storage_client import StorageClient
 from .tools import check_playwright_ui_contracts
@@ -122,7 +120,7 @@ async def ensure_no_running_storage(storage: StorageClient) -> None:
 def ensure_no_pending_journal(settings: Settings) -> None:
     journal = JournalStore(settings.journal_path).load()
     if journal is not None:
-        raise RecoveryIncomplete(f"pending crash journal for {journal.task_id}; run the benchmark with --resume first")
+        raise RecoveryIncomplete(f"pending crash journal for {journal.task_id}; resume the active Superbench run first")
 
 
 @app.command()
@@ -243,39 +241,6 @@ def register_apps() -> None:
     asyncio.run(main())
 
 
-@app.command("inspect-tools")
-def inspect_tools(
-    benchmark: Path = typer.Argument(..., exists=True, dir_okay=False),
-    task_id: str = typer.Option(..., "--task-id"),
-) -> None:
-    settings = Settings()
-    registry = AppRegistry.load(settings.app_registry_path)
-    tasks = load_benchmark(benchmark, tasks_root=settings.tasks_root, registry=registry)
-    matches = [task for task in tasks if task.task_id == task_id]
-    if len(matches) != 1:
-        raise typer.BadParameter(f"task_id {task_id!r} is not present exactly once")
-    task = matches[0]
-    value = {
-        "task_id": task.task_id,
-        "task_fingerprint": task_fingerprint(task),
-        "apps": task_app_provenance(task),
-        "canonical_tools": flatten_app_provenance(task_app_provenance(task)),
-    }
-    console.print_json(json.dumps(value, ensure_ascii=False, sort_keys=True))
-
-
-@app.command("export")
-def export_command(output: Path = typer.Argument(..., dir_okay=False)) -> None:
-    async def main() -> None:
-        settings = Settings()
-        storage = StorageClient(settings.storage_base_url)
-        try:
-            count = await storage.export(output)
-        finally:
-            await storage.close()
-        console.print(f"[green]exported {count} runs -> {output}[/]")
-    asyncio.run(main())
-
 
 @app.command("superbench-fetch")
 def superbench_fetch(adapter: list[str] = typer.Option([], "--adapter")) -> None:
@@ -305,58 +270,6 @@ def superbench_run(adapter: list[str] = typer.Option([], "--adapter"), limit: in
         settings=Settings(); registry=AppRegistry.load(settings.app_registry_path); n,cid=await execute_active(settings=settings,registry=registry,make_lifecycle=make_lifecycle,make_chatgpt=make_chatgpt,console=console,adapter_ids=tuple(adapter),limit=limit,resume=False); console.print(f"campaign={cid} attempted={n}")
     asyncio.run(main())
 
-@app.command("superbench-status")
-def superbench_status(adapter: list[str] = typer.Option([], "--adapter")) -> None:
-    from .superbench.catalog import SuperbenchCatalog
-    from .superbench.registry import AdapterRegistry
-    from .superbench.service import campaign, to_benchmark_task
-
-    async def main():
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        adapters = AdapterRegistry.discover()
-        cat = SuperbenchCatalog(adapters).discover(tuple(adapter))
-        camp = campaign(settings)
-        storage = StorageClient(settings.storage_base_url)
-        attempted = completed = evaluated = passed = failed = unevaluated = infra = 0
-        try:
-            for entry in cat:
-                benchmark_adapter = adapters.get(entry.adapter_id)
-                state = await storage.get(
-                    to_benchmark_task(entry.task, registry, camp, benchmark_adapter).task_id
-                )
-                if state is None:
-                    continue
-                attempted += 1
-                if state.status == "failed":
-                    infra += 1
-                    continue
-                if state.status == "completed":
-                    completed += 1
-                    evaluation = state.evaluation
-                    if evaluation is None:
-                        unevaluated += 1
-                    else:
-                        verdict = evaluation.get("verdict")
-                        if verdict == "pass":
-                            evaluated += 1
-                            passed += 1
-                        elif verdict == "fail":
-                            evaluated += 1
-                            failed += 1
-                        else:
-                            raise RuntimeError(
-                                f"{state.task_id}: invalid evaluation verdict {verdict!r}"
-                            )
-        finally:
-            await storage.close()
-        console.print(
-            f"campaign={camp.campaign_id} catalog={len(cat)} attempted={attempted} "
-            f"completed={completed} evaluated={evaluated} pass={passed} fail={failed} "
-            f"unevaluated={unevaluated} infra_failed={infra}"
-        )
-
-    asyncio.run(main())
 
 @app.command("export-parquet")
 def export_parquet(

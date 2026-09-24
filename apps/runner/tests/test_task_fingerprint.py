@@ -1,8 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
-from gpt_trace_runner.benchmark import load_benchmark
 from gpt_trace_runner.models import BenchmarkTask, task_fingerprint
+from gpt_trace_runner.superbench.service import benchmark_tool
 from registry_helpers import make_registry
 
 
@@ -19,9 +19,12 @@ def test_task_fingerprint_changes_with_exact_prompt_and_attachment(tmp_path: Pat
 
 def test_fingerprint_uses_canonical_contract_not_mutable_ui_name(tmp_path: Path) -> None:
     registry = make_registry(tmp_path, github_ui="First UI name")
-    manifest = tmp_path / "benchmark.jsonl"
-    manifest.write_text('{"task_id":"t","prompt":"x","tools":[{"id":"github","required":true}]}\n')
-    task = load_benchmark(manifest, registry=registry)[0]
+    task = BenchmarkTask(
+        "t",
+        "x",
+        (),
+        tools=(benchmark_tool(registry, "github", required=True),),
+    )
     renamed = replace(task, tools=(replace(task.tools[0], ui_name="Second UI name"),))
     assert task_fingerprint(task) == task_fingerprint(renamed)
     changed_hash = replace(task, tools=(replace(task.tools[0], manifest_sha256="f" * 64),))

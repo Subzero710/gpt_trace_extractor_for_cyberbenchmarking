@@ -1,5 +1,4 @@
 import hashlib
-import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,22 +6,26 @@ import httpx
 import pytest
 
 from gpt_trace_runner.app_lifecycle import AppLifecycle
-from gpt_trace_runner.benchmark import load_benchmark
 from gpt_trace_runner.docker_runtime import AttemptRuntime, RuntimeResource
 from gpt_trace_runner.exceptions import AppInfrastructureError
-from gpt_trace_runner.models import task_fingerprint
+from gpt_trace_runner.models import BenchmarkTask, task_fingerprint
+from gpt_trace_runner.superbench.service import benchmark_tool
 from registry_helpers import make_registry
 
 
 def task(tmp_path: Path):
     attachment = tmp_path / "repo.zip"
     attachment.write_bytes(b"zip")
-    manifest = tmp_path / "benchmark.jsonl"
-    manifest.write_text(json.dumps({
-        "task_id": "t", "prompt": "x", "attachments": ["repo.zip"],
-        "tools": [{"id": "code-workspace", "required": True}, {"id": "browser"}],
-    }) + "\n")
-    return load_benchmark(manifest, tasks_root=tmp_path, registry=make_registry(tmp_path))[0]
+    registry = make_registry(tmp_path)
+    return BenchmarkTask(
+        "t",
+        "x",
+        (attachment,),
+        tools=(
+            benchmark_tool(registry, "code-workspace", required=True),
+            benchmark_tool(registry, "browser", required=False),
+        ),
+    )
 
 
 class Runtime:
