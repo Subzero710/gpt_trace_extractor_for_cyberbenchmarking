@@ -1,14 +1,36 @@
 import pytest
-from gpt_trace_runner.superbench.catalog import SuperbenchCatalog
-from gpt_trace_runner.superbench.registry import AdapterRegistry
+
 from gpt_trace_runner.superbench.adapters.base import BenchmarkAdapter
-from gpt_trace_runner.superbench.models import CanonicalTask,EvaluationResult
+from gpt_trace_runner.superbench.catalog import SuperbenchCatalog
+from gpt_trace_runner.superbench.models import TaskSpec
+from gpt_trace_runner.superbench.registry import AdapterRegistry
+
+
 class A(BenchmarkAdapter):
- adapter_id='a'; adapter_version='1'
- def discover_tasks(self): return [CanonicalTask('a:1','x','1','1','repo','sha','p','a','1',dedup_group='same')]
- async def evaluate(self,*a,**k): return EvaluationResult(True)
+    adapter_id = "a"
+    adapter_version = "1"
+
+    def discover_tasks(self):
+        return [TaskSpec("same", "a")]
+
+
 class B(A):
- adapter_id='b'
- def discover_tasks(self): return [CanonicalTask('b:1','y','1','2','repo2','sha','p','b','1',dedup_group='same')]
-def test_cross_source_duplicate_detection():
- with pytest.raises(ValueError,match='cross-source'): SuperbenchCatalog(AdapterRegistry([A(),B()])).discover()
+    adapter_id = "b"
+
+    def discover_tasks(self):
+        return [TaskSpec("same", "b")]
+
+
+def test_duplicate_task_ids_across_adapters_are_rejected():
+    with pytest.raises(ValueError, match="duplicate task_id"):
+        SuperbenchCatalog(AdapterRegistry([A(), B()])).discover()
+
+
+def test_unknown_adapter_filter_is_rejected():
+    with pytest.raises(ValueError, match="unknown benchmark adapter"):
+        SuperbenchCatalog(AdapterRegistry([A()])).discover(("missing",))
+
+
+def test_duplicate_adapter_filter_is_rejected():
+    with pytest.raises(ValueError, match="duplicate benchmark adapter"):
+        SuperbenchCatalog(AdapterRegistry([A()])).discover(("a", "a"))

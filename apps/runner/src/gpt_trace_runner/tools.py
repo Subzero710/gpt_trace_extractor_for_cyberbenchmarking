@@ -59,6 +59,108 @@ _COMPOSER_ACCEPTED_JS = r"""
 """
 
 
+_APP_CANDIDATE_VISIBLE_JS = r"""
+([appName]) => {
+    const editor =
+        document.querySelector("#prompt-textarea") ||
+        document.querySelector(
+            '[contenteditable="true"][data-lexical-editor="true"]'
+        );
+
+    const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none"
+        );
+    };
+
+    for (const el of document.querySelectorAll("body *")) {
+        if (!visible(el)) continue;
+        if (editor && editor.contains(el)) continue;
+
+        const text = (el.innerText || el.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
+        if (text === appName) return true;
+    }
+
+    return false;
+}
+"""
+
+
+async def _find_app_candidate(
+    page: Page,
+    *,
+    editor: Locator,
+    tool: BenchmarkTool,
+    timeout_seconds: float,
+) -> Locator:
+    """Resolve the visible autocomplete row itself instead of guessing Enter state."""
+    try:
+        await page.wait_for_function(
+            _APP_CANDIDATE_VISIBLE_JS,
+            arg=[tool.name],
+            timeout=int(timeout_seconds * 1000),
+        )
+    except PlaywrightTimeoutError as exc:
+        raise AppUnavailable(
+            f"ChatGPT app {tool.name!r} autocomplete did not expose a visible "
+            "candidate"
+        ) from exc
+
+    matches = page.get_by_text(tool.name, exact=True)
+    editor_box = await editor.bounding_box()
+
+    best: Locator | None = None
+    best_distance = float("inf")
+
+    for index in range(await matches.count()):
+        candidate = matches.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            inside_composer = await candidate.evaluate(
+                """el => Boolean(el.closest(
+                    '#prompt-textarea, '
+                    + '[contenteditable="true"][data-lexical-editor="true"]'
+                ))"""
+            )
+            if inside_composer:
+                continue
+
+            box = await candidate.bounding_box()
+            if box is None:
+                continue
+
+            if editor_box is None:
+                return candidate
+
+            candidate_x = box["x"] + box["width"] / 2
+            candidate_y = box["y"] + box["height"] / 2
+            editor_x = editor_box["x"] + editor_box["width"] / 2
+            editor_y = editor_box["y"] + editor_box["height"] / 2
+            distance = abs(candidate_x - editor_x) + abs(candidate_y - editor_y)
+
+            if distance < best_distance:
+                best = candidate
+                best_distance = distance
+        except Exception:
+            continue
+
+    if best is None:
+        raise AppUnavailable(
+            f"ChatGPT app {tool.name!r} autocomplete text became visible but "
+            "no selectable candidate locator could be resolved"
+        )
+    return best
+
+
 async def _wait_app_accepted(
     page: Page,
     *,
@@ -142,26 +244,22 @@ async def _select_app_via_mention(
         clear_existing=False,
     )
 
-    # InteractionGuard.type_text() already proves that the complete @App query
-    # reached the composer. Let ChatGPT resolve the visible autocomplete with
-    # Enter, then validate the actual result instead of trying to predict the
-    # picker's internal DOM shape beforehand.
-    before_enter_url = page.url
-    await page.keyboard.press("Enter")
+    # Resolve and click the actual visible autocomplete candidate. Enter is
+    # deliberately not used here because it is also ChatGPT's submit key when
+    # the picker has no active keyboard selection.
+    candidate = await _find_app_candidate(
+        page,
+        editor=editor,
+        tool=tool,
+        timeout_seconds=timeout_seconds,
+    )
+    await interaction.click(candidate)
 
-    try:
-        await _wait_app_accepted(
-            page,
-            tool=tool,
-            timeout_seconds=timeout_seconds,
-        )
-    except AppUnavailable as exc:
-        if page.url != before_enter_url and "/c/" in page.url:
-            raise FatalUIState(
-                f"App selection Enter unexpectedly submitted a conversation "
-                f"while selecting {tool.name!r}"
-            ) from exc
-        raise
+    await _wait_app_accepted(
+        page,
+        tool=tool,
+        timeout_seconds=timeout_seconds,
+    )
 
     editor = await get_editor()
     rendered = await editor.inner_text()

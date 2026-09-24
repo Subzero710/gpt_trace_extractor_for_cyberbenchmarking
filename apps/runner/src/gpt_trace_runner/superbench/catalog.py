@@ -17,6 +17,13 @@ class SuperbenchCatalog:
         self.registry = registry
 
     def discover(self, only: tuple[str, ...] = ()) -> list[CatalogEntry]:
+        if only:
+            unknown = sorted(set(only) - set(self.registry.adapters))
+            if unknown:
+                raise ValueError(f"unknown benchmark adapter(s): {unknown!r}")
+            if len(set(only)) != len(only):
+                raise ValueError("duplicate benchmark adapter selector")
+
         tasks: list[CatalogEntry] = []
         seen: dict[str, str] = {}
         for adapter_id, adapter in sorted(self.registry.adapters.items()):

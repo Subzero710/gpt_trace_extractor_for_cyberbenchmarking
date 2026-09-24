@@ -32,23 +32,38 @@ class Storage:
         self.set_calls = []
         self.completed = []
     async def get(self, task_id): return self.existing
-    async def start(self, task_id, runner_id, expected_attempt, task_fingerprint, app_provenance):
+    async def start(
+        self, task_id, runner_id, expected_attempt, task_fingerprint, app_provenance,
+        logical_task_id=None, dataset_metadata=None,
+    ):
         self.existing = StoredRun(
-            task_id, "running", attempt=expected_attempt, runner_id=runner_id,
-            task_fingerprint=task_fingerprint, app_provenance=app_provenance,
+            task_id=task_id, logical_task_id=logical_task_id or task_id, status="running",
+            attempt=expected_attempt, runner_id=runner_id, task_fingerprint=task_fingerprint,
+            app_provenance=app_provenance, dataset_metadata=dataset_metadata or {},
         )
         return self.existing
     async def set_conversation(self, task_id, conversation_id, *, attempt, runner_id):
         self.set_calls.append((task_id, conversation_id, attempt, runner_id))
-        self.existing = StoredRun(task_id, "running", conversation_id, attempt, runner_id, fp(), app_provenance=[])
+        self.existing = StoredRun(
+            task_id=task_id, logical_task_id=task_id, status="running",
+            conversation_id=conversation_id, attempt=attempt, runner_id=runner_id,
+            task_fingerprint=fp(), app_provenance=[],
+        )
         return self.existing
-    async def complete(self, task_id, captured, *, attempt, runner_id):
+    async def complete(self, task_id, captured, *, attempt, runner_id, evaluation=None):
         self.completed.append((task_id, captured.conversation_id, attempt, runner_id))
-        self.existing = StoredRun(task_id, "completed", captured.conversation_id, attempt, runner_id, fp(), app_provenance=[])
+        self.existing = StoredRun(
+            task_id=task_id, logical_task_id=task_id, status="completed",
+            conversation_id=captured.conversation_id, attempt=attempt, runner_id=runner_id,
+            task_fingerprint=fp(), app_provenance=[], evaluation=evaluation,
+        )
         return self.existing
     async def fail(self, task_id, error, *, attempt, runner_id):
         self.failed.append((task_id, type(error).__name__, attempt, runner_id))
-        self.existing = StoredRun(task_id, "failed", attempt=attempt, runner_id=runner_id, task_fingerprint=fp(), app_provenance=[])
+        self.existing = StoredRun(
+            task_id=task_id, logical_task_id=task_id, status="failed",
+            attempt=attempt, runner_id=runner_id, task_fingerprint=fp(), app_provenance=[],
+        )
         return self.existing
 
 
@@ -105,7 +120,7 @@ async def test_ambiguous_after_send_preserves_running_journal_and_environment(tm
 async def test_starting_journal_is_cleaned_then_failed(tmp_path: Path) -> None:
     store = JournalStore(tmp_path / "j.json")
     store.write(SubmissionJournal("t", "old", 2, "starting", task_fingerprint=fp()))
-    storage = Storage(StoredRun("t", "running", attempt=2, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
+    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", attempt=2, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
     lifecycle = Lifecycle()
     await runner(RecoveryChatGPT(), storage, store, lifecycle).reconcile_journal([TASK])
     assert storage.existing.status == "failed"
@@ -120,7 +135,7 @@ async def test_submission_started_recovers_same_environment_without_resubmit(tmp
         "t", "old", 3, "submission_started", task_fingerprint=fp(),
         user_message_id="submitted-user-message",
     ))
-    storage = Storage(StoredRun("t", "running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
+    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
     lifecycle = Lifecycle()
     await runner(RecoveryChatGPT(), storage, store, lifecycle).reconcile_journal([TASK])
     assert storage.set_calls == [("t", "conv", 3, "old")]
@@ -133,7 +148,7 @@ async def test_submission_started_recovers_same_environment_without_resubmit(tmp
 async def test_completed_row_with_cleanup_journal_is_reset(tmp_path: Path) -> None:
     store = JournalStore(tmp_path / "j.json")
     store.write(SubmissionJournal("t", "old", 4, "cleanup_pending", "known", fp()))
-    storage = Storage(StoredRun("t", "completed", "known", 4, "old", fp(), app_provenance=[]))
+    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="completed", conversation_id="known", attempt=4, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
     lifecycle = Lifecycle()
     chatgpt = RecoveryChatGPT()
     await runner(chatgpt, storage, store, lifecycle).reconcile_journal([TASK])
@@ -159,7 +174,7 @@ async def test_known_conversation_required_tool_failure_terminalizes_and_cleans_
         "t", "old", 3, "conversation_known", "known", fp(),
         user_message_id="submitted-user-message",
     ))
-    storage = Storage(StoredRun("t", "running", "known", 3, "old", fp(), app_provenance=[]))
+    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", conversation_id="known", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
     lifecycle = Lifecycle()
     with pytest.raises(RequiredToolNotUsed):
         await runner(MissingRequiredOnRecover(), storage, store, lifecycle).reconcile_journal([TASK])
@@ -175,7 +190,7 @@ async def test_unknown_candidate_required_tool_failure_terminalizes_and_cleans_e
         "t", "old", 3, "submission_started", task_fingerprint=fp(),
         user_message_id="submitted-user-message",
     ))
-    storage = Storage(StoredRun("t", "running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
+    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
     lifecycle = Lifecycle()
     with pytest.raises(RequiredToolNotUsed):
         await runner(MissingRequiredCandidate(), storage, store, lifecycle).reconcile_journal([TASK])
@@ -201,13 +216,9 @@ async def test_abandon_recovery_fails_attempt_resets_apps_and_clears_journal(tmp
     )
     storage = Storage(
         StoredRun(
-            "t",
-            "running",
-            "deleted-conv",
-            3,
-            "old",
-            fp(),
-            app_provenance=[],
+            task_id="t", logical_task_id="t", status="running",
+            conversation_id="deleted-conv", attempt=3, runner_id="old",
+            task_fingerprint=fp(), app_provenance=[],
         )
     )
     lifecycle = Lifecycle()
@@ -231,7 +242,9 @@ async def test_running_conversation_without_message_identity_proof_is_not_auto_r
     store = JournalStore(tmp_path / "j.json")
     storage = Storage(
         StoredRun(
-            "t", "running", "known", 3, "old", fp(), app_provenance=[]
+            task_id="t", logical_task_id="t", status="running",
+            conversation_id="known", attempt=3, runner_id="old",
+            task_fingerprint=fp(), app_provenance=[],
         )
     )
     with pytest.raises(RecoveryIncomplete, match="no submission journal user_message_id proof"):
@@ -251,7 +264,7 @@ def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None
     makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
     block = makefile.split("reset-recovery:", 1)[1].split("reset-stale:", 1)[0]
     assert 'test -n "$(TASK)"' in block
-    assert "docker compose run --rm --no-deps runner reset-recovery" in block
+    assert "docker compose run --rm --no-deps runner superbench-reset-recovery" in block
     assert '"$(TASK)" --yes' in block
 
 

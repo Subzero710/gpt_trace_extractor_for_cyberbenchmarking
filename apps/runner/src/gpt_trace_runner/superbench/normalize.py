@@ -4,6 +4,8 @@ import json
 from collections import defaultdict
 from typing import Any
 
+from ..tool_identity import stable_tool_name
+
 
 def _role(raw: dict) -> str:
     author = raw.get("author")
@@ -30,17 +32,6 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def _stable_tool_name(app_id: str, canonical_name: str) -> str:
-    def clean(value: str) -> str:
-        return "".join(
-            char if char.isalnum() else "_" for char in str(value)
-        ).strip("_")
-
-    app = clean(app_id)
-    tool = clean(canonical_name)
-    return f"{app}__{tool}" if app and tool else tool or app
-
-
 def _identity_maps(used_tool_calls, app_provenance):
     aliases: dict[str, set[str]] = defaultdict(set)
     call_names: dict[str, str] = {}
@@ -56,7 +47,7 @@ def _identity_maps(used_tool_calls, app_provenance):
             if not isinstance(tool, dict) or not tool.get("name"):
                 continue
             canonical = str(tool["name"])
-            stable = _stable_tool_name(app_id, canonical)
+            stable = stable_tool_name(app_id, canonical)
             aliases[canonical].add(stable)
 
     for call in used_tool_calls or []:
@@ -67,7 +58,7 @@ def _identity_maps(used_tool_calls, app_provenance):
         call_id = str(call.get("call_id") or "")
         if not app_id or not canonical:
             continue
-        stable = _stable_tool_name(app_id, canonical)
+        stable = stable_tool_name(app_id, canonical)
         if call_id:
             call_names[call_id] = stable
         call_message_id = str(call.get("call_message_id") or "")
@@ -260,7 +251,7 @@ def tools_from_provenance(apps: list[dict]):
             out.append(
                 {
                     "app_id": app_id,
-                    "name": _stable_tool_name(app_id, canonical),
+                    "name": stable_tool_name(app_id, canonical),
                     "description": str(tool.get("description") or ""),
                     "input_schema": json.dumps(
                         tool.get("inputSchema") or {},

@@ -28,11 +28,16 @@ async def test_health_manifest_and_control_auth(tmp_path: Path) -> None:
 
 def test_mcp_initialize_and_dns_rebinding_guard(tmp_path: Path) -> None:
     manager = WorkspaceManager(tmp_path / "workspace", tmp_path / "state")
-    app = create_app(manager, control_token="x" * 32)
+    app = create_app(
+        manager,
+        control_token="x" * 32,
+        allowed_hosts=["localhost:8000"],
+    )
     headers = {
         "accept": "application/json, text/event-stream",
         "content-type": "application/json",
         "origin": "https://chatgpt.com",
+        "authorization": "Bearer " + "x" * 32,
     }
     payload = {
         "jsonrpc": "2.0",
@@ -45,11 +50,15 @@ def test_mcp_initialize_and_dns_rebinding_guard(tmp_path: Path) -> None:
         },
     }
     with TestClient(app, base_url="http://localhost:8000") as client:
-        response = client.post("/mcp", headers=headers, json=payload)
+        response = client.post("/mcp/", headers=headers, json=payload)
         assert response.status_code == 200
         assert response.json()["result"]["serverInfo"] == {
             "name": "code-workspace",
             "version": "2.0.0",
         }
-        denied = client.post("/mcp", headers={**headers, "host": "attacker.example"}, json=payload)
+        denied = client.post(
+            "/mcp/",
+            headers={**headers, "host": "attacker.example"},
+            json=payload,
+        )
         assert denied.status_code == 421

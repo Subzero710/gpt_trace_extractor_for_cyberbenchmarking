@@ -1,6 +1,6 @@
 # Architecture
 
-Qwen-compatible function calling is the canonical representation. ChatGPT is the teacher runtime. A ChatGPT App is only a deployment grouping around canonical tools.
+Versioned App manifests and `(app_id, tool_name)` are the canonical tool contracts. ChatGPT is the teacher runtime. A ChatGPT App is only a deployment grouping around those contracts; training/export views are provider-independent.
 
 ```mermaid
 flowchart TB
@@ -80,19 +80,20 @@ No recovered conversation is ever paired with a fresh workspace or browser profi
 |---|---|---|---|
 | `core_internal` | PostgreSQL, storage, teacher browser, runner | No | persistent |
 | `ui_egress` | teacher browser | Yes | persistent |
+| `benchmark_source_egress` | generic benchmark-fetch container | Yes | fetch command only |
 | `app_control` | runner + stable gateways | No | persistent |
 | `gpt-trace-task-<id>` | requested backend container(s) + corresponding gateways | No | one attempt |
 | `gpt-trace-egress-<id>` | Browser backend only | Yes | one attempt |
 
-Workspace has no internet route. Browser receives a separate, non-internal egress network for its attempt. Both per-attempt networks are deleted during cleanup.
+Workspace has no internet route. Browser receives a separate, non-internal egress network for its attempt. Both per-attempt networks are deleted during cleanup. Benchmark source fetching is isolated on `benchmark_source_egress` and writes only to the dedicated `benchmark_sources` volume; normal runner execution mounts that volume read-only.
 
 ## Docker ownership
 
 Only the runner receives `/var/run/docker.sock`. Workspace containers, Browser containers and gateways never receive the socket. The model sees only canonical MCP tools, not Docker operations.
 
-## Qwen flattening
+## Dataset tool identity
 
-App boundaries are removed during dataset transformation. Unique canonical tool names stay unchanged. Collisions are deterministically namespaced in the Qwen view while provenance preserves `(app_id, tool_name, manifest_sha256)`. UI labels and Docker names never become canonical model tool names.
+Dataset transformations use one provider-independent global function name: `<normalized_app_id>__<tool_name>`. The shared naming helper is used by inspection and Superbench normalization, while provenance preserves `(app_id, tool_name, manifest_sha256)`. UI labels and Docker names never become model tool identities.
 
 ## Stored evidence
 

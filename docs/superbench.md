@@ -1,21 +1,43 @@
 # Superbench
 
-Superbench imports only original/upstream benchmark sources through `BenchmarkAdapter`. Adapters own discovery, materialization, environment validation, native evaluation and cleanup; the central runner only sees canonical tasks.
+Superbench imports upstream benchmark sources through `BenchmarkAdapter`. Adapters own source fetching, task discovery/materialization and native evaluation; the central runner operates on `TaskSpec` objects and benchmark-independent App/runtime contracts.
 
-Canonical identity is deterministic from upstream provenance and adapter version. `canonical_task_id` identifies a source task while `campaign_id` identifies the teacher/configuration. One task gets one normal attempt per campaign. A completed native evaluation is terminal whether `success=true` or `success=false`; infrastructure failure is stored separately and may be retried.
+A source task is identified by its adapter task ID. A stored trajectory ID is derived from the source task, adapter ID/version and teacher campaign. The campaign identity depends on the expected teacher model only. Runtime settings and the runner Git commit are retained as provenance but do not duplicate a task when a timeout or unrelated commit changes.
 
-Evaluation happens after the teacher trajectory and runtime provenance are captured and before App environment reset. There is no generic LLM judge. `success`, optional `reward`, and the complete native result are retained separately from `run_status`.
+Native evaluation happens after the teacher trajectory/runtime provenance is captured and before App reset. `EvaluationResult` contains `verdict` (`pass`/`fail`), optional score, details and evaluator metadata. Infrastructure failure remains separate in the run status.
 
-PostgreSQL remains authoritative. `make export` remains the complete JSONL debug export with nested messages. `make export-parquet` produces a typed canonical corpus and `make export-sft` derives successful, sanitized, provider-independent trajectories. No Qwen tokenizer or model-specific special tokens are stored; tokenization belongs to training time.
+PostgreSQL is authoritative. `make export` emits the raw JSONL storage export. `make export-parquet` produces the canonical typed corpus. `make export-sft` derives a tool-validated training view and, by default, keeps only native `pass` trajectories; `--verdict` can explicitly select another evaluation class for analysis.
 
-V2 intentionally ships no built-in benchmark adapter until an original upstream source with verified content provenance/license is selected. InterCode-CTF is not registered because its CTF tasks derive from picoCTF. Third-party adapters remain available through the `gpt_trace_runner.benchmark_adapters` entry-point group.
+## Benchmark source fetching
 
-To add a benchmark: implement `BenchmarkAdapter`, map upstream records to `CanonicalTask`, preserve upstream repository/commit/license metadata, implement native `evaluate`, add tests, and expose it through the adapter entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
+Fetching is generic infrastructure. `BenchmarkAdapter.fetch()` owns adapter-specific acquisition, while `make superbench-fetch ADAPTER=<adapter_id>` only selects an adapter. Source URLs, revisions and provider-specific semantics stay inside adapters.
 
-SFT use contaminates those source tasks for later evaluation. Use `dedup_group`/upstream origin to group related challenges, projects or vulnerability families; do not split near-duplicates independently. License metadata is provenance for later policy/filtering, not legal advice.
+Each adapter writes under `/data/state/superbench/sources/<adapter_id>`. The fetch container has its own `benchmark_source_egress` network and a dedicated `benchmark_sources` volume. It does not share the teacher browser's `ui_egress` network or the general `runner_state` volume. Normal runner execution mounts benchmark sources read-only.
 
-V2 uses `/data/state/superbench/staging` for writable staging, requires `GPT_TRACE_RUNNER_BUILD_ID` for campaign identity, evaluates recovery captures through the same task evaluator hook as the happy path, and streams JSONL into bounded Parquet row groups.
+A gated source can consume `BENCHMARK_SOURCE_TOKEN` during fetch. Normal Superbench execution uses only the local pinned cache.
 
-Recovery is journal-first: a pending journal is reconciled against its own canonical Superbench task before completed rows are skipped or new tasks are scheduled. Stateful adapters may override `BenchmarkAdapter.recover()` to reconnect evaluator-side state without provisioning a fresh environment. A running storage row without a matching journal is treated as an explicit recovery error rather than a retryable task.
+## GAIA smoke run
 
-`export-sft` is fail-closed for tool-use structure: every tool call must name a declared globally stable tool, call IDs must be unique, tool results must reference prior calls exactly once, and every call must have a result. The runtime `used_tool_calls` provenance is call-level and joins ChatGPT recipients to canonical App/tool identities.
+The built-in `gaia` adapter pins the official GAIA repository at revision `682dd723ee1e1697e00360edccf2366dc8418dd9`, using the 2023 validation Level-1 split and GAIA's native answer normalization.
+
+The adapter is deliberately configured to exercise both local MCP Apps across a short run. Tasks without a source file require Browser research. Tasks with a source file require Code Workspace; those files are seeded only into `/workspace/attachments/` rather than uploaded directly to ChatGPT. `LIMIT` selection prioritizes tasks that add uncovered required Apps before filling the remainder.
+
+After obtaining upstream GAIA access, set `BENCHMARK_SOURCE_TOKEN` and run:
+
+```bash
+make superbench-fetch ADAPTER=gaia
+make superbench-run ADAPTER=gaia LIMIT=3
+make superbench-status ADAPTER=gaia
+```
+
+The pinned split is validated to contain tasks requiring both Browser and Code Workspace. Ground-truth answers remain evaluator-side and are not copied into task metadata or prompts.
+
+## Adapter contract
+
+To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, preserve useful source provenance in task metadata, implement native `evaluate()` when an upstream oracle exists, add tests and expose the adapter through the `gpt_trace_runner.benchmark_adapters` entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
+
+`TaskSpec.tools` lists Apps available to the task. `TaskSpec.required_tools` is the subset that must actually be invoked; the captured ChatGPT conversation is checked against that requirement. Attachments intended for Code Workspace can be materialized through `initial_workspace` instead of being uploaded to the teacher conversation.
+
+Recovery remains journal-first. A pending journal is reconciled against its exact source task, adapter version and teacher campaign before new work is scheduled. Completed rows are immutable and are skipped only when the current pre-materialization task contract fingerprint still matches; this check includes prompt/source metadata, direct source artifacts/workspaces and current App contracts. Failed infrastructure attempts may be retried.
+
+`export-sft` is fail-closed for tool-use structure: tool calls must name declared stable tools, call IDs must be unique, tool results must reference prior calls exactly once, and every call must have a result.

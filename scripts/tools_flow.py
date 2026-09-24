@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -12,9 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose"]
 REGISTRATION_READY = "registration backends: ready"
-TUNNELS_PATH = ROOT / "state" / "tunnels.json"
 REGISTRY_PATH = ROOT / "apps" / "registry" / "apps.json"
-TUNNEL_ID = re.compile(r"^tunnel_[a-z0-9]{32}$")
 
 TUNNELS = (
     ("mcp-tunnel-workspace", "code-workspace"),
@@ -35,31 +32,6 @@ def parse_env(path: Path) -> dict[str, str]:
             raise RuntimeError(f"invalid .env line: {raw!r}")
         values[key.strip()] = value.strip().strip("'\"")
     return values
-
-
-def tunnel_state() -> dict[str, str]:
-    payload = json.loads(TUNNELS_PATH.read_text(encoding="utf-8"))
-    if (
-        not isinstance(payload, dict)
-        or payload.get("schema_version") != 1
-        or not isinstance(payload.get("tunnels"), dict)
-    ):
-        raise RuntimeError("state/tunnels.json is malformed")
-    tunnels = payload["tunnels"]
-    result: dict[str, str] = {}
-    for app_id in ("code-workspace", "browser"):
-        value = tunnels.get(app_id)
-        if not isinstance(value, str) or not TUNNEL_ID.fullmatch(value):
-            raise RuntimeError(f"invalid/missing tunnel id for {app_id}")
-        result[app_id] = value
-
-    if result["code-workspace"] == result["browser"]:
-        raise RuntimeError(
-            "invalid tunnel state: code-workspace and browser must use "
-            "different tunnel IDs"
-        )
-
-    return result
 
 
 def app_names() -> dict[str, str]:
@@ -85,9 +57,6 @@ def compose_env() -> dict[str, str]:
     env = dict(os.environ)
     for key, value in parse_env(ROOT / ".env").items():
         env[key] = value
-    tunnels = tunnel_state()
-    env["APP_CODE_WORKSPACE_TUNNEL_ID"] = tunnels["code-workspace"]
-    env["APP_BROWSER_TUNNEL_ID"] = tunnels["browser"]
     return env
 
 

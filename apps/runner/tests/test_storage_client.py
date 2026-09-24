@@ -32,7 +32,7 @@ async def test_safe_start_retry_preserves_app_provenance() -> None:
         return httpx.Response(
             200,
             json={
-                "task_id": "t", "status": "running", "attempt": 1,
+                "task_id": "t", "logical_task_id": "t", "status": "running", "attempt": 1,
                 "runner_id": "r", "app_provenance": [{"app_id": "browser"}],
             },
             request=request,

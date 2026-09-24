@@ -1,23 +1,25 @@
 from pathlib import Path
 
 
-def test_conversation_id_unique_index_migration_exists() -> None:
-    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0003_guard_run_integrity.py"
-    text = migration.read_text()
-    assert "unique=True" in text
-    assert "conversation_id IS NOT NULL" in text
+def initial_migration_text() -> str:
+    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0001_initial.py"
+    return migration.read_text(encoding="utf-8")
 
 
-def test_migration_preflights_existing_integrity() -> None:
-    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0003_guard_run_integrity.py"
-    text = migration.read_text()
-    assert "HAVING count(*) > 1" in text
-    assert "invalid run status exists" in text
-    assert "negative attempt exists" in text
+def test_squashed_schema_has_unique_non_null_conversation_index() -> None:
+    text = initial_migration_text()
+    assert '"uq_runs_conversation_id_not_null"' in text
+    assert 'unique=True' in text
+    assert 'conversation_id IS NOT NULL' in text
 
 
-def test_app_provenance_migration_follows_integrity_guards() -> None:
-    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0004_add_app_provenance.py"
-    text = migration.read_text()
-    assert 'down_revision = "0003"' in text
-    assert '"app_provenance"' in text
+def test_squashed_schema_keeps_run_integrity_constraints() -> None:
+    text = initial_migration_text()
+    assert "status IN ('pending','running','completed','failed')" in text
+    assert 'attempt >= 0' in text
+    assert '"ck_runs_status"' in text
+    assert '"ck_runs_attempt_nonnegative"' in text
+
+
+def test_squashed_schema_contains_app_provenance() -> None:
+    assert '"app_provenance"' in initial_migration_text()

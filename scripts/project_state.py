@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import secrets
@@ -14,12 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SECRETS_DIR = ROOT / ".secrets"
 CONTROL_TOKEN = SECRETS_DIR / "app_control_token"
-TUNNELS_PATH = ROOT / "state" / "tunnels.json"
 
 KNOWN_SECRET_KEYS = {
     "POSTGRES_PASSWORD",
     "CLOAKBROWSER_LICENSE_KEY",
     "CONTROL_PLANE_API_KEY",
+    "APP_CODE_WORKSPACE_TUNNEL_ID",
+    "APP_BROWSER_TUNNEL_ID",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -92,31 +92,19 @@ def ensure_control_token() -> None:
     atomic_secret(CONTROL_TOKEN, secrets.token_urlsafe(48) + "\n")
 
 
-def validate_tunnels() -> None:
-    try:
-        payload = json.loads(TUNNELS_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SystemExit(
-            "missing state/tunnels.json; rerun the architecture migration "
-            "or restore the two existing tunnel IDs"
-        ) from exc
-    if (
-        not isinstance(payload, dict)
-        or payload.get("schema_version") != 1
-        or not isinstance(payload.get("tunnels"), dict)
-    ):
-        raise SystemExit("state/tunnels.json is malformed")
-    tunnels = payload["tunnels"]
-    for app_id in ("code-workspace", "browser"):
-        value = tunnels.get(app_id)
-        if not isinstance(value, str) or not TUNNEL_ID.fullmatch(value):
-            raise SystemExit(f"invalid/missing tunnel id for {app_id}")
+def validate_tunnels(values: dict[str, str]) -> None:
+    tunnel_keys = (
+        "APP_CODE_WORKSPACE_TUNNEL_ID",
+        "APP_BROWSER_TUNNEL_ID",
+    )
+    for key in tunnel_keys:
+        value = values.get(key, "")
+        if not TUNNEL_ID.fullmatch(value):
+            raise SystemExit(f"invalid/missing {key} in .env")
 
-    workspace_tunnel = tunnels["code-workspace"]
-    browser_tunnel = tunnels["browser"]
-    if workspace_tunnel == browser_tunnel:
+    if values[tunnel_keys[0]] == values[tunnel_keys[1]]:
         raise SystemExit(
-            "invalid tunnel state: code-workspace and browser must use "
+            "invalid tunnel configuration: code-workspace and browser must use "
             "different tunnel IDs"
         )
 
@@ -132,7 +120,7 @@ def main() -> int:
     ensure_control_token()
 
     if args.mode in ("doctor", "tools"):
-        validate_tunnels()
+        validate_tunnels(values)
 
     if args.mode == "tools":
         if not values.get("CONTROL_PLANE_API_KEY"):

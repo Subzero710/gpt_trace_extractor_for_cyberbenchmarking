@@ -45,7 +45,7 @@ def create_app(manager,control_token,allowed_hosts=None):
   elif name=='search_files':r=manager.search_files(arguments)
   else:raise WorkspaceError(f'unknown tool: {name}')
   return ([types.TextContent(type='text',text=json.dumps(r,sort_keys=True,separators=(',',':')))],r)
- sm=StreamableHTTPSessionManager(app=server,event_store=None,json_response=True,stateless=True,security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=True,allowed_hosts=allowed_hosts or []))
+ sm=StreamableHTTPSessionManager(app=server,event_store=None,json_response=True,stateless=True,security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=True,allowed_hosts=allowed_hosts or [],allowed_origins=["https://chatgpt.com"]))
  async def mcp(scope,receive,send):
   headers={key.decode('latin1').casefold():value.decode('latin1') for key,value in scope.get('headers',[])}
   if not hmac.compare_digest(headers.get('authorization',''),f'Bearer {control_token}'):

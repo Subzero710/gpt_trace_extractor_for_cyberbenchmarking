@@ -4,7 +4,7 @@ This project runs benchmark tasks through the real ChatGPT web UI, captures obse
 
 ## Public workflow
 
-The Make interface intentionally exposes only seven lifecycle commands:
+The public production interface is the Superbench lifecycle below.
 
 ```bash
 sudo make build
@@ -12,11 +12,18 @@ sudo make up
 sudo make doctor
 sudo make tools
 sudo make auth
-sudo make run
+sudo make superbench-fetch ADAPTER=gaia
+sudo make run ADAPTER=gaia
+sudo make pause
+sudo make resume
+sudo make status
+sudo make reset-recovery TASK=<run_task_id>
+sudo make export-parquet
+sudo make export-sft
 sudo make down
 ```
 
-`build` builds project images with the dedicated BuildKit builder. `up` starts the persistent core. `doctor` runs the maximal non-ChatGPT runtime preflight. `tools` prepares the two real local MCP backends and Secure MCP Tunnels for ChatGPT App registration/verification. `auth` verifies the ChatGPT session and resolves Apps through `@` mentions. `run` runs/resumes the benchmark. `down` performs strict runtime teardown without deleting persistent benchmark data.
+`build` builds project images with the dedicated BuildKit builder. `up` starts the persistent core. `doctor` runs the maximal non-ChatGPT runtime preflight. `tools` prepares the two real local MCP backends and Secure MCP Tunnels for ChatGPT App registration/verification. `auth` verifies the ChatGPT session and Apps. `run` starts a new frozen Superbench campaign. `pause` requests a safe-boundary pause. `resume` continues the frozen active run. `status` reports active-run and storage state. `reset-recovery` explicitly abandons pending recovery. `down` performs strict runtime teardown without deleting persistent benchmark data.
 
 ## Configuration and secrets
 
@@ -28,7 +35,7 @@ CLOAKBROWSER_LICENSE_KEY=...
 CONTROL_PLANE_API_KEY=...
 ```
 
-Stable non-secret runner configuration is versioned in `config/runner.toml`. App names, endpoints and canonical manifests are versioned under `apps/registry/` and the App directories. Provisioned non-secret tunnel IDs live in ignored local state at `state/tunnels.json`.
+Stable non-secret runner configuration is versioned in `config/runner.toml`. App names, endpoints and canonical manifests are versioned under `apps/registry/` and the App directories. Provisioned non-secret tunnel IDs are supplied through the current local `.env` provisioning state.
 
 The persistent teacher-browser identity belongs to the `browser_profile` Docker volume at `/profile/.gpt-trace-identity`. It is created once for a fresh profile and reused thereafter. It is never regenerated from `.env`.
 
@@ -55,7 +62,7 @@ The versioned visible names are:
 - `Code Workspace`
 - `Cloak Browser`
 
-Use `sudo make tools` for the one-time/repair registration flow. The command reads tunnel IDs from `state/tunnels.json`, starts real temporary backends, starts the Dockerized Secure MCP Tunnel clients, waits for MCP initialization, and asks you to verify both Apps with `@` in ChatGPT before cleaning the temporary registration backends.
+Use `sudo make tools` for the one-time/repair registration flow. The command uses the currently provisioned tunnel IDs from local `.env` state, starts real temporary backends, starts the Dockerized Secure MCP Tunnel clients, waits for MCP initialization, and asks you to verify both Apps with `@` in ChatGPT before cleaning the temporary registration backends.
 
 The benchmark runner uses the `@` mention path for App discovery/selection instead of relying on the `+` App picker.
 
@@ -63,7 +70,22 @@ The benchmark runner uses the `@` mention path for App discovery/selection inste
 
 Benchmark definitions use stable logical App IDs such as `code-workspace` and `browser`; mutable UI labels are not benchmark identities.
 
-The current smoke benchmark is `benchmarks/benchmark.jsonl`. `make doctor` validates local Workspace/Browser execution and isolation before ChatGPT is involved.
+Superbench is the only production benchmark execution path. `make doctor` validates local Workspace/Browser execution and isolation before ChatGPT is involved.
+
+Production lifecycle:
+
+```bash
+sudo make superbench-fetch ADAPTER=gaia
+sudo make run ADAPTER=gaia
+sudo make pause
+sudo make resume
+sudo make status
+sudo make reset-recovery TASK=<run_task_id>
+```
+
+`make run` freezes the exact selected task IDs and their adapter/task/App/config identity. LIMIT applies only when creating the run; resume uses only the frozen IDs and the same campaign. `make pause` and the first Ctrl+C are cooperative and stop only at a safe task boundary. A second Ctrl+C is a hard interrupt; a later `make resume` recovers the same run when RunnerLock is free.
+
+Evaluator `fail` is a normal completed benchmark result and the batch continues. Every technical error stops the batch. Authentication/challenge/access incidents enter `needs_intervention`; use noVNC to resolve them and then `sudo make resume`. Rate limits, recovery errors and other infrastructure errors pause the run and expose their reason in `make status`. `make status` combines active-run state, storage state and evaluations. `make reset-recovery` abandons only the matching frozen recovery attempt and never marks that task completed.
 
 Persistent PostgreSQL data, the teacher browser profile and provisioned local state survive `make down`.
 

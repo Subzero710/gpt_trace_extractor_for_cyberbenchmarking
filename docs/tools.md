@@ -3,8 +3,9 @@
 ChatGPT App and canonical model tool are different concepts:
 
 - A ChatGPT App is a runtime grouping used to install and select capabilities in the teacher UI.
-- A canonical tool is a stable function contract recorded for the trajectory and later supplied to Qwen.
-- Qwen is the source of truth for names and schemas. Container, MCP transport, connector and UI naming remain provenance or deployment metadata.
+- A canonical tool is a stable function contract recorded for the trajectory and later exposed through provider-independent dataset views.
+- The versioned App manifest is the source of truth for names and schemas. Container, MCP transport, connector and UI naming remain provenance or deployment metadata.
+- Dataset-level function names are globally stable as `<normalized_app_id>__<tool_name>`; the original `(app_id, tool_name)` pair remains in provenance.
 
 ## Registry
 
@@ -12,8 +13,8 @@ ChatGPT App and canonical model tool are different concepts:
 
 | ID | Ownership | Default UI name | Canonical tools |
 |---|---|---|---|
-| `code-workspace` | local MCP | `Code Workspace` | `exec_command`, `read_file`, `write_file`, `apply_patch`, `list_directory`, `search_files` |
-| `browser` | local MCP | `Browser` | `search`, `navigate`, `read_page`, `click`, `type`, `press`, `wait`, `screenshot`, `download`, `tabs` |
+| `code-workspace` | local MCP | `Code Workspace` | 43 tools; authoritative list is `apps/code-workspace/tool-manifest.json` |
+| `browser` | local MCP | `Cloak Browser` | 42 tools; authoritative list is `apps/browser/tool-manifest.json` |
 | `github` | external connector | configuration required | exact externally supplied manifest |
 
 Every entry records ownership, resolution settings, version, manifest path, endpoint metadata and attachment behavior. Committed local entries also lock the expected manifest SHA-256.
@@ -92,7 +93,7 @@ The file must be an authoritative manifest with exactly this outer shape:
 
 The example shows structure only; do not use it as an operational manifest. Obtain the exact version, descriptions and schemas from the installed connector owner or source. The runner computes its SHA-256 at load time and stores the complete validated manifest. A missing manifest is a hard error.
 
-## Inspect and flatten
+## Inspect canonical tool identities
 
 ```bash
 docker compose run --rm --no-deps runner \
@@ -100,25 +101,25 @@ docker compose run --rm --no-deps runner \
   --task-id incident_reconstruction_001
 ```
 
-The command prints the task fingerprint, resolved App provenance, and Qwen-compatible function definitions:
+The command prints the task fingerprint, resolved App provenance, and provider-independent canonical function definitions:
 
 ```json
 {
   "type": "function",
   "function": {
-    "name": "exec_command",
+    "name": "code_workspace__exec_command",
     "description": "Execute one shell command in the active task workspace and return bounded stdout, stderr, exit status, and timeout state.",
     "parameters": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}}, "required": ["command"]}
   }
 }
 ```
 
-The live output contains the complete committed schema. When names collide across Apps, the Qwen view uses `<normalized_app_id>__<tool_name>` for all members of that collision and emits `tool_identity` records mapping each function back to its canonical pair and manifest hash.
+The live output contains the complete committed schema. Every function uses `<normalized_app_id>__<tool_name>` and `tool_identity` records map it back to the canonical pair and manifest hash. The same naming function is used by Superbench normalization, so inspection and exported trajectories cannot disagree.
 
 ## Add or change a local App
 
 1. Use one coherent capability bundle and a stable MCP gateway when the backend must be ephemeral per attempt.
-2. Define precise Qwen-oriented tools in the App's `contracts.py` and generate the matching `tool-manifest.json`.
+2. Define precise provider-neutral tools in the App's `contracts.py` and generate the matching `tool-manifest.json`.
 3. Change the semantic version for a model-visible semantic or schema change.
 4. Canonicalize JSON with sorted keys and compact separators, calculate SHA-256, and update the registry's `version` and `manifest_sha256`.
 5. Add an isolated control endpoint implementing identity-matched `prepare`, `resume` and `reset` if the App owns task state.
