@@ -586,4 +586,3 @@ class BenchmarkRunner:
                 await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
                 self.journal.clear()
             raise
-

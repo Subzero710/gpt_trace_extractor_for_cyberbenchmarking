@@ -230,4 +230,3 @@ class AppRegistry:
         if definition is None:
             raise AppRegistryError(f"unknown logical App id {app_id!r}")
         return definition.resolve()
-

@@ -39,4 +39,3 @@ reset-recovery:
 	@test -n "$(TASK)" || (echo "usage: sudo make reset-recovery TASK=<run_task_id>" >&2; exit 2)
 	python3 scripts/project_state.py core
 	docker compose run --rm --no-deps runner superbench-reset-recovery "$(TASK)" --yes
-

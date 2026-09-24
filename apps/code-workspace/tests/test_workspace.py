@@ -28,9 +28,7 @@ async def manager(tmp_path: Path) -> WorkspaceManager:
     )
     fixture = item.workspace_root / "fixtures" / "a.txt"
     fixture.parent.mkdir(parents=True)
-    fixture.write_bytes(b"hello
-world
-")
+    fixture.write_bytes(b"hello\\nworld\\n")
     await item.prepare(identity())
     return item
 
