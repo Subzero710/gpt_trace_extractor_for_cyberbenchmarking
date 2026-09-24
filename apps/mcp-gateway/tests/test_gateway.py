@@ -83,7 +83,7 @@ async def test_gateway_binds_one_exact_backend_and_proxies_mcp_without_external_
     assert request.url == f"{BACKEND}/mcp/"
     assert request.headers["host"] == "gpt-trace-workspace-0123456789abcdef0123:8000"
     assert request.headers["x-test"] == "ok"
-    assert "authorization" not in request.headers
+    assert request.headers["authorization"] == "Bearer " + "b" * 64
 
 
 @pytest.mark.asyncio
