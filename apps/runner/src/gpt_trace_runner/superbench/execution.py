@@ -90,6 +90,30 @@ async def _connect_chatgpt(*, settings, make_chatgpt, bt):
         raise
 
 
+async def _cleanup_task(
+    *,
+    adapter,
+    task,
+    prepared,
+    console,
+    task_id: str,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        await adapter.cleanup(task, prepared=prepared)
+    except (KeyboardInterrupt, BatchCircuitBreaker):
+        raise
+    except Exception as cleanup_error:
+        if console is not None:
+            console.print(
+                f"[red]{task_id}: cleanup "
+                f"{type(cleanup_error).__name__}: {cleanup_error}[/]"
+            )
+        if primary_error is None:
+            raise
+        # The batch is already stopping for primary_error. Do not mask it.
+
+
 async def _recover_pending_journal(
     *,
     settings,
@@ -137,6 +161,7 @@ async def _recover_pending_journal(
     )
     lifecycle = make_lifecycle(settings, [bt])
     session = None
+    recovery_error: BaseException | None = None
     try:
         session, chatgpt = await _connect_chatgpt(
             settings=settings, make_chatgpt=make_chatgpt, bt=bt
@@ -160,25 +185,27 @@ async def _recover_pending_journal(
         try:
             await runner.reconcile_journal([bt])
         except BaseException as exc:
-            # A task-local recovery failure may have terminalized the attempt and
-            # cleared the journal (for example RequiredToolNotUsed). In that case
-            # recovery is resolved and the Superbench may continue.
-            if journal.load() is None and not isinstance(
-                exc, (KeyboardInterrupt, BatchCircuitBreaker)
-            ):
-                if console is not None:
-                    console.print(
-                        f"[red]{bt.task_id}: recovery terminalized after "
-                        f"{type(exc).__name__}: {exc}[/]"
-                    )
-            else:
-                raise
+            recovery_error = exc
+            if console is not None:
+                console.print(
+                    f"[red]{bt.task_id}: recovery failed after "
+                    f"{type(exc).__name__}: {exc}[/]"
+                )
+            # Recovery failures are technical failures: never continue the batch.
+            raise
     finally:
         if session is not None:
             await session.disconnect()
         # Never destroy evaluator-side state while recovery is still pending.
         if journal.load() is None:
-            await adapter.cleanup(task, prepared=prepared)
+            await _cleanup_task(
+                adapter=adapter,
+                task=task,
+                prepared=prepared,
+                console=console,
+                task_id=bt.task_id,
+                primary_error=recovery_error,
+            )
         await lifecycle.close()
 
 
@@ -324,14 +351,21 @@ async def run_pending(
                     raise RuntimeError("Superbench run identity changed during materialization")
 
                 if executor is not None:
+                    executor_error: BaseException | None = None
                     try:
                         await executor(adapter, task, bt, camp, storage)
-                    except (KeyboardInterrupt, BatchCircuitBreaker):
-                        raise
-                    except Exception:
+                    except BaseException as exc:
+                        executor_error = exc
                         raise
                     finally:
-                        await adapter.cleanup(task, prepared=None)
+                        await _cleanup_task(
+                            adapter=adapter,
+                            task=task,
+                            prepared=None,
+                            console=console,
+                            task_id=bt.task_id,
+                            primary_error=executor_error,
+                        )
                     attempted += 1
                     if control_store is not None:
                         latest = await storage.get(run_id)
@@ -345,6 +379,7 @@ async def run_pending(
                 runner = None
                 runner_started = False
                 recovery_required = False
+                primary_error: BaseException | None = None
                 journal = JournalStore(settings.journal_path)
 
                 try:
@@ -376,6 +411,7 @@ async def run_pending(
                     await runner.run_task(bt, True)
 
                 except BaseException as exc:
+                    primary_error = exc
                     latest = await storage.get(bt.task_id)
                     pending = journal.load()
                     pending_for_task = pending is not None and pending.task_id == bt.task_id
@@ -451,16 +487,14 @@ async def run_pending(
                     if session is not None:
                         await session.disconnect()
                     if not recovery_required:
-                        try:
-                            await adapter.cleanup(task, prepared=prepared)
-                        except (KeyboardInterrupt, BatchCircuitBreaker):
-                            raise
-                        except Exception as exc:
-                            if console is not None:
-                                console.print(
-                                    f"[yellow]{bt.task_id}: cleanup "
-                                    f"{type(exc).__name__}: {exc}[/]"
-                                )
+                        await _cleanup_task(
+                            adapter=adapter,
+                            task=task,
+                            prepared=prepared,
+                            console=console,
+                            task_id=bt.task_id,
+                            primary_error=primary_error,
+                        )
                     if lifecycle is not None:
                         await lifecycle.close()
                 if control_store is not None:

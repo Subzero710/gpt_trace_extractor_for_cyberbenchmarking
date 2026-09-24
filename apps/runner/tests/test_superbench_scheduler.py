@@ -190,3 +190,126 @@ async def test_pre_runner_failure_uses_one_runner_identity():
     )
     assert settings.calls == 1
     assert storage.started_runner == storage.failed_runner == "runner-1"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_technical_failure_stops_before_next_task():
+    class CleanupFailingAdapter(TwoTaskAdapter):
+        async def cleanup(self, task, *, prepared):
+            raise RuntimeError(f"cleanup:{task.task_id}")
+
+    seen = []
+
+    async def execute(adapter, task, *args):
+        seen.append(task.task_id)
+
+    with pytest.raises(RuntimeError, match=r"cleanup:a:1"):
+        await run_pending(
+            settings=Settings(),
+            registry=Registry(),
+            make_lifecycle=None,
+            make_chatgpt=None,
+            console=None,
+            adapters=AdapterRegistry([CleanupFailingAdapter()]),
+            storage=PerTaskStorage(None),
+            executor=execute,
+        )
+
+    assert seen == ["a:1"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_technical_failure_stops_even_if_journal_was_cleared(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import gpt_trace_runner.superbench.execution as execution_module
+    from gpt_trace_runner.superbench.models import run_task_id
+
+    class RecoverySettings(Settings):
+        journal_path = tmp_path / "submission.json"
+
+        def effective_runner_id(self):
+            return "runner-test"
+
+    class FakeJournal:
+        def __init__(self, pending):
+            self.pending = pending
+
+        def load(self):
+            return self.pending
+
+    class FakeLifecycle:
+        async def close(self):
+            return None
+
+    class FakeSession:
+        async def disconnect(self):
+            return None
+
+    settings = RecoverySettings()
+    adapter = A()
+    adapters = AdapterRegistry([adapter])
+    source_task = adapter.discover_tasks()[0]
+    camp = campaign(settings)
+    pending = SimpleNamespace(
+        task_id=run_task_id(
+            source_task.task_id,
+            camp.campaign_id,
+            adapter.adapter_id,
+            adapter.adapter_version,
+        ),
+        attempt=1,
+        app_environments={},
+    )
+    journal = FakeJournal(pending)
+
+    monkeypatch.setattr(
+        execution_module,
+        "JournalStore",
+        lambda _path: journal,
+    )
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        async def reconcile_journal(self, tasks):
+            journal.pending = None
+            raise ValueError("recovery-tech")
+
+    monkeypatch.setattr(
+        execution_module,
+        "BenchmarkRunner",
+        FakeRunner,
+    )
+
+    async def fake_connect_chatgpt(**kwargs):
+        return FakeSession(), object()
+
+    monkeypatch.setattr(
+        execution_module,
+        "_connect_chatgpt",
+        fake_connect_chatgpt,
+    )
+
+    with pytest.raises(ValueError, match="recovery-tech"):
+        await execution_module._recover_pending_journal(
+            settings=settings,
+            registry=Registry(),
+            make_lifecycle=lambda _settings, _tasks: FakeLifecycle(),
+            make_chatgpt=None,
+            console=None,
+            adapters=adapters,
+            entries=[
+                CatalogEntry(
+                    task=source_task,
+                    adapter_id=adapter.adapter_id,
+                )
+            ],
+            camp=camp,
+            storage=object(),
+            staging=tmp_path,
+        )
