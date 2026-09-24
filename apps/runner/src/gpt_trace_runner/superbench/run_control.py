@@ -67,13 +67,19 @@ class RunControlStore:
     def _lock(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            # Mark the transaction before flock acquisition and keep it marked
+            # until after flock release. A SIGINT in either tiny boundary window
+            # must only set _signal_pause_pending; it must never recursively try
+            # to acquire the same flock from the signal handler.
             self._transaction_depth += 1
             try:
-                yield
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self._transaction_depth -= 1
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 if self._transaction_depth == 0:
                     self._flush_signal_pause()
 

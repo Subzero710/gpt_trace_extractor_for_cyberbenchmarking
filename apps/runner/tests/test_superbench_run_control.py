@@ -78,6 +78,83 @@ def test_signal_pause_during_transaction_is_not_lost(tmp_path, monkeypatch):
     assert state.current_run_task_id == "x"
 
 
+
+def test_signal_after_flock_acquire_is_deferred_until_unlock(
+    tmp_path,
+    monkeypatch,
+):
+    import gpt_trace_runner.superbench.run_control as run_control_module
+
+    store = RunControlStore(tmp_path / "active.json")
+    store.create(make_run())
+
+    owned = False
+    fired = False
+
+    def fake_flock(_fd, operation):
+        nonlocal owned, fired
+        if operation == run_control_module.fcntl.LOCK_EX:
+            if owned:
+                raise AssertionError(
+                    "signal path recursively tried to acquire the active flock"
+                )
+            owned = True
+            if not fired:
+                fired = True
+                assert store._transaction_depth == 1
+                store.request_pause_from_signal()
+                assert store._signal_pause_pending is True
+        elif operation == run_control_module.fcntl.LOCK_UN:
+            assert owned is True
+            owned = False
+
+    monkeypatch.setattr(run_control_module.fcntl, "flock", fake_flock)
+
+    store.load()
+
+    assert fired is True
+    assert owned is False
+    assert store.load().status == "pause_requested"
+
+
+def test_signal_before_flock_release_is_deferred_until_unlock(
+    tmp_path,
+    monkeypatch,
+):
+    import gpt_trace_runner.superbench.run_control as run_control_module
+
+    store = RunControlStore(tmp_path / "active.json")
+    store.create(make_run())
+
+    owned = False
+    fired = False
+
+    def fake_flock(_fd, operation):
+        nonlocal owned, fired
+        if operation == run_control_module.fcntl.LOCK_EX:
+            if owned:
+                raise AssertionError(
+                    "signal path recursively tried to acquire the active flock"
+                )
+            owned = True
+        elif operation == run_control_module.fcntl.LOCK_UN:
+            assert owned is True
+            if not fired:
+                fired = True
+                assert store._transaction_depth == 1
+                store.request_pause_from_signal()
+                assert store._signal_pause_pending is True
+            owned = False
+
+    monkeypatch.setattr(run_control_module.fcntl, "flock", fake_flock)
+
+    store.load()
+
+    assert fired is True
+    assert owned is False
+    assert store.load().status == "pause_requested"
+
+
 def test_failed_attempt_is_not_completion(tmp_path):
     store = RunControlStore(tmp_path / "active.json")
     store.create(make_run())

@@ -264,7 +264,7 @@ def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None
     makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
     block = makefile.split("reset-recovery:", 1)[1].split("reset-stale:", 1)[0]
     assert 'test -n "$(TASK)"' in block
-    assert "docker compose run --rm --no-deps runner reset-recovery" in block
+    assert "docker compose run --rm --no-deps runner superbench-reset-recovery" in block
     assert '"$(TASK)" --yes' in block
 
 

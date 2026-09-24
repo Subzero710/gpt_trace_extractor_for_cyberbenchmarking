@@ -4,7 +4,7 @@ This project runs benchmark tasks through the real ChatGPT web UI, captures obse
 
 ## Public workflow
 
-The Make interface exposes the production lifecycle commands `init`, `up`, `auth`, `run`, `pause`, `resume`, `status`, `reset-recovery`, `stop`, and `down`.
+The public production interface is the Superbench lifecycle below.
 
 ```bash
 sudo make build
@@ -12,7 +12,14 @@ sudo make up
 sudo make doctor
 sudo make tools
 sudo make auth
-sudo make run
+sudo make superbench-fetch ADAPTER=gaia
+sudo make run ADAPTER=gaia
+sudo make pause
+sudo make resume
+sudo make status
+sudo make reset-recovery TASK=<run_task_id>
+sudo make export-parquet
+sudo make export-sft
 sudo make down
 ```
 
