@@ -23,7 +23,9 @@ from .exceptions import (
     AuthenticationRequired,
     ChatGPTUIError,
     ConcurrentTurnError,
+    ConversationError,
     ConversationNotFound,
+    ConversationStreamIncomplete,
     EnvironmentDrift,
     FatalUIState,
     ModelMismatch,
@@ -532,8 +534,21 @@ class ChatGPTClient:
         if self._active_turn is not submitted:
             raise ConcurrentTurnError("submitted turn is not active")
         try:
-            stream_result = await submitted.stream.wait()
-            if stream_result.conversation_id != submitted.conversation_id:
+            stream_result = None
+            stream_incomplete: ConversationStreamIncomplete | None = None
+            try:
+                stream_result = await submitted.stream.wait()
+            except ConversationStreamIncomplete as exc:
+                # The frontend can close an SSE without the terminal end_turn
+                # marker even though the durable conversation has already
+                # committed a complete assistant turn. Do not resubmit; verify
+                # the durable conversation below using the exact user message ID.
+                stream_incomplete = exc
+
+            if (
+                stream_result is not None
+                and stream_result.conversation_id != submitted.conversation_id
+            ):
                 raise AmbiguousSubmission(
                     "conversation ID mismatch between browser URL and completed SSE: "
                     f"url={submitted.conversation_id!r}, "
@@ -552,17 +567,46 @@ class ChatGPTClient:
             messages = None
             if conversation is not None:
                 try:
-                    messages = self._validated_messages(conversation, submitted.user_message_id)
+                    messages = self._validated_messages(
+                        conversation,
+                        submitted.user_message_id,
+                    )
                     self._traffic.mark_natural_snapshot_used()
                 except Exception:
                     messages = None
             if messages is None:
                 self._traffic.mark_fallback_snapshot()
-                conversation = await self._conversation.fetch(submitted.conversation_id)
-                messages = self._validated_messages(conversation, submitted.user_message_id)
+                try:
+                    conversation = await self._conversation.fetch(
+                        submitted.conversation_id
+                    )
+                    messages = self._validated_messages(
+                        conversation,
+                        submitted.user_message_id,
+                    )
+                except ConversationError as exc:
+                    if stream_incomplete is not None:
+                        # Keep the durable recovery path intact when the
+                        # conversation snapshot cannot prove completion either.
+                        raise stream_incomplete from exc
+                    raise
 
             used_apps = self._validate_required_tools(submitted.task, messages)
-            metadata = stream_result.runtime_metadata()
+            if stream_result is not None:
+                metadata = stream_result.runtime_metadata()
+            else:
+                assert stream_incomplete is not None
+                metadata = {
+                    "stream_protocol": "sse",
+                    "conversation_id": submitted.conversation_id,
+                    "final_end_turn": False,
+                    "message_stream_complete": False,
+                    "done": False,
+                    "last_token": False,
+                    "stream_recovered_from_incomplete": True,
+                    "stream_error_type": type(stream_incomplete).__name__,
+                    "stream_error_message": str(stream_incomplete),
+                }
             metadata.update(self._traffic.runtime_metadata())
             metadata.update({
                 "recovered": False,

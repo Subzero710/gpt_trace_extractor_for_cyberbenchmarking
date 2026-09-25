@@ -31,6 +31,52 @@ ANSWER_INSTRUCTION = (
     "'FINAL ANSWER: <answer>'."
 )
 
+_BROWSER_TOOL_HINTS = (
+    "web browser",
+    "search engine",
+    "browser",
+    "search",
+    "website",
+    "internet",
+    "youtube",
+    "video",
+    "web",
+)
+_WORKSPACE_TOOL_HINTS = (
+    "calculator",
+    "python",
+    "programming",
+    "code",
+    "spreadsheet",
+    "excel",
+    "csv",
+    "terminal",
+    "shell",
+    "pdf",
+    "image",
+    "audio",
+    "file",
+    "document",
+)
+
+
+def _annotator_tool_text(row: dict[str, Any]) -> str:
+    metadata = row.get("Annotator Metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    value = metadata.get("Tools")
+    return str(value or "").strip()
+
+
+def _runtime_tools(*, file_path: str | None, annotator_tools: str) -> tuple[str, ...]:
+    normalized = re.sub(r"\s+", " ", annotator_tools).casefold()
+    tools: list[str] = []
+    if any(hint in normalized for hint in _BROWSER_TOOL_HINTS):
+        tools.append("browser")
+    if file_path or any(hint in normalized for hint in _WORKSPACE_TOOL_HINTS):
+        tools.append("code-workspace")
+    return tuple(tools)
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -133,7 +179,7 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "4"
+    adapter_version = "5"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}
@@ -227,6 +273,11 @@ class GAIAAdapter(BenchmarkAdapter):
             source_file_sha256 = (
                 _sha256_file(self._require_file(file_path)) if file_path else None
             )
+            annotator_tools = _annotator_tool_text(row)
+            runtime_tools = _runtime_tools(
+                file_path=file_path,
+                annotator_tools=annotator_tools,
+            )
 
             if not upstream_id or not question:
                 raise ValueError("GAIA row has an empty task_id or Question")
@@ -242,21 +293,22 @@ class GAIAAdapter(BenchmarkAdapter):
                 raise ValueError(f"duplicate GAIA task id {logical_id!r}")
 
             answers[logical_id] = str(ground_truth)
+            prompt_parts = [question]
             if file_path:
-                required_tools = ("code-workspace",)
-                tool_instruction = (
-                    "Use Code Workspace to inspect the benchmark file under "
-                    "/workspace/attachments/ before answering."
+                # GAIA normally exposes the attachment directly to the assistant.
+                # In this harness it is mounted into the isolated workspace instead,
+                # so tell the model where the resource is without ordering a tool call.
+                prompt_parts.append(
+                    "A benchmark file is available in Code Workspace under "
+                    "/workspace/attachments/."
                 )
-            else:
-                required_tools = ("browser",)
-                tool_instruction = "Use Browser to research and verify the answer before responding."
+            prompt_parts.append(ANSWER_INSTRUCTION)
             tasks.append(
                 TaskSpec(
                     task_id=logical_id,
-                    prompt=f"{question}\n\n{tool_instruction}\n{ANSWER_INSTRUCTION}",
-                    tools=("browser", "code-workspace"),
-                    required_tools=required_tools,
+                    prompt="\n\n".join(prompt_parts),
+                    tools=runtime_tools,
+                    required_tools=(),
                     metadata={
                         "benchmark": "GAIA",
                         "year": GAIA_YEAR,
@@ -271,20 +323,17 @@ class GAIAAdapter(BenchmarkAdapter):
                         "access": "gated",
                         "file_path": file_path,
                         "source_file_sha256": source_file_sha256,
+                        "annotator_tools": annotator_tools or None,
                     },
                 )
             )
 
-        required_apps = {
-            app_id
-            for task in tasks
-            for app_id in task.required_tools
-        }
+        available_apps = {app_id for task in tasks for app_id in task.tools}
         expected_apps = {"browser", "code-workspace"}
-        if required_apps != expected_apps:
+        if not expected_apps <= available_apps:
             raise RuntimeError(
-                "pinned GAIA smoke split no longer exercises both required MCP Apps: "
-                f"found {sorted(required_apps)!r}"
+                "pinned GAIA smoke split no longer exposes both MCP Apps when "
+                f"the upstream task annotations call for them: found {sorted(available_apps)!r}"
             )
 
         self._answers = answers

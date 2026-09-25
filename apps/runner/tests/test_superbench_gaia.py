@@ -24,6 +24,18 @@ def _write_metadata(path: Path) -> Path:
             "Final answer": "Paris",
             "file_name": None,
             "file_path": None,
+            "Annotator Metadata": {
+                "Tools": "1. A web browser.\n2. A search engine.",
+            },
+        },
+        {
+            "task_id": "task-direct",
+            "Question": "What is two plus two?",
+            "Level": 1,
+            "Final answer": "4",
+            "file_name": None,
+            "file_path": None,
+            "Annotator Metadata": {"Tools": ""},
         },
         {
             "task_id": "task-file",
@@ -32,6 +44,7 @@ def _write_metadata(path: Path) -> Path:
             "Final answer": "42",
             "file_name": "sample.txt",
             "file_path": "2023/validation/sample.txt",
+            "Annotator Metadata": {"Tools": "1. A calculator."},
         },
     ])
     pq.write_table(table, path)
@@ -45,7 +58,9 @@ def test_gaia_native_scorer():
     assert not gaia_question_scorer("Paris, 3", "paris,2")
 
 
-def test_discover_requires_browser_and_workspace_across_split(tmp_path, monkeypatch):
+def test_discover_exposes_only_annotated_or_attachment_tools_without_forcing(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("GPT_TRACE_SUPERBENCH_SOURCE_ROOT", str(tmp_path))
     adapter = GAIAAdapter()
     _write_metadata(adapter.revision_root / GAIA_METADATA_FILE)
@@ -56,10 +71,24 @@ def test_discover_requires_browser_and_workspace_across_split(tmp_path, monkeypa
     tasks = adapter.discover_tasks()
 
     web = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-web")
+    direct = next(
+        task for task in tasks if task.metadata["upstream_task_id"] == "task-direct"
+    )
     file_task = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-file")
-    assert web.tools == ("browser", "code-workspace")
-    assert web.required_tools == ("browser",)
-    assert file_task.required_tools == ("code-workspace",)
+
+    assert web.tools == ("browser",)
+    assert web.required_tools == ()
+    assert direct.tools == ()
+    assert direct.required_tools == ()
+    assert file_task.tools == ("code-workspace",)
+    assert file_task.required_tools == ()
+
+    assert "Use Browser" not in web.prompt
+    assert "Use Code Workspace" not in file_task.prompt
+    assert "/workspace/attachments/" in file_task.prompt
+    assert web.metadata["annotator_tools"] == "1. A web browser.\n2. A search engine."
+    assert direct.metadata["annotator_tools"] is None
+
     assert all(task.metadata["source_revision"] == GAIA_REVISION for task in tasks)
     assert file_task.metadata["source_file_sha256"]
     assert web.metadata["source_file_sha256"] is None
