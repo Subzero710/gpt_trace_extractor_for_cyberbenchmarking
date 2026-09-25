@@ -15,7 +15,6 @@ class BenchmarkTool:
     type: Literal["app"]
     app_id: str
     ui_name: str
-    required: bool
     kind: str
     version: str
     manifest_sha256: str
@@ -106,7 +105,6 @@ def task_fingerprint(task: BenchmarkTask) -> str:
             {
                 "type": tool.type,
                 "app_id": tool.app_id,
-                "required": tool.required,
                 "version": tool.version,
                 "tool_manifest_sha256": tool.manifest_sha256,
             }

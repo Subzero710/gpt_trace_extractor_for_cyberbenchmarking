@@ -13,7 +13,7 @@ def test_capture_maps_observed_runtime_tool_to_canonical_identity() -> None:
         }],
     }
     tool = BenchmarkTool(
-        "app", "browser", "Configured Browser", True, "local_mcp", "1.0.0",
+        "app", "browser", "Configured Browser", "local_mcp", "1.0.0",
         "a" * 64, manifest,
     )
     task = BenchmarkTask("t", "p", (), (tool,))

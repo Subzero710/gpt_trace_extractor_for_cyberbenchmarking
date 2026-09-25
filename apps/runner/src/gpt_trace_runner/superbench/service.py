@@ -21,13 +21,12 @@ def campaign(settings) -> TeacherCampaign:
     )
 
 
-def benchmark_tool(registry, app_id: str, *, required: bool) -> BenchmarkTool:
+def benchmark_tool(registry, app_id: str) -> BenchmarkTool:
     resolved = registry.resolve_id(app_id)
     return BenchmarkTool(
         type="app",
         app_id=resolved.app_id,
         ui_name=resolved.ui_name,
-        required=required,
         kind=resolved.kind,
         version=resolved.version,
         manifest_sha256=resolved.manifest_sha256,
@@ -39,7 +38,6 @@ def benchmark_tool(registry, app_id: str, *, required: bool) -> BenchmarkTool:
 
 
 def to_benchmark_task(task: TaskSpec, registry, camp: TeacherCampaign, adapter) -> BenchmarkTask:
-    required = set(task.required_tools)
     return BenchmarkTask(
         task_id=run_task_id(
             task.task_id,
@@ -49,10 +47,7 @@ def to_benchmark_task(task: TaskSpec, registry, camp: TeacherCampaign, adapter) 
         ),
         prompt=task.prompt,
         attachments=task.attachments,
-        tools=tuple(
-            benchmark_tool(registry, app_id, required=app_id in required)
-            for app_id in task.tools
-        ),
+        tools=tuple(benchmark_tool(registry, app_id) for app_id in task.tools),
         initial_workspace=task.initial_workspace,
     )
 

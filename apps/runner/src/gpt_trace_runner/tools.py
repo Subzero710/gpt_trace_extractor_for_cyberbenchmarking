@@ -323,7 +323,7 @@ async def assert_apps_available(
     interaction: InteractionGuard,
     timeout_seconds: float,
 ) -> None:
-    """Verify required Apps by actually resolving each one through '@'."""
+    """Verify configured Apps by resolving each one through '@'."""
     seen: set[str] = set()
     for tool in tools:
         if tool.type != "app":

@@ -21,20 +21,19 @@ Every entry records ownership, resolution settings, version, manifest path, endp
 
 ## Benchmark selection
 
-Superbench adapters declare logical App IDs directly through `TaskSpec.tools` and `TaskSpec.required_tools`. Runtime resolution is ID-only; mutable ChatGPT display names are deployment metadata and never benchmark identities.
+Superbench adapters declare logical App IDs directly through `TaskSpec.tools`. Runtime resolution is ID-only; mutable ChatGPT display names are deployment metadata and never benchmark identities. `tools` describes capabilities made available to the agent; it does not require the agent to invoke them.
 
-For example, an adapter task that requires both local Apps uses:
+For example, an adapter task that makes both local Apps available uses:
 
 ```python
 TaskSpec(
     task_id="incident_reconstruction_001",
     prompt="Inspect the repository and corroborate the incident timeline.",
     tools=("code-workspace", "browser"),
-    required_tools=("code-workspace", "browser"),
 )
 ```
 
-Unknown logical App IDs fail when the Superbench task is materialized, before ChatGPT is touched. Required Apps must appear in the captured tool provenance; selection alone is not sufficient.
+Unknown logical App IDs fail when the Superbench task is materialized, before ChatGPT is touched. Tool invocation is an agent decision. The trajectory records which Apps and canonical tools were actually used, but does not require use of any available App.
 
 ## Code Workspace contract
 

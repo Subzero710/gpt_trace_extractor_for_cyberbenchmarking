@@ -145,7 +145,6 @@ def tool(app_id: str) -> BenchmarkTool:
         type="app",
         app_id=app_id,
         ui_name="Code Workspace" if app_id == "code-workspace" else "Browser",
-        required=True,
         kind="local_mcp",
         version="1.0.0",
         manifest_sha256="m" * 64,

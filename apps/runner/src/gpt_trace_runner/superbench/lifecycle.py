@@ -15,7 +15,7 @@ from ..exceptions import (
 )
 from ..lock import RunnerLock
 from .catalog import SuperbenchCatalog
-from .execution import _ordered_entries, run_pending
+from .execution import run_pending
 from .models import task_spec_fingerprint
 from .registry import AdapterRegistry
 from .run_control import ActiveRun, PlannedTask, RunControlStore
@@ -56,10 +56,7 @@ def config_fp(settings) -> str:
 
 
 def plan(settings, registry, adapters, adapter_ids=(), limit=None):
-    entries = _ordered_entries(
-        SuperbenchCatalog(adapters).discover(adapter_ids),
-        limit,
-    )
+    entries = list(SuperbenchCatalog(adapters).discover(adapter_ids))
     if limit is not None:
         entries = entries[:limit]
     if not entries:

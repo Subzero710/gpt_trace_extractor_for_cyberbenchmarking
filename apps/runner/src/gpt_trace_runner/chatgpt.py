@@ -31,7 +31,6 @@ from .exceptions import (
     ModelMismatch,
     RateLimited,
     RecoveryIncomplete,
-    RequiredToolNotUsed,
     SiteChallengeFailed,
 )
 from .interaction import InteractionGuard
@@ -339,7 +338,7 @@ class ChatGPTClient:
         self,
         tools: tuple[BenchmarkTool, ...],
     ) -> None:
-        """Fail before benchmark execution if a required ChatGPT App is absent."""
+        """Fail before benchmark execution if a configured ChatGPT App is absent."""
         await self._new_chat_if_needed()
         await assert_apps_available(
             self._page,
@@ -496,19 +495,6 @@ class ChatGPTClient:
         self._active_turn = submitted
         return submitted
 
-    def _validate_required_tools(self, task: BenchmarkTask, messages: list[dict]) -> set[str]:
-        used = invoked_app_names(messages)
-        folded = {name.casefold() for name in used}
-        missing = [
-            tool.name for tool in task.tools
-            if tool.required and tool.name.casefold() not in folded
-        ]
-        if missing:
-            raise RequiredToolNotUsed(
-                "required ChatGPT app(s) were not invoked: " + ", ".join(missing)
-            )
-        return used
-
     def _validate_message_models(self, messages: list[dict]) -> set[str]:
         slugs = assistant_model_slugs(messages)
         if self._expected_model:
@@ -591,7 +577,7 @@ class ChatGPTClient:
                         raise stream_incomplete from exc
                     raise
 
-            used_apps = self._validate_required_tools(submitted.task, messages)
+            used_apps = invoked_app_names(messages)
             if stream_result is not None:
                 metadata = stream_result.runtime_metadata()
             else:
@@ -613,7 +599,7 @@ class ChatGPTClient:
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
                 "requested_tools": [
-                    {"type": t.type, "name": t.name, "required": t.required}
+                    {"type": t.type, "name": t.name}
                     for t in submitted.task.tools
                 ],
                 "used_apps": sorted(used_apps),
@@ -649,7 +635,7 @@ class ChatGPTClient:
             raise RecoveryIncomplete(
                 f"existing conversation cannot be safely recovered: {exc}"
             ) from exc
-        used_apps = self._validate_required_tools(task, messages)
+        used_apps = invoked_app_names(messages)
         return CapturedConversation(
             conversation_id,
             messages,
@@ -659,7 +645,7 @@ class ChatGPTClient:
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
                 "requested_tools": [
-                    {"type": t.type, "name": t.name, "required": t.required}
+                    {"type": t.type, "name": t.name}
                     for t in task.tools
                 ],
                 "used_apps": sorted(used_apps),

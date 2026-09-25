@@ -43,7 +43,6 @@ class TaskSpec:
     task_id: str
     prompt: str
     tools: tuple[str, ...] = ()
-    required_tools: tuple[str, ...] = ()
     attachments: tuple[Path, ...] = ()
     initial_workspace: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -55,15 +54,8 @@ class TaskSpec:
             raise ValueError("prompt must not be empty")
         if len(set(self.tools)) != len(self.tools):
             raise ValueError("duplicate tool app")
-        if len(set(self.required_tools)) != len(self.required_tools):
-            raise ValueError("duplicate required tool app")
         if any(not str(app_id).strip() for app_id in self.tools):
             raise ValueError("tool app id must not be empty")
-        if any(not str(app_id).strip() for app_id in self.required_tools):
-            raise ValueError("required tool app id must not be empty")
-        missing = set(self.required_tools) - set(self.tools)
-        if missing:
-            raise ValueError(f"required tools are not declared in tools: {sorted(missing)!r}")
 
 
 def _file_sha256(path: Path) -> str:
@@ -85,7 +77,6 @@ def task_spec_fingerprint(task: "TaskSpec") -> str:
         "task_id": task.task_id,
         "prompt": task.prompt,
         "tools": list(task.tools),
-        "required_tools": list(task.required_tools),
         "attachments": attachments,
         "initial_workspace": {
             "sha256": workspace.sha256,

@@ -41,8 +41,6 @@ At terminal cleanup the Browser container and both task-specific networks are re
 
 If Send may have happened, containers are deliberately preserved. Recovery must find the same deterministic container and network identities and validate their labels. Missing resources cause `RecoveryIncomplete`/App infrastructure failure; the runner never creates fresh replacements for an already-submitted conversation.
 
-`RequiredToolNotUsed` during recovery terminalizes the storage row as failed, unbinds gateways, destroys the exact attempt runtime and clears the journal.
-
 ## Provenance
 
 The runtime records the configured image reference and Docker's resolved image ID for each backend. This allows the project to use moving image tags during normal collection while still knowing which image actually generated a trajectory.

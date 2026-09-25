@@ -103,7 +103,7 @@ def test_chatgpt_compose_selects_apps_before_appending_exact_benchmark_prompt() 
 def test_chatgpt_binds_input_receipt_to_transport_by_message_identity() -> None:
     source = _source("chatgpt.py")
     submit = source.split("async def submit_task", 1)[1].split(
-        "def _validate_required_tools", 1
+        "def _validate_message_models", 1
     )[0]
     validated = source.split("def _validated_messages", 1)[1].split(
         "async def wait_for_completion", 1

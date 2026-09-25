@@ -17,31 +17,6 @@ from .registry import AdapterRegistry
 from .service import campaign, storage_context, to_benchmark_task
 
 
-def _ordered_entries(entries, limit: int | None):
-    """Keep normal order, but front-load required-App coverage for short runs."""
-    if limit is None:
-        return list(entries)
-
-    remaining = list(entries)
-    selected = []
-    covered: set[str] = set()
-
-    while remaining:
-        gains = [
-            len(set(entry.task.required_tools) - covered)
-            for entry in remaining
-        ]
-        best_gain = max(gains) if gains else 0
-        if best_gain <= 0:
-            break
-        index = gains.index(best_gain)
-        entry = remaining.pop(index)
-        selected.append(entry)
-        covered.update(entry.task.required_tools)
-
-    selected.extend(remaining)
-    return selected
-
 
 async def _record_pre_runner_failure(
     *,
@@ -232,7 +207,7 @@ async def run_pending(
     adapters = adapters or AdapterRegistry.discover()
     entries = SuperbenchCatalog(adapters).discover(adapter_ids)
     camp = campaign(settings)
-    selected_entries = _ordered_entries(entries, limit)
+    selected_entries = list(entries)
     if selected_run_task_ids is not None:
         by_id = {}
         for item in entries:

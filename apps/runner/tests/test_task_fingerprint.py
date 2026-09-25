@@ -23,7 +23,7 @@ def test_fingerprint_uses_canonical_contract_not_mutable_ui_name(tmp_path: Path)
         "t",
         "x",
         (),
-        tools=(benchmark_tool(registry, "github", required=True),),
+        tools=(benchmark_tool(registry, "github"),),
     )
     renamed = replace(task, tools=(replace(task.tools[0], ui_name="Second UI name"),))
     assert task_fingerprint(task) == task_fingerprint(renamed)

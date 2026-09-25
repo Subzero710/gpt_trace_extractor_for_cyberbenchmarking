@@ -179,7 +179,7 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "5"
+    adapter_version = "6"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}
@@ -308,7 +308,6 @@ class GAIAAdapter(BenchmarkAdapter):
                     task_id=logical_id,
                     prompt="\n\n".join(prompt_parts),
                     tools=runtime_tools,
-                    required_tools=(),
                     metadata={
                         "benchmark": "GAIA",
                         "year": GAIA_YEAR,
@@ -361,7 +360,6 @@ class GAIAAdapter(BenchmarkAdapter):
             task_id=task.task_id,
             prompt=task.prompt,
             tools=task.tools,
-            required_tools=task.required_tools,
             attachments=(),
             initial_workspace=workspace,
             metadata=dict(task.metadata),

@@ -34,7 +34,6 @@ class StorageConflict(StorageError): pass
 
 
 class ChatGPTUIError(TraceRunnerError): pass
-class RequiredToolNotUsed(TraceRunnerError): pass
 
 
 class AppUnavailable(TraceRunnerError):

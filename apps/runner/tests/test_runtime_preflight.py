@@ -15,7 +15,6 @@ def _tool() -> BenchmarkTool:
         type="app",
         app_id="code-workspace",
         ui_name="Code Workspace",
-        required=True,
         kind="local_mcp",
         version="1.0.0",
         manifest_sha256="m" * 64,

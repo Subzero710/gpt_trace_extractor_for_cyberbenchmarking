@@ -6,7 +6,6 @@ from gpt_trace_runner.exceptions import RecoveryIncomplete
 from gpt_trace_runner.superbench.adapters.base import BenchmarkAdapter
 from gpt_trace_runner.superbench.catalog import CatalogEntry
 from gpt_trace_runner.superbench.execution import (
-    _ordered_entries,
     _record_pre_runner_failure,
     run_pending,
 )
@@ -119,15 +118,6 @@ async def test_completed_task_with_changed_contract_is_not_silently_skipped():
         )
     assert adapter.materialized == []
 
-
-def test_limit_prioritizes_required_app_coverage():
-    entries = [
-        CatalogEntry(TaskSpec("1", "p", tools=("browser",), required_tools=("browser",)), "a"),
-        CatalogEntry(TaskSpec("2", "p", tools=("browser",), required_tools=("browser",)), "a"),
-        CatalogEntry(TaskSpec("3", "p", tools=("code-workspace",), required_tools=("code-workspace",)), "a"),
-    ]
-    chosen = _ordered_entries(entries, 2)
-    assert [entry.task.task_id for entry in chosen[:2]] == ["1", "3"]
 
 
 class TwoTaskAdapter(A):

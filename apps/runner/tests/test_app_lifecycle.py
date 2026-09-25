@@ -23,8 +23,8 @@ def task(tmp_path: Path):
         "x",
         (attachment,),
         tools=(
-            benchmark_tool(registry, "code-workspace", required=True),
-            benchmark_tool(registry, "browser", required=False),
+            benchmark_tool(registry, "code-workspace"),
+            benchmark_tool(registry, "browser"),
         ),
     )
 

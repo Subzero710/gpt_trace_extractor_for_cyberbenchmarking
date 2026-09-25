@@ -278,7 +278,6 @@ def enrich_capture(
             "type": "app",
             "app_id": tool.app_id,
             "ui_name": tool.ui_name,
-            "required": tool.required,
             "version": tool.version,
             "tool_manifest_sha256": tool.manifest_sha256,
         }

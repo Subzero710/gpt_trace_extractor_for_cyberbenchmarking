@@ -20,7 +20,7 @@ A gated source can consume `BENCHMARK_SOURCE_TOKEN` during fetch. Normal Superbe
 
 The built-in `gaia` adapter pins the official GAIA repository at revision `682dd723ee1e1697e00360edccf2366dc8418dd9`, using the 2023 validation Level-1 split and GAIA's native answer normalization.
 
-The adapter is deliberately configured to exercise both local MCP Apps across a short run. Tasks without a source file require Browser research. Tasks with a source file require Code Workspace; those files are seeded only into `/workspace/attachments/` rather than uploaded directly to ChatGPT. `LIMIT` selection prioritizes tasks that add uncovered required Apps before filling the remainder.
+The adapter exposes local MCP Apps only when the pinned GAIA task metadata or source file makes that capability relevant. It never requires an App invocation. Source files are seeded into `/workspace/attachments/` rather than uploaded directly to ChatGPT, and the agent decides whether to use the available capability.
 
 After obtaining upstream GAIA access, set `BENCHMARK_SOURCE_TOKEN` and run:
 
@@ -30,13 +30,13 @@ make run ADAPTER=gaia LIMIT=3
 make status
 ```
 
-The pinned split is validated to contain tasks requiring both Browser and Code Workspace. Ground-truth answers remain evaluator-side and are not copied into task metadata or prompts.
+The pinned split is validated to expose both Browser and Code Workspace across the source tasks. Ground-truth answers remain evaluator-side and are not copied into task metadata or prompts.
 
 ## Adapter contract
 
 To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, preserve useful source provenance in task metadata, implement native `evaluate()` when an upstream oracle exists, add tests and expose the adapter through the `gpt_trace_runner.benchmark_adapters` entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
 
-`TaskSpec.tools` lists Apps available to the task. `TaskSpec.required_tools` is the subset that must actually be invoked; the captured ChatGPT conversation is checked against that requirement. Attachments intended for Code Workspace can be materialized through `initial_workspace` instead of being uploaded to the teacher conversation.
+`TaskSpec.tools` lists Apps available to the task. Availability never implies mandatory invocation: the agent alone decides whether to use a tool. Captured provenance records observed tool use. Attachments intended for Code Workspace can be materialized through `initial_workspace` instead of being uploaded to the teacher conversation.
 
 Recovery remains journal-first. A pending journal is reconciled against its exact source task, adapter version and teacher campaign before new work is scheduled. Completed rows are immutable and are skipped only when the current pre-materialization task contract fingerprint still matches; this check includes prompt/source metadata, direct source artifacts/workspaces and current App contracts. Failed infrastructure attempts may be retried.
 

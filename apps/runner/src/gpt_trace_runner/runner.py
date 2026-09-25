@@ -9,7 +9,6 @@ from .chatgpt import ChatGPTClient
 from .exceptions import (
     FatalUIState,
     RecoveryIncomplete,
-    RequiredToolNotUsed,
     StorageConflict,
     StorageError,
 )
@@ -197,24 +196,11 @@ class BenchmarkRunner:
         recovery_task = self._recovery_task(task, existing)
         await self.lifecycle.assert_resume(recovery_task, environments, fingerprint, attempt=existing.attempt)
         identity = existing.runner_id or self.runner_id
-        try:
-            captured = await self.chatgpt.recover(
-                conversation_id,
-                task=recovery_task,
-                user_message_id=user_message_id,
-            )
-        except RequiredToolNotUsed as exc:
-            await self.storage.fail(
-                task.task_id, exc, attempt=existing.attempt, runner_id=identity
-            )
-            await self.lifecycle.reset(
-                recovery_task,
-                environments,
-                fingerprint,
-                attempt=existing.attempt,
-            )
-            self.journal.clear()
-            raise
+        captured = await self.chatgpt.recover(
+            conversation_id,
+            task=recovery_task,
+            user_message_id=user_message_id,
+        )
         app_runtime = await self.lifecycle.runtime_metadata(
             recovery_task,
             environments,
@@ -333,23 +319,10 @@ class BenchmarkRunner:
                 "automatic recovery is disabled"
             )
         await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
-        try:
-            captured = await self.chatgpt.recover_current_candidate(
-                task=recovery_task,
-                user_message_id=entry.user_message_id,
-            )
-        except RequiredToolNotUsed as exc:
-            await self.storage.fail(
-                entry.task_id, exc, attempt=entry.attempt, runner_id=entry.runner_id
-            )
-            await self.lifecycle.reset(
-                recovery_task,
-                expected_environments,
-                fingerprint,
-                attempt=entry.attempt,
-            )
-            self.journal.clear()
-            raise
+        captured = await self.chatgpt.recover_current_candidate(
+            task=recovery_task,
+            user_message_id=entry.user_message_id,
+        )
         conversation_id = captured.conversation_id
         self.journal.write(
             self._entry(
@@ -578,10 +551,6 @@ class BenchmarkRunner:
             if phase == "starting" and started is None and isinstance(exc, StorageConflict):
                 self.journal.clear()
             elif phase in {"starting", "apps_prepared", "composer_dirty"} and started is not None and not isinstance(exc, StorageError):
-                await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
-                await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
-                self.journal.clear()
-            elif isinstance(exc, RequiredToolNotUsed) and started is not None:
                 await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
                 await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
                 self.journal.clear()

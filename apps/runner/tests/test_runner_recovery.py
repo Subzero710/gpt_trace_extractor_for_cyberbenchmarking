@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from gpt_trace_runner.exceptions import AmbiguousSubmission, RecoveryIncomplete, RequiredToolNotUsed
+from gpt_trace_runner.exceptions import AmbiguousSubmission, RecoveryIncomplete
 from gpt_trace_runner.journal import JournalStore, SubmissionJournal
 from gpt_trace_runner.models import BenchmarkTask, CapturedConversation, StoredRun, task_fingerprint
 from gpt_trace_runner.runner import BenchmarkRunner, abandon_recovery
@@ -157,46 +157,6 @@ async def test_completed_row_with_cleanup_journal_is_reset(tmp_path: Path) -> No
     assert store.load() is None
 
 
-class MissingRequiredOnRecover(RecoveryChatGPT):
-    async def recover(self, conversation_id, *, task, user_message_id):
-        raise RequiredToolNotUsed("required App was not used")
-
-
-class MissingRequiredCandidate(RecoveryChatGPT):
-    async def recover_current_candidate(self, *, task, user_message_id):
-        raise RequiredToolNotUsed("required App was not used")
-
-
-@pytest.mark.asyncio
-async def test_known_conversation_required_tool_failure_terminalizes_and_cleans_environment(tmp_path: Path) -> None:
-    store = JournalStore(tmp_path / "j.json")
-    store.write(SubmissionJournal(
-        "t", "old", 3, "conversation_known", "known", fp(),
-        user_message_id="submitted-user-message",
-    ))
-    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", conversation_id="known", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
-    lifecycle = Lifecycle()
-    with pytest.raises(RequiredToolNotUsed):
-        await runner(MissingRequiredOnRecover(), storage, store, lifecycle).reconcile_journal([TASK])
-    assert storage.existing.status == "failed"
-    assert lifecycle.calls == ["resume", "reset"]
-    assert store.load() is None
-
-
-@pytest.mark.asyncio
-async def test_unknown_candidate_required_tool_failure_terminalizes_and_cleans_environment(tmp_path: Path) -> None:
-    store = JournalStore(tmp_path / "j.json")
-    store.write(SubmissionJournal(
-        "t", "old", 3, "submission_started", task_fingerprint=fp(),
-        user_message_id="submitted-user-message",
-    ))
-    storage = Storage(StoredRun(task_id="t", logical_task_id="t", status="running", attempt=3, runner_id="old", task_fingerprint=fp(), app_provenance=[]))
-    lifecycle = Lifecycle()
-    with pytest.raises(RequiredToolNotUsed):
-        await runner(MissingRequiredCandidate(), storage, store, lifecycle).reconcile_journal([TASK])
-    assert storage.existing.status == "failed"
-    assert lifecycle.calls == ["resume", "reset"]
-    assert store.load() is None
 
 @pytest.mark.asyncio
 async def test_abandon_recovery_fails_attempt_resets_apps_and_clears_journal(tmp_path: Path) -> None:

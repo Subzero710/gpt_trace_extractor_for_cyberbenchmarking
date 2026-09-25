@@ -102,7 +102,7 @@ def internal_local_apps_task(
         tools.append(
             BenchmarkTool(
                 type="app", app_id=resolved.app_id, ui_name=resolved.ui_name,
-                required=True, kind=resolved.kind, version=resolved.version,
+                kind=resolved.kind, version=resolved.version,
                 manifest_sha256=resolved.manifest_sha256, tool_manifest=resolved.manifest,
                 mcp_endpoint=resolved.mcp_endpoint, control_endpoint=resolved.control_endpoint,
                 attachment_mode=resolved.attachment_mode,
