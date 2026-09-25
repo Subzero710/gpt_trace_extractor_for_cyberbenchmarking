@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -183,6 +184,9 @@ async def _recover_pending_journal(
         )
         try:
             await runner.reconcile_journal([bt])
+        except asyncio.CancelledError as exc:
+            recovery_error = exc
+            raise
         except BaseException as exc:
             recovery_error = exc
             if console is not None:
@@ -413,6 +417,30 @@ async def run_pending(
                     latest = await storage.get(bt.task_id)
                     pending = journal.load()
                     pending_for_task = pending is not None and pending.task_id == bt.task_id
+                    pause_cancelled = (
+                        isinstance(exc, asyncio.CancelledError)
+                        and control_store is not None
+                        and control_store.load().status == "pause_requested"
+                    )
+
+                    if pause_cancelled:
+                        # A real pause stops this coroutine now. Preserve a
+                        # submitted/running attempt so resume recovers the same
+                        # conversation instead of submitting a duplicate.
+                        recovery_required = (
+                            pending_for_task
+                            or (latest is not None and latest.status == "running")
+                        )
+                        if console is not None:
+                            console.print(
+                                f"[yellow]{bt.task_id}: paused"
+                                + (
+                                    "; recovery state preserved[/]"
+                                    if recovery_required
+                                    else "[/]"
+                                )
+                            )
+                        raise
 
                     # If completion committed but cleanup crashed, reconcile the
                     # *same task* immediately. Never advance with its journal left.
@@ -504,6 +532,16 @@ async def run_pending(
                     if control_store.load().status == "pause_requested":
                         control_store.pause_if_requested()
                         break
+    except asyncio.CancelledError:
+        if control_store is not None:
+            state = control_store.load()
+            if state is not None and state.status == "pause_requested":
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    task.uncancel()
+                control_store.pause_if_requested()
+                return attempted, camp.campaign_id
+        raise
     finally:
         if owned_storage:
             await storage.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -132,15 +133,23 @@ class SigintPause:
         self._request_pause = request_pause
         self.n = 0
         self.pause_requested = False
+        self._task = None
 
     def __enter__(self):
         self.old = signal.getsignal(signal.SIGINT)
+        try:
+            self._task = asyncio.current_task()
+        except RuntimeError:
+            self._task = None
 
         def handler(*_):
             self.n += 1
             if self.n == 1:
                 self.pause_requested = True
                 self._request_pause()
+                task = self._task
+                if task is not None and not task.done():
+                    task.cancel("Superbench pause requested")
                 return
             raise KeyboardInterrupt
 
@@ -149,6 +158,21 @@ class SigintPause:
 
     def __exit__(self, *_):
         signal.signal(signal.SIGINT, self.old)
+        self._task = None
+
+
+async def _watch_durable_pause(store, target: asyncio.Task) -> None:
+    """Cancel active execution when another process requests a pause."""
+    while not target.done():
+        await asyncio.sleep(0.1)
+        state = store.load()
+        if state is None:
+            return
+        if state.status == "pause_requested":
+            target.cancel("Superbench pause requested")
+            return
+        if state.status in {"paused", "needs_intervention", "completed"}:
+            return
 
 
 def classify_incident(exc):
@@ -296,6 +320,17 @@ async def _execute_locked(
     make_chatgpt,
     console,
 ):
+    attempted = 0
+    initial_state = store.load()
+    if initial_state is None:
+        raise RecoveryIncomplete("no active Superbench run")
+    campaign_id = initial_state.campaign_id
+    target = asyncio.current_task()
+    pause_watcher = (
+        asyncio.create_task(_watch_durable_pause(store, target))
+        if target is not None
+        else None
+    )
     try:
         with SigintPause(store.request_pause_from_signal) as sigint:
             attempted, campaign_id = await run_pending(
@@ -346,6 +381,15 @@ async def _execute_locked(
 
             return attempted, campaign_id
 
+    except asyncio.CancelledError:
+        state = store.load()
+        if state is not None and state.status == "pause_requested":
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                task.uncancel()
+            store.pause_if_requested()
+            return attempted, campaign_id
+        raise
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
@@ -365,6 +409,13 @@ async def _execute_locked(
                     str(exc),
                 )
         raise
+    finally:
+        if pause_watcher is not None:
+            pause_watcher.cancel()
+            try:
+                await pause_watcher
+            except asyncio.CancelledError:
+                pass
 
 
 async def status_payload(settings):

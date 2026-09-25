@@ -118,6 +118,7 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
             textInput: "",
             keydown: "",
             mutations: 0,
+            linebreaks: 0,
             corrections: {
                 before: 0,
                 input: 0,
@@ -149,6 +150,13 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
         };
         const keyHandler = event => {
             bump(state, "keydown", event);
+            // CloakBrowser/Chromium can materialize Shift+Enter while exposing
+            // the Enter keydown without preserving shiftKey on the observed
+            // event. Count the physical Enter separately; during benchmark
+            // prompt entry every Enter is issued by us as Shift+Enter.
+            if (event.key === "Enter") {
+                state.linebreaks += 1;
+            }
             applyKeyEdit(state, event);
         };
         const observer = new MutationObserver(records => {
@@ -191,6 +199,7 @@ _COMPOSER_INPUT_RECEIPT_JS = r"""
             textInput: slot.state.textInput,
             keydown: slot.state.keydown,
             mutations: slot.state.mutations,
+            linebreaks: slot.state.linebreaks,
             corrections: slot.state.corrections,
             trust: slot.state.trust,
             types: slot.state.types,
@@ -340,6 +349,7 @@ class InteractionGuard:
             text_input = receipt.get("textInput")
             keydown = receipt.get("keydown")
             mutations = receipt.get("mutations")
+            linebreaks = receipt.get("linebreaks")
 
             # input/textInput are post-edit channels. beforeinput/keydown prove
             # the exact source reached the editor boundary, so require an
@@ -355,6 +365,30 @@ class InteractionGuard:
             mutated = isinstance(mutations, int) and mutations > 0
 
             if exact_post_edit or (exact_pre_edit and mutated):
+                return
+
+            # Some Chromium/CloakBrowser paths insert Shift+Enter correctly but
+            # omit the line break from beforeinput/input/textInput.data and may
+            # expose Enter without shiftKey in keydown. In that case require two
+            # independent proofs: every non-newline source character must still
+            # match exactly in at least one receipt channel, and the observed
+            # physical Enter count must equal the requested newline count.
+            expected_without_newlines = expected_receipt.replace("\n", "")
+            newline_count = expected_receipt.count("\n")
+            exact_without_newlines = any(
+                channel == expected_without_newlines
+                for channel in (before, after, text_input, keydown)
+            )
+            exact_linebreak_count = (
+                isinstance(linebreaks, int)
+                and linebreaks == newline_count
+            )
+            if (
+                newline_count > 0
+                and exact_without_newlines
+                and exact_linebreak_count
+                and mutated
+            ):
                 return
 
             def first_mismatch(actual: object) -> int | None:
@@ -383,6 +417,7 @@ class InteractionGuard:
                 "text_input_mismatch": first_mismatch(text_input),
                 "keydown_mismatch": first_mismatch(keydown),
                 "mutations": mutations,
+                "linebreaks": linebreaks,
                 "corrections": receipt.get("corrections"),
                 "trust": receipt.get("trust"),
                 "types": receipt.get("types"),

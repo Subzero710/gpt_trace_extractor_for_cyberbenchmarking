@@ -1,3 +1,4 @@
+import asyncio
 import json
 import signal
 from dataclasses import asdict, replace
@@ -296,6 +297,36 @@ def test_first_sigint_persists_pause_request(tmp_path, monkeypatch):
         assert guard.pause_requested is True
         assert guard.n == 1
         assert store.load().status == "pause_requested"
+
+
+
+@pytest.mark.asyncio
+async def test_first_sigint_cancels_active_async_work(tmp_path, monkeypatch):
+    store = RunControlStore(tmp_path / "active.json")
+    store.create(make_run())
+    handlers = {}
+    started = asyncio.Event()
+
+    monkeypatch.setattr(signal, "getsignal", lambda *_: object())
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda sig, handler: handlers.__setitem__(sig, handler),
+    )
+
+    async def worker():
+        with SigintPause(store.request_pause_from_signal):
+            started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(worker())
+    await started.wait()
+    handlers[signal.SIGINT](signal.SIGINT, None)
+
+    with pytest.raises(asyncio.CancelledError, match="Superbench pause requested"):
+        await task
+
+    assert store.load().status == "pause_requested"
 
 
 def test_second_sigint_is_hard_interrupt(tmp_path, monkeypatch):

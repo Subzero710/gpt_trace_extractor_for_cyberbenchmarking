@@ -80,6 +80,7 @@ class FakeLocator:
         self.receipt_text_input = ""
         self.receipt_keydown = ""
         self.receipt_mutations = 0
+        self.receipt_linebreaks = 0
     async def wait_for(self, **kwargs): pass
     async def is_enabled(self): return True
     async def click(self, **kwargs):
@@ -95,6 +96,7 @@ class FakeLocator:
             self.receipt_text_input = ""
             self.receipt_keydown = ""
             self.receipt_mutations = 0
+            self.receipt_linebreaks = 0
             return True
         if arg == "stop":
             result = {
@@ -103,6 +105,7 @@ class FakeLocator:
                 "textInput": self.receipt_text_input,
                 "keydown": self.receipt_keydown,
                 "mutations": self.receipt_mutations,
+                "linebreaks": self.receipt_linebreaks,
                 "trust": {"trusted": 0, "untrusted": 1},
                 "types": {},
             }
@@ -114,6 +117,7 @@ class FakeLocator:
         return self.focused
     def record_keyboard_input(self, text):
         if self.receipt_active:
+            self.receipt_linebreaks += text.count("\n")
             self.receipt_before += text
             self.receipt_input += text
             self.receipt_text_input += text
@@ -343,6 +347,66 @@ async def test_type_text_validates_input_receipt_not_rendered_lexical_dom() -> N
     assert locator.receipt_text_input == " " + prompt
     assert locator.receipt_keydown == " " + prompt
     assert await locator.inner_text() != "Code Workspace " + prompt
+
+
+class NewlineBlindReceiptLocator(FakeLocator):
+    def record_keyboard_input(self, text):
+        if not self.receipt_active:
+            return
+        self.receipt_linebreaks += text.count("\n")
+        recorded = text.replace("\n", "")
+        self.receipt_before += recorded
+        self.receipt_input += recorded
+        self.receipt_text_input += recorded
+        self.receipt_keydown += recorded
+        self.receipt_mutations += 1
+
+
+@pytest.mark.asyncio
+async def test_type_text_accepts_exact_text_when_receipt_omits_shift_enter_data() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = NewlineBlindReceiptLocator(holder)
+    page.keyboard.locator = locator
+
+    await guard.type_text(locator, "first\nsecond\nthird")
+
+    assert locator.rendered == "first\nsecond\nthird"
+    assert locator.receipt_input == "firstsecondthird"
+    assert locator.receipt_linebreaks == 2
+
+
+class NewlineBlindWithoutEnterProofLocator(NewlineBlindReceiptLocator):
+    def record_keyboard_input(self, text):
+        if not self.receipt_active:
+            return
+        recorded = text.replace("\n", "")
+        self.receipt_before += recorded
+        self.receipt_input += recorded
+        self.receipt_text_input += recorded
+        self.receipt_keydown += recorded
+        self.receipt_mutations += 1
+
+
+@pytest.mark.asyncio
+async def test_type_text_rejects_missing_newline_without_enter_proof() -> None:
+    holder = {}
+    page = FakePage({"visible": True, "focused": True})
+    guard = InteractionGuard(
+        page,
+        clipboard_url="http://browser:8765/clipboard",
+        timeout_seconds=1,
+    )
+    locator = NewlineBlindWithoutEnterProofLocator(holder)
+    page.keyboard.locator = locator
+
+    with pytest.raises(Exception, match="keyboard input receipt differs"):
+        await guard.type_text(locator, "first\nsecond")
 
 
 class DroppedInputReceiptLocator(FakeLocator):

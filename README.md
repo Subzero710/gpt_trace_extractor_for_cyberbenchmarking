@@ -23,7 +23,7 @@ sudo make export-sft
 sudo make down
 ```
 
-`build` builds project images with the dedicated BuildKit builder. `up` starts the persistent core. `doctor` runs the maximal non-ChatGPT runtime preflight. `tools` prepares the two real local MCP backends and Secure MCP Tunnels for ChatGPT App registration/verification. `auth` verifies the ChatGPT session and Apps. `run` starts a new frozen Superbench campaign. `pause` requests a safe-boundary pause. `resume` continues the frozen active run. `status` reports active-run and storage state. `reset-recovery` explicitly abandons pending recovery. `down` performs strict runtime teardown without deleting persistent benchmark data.
+`build` builds project images with the dedicated BuildKit builder. `up` starts the persistent core. `doctor` runs the maximal non-ChatGPT runtime preflight. `tools` prepares the two real local MCP backends and Secure MCP Tunnels for ChatGPT App registration/verification. `auth` verifies the ChatGPT session and Apps. `run` starts a new frozen Superbench campaign. `pause` requests an immediate durable pause. `resume` continues the frozen active run. `status` reports active-run and storage state. `reset-recovery` explicitly abandons pending recovery. `down` performs strict runtime teardown without deleting persistent benchmark data.
 
 ## Configuration and secrets
 
@@ -83,7 +83,7 @@ sudo make status
 sudo make reset-recovery TASK=<run_task_id>
 ```
 
-`make run` freezes the exact selected task IDs and their adapter/task/App/config identity. LIMIT applies only when creating the run; resume uses only the frozen IDs and the same campaign. `make pause` and the first Ctrl+C are cooperative and stop only at a safe task boundary. A second Ctrl+C is a hard interrupt; a later `make resume` recovers the same run when RunnerLock is free.
+`make run` freezes the exact selected task IDs and their adapter/task/App/config identity. LIMIT applies only when creating the run; resume uses only the frozen IDs and the same campaign. The first Ctrl+C requests a durable pause and immediately cancels the active runner coroutine; submitted work is left recoverable and `make resume` continues from the durable journal instead of resubmitting it. A second Ctrl+C remains a hard interrupt. `make pause` writes the same durable pause request from another shell; the active runner watches that state and cancels the active coroutine immediately, using the same recovery path.
 
 Evaluator `fail` is a normal completed benchmark result and the batch continues. Every technical error stops the batch. Authentication/challenge/access incidents enter `needs_intervention`; use noVNC to resolve them and then `sudo make resume`. Rate limits, recovery errors and other infrastructure errors pause the run and expose their reason in `make status`. `make status` combines active-run state, storage state and evaluations. `make reset-recovery` abandons only the matching frozen recovery attempt and never marks that task completed.
 
