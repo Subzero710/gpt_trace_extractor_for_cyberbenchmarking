@@ -14,12 +14,13 @@ STATE=ROOT/'state/broker'
 SOCKET=STATE/'broker.sock'
 PID=STATE/'broker.pid'
 BASE=Path('/var/lib/libvirt/images/gpt-trace/kali-base.qcow2')
-TOKEN=ROOT/'.secrets/app_control_token'
+ADMIN_TOKEN=ROOT/'.secrets/workstation_broker_admin_token'
+CONTROLLER_TOKEN=ROOT/'.secrets/workstation_broker_controller_token'
 PYTHON=ROOT/'.venv-workstation-broker/bin/python'
 
 def send(action):
     payload=b'{}'
-    token=TOKEN.read_text().strip()
+    token=ADMIN_TOKEN.read_text().strip()
     header=(f'POST /v1/{action} HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n').encode()
     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as conn:
         conn.settimeout(180);conn.connect(str(SOCKET));conn.sendall(header+payload)
@@ -37,7 +38,8 @@ def start():
     if not PYTHON.is_file():raise RuntimeError('build broker venv before make up')
     STATE.mkdir(mode=0o700,parents=True,exist_ok=True)
     (ROOT/'state').chmod(0o711)
-    env={**os.environ,'WORKSTATION_BROKER_TOKEN_FILE':str(TOKEN),
+    env={**os.environ,'WORKSTATION_BROKER_ADMIN_TOKEN_FILE':str(ADMIN_TOKEN),
+         'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE':str(CONTROLLER_TOKEN),
          'WORKSTATION_BROKER_STATE':str(BASE.parent/'attempts'),
          'WORKSTATION_BASE_IMAGE':str(BASE),'WORKSTATION_BROKER_SOCKET':str(SOCKET),
          'WORKSTATION_CONFIG':str(ROOT/'config/runner.toml')}

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     runner_state_root: Path = Path("/data/state")
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
     app_control_token_file: Path = Path("/run/secrets/app_control_token")
+    workstation_broker_token_file: Path = Path("/run/secrets/workstation_broker_admin_token")
 
     workstation_provider: Literal["libvirt"] = "libvirt"
     workstation_broker_socket: Path = Path("/run/workstation-broker/broker.sock")
@@ -64,9 +65,6 @@ class Settings(BaseSettings):
     workstation_max_transfer_bytes: int = Field(default=67108864, ge=1024, le=268435456)
     workstation_max_seed_bytes: int = Field(default=671088640, ge=1024, le=671088640)
     workstation_egress_allow_cidrs: list[str] = Field(default_factory=list)
-
-    # Secret, intentionally absent from runner.toml.
-    cloakbrowser_license_key: str = ""
 
 
     chatgpt_base_url: str = "https://chatgpt.com"

@@ -68,11 +68,11 @@ services:
       context: ./apps/runner
       labels:
         io.gpttrace.project: gpt-trace-extractor
-    environment:
-      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
     secrets:
     - source: app_control_token
       target: app_control_token
+    - source: workstation_broker_admin_token
+      target: workstation_broker_admin_token
     volumes:
     - ./exports:/data/exports
     - ./apps:/data/apps:ro
@@ -80,7 +80,7 @@ services:
     - browser_profile:/browser-profile:ro
     - runner_state:/data/state
     - benchmark_sources:/data/state/superbench/sources:ro
-    - ./state/broker:/run/workstation-broker
+    - ./state/broker:/run/workstation-broker:ro
     networks:
     - core_internal
     - app_control
@@ -102,7 +102,6 @@ services:
       labels:
         io.gpttrace.project: gpt-trace-extractor
     environment:
-      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
       DISPLAY: :99
       BROWSER_CLIPBOARD_PORT: '8765'
     volumes:
@@ -209,12 +208,15 @@ services:
       MCP_TOOL_MANIFEST: /app/tool-manifest.json
       WORKSTATION_CONFIG: /app/config/runner.toml
       APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+      WORKSTATION_BROKER_TOKEN_FILE: /run/secrets/workstation_broker_controller_token
     volumes:
-    - ./state/broker:/run/workstation-broker
+    - ./state/broker:/run/workstation-broker:ro
     - ./config/runner.toml:/app/config/runner.toml:ro
     secrets:
     - source: app_control_token
       target: app_control_token
+    - source: workstation_broker_controller_token
+      target: workstation_broker_controller_token
     networks:
     - app_control
     read_only: true
@@ -241,3 +243,7 @@ networks:
 secrets:
   app_control_token:
     file: ./.secrets/app_control_token
+  workstation_broker_admin_token:
+    file: ./.secrets/workstation_broker_admin_token
+  workstation_broker_controller_token:
+    file: ./.secrets/workstation_broker_controller_token

@@ -49,7 +49,7 @@ def build():
         unit=ROOT/'infra/workstation/systemd/gpt-trace-workstation-agent.service'
         run('virt-customize','--network','-a',str(image),
             '--run-command',"printf 'deb https://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware\\n' > /etc/apt/sources.list && rm -f /etc/apt/sources.list.d/kali.sources",
-            '--install','qemu-guest-agent,lightdm,xfce4,python3,python3-venv,python3-pip,git,build-essential,rustc,cargo,gdb,curl,wget,iproute2,iputils-ping,tcpdump,nmap',
+            '--install','qemu-guest-agent,lightdm,xfce4,python3,python3-venv,python3-pip,git,build-essential,rustc,cargo,gdb,curl,wget,iproute2,iputils-ping,tcpdump,nmap,util-linux',
             '--mkdir','/opt/gpt-trace',
             '--copy-in',str(bundle)+':/opt/gpt-trace',
             '--copy-in',str(unit)+':/etc/systemd/system',

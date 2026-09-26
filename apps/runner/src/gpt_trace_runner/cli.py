@@ -53,7 +53,7 @@ def make_lifecycle(
     browser_blocked_hosts: tuple[str, ...] = (),
 ) -> AppLifecycle:
     runtime = LibvirtWorkstationProvider(
-        settings.workstation_broker_socket, settings.app_control_token_file,
+        settings.workstation_broker_socket, settings.workstation_broker_token_file,
     )
     return AppLifecycle(
         settings.app_control_token_file,

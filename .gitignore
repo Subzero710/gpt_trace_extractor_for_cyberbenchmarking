@@ -14,3 +14,4 @@ state/
 exports/*.parquet
 .DS_Store
 .idea/
+/exports/

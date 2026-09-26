@@ -32,10 +32,22 @@ def verify_manifest(path: Path):
         raise RuntimeError("MCP implementation and tool-manifest.json differ")
 
 
+def model_content(name: str, result: dict[str, Any]) -> list[Any]:
+    if name == "observe_screen":
+        encoded = result["content_base64"]
+        metadata = {key: value for key, value in result.items() if key != "content_base64"}
+        return [
+            types.ImageContent(type="image", data=encoded, mimeType=result["mime_type"]),
+            types.TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))),
+        ]
+    return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))]
+
+
 class WorkstationController:
-    def __init__(self, broker_socket: Path, token: str, max_seed: int = 268435456,
-                 max_transfer: int = 67108864):
+    def __init__(self, broker_socket: Path, token: str, broker_token: str,
+                 max_seed: int = 268435456, max_transfer: int = 67108864):
         self.token = token
+        self.broker_token = broker_token
         self.max_seed = max_seed
         self.max_transfer = max_transfer
         self.client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(broker_socket)),
@@ -55,7 +67,7 @@ class WorkstationController:
         if method is not None: payload["method"] = method
         if args is not None: payload["args"] = args
         response = await self.client.post(f"/v1/{operation}", json=payload,
-                                          headers={"authorization": f"Bearer {self.token}"})
+                                          headers={"authorization": f"Bearer {self.broker_token}"})
         if response.status_code != 200:
             raise RuntimeError(f"broker {operation} failed: {response.text[:1000]}")
         return response.json()
@@ -86,7 +98,9 @@ def create_app(controller: WorkstationController) -> Starlette:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]):
         result = await controller.call(name, arguments)
-        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))], result
+        # content is the model-facing MCP channel; structuredContent remains the
+        # complete typed result for application-side validation and provenance.
+        return model_content(name, result), result
 
     manager = StreamableHTTPSessionManager(
         app=server, event_store=None, json_response=True, stateless=True,
@@ -235,9 +249,11 @@ def main():
     import uvicorn
     verify_manifest(Path(os.environ.get("MCP_TOOL_MANIFEST", "/app/tool-manifest.json")))
     token = Path(os.environ.get("APP_CONTROL_TOKEN_FILE", "/run/secrets/app_control_token")).read_text().strip()
+    broker_token = Path(os.environ["WORKSTATION_BROKER_TOKEN_FILE"]).read_text().strip()
     if len(token) < 32: raise RuntimeError("missing controller token")
+    if len(broker_token) < 32: raise RuntimeError("missing workstation broker token")
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
-    controller = WorkstationController(Path(os.environ["WORKSTATION_BROKER_SOCKET"]), token,
+    controller = WorkstationController(Path(os.environ["WORKSTATION_BROKER_SOCKET"]), token, broker_token,
                                        config["max_seed_bytes"], config["max_transfer_bytes"])
     uvicorn.run(create_app(controller), host="0.0.0.0", port=8000)
 

@@ -26,11 +26,30 @@ def _validate_endpoint(tool: BenchmarkTool) -> str:
 
 async def _call(session: ClientSession, name: str, args: dict) -> dict:
     result = await session.call_tool(name, args)
-    if result.isError or len(result.content) != 1:
+    if result.isError:
         raise AppInfrastructureError(f'MCP {name} failed: {result.content}')
-    output = json.loads(result.content[0].text)
+    structured = getattr(result, "structuredContent", None)
+    if structured is None:
+        structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        output = dict(structured)
+    else:
+        texts = [block.text for block in result.content if getattr(block, "type", None) == "text"]
+        if len(texts) != 1:
+            raise AppInfrastructureError(f'MCP {name} did not return one structured/text object')
+        output = json.loads(texts[0])
     if not isinstance(output, dict):
         raise AppInfrastructureError(f'MCP {name} result was not an object')
+    if name == "observe_screen":
+        images = [block for block in result.content if getattr(block, "type", None) == "image"]
+        if len(images) != 1:
+            raise AppInfrastructureError('observe_screen did not expose exactly one MCP ImageContent')
+        # Older clients may not surface structuredContent even though the server
+        # returned it. Reconstruct the private integrity field from ImageContent
+        # rather than requiring the base64 payload in model-facing text.
+        output.setdefault("content_base64", images[0].data)
+        if images[0].data != output.get("content_base64"):
+            raise AppInfrastructureError('observe_screen image/structured payload mismatch')
     return output
 
 

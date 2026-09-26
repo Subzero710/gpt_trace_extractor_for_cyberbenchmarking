@@ -112,7 +112,8 @@ def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: in
 class Broker:
     root: Path
     base: Path
-    token: str
+    admin_token: str
+    controller_token: str
     memory_mb: int = 8192
     vcpus: int = 4
     boot_timeout_seconds: int = 120
@@ -166,27 +167,37 @@ class Broker:
         if mountpoint.is_mount():
             run("umount", str(mountpoint))
 
-    def _firewall(self, ident: dict, bridge: str) -> None:
+    def _firewall(self, ident: dict, bridge: str, gateway_ip: str) -> None:
         table = "gt_" + suffix(ident)
         exception_rules = "\n".join(f'add rule inet {table} forward iifname "{bridge}" ip daddr {cidr} accept'
                                     for cidr in self.egress_allow_cidrs)
+        # DNS is accepted only to dnsmasq on this attempt's bridge. DHCP discover
+        # is necessarily broadcast before the guest owns an address, while renewals
+        # may be unicast to the bridge gateway. No other host-local service is exposed.
         script = f'''add table inet {table}
 add chain inet {table} forward {{ type filter hook forward priority -50; policy accept; }}
 add chain inet {table} input {{ type filter hook input priority -50; policy accept; }}
 add rule inet {table} forward iifname "{bridge}" meta nfproto ipv6 drop
 {exception_rules}
 add rule inet {table} forward iifname "{bridge}" ip daddr {{ {', '.join(BLOCKED_EGRESS)} }} drop
-add rule inet {table} input iifname "{bridge}" udp dport {{ 53, 67 }} accept
-add rule inet {table} input iifname "{bridge}" tcp dport 53 accept
+add rule inet {table} input iifname "{bridge}" ip daddr {gateway_ip} udp dport 53 accept
+add rule inet {table} input iifname "{bridge}" ip daddr {gateway_ip} tcp dport 53 accept
+add rule inet {table} input iifname "{bridge}" ip daddr {{ {gateway_ip}, 255.255.255.255 }} udp dport 67 accept
 add rule inet {table} input iifname "{bridge}" drop
 '''
         run("nft", "-f", "-", input=script.encode())
 
     @staticmethod
-    def _remove_firewall(ident: dict) -> None:
-        table = "gt_" + suffix(ident)
+    def _remove_firewall_key(key: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{20}", key):
+            raise ValueError("invalid workstation resource key")
+        table = "gt_" + key
         if subprocess.run(("nft", "list", "table", "inet", table), capture_output=True).returncode == 0:
             run("nft", "delete", "table", "inet", table)
+
+    @classmethod
+    def _remove_firewall(cls, ident: dict) -> None:
+        cls._remove_firewall_key(suffix(ident))
 
     def _paths(self, ident: dict) -> tuple[str, str, Path]:
         key = suffix(ident)
@@ -261,7 +272,7 @@ add rule inet {table} input iifname "{bridge}" drop
             network_definition.write_bytes(net)
             run("virsh", "-c", "qemu:///system", "net-define", str(network_definition))
             run("virsh", "-c", "qemu:///system", "net-start", network)
-            self._firewall(ident, bridge)
+            self._firewall(ident, bridge, f"{subnet}.1")
             (directory / "identity.json").write_text(json.dumps({**ident, "secret": secret,
                 "limits": {"max_terminals": self.max_terminals, "max_output_bytes": self.max_output_bytes,
                            "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes}}))
@@ -331,22 +342,88 @@ add rule inet {table} input iifname "{bridge}" drop
 
     def assert_absent(self, ident: dict) -> None:
         name, network, directory = self._paths(ident)
-        if directory.exists() or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines() or network in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines():
+        key = suffix(ident)
+        firewall_present = subprocess.run(("nft", "list", "table", "inet", "gt_" + key),
+                                          capture_output=True).returncode == 0
+        if (directory.exists() or (directory / "disk").is_mount() or firewall_present
+                or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
+                or network in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()):
             raise ValueError("attempt resources remain")
+
+    def _destroy_orphan_key(self, key: str, directory: Path | None = None) -> None:
+        if not re.fullmatch(r"[0-9a-f]{20}", key):
+            raise ValueError("invalid orphan workstation resource key")
+        name = f"gpt-trace-ws-{key}"
+        network = f"gpt-trace-net-{key}"
+        domains = run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
+        if name in domains:
+            state = run("virsh", "-c", "qemu:///system", "domstate", name).decode().strip()
+            if state == "running":
+                run("virsh", "-c", "qemu:///system", "destroy", name)
+            run("virsh", "-c", "qemu:///system", "undefine", name)
+        networks = run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()
+        if network in networks:
+            active = run("virsh", "-c", "qemu:///system", "net-list", "--name").decode().splitlines()
+            if network in active:
+                run("virsh", "-c", "qemu:///system", "net-destroy", network)
+            run("virsh", "-c", "qemu:///system", "net-undefine", network)
+        self._remove_firewall_key(key)
+        if directory is not None and directory.exists():
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError(f"unsafe attempt state entry: {directory}")
+            self._unmount(directory)
+            shutil.rmtree(directory, ignore_errors=False)
 
     def destroy_all(self) -> dict:
         removed = []
-        for state in sorted(self.root.glob("*/state.json")):
-            data = json.loads(state.read_text())
-            ident = identity(data["identity"])
-            self.destroy(ident)
-            self.assert_absent(ident)
-            removed.append(ident)
-        remaining = [name for name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines() if name.startswith("gpt-trace-ws-")]
-        remaining += [name for name in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines() if name.startswith("gpt-trace-net-")]
-        if remaining:
-            raise ValueError(f"untracked project resources require inspection: {remaining}")
-        return {"removed": removed}
+        orphaned = []
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for directory in sorted(self.root.iterdir()):
+            if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{20}", directory.name):
+                raise ValueError(f"unexpected workstation state entry: {directory.name}")
+            state = directory / "state.json"
+            if state.is_file() and not state.is_symlink():
+                data = json.loads(state.read_text())
+                ident = identity(data["identity"])
+                if suffix(ident) != directory.name:
+                    raise ValueError("attempt state directory/identity mismatch")
+                self.destroy(ident)
+                self.assert_absent(ident)
+                removed.append(ident)
+            else:
+                # A host crash can happen after the quota filesystem or libvirt
+                # resources exist but before state.json is durable. The directory
+                # name is the project-owned deterministic key, so recover it without
+                # requiring partially-written identity metadata.
+                self._destroy_orphan_key(directory.name, directory)
+                orphaned.append(directory.name)
+
+        # Also reap project-prefixed libvirt/nft resources whose state directory was
+        # lost entirely. The prefixes are reserved exclusively by this broker.
+        domains = [name for name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
+                   if re.fullmatch(r"gpt-trace-ws-[0-9a-f]{20}", name)]
+        networks = [name for name in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()
+                    if re.fullmatch(r"gpt-trace-net-[0-9a-f]{20}", name)]
+        keys = {name.removeprefix("gpt-trace-ws-") for name in domains}
+        keys.update(name.removeprefix("gpt-trace-net-") for name in networks)
+        nft_tables = run("nft", "list", "tables").decode(errors="replace").splitlines()
+        for line in nft_tables:
+            match = re.fullmatch(r"table inet gt_([0-9a-f]{20})", line.strip())
+            if match:
+                keys.add(match.group(1))
+        for key in sorted(keys):
+            self._destroy_orphan_key(key)
+            orphaned.append(key)
+
+        remaining = [name for name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
+                     if name.startswith("gpt-trace-ws-")]
+        remaining += [name for name in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()
+                      if name.startswith("gpt-trace-net-")]
+        remaining_tables = [line.strip() for line in run("nft", "list", "tables").decode(errors="replace").splitlines()
+                            if re.fullmatch(r"table inet gt_[0-9a-f]{20}", line.strip())]
+        if remaining or remaining_tables:
+            raise ValueError(f"project resources remain: {remaining + remaining_tables}")
+        return {"removed": removed, "orphaned": sorted(set(orphaned))}
 
     async def rpc(self, ident: dict, method: str, args: dict) -> dict:
         data = self._read(ident)
@@ -513,12 +590,24 @@ def recv_exact(connection: socket.socket, length: int) -> bytes:
 
 
 def create_app(broker: Broker) -> Starlette:
+    controller_actions = frozenset({
+        "inspect_attempt", "rpc", "capture_screen", "send_input",
+        "artifact_stage_begin", "artifact_stage_chunk", "artifact_stage_end",
+        "artifact_stage_abort", "artifact_export", "artifact_import", "artifact_read",
+    })
+
     async def health(_: Request):
         return JSONResponse({"status": "ok", "project": PROJECT})
 
     async def dispatch(request: Request):
-        if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {broker.token}"):
+        authorization = request.headers.get("authorization", "")
+        admin = hmac.compare_digest(authorization, f"Bearer {broker.admin_token}")
+        controller = hmac.compare_digest(authorization, f"Bearer {broker.controller_token}")
+        if not admin and not controller:
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        action = request.path_params["action"]
+        if controller and not admin and action not in controller_actions:
+            return JSONResponse({"detail": "broker action forbidden for controller token"}, status_code=403)
         try:
             raw = await request.body()
             if len(raw) > MAX_BODY:
@@ -526,7 +615,6 @@ def create_app(broker: Broker) -> Starlette:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("broker request must be an object")
-            action = request.path_params["action"]
             if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
             if action == "destroy_all": return JSONResponse(broker.destroy_all())
             ident = identity(payload)
@@ -557,11 +645,15 @@ def create_app(broker: Broker) -> Starlette:
 
 def main():
     import uvicorn
-    token = Path(os.environ["WORKSTATION_BROKER_TOKEN_FILE"]).read_text().strip()
-    if len(token) < 32:
-        raise RuntimeError("broker token too short")
+    admin_token = Path(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN_FILE"]).read_text().strip()
+    controller_token = Path(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE"]).read_text().strip()
+    if len(admin_token) < 32 or len(controller_token) < 32:
+        raise RuntimeError("broker tokens are missing or too short")
+    if hmac.compare_digest(admin_token, controller_token):
+        raise RuntimeError("broker admin and controller tokens must be distinct")
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
-    broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), Path(os.environ["WORKSTATION_BASE_IMAGE"]), token,
+    broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), Path(os.environ["WORKSTATION_BASE_IMAGE"]),
+                    admin_token, controller_token,
                     memory_mb=config["memory_mb"], vcpus=config["vcpus"],
                     boot_timeout_seconds=config["boot_timeout_seconds"],
                     guest_agent_timeout_seconds=config["guest_agent_timeout_seconds"],

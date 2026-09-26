@@ -12,7 +12,6 @@ import subprocess
 import termios
 import time
 import uuid
-import sys
 
 MAX_OUTPUT = 1024 * 1024
 MAX_STDIN = 4 * 1024 * 1024
@@ -89,11 +88,14 @@ class Terminal:
     def __init__(self, cwd: str, env: dict, rows: int, cols: int):
         self.master, slave = pty.openpty()
         self.resize(rows, cols)
-        # The child execs a small launcher before acquiring its controlling TTY.
-        # No Python code runs in a forked child of the (potentially threaded) agent.
-        self.process = subprocess.Popen([sys.executable, "-m", "kali_workstation.guest.pty_child"],
+        # util-linux setsid is a tiny native launcher: it creates a fresh session,
+        # assigns the inherited slave as the controlling TTY, then execs Bash.
+        # This avoids both Python pre-exec code and the startup race of launching a
+        # second Python interpreter before the interactive shell exists.
+        self.process = subprocess.Popen(["/usr/bin/setsid", "--ctty", "/bin/bash",
+                                         "--noprofile", "--norc", "-i"],
                                         cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave,
-                                        close_fds=True, start_new_session=True)
+                                        close_fds=True)
         os.close(slave)
         os.set_blocking(self.master, False)
         self.output = bytearray()
@@ -193,21 +195,22 @@ class Terminals:
         maximum = args.get("max_bytes", 65536)
         if type(wait) not in (int, float) or not 0 <= wait <= 30 or type(maximum) is not int or not 1 <= maximum <= MAX_OUTPUT:
             raise ValueError("invalid terminal read limits")
-        # Wait for output to settle, including data after a prompt/line echo.
-        # The deadline bounds the whole read, even with continuous output.
+        # wait_seconds is a true bounded collection window.  In particular, do
+        # not return merely because the PTY echoed the submitted command and then
+        # went briefly quiet while a freshly-started shell is still executing it.
+        # This makes the result deterministic for prompts and short-lived commands
+        # while still bounding reads with continuous output.
         if wait:
             deadline = asyncio.get_running_loop().time() + wait
-            quiet = min(.25, wait)
             while terminal.process.poll() is None:
                 terminal.changed.clear()
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
                 try:
-                    await asyncio.wait_for(terminal.changed.wait(), min(quiet, remaining))
+                    await asyncio.wait_for(terminal.changed.wait(), remaining)
                 except asyncio.TimeoutError:
-                    if terminal.output:
-                        break
+                    break
         return terminal.read(maximum)
 
     def resize(self, args: dict) -> dict:
