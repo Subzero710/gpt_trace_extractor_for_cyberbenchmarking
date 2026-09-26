@@ -1,0 +1,22 @@
+[Unit]
+Description=Disposable Kali guest agent for GPT Trace
+After=display-manager.service
+Wants=display-manager.service
+
+[Service]
+Type=simple
+User=root
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/kali/.Xauthority
+Environment=CLOAKBROWSER_BINARY_PATH=/opt/cloakbrowser/chromium/chrome
+Environment=CLOAKBROWSER_VERSION=146.0.7680.177.5
+Environment=CLOAKBROWSER_AUTO_UPDATE=false
+Environment=PYTHONPATH=/opt/gpt-trace/bundle/src
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 90); do test -S /tmp/.X11-unix/X0 && exit 0; sleep 1; done; exit 1'
+ExecStart=/opt/gpt-trace/venv/bin/python -m kali_workstation.guest.agent
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

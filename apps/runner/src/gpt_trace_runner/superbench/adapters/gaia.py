@@ -70,12 +70,9 @@ def _annotator_tool_text(row: dict[str, Any]) -> str:
 
 def _runtime_tools(*, file_path: str | None, annotator_tools: str) -> tuple[str, ...]:
     normalized = re.sub(r"\s+", " ", annotator_tools).casefold()
-    tools: list[str] = []
-    if any(hint in normalized for hint in _BROWSER_TOOL_HINTS):
-        tools.append("browser")
-    if file_path or any(hint in normalized for hint in _WORKSPACE_TOOL_HINTS):
-        tools.append("code-workspace")
-    return tuple(tools)
+    if file_path or any(hint in normalized for hint in _BROWSER_TOOL_HINTS + _WORKSPACE_TOOL_HINTS):
+        return ("kali-workstation",)
+    return ()
 
 
 def _sha256_file(path: Path) -> str:
@@ -328,10 +325,10 @@ class GAIAAdapter(BenchmarkAdapter):
             )
 
         available_apps = {app_id for task in tasks for app_id in task.tools}
-        expected_apps = {"browser", "code-workspace"}
+        expected_apps = {"kali-workstation"}
         if not expected_apps <= available_apps:
             raise RuntimeError(
-                "pinned GAIA smoke split no longer exposes both MCP Apps when "
+                "pinned GAIA smoke split no longer exposes the workstation App when "
                 f"the upstream task annotations call for them: found {sorted(available_apps)!r}"
             )
 

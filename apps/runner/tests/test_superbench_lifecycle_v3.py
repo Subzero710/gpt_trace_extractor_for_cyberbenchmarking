@@ -47,11 +47,9 @@ class V3Settings:
     chatgpt_natural_snapshot_wait_seconds: int = 1
     browser_humanize: bool = False
     browser_humanize_preset: str = "default"
-    app_browser_humanize: bool = False
-    app_browser_humanize_preset: str = "default"
-    app_browser_timezone: str = "UTC"
-    app_browser_locale: str = "en-US"
-    app_browser_geoip: str = ""
+    workstation_provider: str = "libvirt"
+    workstation_memory_mb: int = 8192
+    workstation_vcpus: int = 4
 
 
 class EmptyRegistry:

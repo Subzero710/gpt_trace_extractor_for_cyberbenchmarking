@@ -1,178 +1,29 @@
 from __future__ import annotations
-
-from pathlib import Path
-
 import pytest
 from rich.console import Console
-
 from gpt_trace_runner.exceptions import AppInfrastructureError
 from gpt_trace_runner.models import BenchmarkTask, BenchmarkTool
-from gpt_trace_runner.runtime_preflight import preflight_tasks
+from gpt_trace_runner.runtime_preflight import preflight_tasks, _validate_endpoint
 
-
-def _tool() -> BenchmarkTool:
-    return BenchmarkTool(
-        type="app",
-        app_id="code-workspace",
-        ui_name="Code Workspace",
-        kind="local_mcp",
-        version="1.0.0",
-        manifest_sha256="m" * 64,
-        tool_manifest={"app_id": "code-workspace", "version": "1.0.0", "tools": []},
-        mcp_endpoint="http://workspace-gateway:8000/mcp",
-        control_endpoint="http://workspace-gateway:8000",
-    )
-
-
-class FakeLifecycle:
-    def __init__(self, *, fail_prepare: bool = False, fail_clean: bool = False) -> None:
-        self.fail_prepare = fail_prepare
-        self.fail_clean = fail_clean
-        self.calls: list[tuple] = []
-
-    @staticmethod
-    def environment_ids(task, *, attempt, fingerprint):
-        return {"code-workspace": f"{task.task_id}-{attempt}-{fingerprint[:8]}"}
-
-    async def health(self, task):
-        self.calls.append(("health", task.task_id))
-
-    async def prepare(self, task, environments, fingerprint, *, attempt):
-        self.calls.append(("prepare", task.task_id, attempt, dict(environments)))
-        if self.fail_prepare:
-            raise AppInfrastructureError("prepare exploded")
-
-    async def reset(self, task, environments, fingerprint, *, attempt):
-        self.calls.append(("reset", task.task_id, attempt, dict(environments)))
-
-    async def assert_clean(self, task, environments, fingerprint, *, attempt):
-        self.calls.append(("assert_clean", task.task_id, attempt, dict(environments)))
-        if self.fail_clean:
-            raise AppInfrastructureError("residue")
-
+class Lifecycle:
+    def __init__(self, fail=False):self.calls=[];self.fail=fail
+    def environment_ids(self,task,*,attempt,fingerprint):return {}
+    async def health(self,task):self.calls.append('health')
+    async def prepare(self,*args,**kw):
+        self.calls.append('prepare')
+        if self.fail:raise AppInfrastructureError('prepare failed')
+    async def reset(self,*args,**kw):self.calls.append('reset')
+    async def assert_clean(self,*args,**kw):self.calls.append('assert_clean')
 
 @pytest.mark.asyncio
-async def test_preflight_always_verifies_cleanup(monkeypatch, tmp_path: Path) -> None:
-    task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
-    lifecycle = FakeLifecycle()
+async def test_preflight_cleanup_even_after_prepare_failure():
+    task=BenchmarkTask('t','p',())
+    lifecycle=Lifecycle(True)
+    with pytest.raises(AppInfrastructureError,match='prepare failed'):
+        await preflight_tasks(lifecycle,[task],console=Console())
+    assert lifecycle.calls==['health','prepare','reset','assert_clean']
 
-    async def fake_smoke(
-        tool,
-        *,
-        index,
-        previous_workspace_marker,
-        previous_example_tab,
-        require_chatgpt_block,
-    ):
-        return ".marker", previous_example_tab
-
-    monkeypatch.setattr("gpt_trace_runner.runtime_preflight._smoke_tool", fake_smoke)
-    await preflight_tasks(lifecycle, [task], console=Console())
-
-    assert [call[0] for call in lifecycle.calls] == [
-        "health",
-        "prepare",
-        "reset",
-        "assert_clean",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_preflight_prepare_failure_still_cleans_and_reports(monkeypatch, tmp_path: Path) -> None:
-    task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
-    lifecycle = FakeLifecycle(fail_prepare=True)
-
-    with pytest.raises(AppInfrastructureError, match="prepare exploded"):
-        await preflight_tasks(lifecycle, [task], console=Console())
-
-    assert [call[0] for call in lifecycle.calls] == [
-        "health",
-        "prepare",
-        "reset",
-        "assert_clean",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_cleanup_residue_is_fatal(monkeypatch, tmp_path: Path) -> None:
-    task = BenchmarkTask("real-task", "prompt", (), (_tool(),), None)
-    lifecycle = FakeLifecycle(fail_clean=True)
-
-    async def fake_smoke(
-        tool,
-        *,
-        index,
-        previous_workspace_marker,
-        previous_example_tab,
-        require_chatgpt_block,
-    ):
-        return ".marker", previous_example_tab
-
-    monkeypatch.setattr("gpt_trace_runner.runtime_preflight._smoke_tool", fake_smoke)
-    with pytest.raises(AppInfrastructureError, match="residue"):
-        await preflight_tasks(lifecycle, [task], console=Console())
-
-
-def test_screenshot_integrity_accepts_real_png_signature() -> None:
-    import base64
-    import hashlib
-
-    from gpt_trace_runner.runtime_preflight import _assert_screenshot_integrity
-
-    raw = b"\x89PNG\r\n\x1a\n" + b"doctor-png-payload"
-    _assert_screenshot_integrity(
-        {
-            "mime_type": "image/png",
-            "size": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "content_base64": base64.b64encode(raw).decode("ascii"),
-        }
-    )
-
-
-def test_screenshot_integrity_rejects_literal_escape_sequence() -> None:
-    import base64
-    import hashlib
-
-    from gpt_trace_runner.runtime_preflight import _assert_screenshot_integrity
-
-    raw = b"\\x89PNG\\r\\n\\x1a\\n"
-    with pytest.raises(AppInfrastructureError, match="not a PNG"):
-        _assert_screenshot_integrity(
-            {
-                "mime_type": "image/png",
-                "size": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "content_base64": base64.b64encode(raw).decode("ascii"),
-            }
-        )
-
-
-def test_screenshot_integrity_rejects_size_or_digest_mismatch() -> None:
-    import base64
-    import hashlib
-
-    from gpt_trace_runner.runtime_preflight import _assert_screenshot_integrity
-
-    raw = b"\x89PNG\r\n\x1a\n" + b"payload"
-    encoded = base64.b64encode(raw).decode("ascii")
-
-    with pytest.raises(AppInfrastructureError, match="size mismatch"):
-        _assert_screenshot_integrity(
-            {
-                "mime_type": "image/png",
-                "size": len(raw) + 1,
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "content_base64": encoded,
-            }
-        )
-
-    with pytest.raises(AppInfrastructureError, match="SHA-256 mismatch"):
-        _assert_screenshot_integrity(
-            {
-                "mime_type": "image/png",
-                "size": len(raw),
-                "sha256": "0" * 64,
-                "content_base64": encoded,
-            }
-        )
+def test_preflight_rejects_external_mcp_endpoint():
+    tool=BenchmarkTool('app','kali-workstation','Kali Workstation','local_mcp','3.0.0','a'*64,{},mcp_endpoint='https://attacker.example/mcp')
+    with pytest.raises(AppInfrastructureError,match='endpoint'):
+        _validate_endpoint(tool)

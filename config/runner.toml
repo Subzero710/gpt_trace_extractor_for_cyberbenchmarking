@@ -3,34 +3,15 @@
 [runner]
 storage_base_url = "http://storage:8080"
 browser_cdp_url = ""
-browser_cdp_base_url = "http://browser:9222"
+browser_cdp_base_url = "http://teacher-browser:9222"
 browser_profile_identity_path = "/browser-profile/.gpt-trace-identity"
 browser_novnc_url = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
 browser_humanize = true
 browser_humanize_preset = "default"
-browser_clipboard_url = "http://browser:8765/clipboard"
+browser_clipboard_url = "http://teacher-browser:8765/clipboard"
 runner_state_root = "/data/state"
 app_registry_path = "/data/apps/registry/apps.json"
 app_control_token_file = "/run/secrets/app_control_token"
-docker_socket_path = "/var/run/docker.sock"
-app_code_workspace_image = "gpt-trace-code-workspace:latest"
-app_browser_image = "gpt-trace-browser:latest"
-app_file_relay_image = "gpt-trace-file-relay:latest"
-file_transfer_max_file_bytes = 134217728
-file_transfer_max_total_bytes = 268435456
-file_transfer_max_objects = 32
-file_transfer_max_concurrent_uploads = 2
-file_transfer_max_concurrent_downloads = 2
-file_transfer_ttl_seconds = 1800
-workspace_gateway_container = "gpt-trace-workspace-gateway"
-browser_gateway_container = "gpt-trace-browser-gateway"
-app_browser_search_url_template = "https://duckduckgo.com/?q={query}"
-app_browser_allowed_private_hosts = ""
-app_browser_humanize = true
-app_browser_humanize_preset = "default"
-app_browser_timezone = ""
-app_browser_locale = ""
-app_browser_geoip = false
 chatgpt_base_url = "https://chatgpt.com"
 chatgpt_conversation_turns = 100
 chatgpt_turn_timeout_seconds = 1800.0
@@ -43,3 +24,19 @@ chatgpt_natural_snapshot_wait_seconds = 0.0
 chatgpt_expected_model_slug = "gpt-5-6-thinking"
 runner_id = ""
 runner_recover_existing = true
+
+[workstation]
+provider = "libvirt"
+broker_socket = "/run/workstation-broker/broker.sock"
+gateway_container = "gpt-trace-workstation-gateway"
+boot_timeout_seconds = 120
+guest_agent_timeout_seconds = 60
+memory_mb = 8192
+vcpus = 4
+overlay_quota_gb = 16
+screenshot_max_bytes = 8388608
+max_terminals = 8
+max_output_bytes = 1048576
+max_transfer_bytes = 67108864
+max_seed_bytes = 671088640
+egress_allow_cidrs = []

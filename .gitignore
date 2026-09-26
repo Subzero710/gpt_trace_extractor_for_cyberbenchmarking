@@ -1,6 +1,7 @@
 .env
 .secrets/
 .venv/
+.venv-workstation-broker/
 __pycache__/
 *.py[cod]
 .pytest_cache/

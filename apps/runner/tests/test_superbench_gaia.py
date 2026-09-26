@@ -76,9 +76,9 @@ def test_discover_exposes_only_annotated_or_attachment_tools_without_forcing(
     )
     file_task = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-file")
 
-    assert web.tools == ("browser",)
+    assert web.tools == ("kali-workstation",)
     assert direct.tools == ()
-    assert file_task.tools == ("code-workspace",)
+    assert file_task.tools == ("kali-workstation",)
 
     assert "Use Browser" not in web.prompt
     assert "Use Code Workspace" not in file_task.prompt

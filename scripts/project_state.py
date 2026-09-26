@@ -18,8 +18,7 @@ KNOWN_SECRET_KEYS = {
     "POSTGRES_PASSWORD",
     "CLOAKBROWSER_LICENSE_KEY",
     "CONTROL_PLANE_API_KEY",
-    "APP_CODE_WORKSPACE_TUNNEL_ID",
-    "APP_BROWSER_TUNNEL_ID",
+    "APP_KALI_WORKSTATION_TUNNEL_ID",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -93,20 +92,12 @@ def ensure_control_token() -> None:
 
 
 def validate_tunnels(values: dict[str, str]) -> None:
-    tunnel_keys = (
-        "APP_CODE_WORKSPACE_TUNNEL_ID",
-        "APP_BROWSER_TUNNEL_ID",
-    )
+    tunnel_keys = ("APP_KALI_WORKSTATION_TUNNEL_ID",)
     for key in tunnel_keys:
         value = values.get(key, "")
         if not TUNNEL_ID.fullmatch(value):
             raise SystemExit(f"invalid/missing {key} in .env")
 
-    if values[tunnel_keys[0]] == values[tunnel_keys[1]]:
-        raise SystemExit(
-            "invalid tunnel configuration: code-workspace and browser must use "
-            "different tunnel IDs"
-        )
 
 
 def main() -> int:

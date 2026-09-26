@@ -3,26 +3,14 @@
     {
       "aliases": [],
       "attachment_mode": "copy",
-      "control_endpoint_default": "http://workspace-gateway:8000",
-      "display_name_default": "Code Workspace",
-      "id": "code-workspace",
+      "control_endpoint_default": "http://workstation-gateway:8000",
+      "display_name_default": "Kali Workstation",
+      "id": "kali-workstation",
       "kind": "local_mcp",
-      "manifest_path_default": "../code-workspace/tool-manifest.json",
-      "manifest_sha256": "7b1c15dbeae0682a0327a826d3434bff9e49a674469f06a0cff84b54c63e2a07",
-      "mcp_endpoint_default": "http://workspace-gateway:8000/mcp",
-      "version": "2.0.0"
-    },
-    {
-      "aliases": [],
-      "attachment_mode": "none",
-      "control_endpoint_default": "http://browser-gateway:8000",
-      "display_name_default": "Cloak Browser",
-      "id": "browser",
-      "kind": "local_mcp",
-      "manifest_path_default": "../browser/tool-manifest.json",
-      "manifest_sha256": "357562b92925e05cfce7f7a4007e923d77d9e839ae0b2040aed03ab1ad25d692",
-      "mcp_endpoint_default": "http://browser-gateway:8000/mcp",
-      "version": "2.0.0"
+      "manifest_path_default": "../kali-workstation/tool-manifest.json",
+      "manifest_sha256": "25759fb848682426a4142af14f241071cfd9c6cd57e09031f193e7d9fc3ae730",
+      "mcp_endpoint_default": "http://workstation-gateway:8000/mcp",
+      "version": "3.0.0"
     },
     {
       "aliases": [

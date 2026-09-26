@@ -1,0 +1,2138 @@
+{
+  "schema_version": 2,
+  "app_id": "kali-workstation",
+  "version": "3.0.0",
+  "tools": [
+    {
+      "name": "exec_command",
+      "category": "shell",
+      "description": "Execute a Bash command in the Kali guest with optional stdin, cwd, environment and bounded output.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "maxLength": 131072,
+            "minLength": 1,
+            "title": "Command",
+            "type": "string"
+          },
+          "cwd": {
+            "default": "/home/kali/workspace",
+            "maxLength": 4096,
+            "title": "Cwd",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "default": 120,
+            "maximum": 1800,
+            "minimum": 1,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "stdin": {
+            "default": "",
+            "maxLength": 4194304,
+            "title": "Stdin",
+            "type": "string"
+          },
+          "environment": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 128,
+            "title": "Environment",
+            "type": "object"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "Command",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "exit_code": {
+            "title": "Exit Code",
+            "type": "integer"
+          },
+          "timed_out": {
+            "title": "Timed Out",
+            "type": "boolean"
+          },
+          "stdout": {
+            "title": "Stdout",
+            "type": "string"
+          },
+          "stderr": {
+            "title": "Stderr",
+            "type": "string"
+          },
+          "stdout_truncated": {
+            "title": "Stdout Truncated",
+            "type": "boolean"
+          },
+          "stderr_truncated": {
+            "title": "Stderr Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "exit_code",
+          "timed_out",
+          "stdout",
+          "stderr",
+          "stdout_truncated",
+          "stderr_truncated"
+        ],
+        "title": "CommandOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "create_terminal",
+      "category": "shell",
+      "description": "Create an interactive Bash session attached to a Unix PTY in the Kali guest.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "default": "/home/kali/workspace",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "environment": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Environment",
+            "type": "object"
+          },
+          "rows": {
+            "default": 24,
+            "maximum": 200,
+            "minimum": 10,
+            "title": "Rows",
+            "type": "integer"
+          },
+          "cols": {
+            "default": 80,
+            "maximum": 400,
+            "minimum": 20,
+            "title": "Cols",
+            "type": "integer"
+          }
+        },
+        "title": "NewTerminal",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "terminal_id": {
+            "title": "Terminal Id",
+            "type": "string"
+          },
+          "pid": {
+            "title": "Pid",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "pid"
+        ],
+        "title": "Created",
+        "type": "object"
+      }
+    },
+    {
+      "name": "send_terminal_input",
+      "category": "shell",
+      "description": "Write text or control characters to a persistent PTY.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "terminal_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Terminal Id",
+            "type": "string"
+          },
+          "input": {
+            "maxLength": 65536,
+            "title": "Input",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "input"
+        ],
+        "title": "TerminalSend",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted_bytes": {
+            "title": "Accepted Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted_bytes"
+        ],
+        "title": "Sent",
+        "type": "object"
+      }
+    },
+    {
+      "name": "read_terminal_output",
+      "category": "shell",
+      "description": "Read bounded output from a persistent PTY.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "terminal_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Terminal Id",
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 65536,
+            "maximum": 1048576,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          },
+          "wait_seconds": {
+            "default": 0,
+            "maximum": 30,
+            "minimum": 0,
+            "title": "Wait Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "terminal_id"
+        ],
+        "title": "TerminalRead",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "output": {
+            "title": "Output",
+            "type": "string"
+          },
+          "output_base64": {
+            "title": "Output Base64",
+            "type": "string"
+          },
+          "dropped_bytes": {
+            "title": "Dropped Bytes",
+            "type": "integer"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exit Code"
+          },
+          "running": {
+            "title": "Running",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "output",
+          "output_base64",
+          "dropped_bytes",
+          "exit_code",
+          "running"
+        ],
+        "title": "Read",
+        "type": "object"
+      }
+    },
+    {
+      "name": "close_terminal",
+      "category": "shell",
+      "description": "Terminate and reap a persistent PTY session.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "terminal_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Terminal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "terminal_id"
+        ],
+        "title": "TerminalId",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "closed": {
+            "title": "Closed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "closed"
+        ],
+        "title": "ClosedTerminal",
+        "type": "object"
+      }
+    },
+    {
+      "name": "resize_terminal",
+      "category": "shell",
+      "description": "Set PTY rows and columns and signal the foreground terminal process.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "terminal_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Terminal Id",
+            "type": "string"
+          },
+          "rows": {
+            "maximum": 200,
+            "minimum": 10,
+            "title": "Rows",
+            "type": "integer"
+          },
+          "cols": {
+            "maximum": 400,
+            "minimum": 20,
+            "title": "Cols",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "terminal_id",
+          "rows",
+          "cols"
+        ],
+        "title": "TerminalResize",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "Resized",
+        "type": "object"
+      }
+    },
+    {
+      "name": "observe_screen",
+      "category": "computer",
+      "description": "Capture the Kali desktop PNG, resolution and SHA-256.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "width": {
+            "title": "Width",
+            "type": "integer"
+          },
+          "height": {
+            "title": "Height",
+            "type": "integer"
+          },
+          "mime_type": {
+            "const": "image/png",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "content_base64": {
+            "title": "Content Base64",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "mime_type",
+          "content_base64",
+          "sha256"
+        ],
+        "title": "Image",
+        "type": "object"
+      }
+    },
+    {
+      "name": "computer_input",
+      "category": "computer",
+      "description": "Apply bounded generic mouse and keyboard events to the Kali desktop.",
+      "inputSchema": {
+        "$defs": {
+          "Event": {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "mouse_move",
+                  "mouse_down",
+                  "mouse_up",
+                  "click",
+                  "scroll",
+                  "text",
+                  "key",
+                  "key_down",
+                  "key_up"
+                ],
+                "title": "Type",
+                "type": "string"
+              },
+              "x": {
+                "anyOf": [
+                  {
+                    "maximum": 3840,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "X"
+              },
+              "y": {
+                "anyOf": [
+                  {
+                    "maximum": 2160,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Y"
+              },
+              "button": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "left",
+                      "middle",
+                      "right"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Button"
+              },
+              "steps": {
+                "anyOf": [
+                  {
+                    "maximum": 20,
+                    "minimum": -20,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Steps"
+              },
+              "text": {
+                "anyOf": [
+                  {
+                    "maxLength": 8192,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Text"
+              },
+              "key": {
+                "anyOf": [
+                  {
+                    "maxLength": 64,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Key"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "Event",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/$defs/Event"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "Input",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "events_processed": {
+            "title": "Events Processed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ok",
+          "events_processed"
+        ],
+        "title": "InputOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "import_file",
+      "category": "transfer",
+      "description": "Import an artifact from the attempt's controller-side store into a guest path.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "artifact_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "title": "Overwrite",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "artifact_id"
+        ],
+        "title": "Import",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "title": "FileOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "export_file",
+      "category": "transfer",
+      "description": "Export a bounded guest file to the controller-side store and return its artifact ID.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "Export",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "sha256",
+          "artifact_id"
+        ],
+        "title": "ExportOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "navigate",
+      "category": "browser",
+      "description": "Navigate a browser page to an HTTP(S) URL.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "url": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "URL",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "new_page",
+      "category": "browser",
+      "description": "Open a new browser tab, optionally at a URL.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Url"
+          }
+        },
+        "title": "NewPage",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_pages",
+      "category": "browser",
+      "description": "List browser tabs and the active tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "PageOut": {
+            "additionalProperties": false,
+            "properties": {
+              "page_id": {
+                "title": "Page Id",
+                "type": "string"
+              },
+              "url": {
+                "title": "Url",
+                "type": "string"
+              },
+              "title": {
+                "title": "Title",
+                "type": "string"
+              }
+            },
+            "required": [
+              "page_id",
+              "url",
+              "title"
+            ],
+            "title": "PageOut",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "pages": {
+            "items": {
+              "$ref": "#/$defs/PageOut"
+            },
+            "title": "Pages",
+            "type": "array"
+          },
+          "active_page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Page Id"
+          }
+        },
+        "required": [
+          "pages",
+          "active_page_id"
+        ],
+        "title": "PagesOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "close_page",
+      "category": "browser",
+      "description": "Close the selected browser tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "closed": {
+            "title": "Closed",
+            "type": "boolean"
+          },
+          "active_page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Page Id"
+          }
+        },
+        "required": [
+          "closed",
+          "active_page_id"
+        ],
+        "title": "Closed",
+        "type": "object"
+      }
+    },
+    {
+      "name": "switch_page",
+      "category": "browser",
+      "description": "Activate a browser tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "pattern": "^page-[0-9a-f]{16}$",
+            "title": "Page Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id"
+        ],
+        "title": "SwitchPage",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "go_back",
+      "category": "browser",
+      "description": "Navigate backward in a browser tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "go_forward",
+      "category": "browser",
+      "description": "Navigate forward in a browser tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "reload",
+      "category": "browser",
+      "description": "Reload a browser tab.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          }
+        },
+        "title": "Page",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "click",
+      "category": "browser",
+      "description": "Click a DOM element selected by CSS.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Selector",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "type_text",
+      "category": "browser",
+      "description": "Fill a DOM form element with text.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 262144,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "text"
+        ],
+        "title": "Fill",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "press",
+      "category": "browser",
+      "description": "Press a key on a DOM element.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          },
+          "key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "key"
+        ],
+        "title": "Press",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "hover",
+      "category": "browser",
+      "description": "Hover over a DOM element.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Selector",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "drag",
+      "category": "browser",
+      "description": "Drag one DOM element onto another.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "source_selector": {
+            "title": "Source Selector",
+            "type": "string"
+          },
+          "target_selector": {
+            "title": "Target Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_selector",
+          "target_selector"
+        ],
+        "title": "Drag",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "select_option",
+      "category": "browser",
+      "description": "Select option values in a DOM select element.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "selector",
+          "values"
+        ],
+        "title": "Select",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "query_selector",
+      "category": "browser",
+      "description": "Query matching DOM elements and bounded text.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Selector",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "matches": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Matches",
+            "type": "array"
+          }
+        },
+        "required": [
+          "count",
+          "matches"
+        ],
+        "title": "QueryOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "inspect_dom",
+      "category": "browser",
+      "description": "Inspect bounded DOM nodes for a CSS selector.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "default": "html",
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "title": "Inspect",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "nodes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Nodes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "title": "InspectOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_html",
+      "category": "browser",
+      "description": "Return bounded page or element HTML.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Selector"
+          }
+        },
+        "title": "Html",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "html": {
+            "title": "Html",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "html",
+          "truncated"
+        ],
+        "title": "HtmlOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_attribute",
+      "category": "browser",
+      "description": "Read an attribute of a DOM element.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "name"
+        ],
+        "title": "Attr",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "AttrOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "evaluate_javascript",
+      "category": "browser",
+      "description": "Evaluate JavaScript in the selected browser page.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "expression": {
+            "maxLength": 262144,
+            "minLength": 1,
+            "title": "Expression",
+            "type": "string"
+          },
+          "argument": {
+            "default": null,
+            "title": "Argument"
+          }
+        },
+        "required": [
+          "expression"
+        ],
+        "title": "Eval",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "title": "Result"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "EvalOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_cookies",
+      "category": "browser",
+      "description": "Read browser cookies.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "urls": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Urls",
+            "type": "array"
+          }
+        },
+        "title": "Cookies",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cookies": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Cookies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cookies"
+        ],
+        "title": "CookiesOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "set_cookie",
+      "category": "browser",
+      "description": "Set a browser cookie.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "cookie": {
+            "additionalProperties": true,
+            "title": "Cookie",
+            "type": "object"
+          }
+        },
+        "required": [
+          "cookie"
+        ],
+        "title": "Cookie",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cookies": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Cookies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cookies"
+        ],
+        "title": "CookiesOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "clear_cookies",
+      "category": "browser",
+      "description": "Clear browser cookies.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "Empty",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cookies": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Cookies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "cookies"
+        ],
+        "title": "CookiesOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_console_logs",
+      "category": "browser",
+      "description": "Read bounded browser console events.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "limit": {
+            "default": 200,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Logs",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "title": "LogsOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_network_logs",
+      "category": "browser",
+      "description": "Read bounded browser request and response events.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "limit": {
+            "default": 200,
+            "maximum": 500,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Logs",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "title": "LogsOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_request_details",
+      "category": "browser",
+      "description": "Read headers and method for a captured browser request.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "pattern": "^req-[0-9a-f]{16}$",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "Request",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "additionalProperties": true,
+            "title": "Request",
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "title": "RequestOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "get_response_body",
+      "category": "browser",
+      "description": "Read a bounded captured browser response body.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "pattern": "^req-[0-9a-f]{16}$",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 8388608,
+            "maximum": 8388608,
+            "minimum": 1,
+            "title": "Max Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "title": "Response",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "content_base64": {
+            "title": "Content Base64",
+            "type": "string"
+          }
+        },
+        "required": [
+          "size",
+          "sha256",
+          "truncated",
+          "content_base64"
+        ],
+        "title": "BodyOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "upload_file",
+      "category": "browser",
+      "description": "Select an existing Kali file for a browser file input.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "path"
+        ],
+        "title": "Upload",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "title": "Page Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "page_id",
+          "url",
+          "title"
+        ],
+        "title": "PageOut",
+        "type": "object"
+      }
+    },
+    {
+      "name": "download_file",
+      "category": "browser",
+      "description": "Download a clicked browser link into the Kali Downloads directory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "page_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Id"
+          },
+          "selector": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Selector",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "Selector",
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "title": "FileOut",
+        "type": "object"
+      }
+    }
+  ]
+}

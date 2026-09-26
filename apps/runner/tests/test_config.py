@@ -85,15 +85,15 @@ def test_runner_id_is_unique_even_with_fixed_label() -> None:
     assert first != second
 
 
-def test_dynamic_browser_environment_has_no_global_seed() -> None:
+def test_workstation_uses_narrow_broker_socket() -> None:
     settings = Settings()
-    env = settings.dynamic_browser_environment()
-    assert "APP_BROWSER_FINGERPRINT_SEED" not in env
+    assert settings.workstation_broker_socket == Path('/run/workstation-broker/broker.sock')
+    assert settings.workstation_provider == 'libvirt'
 
 
-def test_invalid_app_browser_timezone_and_empty_model_are_rejected() -> None:
+def test_invalid_workstation_resources_and_empty_model_are_rejected() -> None:
     from pydantic import ValidationError
     with pytest.raises(ValidationError):
-        Settings(app_browser_timezone="Europe/Zurich\nInjected")
+        Settings(workstation_memory_mb=128)
     with pytest.raises(ValidationError):
         Settings(chatgpt_expected_model_slug="   ")

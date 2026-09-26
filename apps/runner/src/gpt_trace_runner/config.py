@@ -23,9 +23,12 @@ def _versioned_config() -> dict[str, Any]:
         payload = tomllib.loads(RUNNER_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"cannot parse versioned runner config: {RUNNER_CONFIG_PATH}") from exc
-    if set(payload) != {"runner"} or not isinstance(payload["runner"], dict):
-        raise RuntimeError("runner.toml must contain exactly one [runner] table")
-    return dict(payload["runner"])
+    if set(payload) != {"runner", "workstation"} or not isinstance(payload["runner"], dict) or not isinstance(payload["workstation"], dict):
+        raise RuntimeError("runner.toml must contain [runner] and [workstation] tables")
+    allowed = {"provider", "broker_socket", "gateway_container", "boot_timeout_seconds", "guest_agent_timeout_seconds", "memory_mb", "vcpus", "overlay_quota_gb", "screenshot_max_bytes", "max_terminals", "max_output_bytes", "max_transfer_bytes", "max_seed_bytes", "egress_allow_cidrs"}
+    if set(payload["workstation"]) != allowed:
+        raise RuntimeError("workstation configuration has missing or unknown fields")
+    return {**payload["runner"], **{"workstation_" + k: v for k, v in payload["workstation"].items()}}
 
 
 class Settings(BaseSettings):
@@ -36,40 +39,35 @@ class Settings(BaseSettings):
 
     storage_base_url: str = "http://storage:8080"
     browser_cdp_url: str = ""
-    browser_cdp_base_url: str = "http://browser:9222"
+    browser_cdp_base_url: str = "http://teacher-browser:9222"
     browser_profile_identity_path: Path = Path("/browser-profile/.gpt-trace-identity")
     browser_novnc_url: str = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
     browser_humanize: bool = True
     browser_humanize_preset: Literal["default", "careful"] = "default"
-    browser_clipboard_url: str = "http://browser:8765/clipboard"
+    browser_clipboard_url: str = "http://teacher-browser:8765/clipboard"
 
     runner_state_root: Path = Path("/data/state")
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
     app_control_token_file: Path = Path("/run/secrets/app_control_token")
 
-    docker_socket_path: Path = Path("/var/run/docker.sock")
-    app_code_workspace_image: str = "gpt-trace-code-workspace:latest"
-    app_browser_image: str = "gpt-trace-browser:latest"
-    app_file_relay_image: str = "gpt-trace-file-relay:latest"
-    file_transfer_max_file_bytes: int = Field(default=134217728, ge=1)
-    file_transfer_max_total_bytes: int = Field(default=268435456, ge=1)
-    file_transfer_max_objects: int = Field(default=32, ge=1, le=10000)
-    file_transfer_max_concurrent_uploads: int = Field(default=2, ge=1, le=64)
-    file_transfer_max_concurrent_downloads: int = Field(default=2, ge=1, le=64)
-    file_transfer_ttl_seconds: int = Field(default=1800, ge=30, le=86400)
-    workspace_gateway_container: str = "gpt-trace-workspace-gateway"
-    browser_gateway_container: str = "gpt-trace-browser-gateway"
+    workstation_provider: Literal["libvirt"] = "libvirt"
+    workstation_broker_socket: Path = Path("/run/workstation-broker/broker.sock")
+    workstation_gateway_container: str = "gpt-trace-workstation-gateway"
+    workstation_boot_timeout_seconds: int = Field(default=120, ge=30, le=600)
+    workstation_guest_agent_timeout_seconds: int = Field(default=60, ge=10, le=300)
+    workstation_memory_mb: int = Field(default=8192, ge=1024, le=65536)
+    workstation_vcpus: int = Field(default=4, ge=1, le=32)
+    workstation_overlay_quota_gb: int = Field(default=16, ge=4, le=128)
+    workstation_screenshot_max_bytes: int = Field(default=8388608, ge=1024, le=16777216)
+    workstation_max_terminals: int = Field(default=8, ge=1, le=64)
+    workstation_max_output_bytes: int = Field(default=1048576, ge=1024, le=8388608)
+    workstation_max_transfer_bytes: int = Field(default=67108864, ge=1024, le=268435456)
+    workstation_max_seed_bytes: int = Field(default=671088640, ge=1024, le=671088640)
+    workstation_egress_allow_cidrs: list[str] = Field(default_factory=list)
 
     # Secret, intentionally absent from runner.toml.
     cloakbrowser_license_key: str = ""
 
-    app_browser_search_url_template: str = "https://duckduckgo.com/?q={query}"
-    app_browser_allowed_private_hosts: str = ""
-    app_browser_humanize: bool = True
-    app_browser_humanize_preset: Literal["default", "careful"] = "default"
-    app_browser_timezone: str = ""
-    app_browser_locale: str = ""
-    app_browser_geoip: bool = False
 
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_conversation_turns: int = Field(default=100, ge=1, le=1000)
@@ -89,36 +87,6 @@ class Settings(BaseSettings):
         merged = _versioned_config()
         merged.update(values)
         super().__init__(**merged)
-
-    @field_validator("app_browser_timezone")
-    @classmethod
-    def _valid_timezone(cls, value: str) -> str:
-        value = value.strip()
-        if value and (
-            len(value) > 128
-            or any(
-                ch not in
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+/-"
-                for ch in value
-            )
-        ):
-            raise ValueError("app_browser_timezone contains unsupported characters")
-        return value
-
-    @field_validator("app_browser_locale")
-    @classmethod
-    def _valid_locale(cls, value: str) -> str:
-        value = value.strip()
-        if value and (
-            len(value) > 64
-            or any(
-                ch not in
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-"
-                for ch in value
-            )
-        ):
-            raise ValueError("app_browser_locale must be a simple BCP-47 locale")
-        return value
 
     @field_validator("chatgpt_expected_model_slug")
     @classmethod
@@ -226,7 +194,7 @@ class Settings(BaseSettings):
         parsed = urlparse(self.browser_clipboard_url)
         if (
             parsed.scheme != "http"
-            or parsed.hostname != "browser"
+            or parsed.hostname != "teacher-browser"
             or parsed.path != "/clipboard"
             or parsed.query
             or parsed.fragment
@@ -234,25 +202,9 @@ class Settings(BaseSettings):
             or parsed.password is not None
         ):
             raise BrowserIdentityError(
-                "browser_clipboard_url must be the internal http://browser:<port>/clipboard helper"
+                "browser_clipboard_url must be the internal http://teacher-browser:<port>/clipboard helper"
             )
         return self.browser_clipboard_url
-
-    def dynamic_browser_environment(self) -> dict[str, str]:
-        if "{query}" not in self.app_browser_search_url_template:
-            raise BrowserIdentityError(
-                "app_browser_search_url_template must contain {query}"
-            )
-        return {
-            "CLOAKBROWSER_LICENSE_KEY": self.cloakbrowser_license_key,
-            "APP_BROWSER_SEARCH_URL_TEMPLATE": self.app_browser_search_url_template,
-            "APP_BROWSER_ALLOWED_PRIVATE_HOSTS": self.app_browser_allowed_private_hosts,
-            "APP_BROWSER_HUMANIZE": "true" if self.app_browser_humanize else "false",
-            "APP_BROWSER_HUMANIZE_PRESET": self.app_browser_humanize_preset,
-            "APP_BROWSER_TIMEZONE": self.app_browser_timezone.strip(),
-            "APP_BROWSER_LOCALE": self.app_browser_locale.strip(),
-            "APP_BROWSER_GEOIP": "true" if self.app_browser_geoip else "false",
-        }
 
     def effective_runner_id(self) -> str:
         label = self.runner_id.strip() or socket.gethostname()

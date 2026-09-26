@@ -10,8 +10,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MANAGED_LABEL = "gpttrace.managed=true"
-TASK_NETWORK_RE = re.compile(r"^gpt-trace-(?:task|egress)-[0-9a-f]{20}$")
 
 
 class DownError(RuntimeError):
@@ -65,8 +63,6 @@ def _compose_config() -> dict:
             "compose",
             "--profile",
             "runner",
-            "--profile",
-            "runtime-images",
             "--profile",
             "app-tunnels",
             "config",
@@ -139,66 +135,6 @@ def _container_ids(*filters: str, running_only: bool = False) -> set[str]:
 def _remove_containers(ids: set[str]) -> None:
     if ids:
         _run(["docker", "rm", "-f", *sorted(ids)])
-
-
-def _network_rows() -> list[tuple[str, str]]:
-    rows = _lines(["docker", "network", "ls", "--format", "{{.ID}}\t{{.Name}}"])
-    parsed: list[tuple[str, str]] = []
-    for row in rows:
-        parts = row.split("\t", 1)
-        if len(parts) != 2:
-            raise DownError(f"unexpected docker network row: {row!r}")
-        parsed.append((parts[0], parts[1]))
-    return parsed
-
-
-def _managed_network_ids() -> set[str]:
-    managed = set(
-        _lines(
-            [
-                "docker",
-                "network",
-                "ls",
-                "-q",
-                "--filter",
-                f"label={MANAGED_LABEL}",
-            ]
-        )
-    )
-    for network_id, name in _network_rows():
-        if TASK_NETWORK_RE.fullmatch(name):
-            managed.add(network_id)
-    return managed
-
-
-def _network_members(network: str) -> list[str]:
-    result = _run(
-        [
-            "docker",
-            "network",
-            "inspect",
-            network,
-            "--format",
-            "{{range $id, $c := .Containers}}{{$id}}{{println}}{{end}}",
-        ],
-        capture=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-
-def _remove_networks(ids: set[str]) -> None:
-    for network in sorted(ids):
-        for container in _network_members(network):
-            _run(
-                ["docker", "network", "disconnect", "-f", network, container],
-                check=False,
-            )
-        result = _run(["docker", "network", "rm", network], check=False)
-        if result.returncode != 0:
-            raise DownError(f"could not remove task network {network}")
 
 
 def _postgres_running_container(project: str) -> str | None:
@@ -393,21 +329,11 @@ def _verify_no_execution_resources(project: str) -> None:
     project_containers = _container_ids(
         f"label=com.docker.compose.project={project}"
     )
-    runtime_containers = _container_ids(f"label={MANAGED_LABEL}")
-    task_networks = _managed_network_ids()
 
     problems: list[str] = []
     if project_containers:
         problems.append(
             "project containers=" + ",".join(sorted(project_containers))
-        )
-    if runtime_containers:
-        problems.append(
-            "managed runtime containers=" + ",".join(sorted(runtime_containers))
-        )
-    if task_networks:
-        problems.append(
-            "task networks=" + ",".join(sorted(task_networks))
         )
     if problems:
         raise DownError(
@@ -449,9 +375,8 @@ def main() -> int:
     # Purge local recovery markers directly from an already-existing volume.
     _clear_runner_state_without_container(configured_volumes)
 
-    # Remove dynamic Docker-API runtimes and per-task networks.
-    _remove_containers(_container_ids(f"label={MANAGED_LABEL}"))
-    _remove_networks(_managed_network_ids())
+    # Destroy owned libvirt attempts while the trusted broker is still available.
+    _run([sys.executable, "scripts/workstation_broker.py", "stop"])
 
     # This is the only Compose lifecycle command: DOWN. No --volumes.
     _run(
@@ -460,8 +385,6 @@ def main() -> int:
             "compose",
             "--profile",
             "runner",
-            "--profile",
-            "runtime-images",
             "--profile",
             "app-tunnels",
             "down",
@@ -472,8 +395,6 @@ def main() -> int:
     )
 
     # Final idempotent cleanup/verification.
-    _remove_containers(_container_ids(f"label={MANAGED_LABEL}"))
-    _remove_networks(_managed_network_ids())
     _verify_no_execution_resources(project)
 
     # Prove down did not delete any persistent volume that existed beforehand.
@@ -488,7 +409,7 @@ def main() -> int:
 
     preserved = ", ".join(sorted(preexisting_volumes)) or "(none existed)"
     print(
-        "down complete: zero active project/task execution resources; "
+        "down complete: zero active project containers and workstation attempts; "
         f"pre-existing volumes preserved: {preserved}",
         flush=True,
     )

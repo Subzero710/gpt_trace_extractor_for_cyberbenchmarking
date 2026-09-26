@@ -46,11 +46,9 @@ def config_fp(settings) -> str:
         "chatgpt_natural_snapshot_wait_seconds",
         "browser_humanize",
         "browser_humanize_preset",
-        "app_browser_humanize",
-        "app_browser_humanize_preset",
-        "app_browser_timezone",
-        "app_browser_locale",
-        "app_browser_geoip",
+        "workstation_provider",
+        "workstation_memory_mb",
+        "workstation_vcpus",
     )
     return _hash_json({key: getattr(settings, key) for key in keys})
 

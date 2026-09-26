@@ -5,11 +5,11 @@ build:
 
 up:
 	python3 scripts/project_state.py core
-	docker compose up -d postgres storage browser workspace-gateway browser-gateway
+	python3 scripts/workstation_broker.py start
+	docker compose up -d postgres storage teacher-browser kali-workstation-controller workstation-gateway
 
 doctor:
-	python3 scripts/project_state.py doctor
-	# Doctor is observational: never start/recreate persistent dependencies.
+	python3 scripts/host_doctor.py
 	docker compose run --rm --no-deps runner doctor
 
 tools:

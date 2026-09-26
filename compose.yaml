@@ -1,5 +1,4 @@
 name: gpt-trace-extractor
-
 services:
   postgres:
     image: postgres:17-alpine
@@ -8,16 +7,17 @@ services:
       POSTGRES_USER: gpt_traces
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+    - postgres_data:/var/lib/postgresql/data
     networks:
-      - core_internal
+    - core_internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gpt_traces -d gpt_traces"]
+      test:
+      - CMD-SHELL
+      - pg_isready -U gpt_traces -d gpt_traces
       interval: 5s
       timeout: 5s
       retries: 20
     restart: unless-stopped
-
   storage:
     build:
       context: ./apps/storage
@@ -29,209 +29,23 @@ services:
       postgres:
         condition: service_healthy
     networks:
-      - core_internal
+    - core_internal
     ports:
-      - "127.0.0.1:8080:8080"
+    - 127.0.0.1:8080:8080
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)"]
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz',
+        timeout=2)
       interval: 5s
       timeout: 3s
       retries: 20
     restart: unless-stopped
-
-  # Persistent teacher browser used only to drive chatgpt.com.
-  # Its identity is owned by browser_profile/.gpt-trace-identity.
-  browser:
-    build:
-      context: ./infra/browser
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    environment:
-      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
-      DISPLAY: :99
-      BROWSER_CLIPBOARD_PORT: "8765"
-    volumes:
-      - browser_profile:/profile
-    networks:
-      - core_internal
-      - ui_egress
-    ports:
-      - "127.0.0.1:9222:9222"
-      - "127.0.0.1:7900:7900"
-    shm_size: "2gb"
-    security_opt:
-      - seccomp=./infra/browser/seccomp_profile.json
-    init: true
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/browser-healthcheck"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 15s
-    restart: unless-stopped
-
-  workspace-gateway:
-    build:
-      context: ./apps/mcp-gateway
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    container_name: gpt-trace-workspace-gateway
-    environment:
-      GATEWAY_APP_ID: code-workspace
-      GATEWAY_BACKEND_PREFIX: gpt-trace-workspace-
-      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
-    secrets:
-      - source: app_control_token
-        target: app_control_token
-    networks:
-      - app_control
-    ports:
-      - "127.0.0.1:8011:8000"
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
-    cap_drop:
-      - ALL
-    cap_add:
-      - DAC_READ_SEARCH
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 64
-    mem_limit: 256m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    restart: unless-stopped
-
-  browser-gateway:
-    build:
-      context: ./apps/mcp-gateway
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    container_name: gpt-trace-browser-gateway
-    environment:
-      GATEWAY_APP_ID: browser
-      GATEWAY_BACKEND_PREFIX: gpt-trace-browser-
-      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
-    secrets:
-      - source: app_control_token
-        target: app_control_token
-    networks:
-      - app_control
-    ports:
-      - "127.0.0.1:8012:8000"
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
-    cap_drop:
-      - ALL
-    cap_add:
-      - DAC_READ_SEARCH
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 64
-    mem_limit: 256m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    restart: unless-stopped
-
-  workspace-runtime-image:
-    profiles: ["runtime-images"]
-    build:
-      context: ./apps/code-workspace
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    image: gpt-trace-code-workspace:latest
-    entrypoint: ["/bin/true"]
-    restart: "no"
-
-  file-relay-runtime-image:
-    profiles: ["runtime-images"]
-    build:
-      context: ./apps/file-relay
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    image: gpt-trace-file-relay:latest
-    entrypoint: ["/bin/true"]
-    restart: "no"
-
-  browser-runtime-image:
-    profiles: ["runtime-images"]
-    build:
-      context: ./apps/browser
-      labels:
-        io.gpttrace.project: gpt-trace-extractor
-    image: gpt-trace-browser:latest
-    entrypoint: ["/bin/true"]
-    restart: "no"
-
-  mcp-tunnel-workspace:
-    profiles: ["app-tunnels"]
-    image: ghcr.io/openai/tunnel-client:v0.0.14
-    entrypoint: ["/usr/bin/tunnel-client"]
-    command: ["run", "--log.level=info", "--log.format=struct-text"]
-    environment:
-      CONTROL_PLANE_TUNNEL_ID: ${APP_CODE_WORKSPACE_TUNNEL_ID:-}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
-      MCP_SERVER_URL: http://workspace-gateway:8000/mcp
-      HEALTH_LISTEN_ADDR: :8080
-      HOME: /tmp/tunnel-home
-    depends_on:
-      workspace-gateway:
-        condition: service_healthy
-    networks:
-      - app_control
-      - mcp_tunnel_egress
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
-    restart: unless-stopped
-
-  mcp-tunnel-browser:
-    profiles: ["app-tunnels"]
-    image: ghcr.io/openai/tunnel-client:v0.0.14
-    entrypoint: ["/usr/bin/tunnel-client"]
-    command: ["run", "--log.level=info", "--log.format=struct-text"]
-    environment:
-      CONTROL_PLANE_TUNNEL_ID: ${APP_BROWSER_TUNNEL_ID:-}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
-      MCP_SERVER_URL: http://browser-gateway:8000/mcp
-      HEALTH_LISTEN_ADDR: :8080
-      HOME: /tmp/tunnel-home
-    depends_on:
-      browser-gateway:
-        condition: service_healthy
-    networks:
-      - app_control
-      - mcp_tunnel_egress
-    read_only: true
-    tmpfs:
-      - /tmp:rw,nosuid,nodev,size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 256m
-    cpus: 0.50
-    restart: unless-stopped
-
   benchmark-fetch:
-    profiles: ["benchmark-fetch"]
+    profiles:
+    - benchmark-fetch
     build:
       context: ./apps/runner
       labels:
@@ -240,14 +54,16 @@ services:
       BENCHMARK_SOURCE_TOKEN: ${BENCHMARK_SOURCE_TOKEN:-}
       GPT_TRACE_SUPERBENCH_SOURCE_ROOT: /data/state/superbench/sources
     volumes:
-      - benchmark_sources:/data/state/superbench/sources
+    - benchmark_sources:/data/state/superbench/sources
     networks:
-      - benchmark_source_egress
-    entrypoint: ["gpt-trace", "superbench-fetch"]
-    restart: "no"
-
+    - benchmark_source_egress
+    entrypoint:
+    - gpt-trace
+    - superbench-fetch
+    restart: 'no'
   runner:
-    profiles: ["runner"]
+    profiles:
+    - runner
     build:
       context: ./apps/runner
       labels:
@@ -255,47 +71,173 @@ services:
     environment:
       CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
     secrets:
-      - source: app_control_token
-        target: app_control_token
+    - source: app_control_token
+      target: app_control_token
     volumes:
-      - ./exports:/data/exports
-      - ./apps:/data/apps:ro
-      - ./config:/data/config:ro
-      - browser_profile:/browser-profile:ro
-      - runner_state:/data/state
-      - benchmark_sources:/data/state/superbench/sources:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+    - ./exports:/data/exports
+    - ./apps:/data/apps:ro
+    - ./config:/data/config:ro
+    - browser_profile:/browser-profile:ro
+    - runner_state:/data/state
+    - benchmark_sources:/data/state/superbench/sources:ro
+    - ./state/broker:/run/workstation-broker
     networks:
-      - core_internal
-      - app_control
+    - core_internal
+    - app_control
     depends_on:
       storage:
         condition: service_healthy
-      browser:
+      teacher-browser:
         condition: service_healthy
-      workspace-gateway:
+      workstation-gateway:
         condition: service_healthy
-      browser-gateway:
-        condition: service_healthy
+      kali-workstation-controller:
+        condition: service_started
     stdin_open: true
     tty: true
-    restart: "no"
-
+    restart: 'no'
+  teacher-browser:
+    build:
+      context: ./infra/browser
+      labels:
+        io.gpttrace.project: gpt-trace-extractor
+    environment:
+      CLOAKBROWSER_LICENSE_KEY: ${CLOAKBROWSER_LICENSE_KEY:-}
+      DISPLAY: :99
+      BROWSER_CLIPBOARD_PORT: '8765'
+    volumes:
+    - browser_profile:/profile
+    networks:
+    - core_internal
+    - ui_egress
+    ports:
+    - 127.0.0.1:9222:9222
+    - 127.0.0.1:7900:7900
+    shm_size: 2gb
+    security_opt:
+    - seccomp=./infra/browser/seccomp_profile.json
+    init: true
+    healthcheck:
+      test:
+      - CMD
+      - /usr/local/bin/browser-healthcheck
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+  workstation-gateway:
+    build:
+      context: ./apps/mcp-gateway
+      labels:
+        io.gpttrace.project: gpt-trace-extractor
+    container_name: gpt-trace-workstation-gateway
+    environment:
+      GATEWAY_APP_ID: kali-workstation
+      GATEWAY_BACKEND_PREFIX: kali-workstation-controller
+      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+    secrets:
+    - source: app_control_token
+      target: app_control_token
+    networks:
+    - app_control
+    ports:
+    - 127.0.0.1:8011:8000
+    read_only: true
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    cap_drop:
+    - ALL
+    cap_add:
+    - DAC_READ_SEARCH
+    security_opt:
+    - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz',
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  mcp-tunnel-workstation:
+    profiles:
+    - app-tunnels
+    image: ghcr.io/openai/tunnel-client:v0.0.14
+    entrypoint:
+    - /usr/bin/tunnel-client
+    command:
+    - run
+    - --log.level=info
+    - --log.format=struct-text
+    environment:
+      CONTROL_PLANE_TUNNEL_ID: ${APP_KALI_WORKSTATION_TUNNEL_ID:-}
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:-}
+      MCP_SERVER_URL: http://workstation-gateway:8000/mcp
+      HEALTH_LISTEN_ADDR: :8080
+      HOME: /tmp/tunnel-home
+    depends_on:
+      workstation-gateway:
+        condition: service_healthy
+    networks:
+    - app_control
+    - mcp_tunnel_egress
+    read_only: true
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=16m,mode=1777
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+  kali-workstation-controller:
+    build:
+      context: ./apps/kali-workstation
+      labels:
+        io.gpttrace.project: gpt-trace-extractor
+    environment:
+      WORKSTATION_BROKER_SOCKET: /run/workstation-broker/broker.sock
+      MCP_TOOL_MANIFEST: /app/tool-manifest.json
+      WORKSTATION_CONFIG: /app/config/runner.toml
+      APP_CONTROL_TOKEN_FILE: /run/secrets/app_control_token
+    volumes:
+    - ./state/broker:/run/workstation-broker
+    - ./config/runner.toml:/app/config/runner.toml:ro
+    secrets:
+    - source: app_control_token
+      target: app_control_token
+    networks:
+    - app_control
+    read_only: true
+    tmpfs:
+    - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    restart: unless-stopped
 volumes:
-  postgres_data:
-  browser_profile:
-  runner_state:
-  benchmark_sources:
-
+  postgres_data: null
+  browser_profile: null
+  runner_state: null
+  benchmark_sources: null
 networks:
   core_internal:
     internal: true
   app_control:
     internal: true
-  mcp_tunnel_egress:
-  benchmark_source_egress:
-  ui_egress:
-
+  mcp_tunnel_egress: null
+  benchmark_source_egress: null
+  ui_egress: null
 secrets:
   app_control_token:
     file: ./.secrets/app_control_token

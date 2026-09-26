@@ -14,8 +14,7 @@ REGISTRATION_READY = "registration backends: ready"
 REGISTRY_PATH = ROOT / "apps" / "registry" / "apps.json"
 
 TUNNELS = (
-    ("mcp-tunnel-workspace", "code-workspace"),
-    ("mcp-tunnel-browser", "browser"),
+    ("mcp-tunnel-workstation", "kali-workstation"),
 )
 
 
@@ -167,8 +166,7 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
             "up",
             "-d",
             "--force-recreate",
-            "mcp-tunnel-workspace",
-            "mcp-tunnel-browser",
+            "mcp-tunnel-workstation",
         ],
         env=env,
     )
@@ -248,14 +246,13 @@ def main() -> int:
         ensure_tunnels_ready(env)
 
         names = app_names()
-        code_name = names.get("code-workspace", "Code Workspace")
-        browser_name = names.get("browser", "Cloak Browser")
+        workstation_name = names.get("kali-workstation", "Kali Workstation")
 
         print()
         print("MCP backends + Secure MCP Tunnels: ready")
-        print(f"Verify the ChatGPT Apps with @: @{code_name} and @{browser_name}")
+        print(f"Verify the ChatGPT App with @: @{workstation_name}")
         input(
-            "Press Enter only after both Apps resolve and their tools are visible... "
+            "Press Enter after Kali Workstation resolves and its tools are visible... "
         )
 
         finish_registration(proc)

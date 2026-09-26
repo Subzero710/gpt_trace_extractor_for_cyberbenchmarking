@@ -9,7 +9,33 @@ from pathlib import Path
 
 BUILDER_NAME = "gpt-trace-extractor-builder"
 PROJECT_IMAGE_LABEL = "io.gpttrace.project=gpt-trace-extractor"
-PROFILES = ("runner", "runtime-images")
+PROFILES = ("runner",)
+
+
+def verify_manifests(root: Path) -> None:
+    import os
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(root / "apps/kali-workstation/src")
+    code = "from kali_workstation.contracts import manifest,canonical_bytes; import json,pathlib; p=pathlib.Path('apps/kali-workstation/tool-manifest.json'); assert canonical_bytes(manifest())==canonical_bytes(json.loads(p.read_text()))"
+    subprocess.run([str(root / ".venv-workstation-broker/bin/python"), "-c", code], cwd=root, env=environment, check=True)
+
+
+def build_workstation_guest(root: Path) -> None:
+    run([sys.executable, "-m", "venv", str(root / ".venv-workstation-broker")])
+    run([str(root / ".venv-workstation-broker/bin/pip"), "install", "-e", str(root / "apps/workstation-broker")])
+    run([str(root / ".venv-workstation-broker/bin/pip"), "install", "pydantic==2.13.5"])
+
+
+def build_workstation_base_image(root: Path) -> None:
+    run([sys.executable, str(root / "infra/workstation/image/build.py")])
+
+
+def verify_workstation_image(root: Path) -> None:
+    run([sys.executable, str(root / "infra/workstation/image/build.py")])
+
+
+def build_control_plane(root: Path) -> None:
+    build(root)
 
 
 def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -196,7 +222,11 @@ def main() -> int:
     elif args.status:
         status(root)
     else:
-        build(root)
+        build_workstation_guest(root)
+        verify_manifests(root)
+        build_workstation_base_image(root)
+        verify_workstation_image(root)
+        build_control_plane(root)
     return 0
 
 
