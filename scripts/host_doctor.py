@@ -10,6 +10,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from host_requirements import verify_host_requirements
+
 ROOT = Path(__file__).resolve().parents[1]
 BASE = Path('/var/lib/libvirt/images/gpt-trace/kali-base.qcow2')
 
@@ -39,19 +41,9 @@ def accessible(path: Path, user, bit: int) -> bool:
 def main():
     cfg = tomllib.loads((ROOT/'config/runner.toml').read_text())['workstation']
     checks = [check('Linux host', platform.system() == 'Linux', platform.platform())]
-    tools = [('docker', 'Docker Engine'), ('curl', 'curl'), ('qemu-img', 'qemu-utils'),
-             ('virsh', 'libvirt-clients'), ('virt-customize', 'libguestfs-tools'),
-             ('virt-cat', 'libguestfs-tools'), ('xorriso', 'xorriso'), ('7z', 'p7zip-full'),
-             ('fallocate', 'util-linux'), ('mkfs.ext4', 'e2fsprogs'), ('mount', 'util-linux'),
-             ('umount', 'util-linux'), ('nft', 'nftables'), ('ip', 'iproute2')]
-    for name, package in tools:
-        found = shutil.which(name)
-        checks.append(check(name, found is not None, found or f'install {package}'))
-    if shutil.which('docker'):
-        for label, command in [('Docker Compose', ('docker', 'compose', 'version')),
-                               ('Docker Buildx', ('docker', 'buildx', 'version'))]:
-            ok, detail = probe(*command)
-            checks.append(check(label, ok, detail))
+    requirements_ok = verify_host_requirements(require_root=False, verbose=False)
+    checks.append(check('host requirements', requirements_ok,
+                        'requirements.txt + Python venv + Docker Engine/Compose/Buildx'))
     checks.append(check('broker privilege', os.geteuid() == 0,
                         'start the host broker as root (mount, nftables, libvirt system)'))
     kvm = Path('/dev/kvm')

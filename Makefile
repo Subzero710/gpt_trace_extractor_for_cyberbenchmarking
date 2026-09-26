@@ -1,4 +1,7 @@
-.PHONY: build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: requirements build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+
+requirements:
+	python3 scripts/host_requirements.py
 
 build:
 	python3 scripts/build.py

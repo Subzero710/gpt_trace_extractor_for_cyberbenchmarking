@@ -5,7 +5,8 @@ This project runs benchmarks through the ChatGPT web UI, captures tool trajector
 ## Workflow
 
 ```bash
-make build
+make requirements  # optional explicit host preflight; make build runs it too
+sudo make build
 make up
 make doctor
 make tools
@@ -21,9 +22,11 @@ make export-sft
 make down
 ```
 
-`doctor` checks the Ubuntu host, then creates and destroys dedicated VM smoke attempts through the runner. `build` verifies the manifest in its own Python environment, builds trusted Docker images and the host broker, and creates a checksum-verified Kali golden disk. `up` starts the host broker plus persistent Docker services. `tools` registers the one App tunnel. `down` destroys project-owned VM attempts and Docker execution containers without deleting database or teacher browser profile volumes. The host broker needs root privileges for loop mounts and nftables; run its lifecycle on a dedicated Ubuntu host with KVM.
+`doctor` checks the Ubuntu host, then creates and destroys dedicated VM smoke attempts through the runner. `build` first validates the host-only system package manifest plus Python venv and Docker Engine/Compose/Buildx, builds the host broker, builds trusted Docker images, verifies the MCP manifest inside the built controller image, and creates a checksum-verified Kali golden disk. `up` starts the host broker plus persistent Docker services. `tools` registers the one App tunnel. `down` destroys project-owned VM attempts and Docker execution containers without deleting database or teacher browser profile volumes. The host broker needs root privileges for loop mounts and nftables; run its lifecycle on a dedicated Ubuntu host with KVM.
 
 Put secrets in `.env` using `.env.example`: PostgreSQL password, control plane API key, optional benchmark source token, and `APP_KALI_WORKSTATION_TUNNEL_ID`. Non-secret runner/workstation settings live in `config/runner.toml`; the App registry and manifest live in `apps/registry/` and `apps/kali-workstation/`.
+
+Root `requirements.txt` is deliberately a Debian/Ubuntu **system-package** manifest, not a pip file. It contains only dependencies for the trusted host-native broker/KVM/image path; application Python dependencies stay in Docker, and Kali guest dependencies stay in the image lock. `make build` fails before creating artifacts if a listed package, a functional Python `venv`/`ensurepip`, Docker Engine, Compose, or Buildx is missing, and prints the exact `apt-get install` command for missing host packages.
 
 The teacher browser is the `teacher-browser` Compose service, with identity in the persistent `browser_profile` volume. It drives the ChatGPT UI only. The agent browser, shell, interactive Unix PTY and desktop all run in the same disposable Kali VM. Its workspace is `/home/kali/workspace`, its Downloads folder is `/home/kali/Downloads`, and a new attempt uses a fresh qcow2 overlay over the immutable golden disk. The runner has a read-only-mounted broker Unix socket and an admin-scoped broker token, without direct access to Docker or libvirt; the MCP controller receives a separate data-plane-only broker token.
 
