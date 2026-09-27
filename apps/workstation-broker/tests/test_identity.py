@@ -79,3 +79,20 @@ def test_firewall_exposes_only_attempt_dns_and_dhcp_on_host(monkeypatch):
     assert 'ip daddr { 10.200.42.1, 255.255.255.255 } udp dport 67 accept' in script
     assert 'udp dport { 53, 67 } accept' not in script
 
+def test_qemu_image_info_force_share_for_running_overlay(monkeypatch, tmp_path):
+    from workstation_broker.server import qemu_image_info
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return b'{"format":"qcow2","backing-filename":"/base.qcow2"}'
+
+    monkeypatch.setattr("workstation_broker.server.run", fake_run)
+    result = qemu_image_info(tmp_path / "overlay.qcow2", force_share=True)
+
+    assert result["format"] == "qcow2"
+    assert calls == [(
+        "qemu-img", "info", "--force-share", "--output=json",
+        str(tmp_path / "overlay.qcow2"),
+    )]

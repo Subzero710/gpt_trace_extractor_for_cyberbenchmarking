@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -22,6 +23,13 @@ SHIFTED = dict(zip('~!@#$%^&*()_+{}|:"<>?',
                    ['grave_accent', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
                     'minus', 'equal', 'bracket_left', 'bracket_right', 'backslash',
                     'semicolon', 'apostrophe', 'comma', 'dot', 'slash']))
+
+
+# QMP acknowledges input injection before the guest desktop has necessarily
+# completed pointer focus changes. Without a bounded settle after a click,
+# immediate text can lose its leading characters on nested-virtualization hosts.
+QMP_POINTER_SETTLE_SECONDS = 0.05
+QMP_CLICK_SETTLE_SECONDS = 0.35
 
 
 def capture(run, domain: str, directory: Path, max_bytes: int) -> dict:
@@ -97,6 +105,7 @@ def input_events(run, domain: str, args: dict, width: int, height: int) -> dict:
                 raise ValueError("mouse coordinates outside captured screen")
             qmp(run, domain, [{"type": "abs", "data": {"axis": axis, "value": round(pos * 32767 / max(1, size - 1))}}
                               for axis, pos, size in (("x", x, width), ("y", y, height))])
+            time.sleep(QMP_POINTER_SETTLE_SECONDS)
         elif kind in {"mouse_down", "mouse_up", "click"}:
             button = item.get("button") or "left"
             if button not in {"left", "middle", "right"}:
@@ -104,6 +113,8 @@ def input_events(run, domain: str, args: dict, width: int, height: int) -> dict:
             states = [True, False] if kind == "click" else [kind == "mouse_down"]
             for down in states:
                 qmp(run, domain, [{"type": "btn", "data": {"down": down, "button": button}}])
+            if kind == "click":
+                time.sleep(QMP_CLICK_SETTLE_SECONDS)
         elif kind == "scroll":
             steps = item.get("steps") if item.get("steps") is not None else 1
             if type(steps) is not int or not -20 <= steps <= 20:

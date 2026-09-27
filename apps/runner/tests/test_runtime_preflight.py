@@ -21,9 +21,17 @@ async def test_preflight_cleanup_even_after_prepare_failure():
     lifecycle=Lifecycle(True)
     with pytest.raises(AppInfrastructureError,match='prepare failed'):
         await preflight_tasks(lifecycle,[task],console=Console())
-    assert lifecycle.calls==['health','prepare','reset','assert_clean']
+    assert lifecycle.calls==['health','prepare','assert_clean']
 
 def test_preflight_rejects_external_mcp_endpoint():
     tool=BenchmarkTool('app','kali-workstation','Kali Workstation','local_mcp','3.0.0','a'*64,{},mcp_endpoint='https://attacker.example/mcp')
     with pytest.raises(AppInfrastructureError,match='endpoint'):
         _validate_endpoint(tool)
+
+def test_computer_probe_uses_qmp_pointer_then_keyboard():
+    source = Path(__file__).resolve().parents[1] / 'src/gpt_trace_runner/runtime_preflight.py'
+    text = source.read_text(encoding='utf-8')
+    assert "{'type': 'mouse_move', 'x': width // 2, 'y': height // 2}" in text
+    assert "{'type': 'click', 'button': 'left'}" in text
+    assert "{'type': 'text', 'text': 'FROM_COMPUTER'}" in text
+    assert "for _ in range(30):" in text

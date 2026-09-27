@@ -68,6 +68,16 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def qemu_image_info(path: Path, *, force_share: bool = False) -> dict:
+    args = ["qemu-img", "info"]
+    if force_share:
+        # qemu owns the overlay with a write lock while an attempt is running.
+        # --force-share is qemu-img's read-only inspection mode for that case.
+        args.append("--force-share")
+    args.extend(["--output=json", str(path)])
+    return json.loads(run(*args))
+
+
 def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: int,
                memory_mb: int, vcpus: int, ident: dict, digest: str) -> bytes:
     domain = ET.Element("domain", type="kvm")
@@ -222,7 +232,7 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError("domain overlay mismatch")
         if not (directory / "disk").is_mount() or not (directory / "disk/overlay.qcow2").is_file():
             raise ValueError("overlay missing")
-        disk_info = json.loads(run("qemu-img", "info", "--output=json", str(directory / "disk/overlay.qcow2")))
+        disk_info = qemu_image_info(directory / "disk/overlay.qcow2", force_share=True)
         if disk_info.get("format") != "qcow2" or Path(disk_info.get("backing-filename", "")).resolve() != self.base.resolve():
             raise ValueError("overlay backing image mismatch")
         if not run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines().__contains__(network):

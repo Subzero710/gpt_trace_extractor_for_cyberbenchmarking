@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -111,13 +112,45 @@ async def _smoke(session: ClientSession, tool: BenchmarkTool, index: int, prior:
     html = await _call(session, 'get_html', {'selector': '#name'})
     if 'marker.txt' not in html['html']:
         raise AppInfrastructureError('browser cannot upload guest shell file')
-    await _call(session, 'evaluate_javascript', {'expression':
-        "() => { const input = document.createElement('input'); input.id = 'computer-probe'; document.body.appendChild(input); return true; }"})
+    await _call(session, 'evaluate_javascript', {'expression': '''() => {
+        const input = document.createElement('input');
+        input.id = 'computer-probe';
+        input.style.cssText = [
+            'position:fixed', 'left:10vw', 'top:20vh', 'width:80vw', 'height:60vh',
+            'z-index:2147483647', 'font-size:32px', 'background:white', 'color:black'
+        ].join(';');
+        document.body.appendChild(input);
+        return true;
+    }'''})
     await _call(session, 'click', {'selector': '#computer-probe'})
-    await _call(session, 'computer_input', {'events': [{'type': 'text', 'text': 'FROM_COMPUTER'}]})
-    value = await _call(session, 'evaluate_javascript', {'expression': "() => document.querySelector('#computer-probe').value"})
-    if value['result'] != 'FROM_COMPUTER':
-        raise AppInfrastructureError('QMP computer input did not affect the structured browser page')
+
+    # Acquire focus through QMP itself. A structured browser click proves the
+    # DOM target is interactable, but it does not prove guest desktop keyboard
+    # focus is routed to the browser window.
+    input_screen = await _call(session, 'observe_screen', {})
+    width, height = input_screen.get('width'), input_screen.get('height')
+    if type(width) is not int or type(height) is not int or width < 2 or height < 2:
+        raise AppInfrastructureError('invalid libvirt display dimensions for QMP input')
+    await _call(session, 'computer_input', {'events': [
+        {'type': 'mouse_move', 'x': width // 2, 'y': height // 2},
+        {'type': 'click', 'button': 'left'},
+        {'type': 'text', 'text': 'FROM_COMPUTER'},
+    ]})
+
+    # QMP acknowledges injection before Chromium is guaranteed to consume all
+    # emulated events. Poll briefly instead of racing the nested guest.
+    value = None
+    for _ in range(30):
+        value = await _call(session, 'evaluate_javascript',
+            {'expression': "() => document.querySelector('#computer-probe').value"})
+        if value.get('result') == 'FROM_COMPUTER':
+            break
+        await asyncio.sleep(0.1)
+    if not isinstance(value, dict) or value.get('result') != 'FROM_COMPUTER':
+        actual = value.get('result') if isinstance(value, dict) else value
+        raise AppInfrastructureError(
+            f'QMP computer input did not affect the structured browser page; observed={actual!r}'
+        )
     image = await _call(session, 'observe_screen', {})
     raw = base64.b64decode(image['content_base64'], validate=True)
     if not raw.startswith(b'\x89PNG\r\n\x1a\n') or image['sha256'] != hashlib.sha256(raw).hexdigest():
@@ -148,5 +181,10 @@ async def preflight_tasks(lifecycle: AppLifecycle, tasks: Sequence[BenchmarkTask
                         prior = await _smoke(session, tool, index, prior)
             console.print(f'[green]preflight {task.task_id}: ok[/]')
         finally:
-            await lifecycle.reset(probe, environments, fingerprint, attempt=1)
+            # AppLifecycle.prepare() already destroys/deactivates any partial
+            # runtime when prepare itself fails. Calling reset again in that
+            # case hits an intentionally inactive gateway and can mask the
+            # original infrastructure error with a secondary 503.
+            if prepared:
+                await lifecycle.reset(probe, environments, fingerprint, attempt=1)
             await lifecycle.assert_clean(probe, environments, fingerprint, attempt=1)
