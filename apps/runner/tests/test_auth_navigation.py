@@ -223,37 +223,58 @@ def test_superbench_recovery_is_centralized_in_execution_path() -> None:
     assert "pending.task_id not in set(selected_run_task_ids)" in scheduler
 
 @pytest.mark.asyncio
-async def test_wait_for_conversation_id_ignores_transient_web_route() -> None:
+async def test_wait_for_conversation_id_accepts_stable_route_without_lookup() -> None:
     stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
     page = type("PageDouble", (), {})()
     page.url = f"https://chatgpt.com/c/{stable}"
-    page.wait_for_url = AsyncMock(return_value=None)
+    conversation = type("ConversationDouble", (), {})()
+    conversation.fetch = AsyncMock(
+        return_value={
+            "messages": [
+                {"id": "user-1", "author": {"role": "user"}},
+            ]
+        }
+    )
+    conversation.find_recent_conversation_id_by_user_message_id = AsyncMock()
 
     client = ChatGPTClient.__new__(ChatGPTClient)
     client._page = page
+    client._conversation = conversation
     client._stream_start_timeout = 17.0
 
-    result = await client._wait_for_conversation_id()
+    result = await client._wait_for_conversation_id("user-1")
 
     assert result == stable
-    pattern = page.wait_for_url.await_args.args[0]
-    assert pattern.search("https://chatgpt.com/c/WEB:565d236a-8024-4ec4-ac02-06dfc91cc8da") is None
-    assert pattern.search(f"https://chatgpt.com/c/{stable}") is not None
-    assert page.wait_for_url.await_args.kwargs["timeout"] == 17_000
+    conversation.fetch.assert_awaited_once_with(stable)
+    conversation.find_recent_conversation_id_by_user_message_id.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_wait_for_conversation_id_refuses_web_route_defensively() -> None:
+@pytest.mark.parametrize(
+    "route",
+    [
+        "WEB:565d236a-8024-4ec4-ac02-06dfc91cc8da",
+        "local-chatgpt%3A8104476a-ffc2-4170-bc04-ec817470d8a2",
+    ],
+)
+async def test_wait_for_conversation_id_resolves_transient_route_by_message_identity(route) -> None:
+    stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
     page = type("PageDouble", (), {})()
-    page.url = "https://chatgpt.com/c/WEB:565d236a-8024-4ec4-ac02-06dfc91cc8da"
-    page.wait_for_url = AsyncMock(return_value=None)
+    page.url = f"https://chatgpt.com/c/{route}"
+    conversation = type("ConversationDouble", (), {})()
+    conversation.find_recent_conversation_id_by_user_message_id = AsyncMock(return_value=stable)
 
     client = ChatGPTClient.__new__(ChatGPTClient)
     client._page = page
+    client._conversation = conversation
     client._stream_start_timeout = 17.0
 
-    with pytest.raises(AmbiguousSubmission, match="still transient"):
-        await client._wait_for_conversation_id()
+    result = await client._wait_for_conversation_id("user-1")
+
+    assert result == stable
+    conversation.find_recent_conversation_id_by_user_message_id.assert_awaited_once_with(
+        "user-1", limit=5
+    )
 
 
 def test_completion_still_requires_stable_url_id_to_equal_sse_id() -> None:
@@ -284,4 +305,3 @@ def test_superbench_auth_reports_success_after_app_verification() -> None:
     assert verify in auth
     assert success in auth
     assert auth.index(verify) < auth.index(success)
-

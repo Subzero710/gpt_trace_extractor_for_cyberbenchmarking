@@ -9,6 +9,7 @@ from gpt_trace_runner.conversation import (
     extract_dataset_messages,
     invoked_app_names,
     is_complete,
+    is_transient_conversation_id,
 )
 from gpt_trace_runner.exceptions import AuthenticationRequired, ConversationNotFound
 
@@ -166,4 +167,50 @@ async def test_conversation_delete_404_is_idempotent_success() -> None:
     client = ConversationClient(page)
 
     await client.delete("already-gone")
+
+
+def test_transient_conversation_ids_include_encoded_local_chatgpt_routes() -> None:
+    assert is_transient_conversation_id("WEB:abc")
+    assert is_transient_conversation_id("local-chatgpt:abc")
+    assert is_transient_conversation_id("local-chatgpt%3Aabc")
+    assert not is_transient_conversation_id("6aaf0c08-96f0-83eb-8994-4584094a99b3")
+
+
+@pytest.mark.asyncio
+async def test_recent_conversation_resolution_uses_exact_user_message_identity() -> None:
+    stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
+    page = type("PageDouble", (), {})()
+
+    def result_for_call(_javascript, endpoint):
+        if endpoint.startswith("/backend-api/conversations?offset=0&limit=5"):
+            return {
+                "sessionStatus": 200,
+                "tokenPresent": True,
+                "status": 200,
+                "ok": True,
+                "statusText": "OK",
+                "text": '{"items":[{"id":"' + stable + '"}]}',
+            }
+        assert endpoint.startswith(f"/backend-api/conversations/{stable}?")
+        return {
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 200,
+            "ok": True,
+            "statusText": "OK",
+            "text": (
+                '{"messages":['
+                '{"id":"user-1","author":{"role":"user"},"content":{"parts":["q"]}},'
+                '{"id":"assistant-1","author":{"role":"assistant"},"end_turn":true}'
+                ']}'
+            ),
+        }
+
+    page.evaluate = AsyncMock(side_effect=result_for_call)
+    client = ConversationClient(page)
+
+    result = await client.find_recent_conversation_id_by_user_message_id("user-1", limit=5)
+
+    assert result == stable
+    assert page.evaluate.await_count == 2
 

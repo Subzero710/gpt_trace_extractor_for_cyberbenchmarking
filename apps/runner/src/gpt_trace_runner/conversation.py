@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import unquote
 
 from playwright.async_api import Page
 
@@ -18,8 +19,15 @@ def conversation_id_from_url(url: str) -> str | None:
     if "/c/" not in url:
         return None
     value = url.split("/c/", 1)[1].split("?", 1)[0].split("/", 1)[0].strip()
+    value = unquote(value).strip()
     return value or None
 
+
+def is_transient_conversation_id(value: str | None) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return True
+    normalized = unquote(value).strip().casefold()
+    return normalized.startswith("web:") or normalized.startswith("local-chatgpt:")
 
 def _hidden_raw_cot(message: dict[str, Any]) -> bool:
     metadata = message.get("metadata")
@@ -101,6 +109,122 @@ class ConversationClient:
     def __init__(self, page: Page, turns: int = 100) -> None:
         self._page = page
         self._turns = turns
+
+
+    async def recent_conversation_ids(self, *, limit: int = 5) -> tuple[str, ...]:
+        """Return only recent durable backend IDs; never expose the bearer token."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        endpoint = f"/backend-api/conversations?offset=0&limit={limit}&order=updated"
+        try:
+            result = await self._page.evaluate(
+                """async (endpoint) => {
+                    const session = await fetch(
+                        '/api/auth/session',
+                        {credentials:'include', cache:'no-store'}
+                    );
+                    let accessToken = null;
+                    if (session.ok) {
+                        try {
+                            const payload = await session.json();
+                            if (
+                                payload &&
+                                typeof payload.accessToken === 'string' &&
+                                payload.accessToken.trim()
+                            ) {
+                                accessToken = payload.accessToken;
+                            }
+                        } catch (_) {
+                        }
+                    }
+                    if (!accessToken) {
+                        return {
+                            sessionStatus: session.status,
+                            tokenPresent: false,
+                            status: 0,
+                            ok: false,
+                            statusText: '',
+                            text: ''
+                        };
+                    }
+                    const r = await fetch(endpoint, {
+                        credentials: 'include',
+                        cache: 'no-store',
+                        headers: {authorization: `Bearer ${accessToken}`}
+                    });
+                    return {
+                        sessionStatus: session.status,
+                        tokenPresent: true,
+                        status: r.status,
+                        ok: r.ok,
+                        statusText: r.statusText,
+                        text: await r.text()
+                    };
+                }""",
+                endpoint,
+            )
+        except Exception as exc:
+            raise ConversationError(f"conversation list fetch failed: {exc}") from exc
+        if not isinstance(result, dict):
+            raise ConversationError("conversation list fetch returned invalid result")
+
+        session_status = int(result.get("sessionStatus", 0))
+        if result.get("tokenPresent") is not True:
+            raise AuthenticationRequired(
+                "ChatGPT browser session did not yield a backend access token "
+                f"(session HTTP {session_status})"
+            )
+        status = int(result.get("status", 0))
+        if status == 401:
+            raise AuthenticationRequired("conversation list rejected the backend token (HTTP 401)")
+        if status == 403:
+            raise AccessDenied("conversation list returned HTTP 403")
+        if status == 429:
+            raise RateLimited("conversation list returned HTTP 429")
+        if not result.get("ok"):
+            raise ConversationError(
+                f"conversation list HTTP {status} {result.get('statusText', '')}"
+            )
+        try:
+            payload = json.loads(str(result.get("text", "")))
+        except json.JSONDecodeError as exc:
+            raise ConversationError("conversation list returned invalid JSON") from exc
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise ConversationError("conversation list JSON has no items[]")
+        ids: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("id")
+            if isinstance(value, str) and value.strip() and not is_transient_conversation_id(value):
+                ids.append(value.strip())
+        return tuple(ids)
+
+    async def find_recent_conversation_id_by_user_message_id(
+        self,
+        user_message_id: str,
+        *,
+        limit: int = 5,
+    ) -> str | None:
+        """Resolve a frontend-local route handle by exact submitted message identity."""
+        if not isinstance(user_message_id, str) or not user_message_id.strip():
+            raise ConversationError("expected user_message_id is missing")
+        for conversation_id in await self.recent_conversation_ids(limit=limit):
+            try:
+                payload = await self.fetch(conversation_id)
+                messages = extract_dataset_messages(payload)
+            except (ConversationError, ConversationNotFound):
+                continue
+            user_ids = [
+                message.get("id")
+                for message in messages
+                if isinstance(message.get("author"), dict)
+                and message["author"].get("role") == "user"
+            ]
+            if len(user_ids) == 1 and user_ids[0] == user_message_id:
+                return conversation_id
+        return None
 
     async def fetch(self, conversation_id: str) -> dict[str, Any]:
         endpoint = (
@@ -288,4 +412,3 @@ class ConversationClient:
         raise ConversationError(
             f"conversation delete HTTP {status} {result.get('statusText', '')}"
         )
-

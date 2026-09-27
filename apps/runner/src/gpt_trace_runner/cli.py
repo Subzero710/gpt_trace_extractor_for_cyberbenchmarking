@@ -12,7 +12,7 @@ from rich.table import Table
 
 from .app_lifecycle import AppLifecycle
 from .browser import BrowserClient
-from .chatgpt import ChatGPTClient
+from .chatgpt import ChatGPTClient, check_chatgpt_protocol_contracts
 from .config import Settings
 from .workstation_provider import LibvirtWorkstationProvider
 from .exceptions import RecoveryIncomplete
@@ -128,6 +128,8 @@ def doctor() -> None:
         console.print("[green]CloakBrowser humanize API: ok[/]")
         check_playwright_ui_contracts()
         console.print("[green]Playwright UI API contracts: ok[/]")
+        check_chatgpt_protocol_contracts(settings.chatgpt_base_url)
+        console.print("[green]ChatGPT protocol contracts: ok[/]")
         async with httpx.AsyncClient(timeout=10) as client:
             (await client.get(settings.browser_version_url())).raise_for_status()
             console.print("[green]operator browser CDP: ok[/]")

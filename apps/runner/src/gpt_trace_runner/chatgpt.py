@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -15,6 +16,7 @@ from .conversation import (
     conversation_id_from_url,
     extract_dataset_messages,
     invoked_app_names,
+    is_transient_conversation_id,
     validate_conversation_identity,
 )
 from .exceptions import (
@@ -25,6 +27,7 @@ from .exceptions import (
     ConcurrentTurnError,
     ConversationError,
     ConversationNotFound,
+    ConversationStreamAborted,
     ConversationStreamIncomplete,
     EnvironmentDrift,
     FatalUIState,
@@ -55,6 +58,33 @@ ATTACH_BUTTON_SELECTORS = (
 UPLOAD_MENU_LABELS = (
     "Upload from computer", "Upload files", "Upload file", "Add photos & files",
 )
+
+REQUIRED_THINKING_EFFORT = "extended"
+
+def _thinking_effort_route_pattern(base_url: str):
+    return re.compile(
+        rf"^{re.escape(base_url.rstrip('/'))}/backend-api/f/conversation"
+        r"(?:/prepare)?(?:\?.*)?$"
+    )
+
+
+def check_chatgpt_protocol_contracts(base_url: str) -> None:
+    if REQUIRED_THINKING_EFFORT != "extended":
+        raise RuntimeError(
+            "ChatGPT benchmark thinking effort must remain forced to 'extended'"
+        )
+    pattern = _thinking_effort_route_pattern(base_url)
+    expected = (
+        f"{base_url.rstrip('/')}/backend-api/f/conversation",
+        f"{base_url.rstrip('/')}/backend-api/f/conversation/prepare",
+    )
+    for url in expected:
+        if pattern.fullmatch(url) is None:
+            raise RuntimeError(
+                f"ChatGPT thinking-effort route pattern does not match {url!r}"
+            )
+
+
 
 @dataclass(slots=True)
 class PreparedTurn:
@@ -110,6 +140,72 @@ class ChatGPTClient:
         self._active_turn: SubmittedTurn | None = None
         self._environment_baseline: dict[str, Any] | None = None
         self._environment_hash: str | None = None
+        self._thinking_effort_route_installed = False
+        self._thinking_effort_stream_requests = 0
+        self._thinking_effort_force_error: str | None = None
+
+    @staticmethod
+    def _extended_thinking_post_data(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            raise ValueError("ChatGPT conversation request body is not a JSON object")
+        rewritten = dict(payload)
+        rewritten["thinking_effort"] = REQUIRED_THINKING_EFFORT
+        return json.dumps(
+            rewritten,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    async def _force_extended_thinking_effort(self, route, request) -> None:
+        request_url = request.url.split("?", 1)[0].rstrip("/")
+        conversation_url = f"{self._base_url}/backend-api/f/conversation"
+        prepare_url = f"{conversation_url}/prepare"
+
+        if request.method.upper() != "POST" or request_url not in {
+            conversation_url,
+            prepare_url,
+        }:
+            await route.continue_()
+            return
+
+        try:
+            post_data = self._extended_thinking_post_data(request.post_data_json)
+        except Exception as exc:
+            self._thinking_effort_force_error = (
+                "could not force ChatGPT thinking_effort="
+                f"{REQUIRED_THINKING_EFFORT!r}: {exc}"
+            )
+            await route.abort()
+            return
+
+        try:
+            await route.continue_(post_data=post_data)
+        except Exception as exc:
+            self._thinking_effort_force_error = (
+                "failed to continue ChatGPT request after forcing "
+                f"thinking_effort={REQUIRED_THINKING_EFFORT}: {exc}"
+            )
+            raise
+        else:
+            if request_url == conversation_url:
+                self._thinking_effort_stream_requests += 1
+
+    async def _ensure_thinking_effort_enforcer(self) -> None:
+        if self._thinking_effort_route_installed:
+            return
+        pattern = _thinking_effort_route_pattern(self._base_url)
+        await self._page.route(pattern, self._force_extended_thinking_effort)
+        self._thinking_effort_route_installed = True
+
+    def _validate_thinking_effort_enforcement(self) -> None:
+        if self._thinking_effort_force_error is not None:
+            raise FatalUIState(self._thinking_effort_force_error)
+        if self._thinking_effort_stream_requests != 1:
+            raise AmbiguousSubmission(
+                "expected exactly one ChatGPT conversation POST rewritten with "
+                f"thinking_effort={REQUIRED_THINKING_EFFORT!r}; observed "
+                f"{self._thinking_effort_stream_requests}"
+            )
 
     async def _navigate(self, url: str) -> None:
         # BrowserClient applies cloakbrowser.human.patch_browser_async() to the
@@ -375,6 +471,9 @@ class ChatGPTClient:
         if self._active_turn is not None:
             raise ConcurrentTurnError("another ChatGPT turn is already active")
         self._traffic.begin_task()
+        self._thinking_effort_stream_requests = 0
+        self._thinking_effort_force_error = None
+        await self._ensure_thinking_effort_enforcer()
         await self._check_environment()
         try:
             await self._new_chat_if_needed()
@@ -405,27 +504,84 @@ class ChatGPTClient:
         before_send()
         await self._interaction.click(button)
 
-    async def _wait_for_conversation_id(self) -> str:
-        # ChatGPT can expose a transient /c/WEB:<client-id> route while a new
-        # conversation is being created. That route is not the persistent
-        # conversation identity returned by the completed conversation stream.
-        # Wait for the durable /c/<id> route instead of accepting the first
-        # syntactically valid /c/... URL.
+    @staticmethod
+    def _conversation_has_exact_user_message(
+        conversation: dict[str, Any],
+        user_message_id: str,
+    ) -> bool:
+        messages = extract_dataset_messages(conversation)
+        user_ids = [
+            message.get("id")
+            for message in messages
+            if isinstance(message.get("author"), dict)
+            and message["author"].get("role") == "user"
+        ]
+        if not user_ids:
+            return False
+        if len(user_ids) != 1 or user_ids[0] != user_message_id:
+            raise AmbiguousSubmission(
+                "durable conversation candidate does not contain exactly the "
+                "submitted frontend user_message_id"
+            )
+        return True
+
+    async def _wait_for_conversation_id(self, user_message_id: str) -> str:
+        """Resolve only a durable conversation identity for the submitted message."""
+        deadline = asyncio.get_running_loop().time() + self._stream_start_timeout
+        last_route: str | None = None
+        last_error: str | None = None
+
+        while True:
+            candidate = conversation_id_from_url(self._page.url)
+            if candidate:
+                last_route = candidate
+                if not is_transient_conversation_id(candidate):
+                    try:
+                        conversation = await self._conversation.fetch(candidate)
+                        if self._conversation_has_exact_user_message(
+                            conversation,
+                            user_message_id,
+                        ):
+                            return candidate
+                    except (ConversationError, AmbiguousSubmission) as exc:
+                        last_error = f"{type(exc).__name__}: {exc}"
+
+            try:
+                resolved = await self._conversation.find_recent_conversation_id_by_user_message_id(
+                    user_message_id,
+                    limit=5,
+                )
+            except ConversationError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            else:
+                if resolved is not None:
+                    return resolved
+
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                detail = f"; last route={last_route!r}"
+                if last_error is not None:
+                    detail += f"; last error={last_error}"
+                raise AmbiguousSubmission(
+                    "conversation SSE started but no verified durable conversation ID "
+                    "was resolved" + detail
+                )
+            await asyncio.sleep(min(0.25, remaining))
+
+    async def _resolve_durable_conversation_id(
+        self,
+        conversation_id: str,
+        user_message_id: str,
+    ) -> str:
+        if not is_transient_conversation_id(conversation_id):
+            return conversation_id
         try:
-            await self._page.wait_for_url(
-                re.compile(r"/c/(?!WEB:)[^/?#]+"),
-                timeout=int(self._stream_start_timeout * 1000),
-            )
-        except Exception as exc:
-            raise AmbiguousSubmission(
-                "conversation SSE started but no stable conversation URL was assigned"
+            return await self._wait_for_conversation_id(user_message_id)
+        except AmbiguousSubmission as exc:
+            raise RecoveryIncomplete(
+                "transient ChatGPT route could not be mapped to the durable "
+                "conversation using the persisted user_message_id"
             ) from exc
-        value = conversation_id_from_url(self._page.url)
-        if not value or value.startswith("WEB:"):
-            raise AmbiguousSubmission(
-                f"conversation URL is still transient: {self._page.url!r}"
-            )
-        return value
 
     def _validate_submitted_model(self) -> None:
         model = self._traffic.submitted_model
@@ -482,10 +638,11 @@ class ChatGPTClient:
             ) from exc
 
         self._traffic.validate_single_stream_request()
+        self._validate_thinking_effort_enforcement()
         self._validate_submitted_model()
         user_message_id = self._traffic.submitted_user_message_id()
         on_user_message_id(user_message_id)
-        conversation_id = await self._wait_for_conversation_id()
+        conversation_id = await self._wait_for_conversation_id(user_message_id)
         submitted = SubmittedTurn(
             conversation_id=conversation_id,
             user_message_id=user_message_id,
@@ -516,20 +673,67 @@ class ChatGPTClient:
         self._validate_message_models(messages)
         return messages
 
+    async def _wait_stream_or_durable_completion(
+        self,
+        submitted: SubmittedTurn,
+    ):
+        """Race the SSE transport against durable conversation completion."""
+        stream_task = asyncio.create_task(submitted.stream.wait())
+        await asyncio.sleep(0)
+
+        async def durable_snapshot():
+            self._traffic.mark_fallback_snapshot()
+            try:
+                conversation = await self._conversation.fetch(
+                    submitted.conversation_id
+                )
+            except ConversationNotFound:
+                return None, None
+            try:
+                messages = self._validated_messages(
+                    conversation,
+                    submitted.user_message_id,
+                )
+            except ConversationError:
+                return conversation, None
+            return conversation, messages
+
+        try:
+            while True:
+                if stream_task.done():
+                    try:
+                        return stream_task.result(), None, None, None
+                    except (
+                        ConversationStreamIncomplete,
+                        ConversationStreamAborted,
+                    ) as exc:
+                        conversation, messages = await durable_snapshot()
+                        if messages is not None:
+                            return None, exc, conversation, messages
+                        raise exc
+
+                conversation, messages = await durable_snapshot()
+                if messages is not None:
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
+                    return None, None, conversation, messages
+
+                await asyncio.wait({stream_task}, timeout=0.5)
+        finally:
+            if not stream_task.done():
+                stream_task.cancel()
+                await asyncio.gather(stream_task, return_exceptions=True)
+
     async def wait_for_completion(self, submitted: SubmittedTurn) -> CapturedConversation:
         if self._active_turn is not submitted:
             raise ConcurrentTurnError("submitted turn is not active")
         try:
-            stream_result = None
-            stream_incomplete: ConversationStreamIncomplete | None = None
-            try:
-                stream_result = await submitted.stream.wait()
-            except ConversationStreamIncomplete as exc:
-                # The frontend can close an SSE without the terminal end_turn
-                # marker even though the durable conversation has already
-                # committed a complete assistant turn. Do not resubmit; verify
-                # the durable conversation below using the exact user message ID.
-                stream_incomplete = exc
+            (
+                stream_result,
+                stream_error,
+                conversation,
+                messages,
+            ) = await self._wait_stream_or_durable_completion(submitted)
 
             if (
                 stream_result is not None
@@ -540,26 +744,28 @@ class ChatGPTClient:
                     f"url={submitted.conversation_id!r}, "
                     f"sse={stream_result.conversation_id!r}"
                 )
+
             self._traffic.validate_single_stream_request()
             self._validate_submitted_model()
             await self._check_environment()
             if self._traffic.saw_backend_429:
                 raise RateLimited("ChatGPT returned HTTP 429 during the turn")
 
-            conversation = await self._traffic.natural_snapshot(
-                submitted.conversation_id,
-                wait_seconds=self._natural_snapshot_wait,
-            )
-            messages = None
-            if conversation is not None:
-                try:
-                    messages = self._validated_messages(
-                        conversation,
-                        submitted.user_message_id,
-                    )
-                    self._traffic.mark_natural_snapshot_used()
-                except Exception:
-                    messages = None
+            if messages is None:
+                conversation = await self._traffic.natural_snapshot(
+                    submitted.conversation_id,
+                    wait_seconds=self._natural_snapshot_wait,
+                )
+                if conversation is not None:
+                    try:
+                        messages = self._validated_messages(
+                            conversation,
+                            submitted.user_message_id,
+                        )
+                        self._traffic.mark_natural_snapshot_used()
+                    except Exception:
+                        messages = None
+
             if messages is None:
                 self._traffic.mark_fallback_snapshot()
                 try:
@@ -571,33 +777,48 @@ class ChatGPTClient:
                         submitted.user_message_id,
                     )
                 except ConversationError as exc:
-                    if stream_incomplete is not None:
-                        # Keep the durable recovery path intact when the
-                        # conversation snapshot cannot prove completion either.
-                        raise stream_incomplete from exc
+                    if stream_error is not None:
+                        raise stream_error from exc
                     raise
 
             used_apps = invoked_app_names(messages)
             if stream_result is not None:
                 metadata = stream_result.runtime_metadata()
             else:
-                assert stream_incomplete is not None
                 metadata = {
                     "stream_protocol": "sse",
                     "conversation_id": submitted.conversation_id,
-                    "final_end_turn": False,
+                    "final_end_turn": True,
                     "message_stream_complete": False,
                     "done": False,
                     "last_token": False,
-                    "stream_recovered_from_incomplete": True,
-                    "stream_error_type": type(stream_incomplete).__name__,
-                    "stream_error_message": str(stream_incomplete),
+                    "stream_completed_via_durable_snapshot": True,
+                    "stream_transport_finished": False,
                 }
+                if isinstance(stream_error, ConversationStreamIncomplete):
+                    metadata["stream_recovered_from_incomplete"] = True
+                if stream_error is not None:
+                    metadata.update(
+                        {
+                            "stream_recovered_from_error": True,
+                            "stream_error_type": type(stream_error).__name__,
+                            "stream_error_message": str(stream_error),
+                        }
+                    )
+                else:
+                    metadata["stream_transport_cancelled_after_durable_completion"] = True
+
             metadata.update(self._traffic.runtime_metadata())
             metadata.update({
                 "recovered": False,
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
+                "required_thinking_effort": REQUIRED_THINKING_EFFORT,
+                "thinking_effort_forced_requests": getattr(
+                    self,
+                    "_thinking_effort_stream_requests",
+                    0,
+                ),
                 "requested_tools": [
                     {"type": t.type, "name": t.name}
                     for t in submitted.task.tools
@@ -605,7 +826,11 @@ class ChatGPTClient:
                 "used_apps": sorted(used_apps),
                 "submitted_user_message_id": submitted.user_message_id,
             })
-            return CapturedConversation(submitted.conversation_id, messages, metadata)
+            return CapturedConversation(
+                submitted.conversation_id,
+                messages,
+                metadata,
+            )
         finally:
             self._active_turn = None
 
@@ -618,6 +843,10 @@ class ChatGPTClient:
     ) -> CapturedConversation:
         if self._active_turn is not None:
             raise ConcurrentTurnError("cannot recover while another turn is active")
+        conversation_id = await self._resolve_durable_conversation_id(
+            conversation_id,
+            user_message_id,
+        )
         await self._navigate(f"{self._base_url}/c/{conversation_id}")
         await self._site.wait_ready()
         await self._check_environment()
@@ -644,6 +873,7 @@ class ChatGPTClient:
                 "stream_observed": False,
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
+                "required_thinking_effort": REQUIRED_THINKING_EFFORT,
                 "requested_tools": [
                     {"type": t.type, "name": t.name}
                     for t in task.tools
@@ -659,11 +889,7 @@ class ChatGPTClient:
         task: BenchmarkTask,
         user_message_id: str,
     ) -> CapturedConversation:
-        conversation_id = conversation_id_from_url(self._page.url)
-        if not conversation_id:
-            raise RecoveryIncomplete(
-                "submission may have happened but current browser URL has no conversation ID"
-            )
+        conversation_id = await self._wait_for_conversation_id(user_message_id)
         return await self.recover(
             conversation_id,
             task=task,

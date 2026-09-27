@@ -254,3 +254,51 @@ def test_runner_deletes_completed_remote_conversation_before_app_reset() -> None
     assert run_task.index(delete_call) < run_task.index(reset_call)
     assert "await self.chatgpt.delete_completed_conversation(existing.conversation_id)" in run_task
 
+
+class ResolvingRecoveryChatGPT(RecoveryChatGPT):
+    async def recover(self, conversation_id, *, task, user_message_id):
+        assert conversation_id.startswith("local-chatgpt")
+        assert user_message_id == "submitted-user-message"
+        return CapturedConversation("durable-conv", [{"id": "m"}], {})
+
+
+@pytest.mark.asyncio
+async def test_recovery_persists_resolved_durable_conversation_id(tmp_path: Path) -> None:
+    transient = "local-chatgpt%3A8104476a-ffc2-4170-bc04-ec817470d8a2"
+    store = JournalStore(tmp_path / "j.json")
+    store.write(
+        SubmissionJournal(
+            "t",
+            "old",
+            3,
+            "conversation_known",
+            transient,
+            fp(),
+            {},
+            {},
+            "submitted-user-message",
+        )
+    )
+    storage = Storage(
+        StoredRun(
+            task_id="t",
+            logical_task_id="t",
+            status="running",
+            conversation_id=transient,
+            attempt=3,
+            runner_id="old",
+            task_fingerprint=fp(),
+            app_provenance=[],
+        )
+    )
+    lifecycle = Lifecycle()
+    chatgpt = ResolvingRecoveryChatGPT()
+
+    await runner(chatgpt, storage, store, lifecycle).reconcile_journal([TASK])
+
+    assert storage.set_calls == [("t", "durable-conv", 3, "old")]
+    assert storage.completed == [("t", "durable-conv", 3, "old")]
+    assert chatgpt.deleted == ["durable-conv"]
+    assert lifecycle.calls == ["resume", "reset"]
+    assert store.load() is None
+
