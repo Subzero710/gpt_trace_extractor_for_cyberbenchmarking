@@ -12,6 +12,17 @@ from gpt_trace_runner.runner import BenchmarkRunner, abandon_recovery
 TASK = BenchmarkTask("t", "p", ())
 
 
+def _repository_makefile_text() -> str:
+    candidates = [Path("/repo/Makefile")]
+    candidates.extend(parent / "Makefile" for parent in Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise AssertionError(
+        "repository Makefile is unavailable; compose must mount it at /repo/Makefile"
+    )
+
+
 def fp():
     return task_fingerprint(TASK)
 
@@ -221,7 +232,7 @@ def test_submission_journal_persists_user_message_identity(tmp_path: Path) -> No
     assert store.load() == entry
 
 def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None:
-    makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
+    makefile = _repository_makefile_text()
     block = makefile.split("reset-recovery:", 1)[1].split("throw_volumes:", 1)[0]
     assert 'test -n "$(TASK)"' in block
     assert "docker compose run --rm --no-deps runner superbench-reset-recovery" in block

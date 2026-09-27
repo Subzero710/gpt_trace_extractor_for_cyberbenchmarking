@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,17 @@ from gpt_trace_runner.exceptions import (
     AuthenticationRequired,
     FatalUIState,
 )
+
+
+def _repository_makefile_text() -> str:
+    candidates = [Path("/repo/Makefile")]
+    candidates.extend(parent / "Makefile" for parent in Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise AssertionError(
+        "repository Makefile is unavailable; compose must mount it at /repo/Makefile"
+    )
 
 
 @pytest.mark.asyncio
@@ -163,7 +175,7 @@ async def test_resume_auth_check_rejects_missing_session_without_reload() -> Non
 def test_make_run_and_resume_use_no_deps_superbench_commands() -> None:
     from pathlib import Path
 
-    makefile = (Path(__file__).parents[3] / "Makefile").read_text(encoding="utf-8")
+    makefile = _repository_makefile_text()
     run_block = makefile.split("run:", 1)[1].split("pause:", 1)[0]
     resume_block = makefile.split("resume:", 1)[1].split("status:", 1)[0]
 
@@ -259,4 +271,17 @@ def test_completion_still_requires_stable_url_id_to_equal_sse_id() -> None:
 
     assert "stream_result.conversation_id != submitted.conversation_id" in wait
     assert "conversation ID mismatch between browser URL and completed SSE" in wait
+
+def test_superbench_auth_reports_success_after_app_verification() -> None:
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    cli_source = (package / "cli.py").read_text(encoding="utf-8")
+    auth = cli_source.split("def superbench_auth(", 1)[1].split(
+        '@app.command("superbench-reset-recovery")', 1
+    )[0]
+
+    verify = "await chatgpt.verify_apps_available(task.tools)"
+    success = 'console.print("[green]auth detected; Kali Workstation available[/]")'
+    assert verify in auth
+    assert success in auth
+    assert auth.index(verify) < auth.index(success)
 

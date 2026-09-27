@@ -332,6 +332,7 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
                 )
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
                 await chatgpt.verify_apps_available(task.tools)
+                console.print("[green]auth detected; Kali Workstation available[/]")
             finally:
                 await session.disconnect()
 

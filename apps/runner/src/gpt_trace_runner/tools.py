@@ -24,11 +24,23 @@ from .models import BenchmarkTool
 EditorGetter = Callable[[], Awaitable[Locator]]
 
 
+# A visually empty contenteditable is not guaranteed to have innerText == "".
+# Chromium/ChatGPT can leave line-break whitespace or zero-width formatting
+# characters after the last structured mention is removed.
+_EMPTY_COMPOSER_FORMAT_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff")
+
+
+def _composer_text_is_empty(text: str) -> bool:
+    visible = "".join(ch for ch in text if ch not in _EMPTY_COMPOSER_FORMAT_CHARS)
+    return not visible.strip()
+
+
 _COMPOSER_ACCEPTED_JS = r"""
 ([rawMention, appName]) => {
     const selectors = [
         "#prompt-textarea",
         '[contenteditable="true"][data-lexical-editor="true"]',
+        '[contenteditable="true"][role="textbox"]',
     ];
     const seen = new Set();
 
@@ -65,6 +77,9 @@ _APP_CANDIDATE_VISIBLE_JS = r"""
         document.querySelector("#prompt-textarea") ||
         document.querySelector(
             '[contenteditable="true"][data-lexical-editor="true"]'
+        ) ||
+        document.querySelector(
+            '[contenteditable="true"][role="textbox"]'
         );
 
     const visible = (el) => {
@@ -128,7 +143,8 @@ async def _find_app_candidate(
             inside_composer = await candidate.evaluate(
                 """el => Boolean(el.closest(
                     '#prompt-textarea, '
-                    + '[contenteditable="true"][data-lexical-editor="true"]'
+                    + '[contenteditable="true"][data-lexical-editor="true"], '
+                    + '[contenteditable="true"][role="textbox"]'
                 ))"""
             )
             if inside_composer:
@@ -293,7 +309,7 @@ async def _clear_auth_editor(
     max_backspaces = max(32, len(rendered) * 4 + 32)
 
     for _ in range(max_backspaces):
-        if rendered == "":
+        if _composer_text_is_empty(rendered):
             return
 
         # Never click during cleanup. If context_change did not leave keyboard

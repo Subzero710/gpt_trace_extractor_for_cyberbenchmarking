@@ -11,6 +11,7 @@ from .traffic import TrafficMonitor
 PROMPT_SELECTORS = (
     "#prompt-textarea",
     '[contenteditable="true"][data-lexical-editor="true"]',
+    '[contenteditable="true"][role="textbox"]',
 )
 AUTH_SELECTORS = (
     'button:has-text("Log in")',

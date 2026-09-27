@@ -77,6 +77,7 @@ services:
     - ./exports:/data/exports
     - ./apps:/data/apps:ro
     - ./config:/data/config:ro
+    - ./Makefile:/repo/Makefile:ro
     - browser_profile:/browser-profile:ro
     - runner_state:/data/state
     - benchmark_sources:/data/state/superbench/sources:ro
