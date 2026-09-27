@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -50,7 +51,50 @@ def compose_service_image(root: Path, service: str) -> str:
     return image.strip()
 
 
+
+def verify_registry_manifest_pin(root: Path) -> None:
+    manifest = json.loads(
+        (root / 'apps/kali-workstation/tool-manifest.json').read_text(encoding='utf-8')
+    )
+    registry = json.loads(
+        (root / 'apps/registry/apps.json').read_text(encoding='utf-8')
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+        ).encode('utf-8')
+    ).hexdigest()
+    matches = [
+        app for app in registry.get('apps', [])
+        if isinstance(app, dict) and app.get('id') == 'kali-workstation'
+    ]
+    if len(matches) != 1 or matches[0].get('manifest_sha256') != digest:
+        raise RuntimeError(
+            f'kali-workstation registry manifest pin is stale; expected {digest}'
+        )
+
+
+
+def verify_storage_runtime(root: Path) -> None:
+    image = compose_service_image(root, "storage")
+    inspected = run(["docker", "image", "inspect", image], check=False, capture=True)
+    if inspected.returncode != 0:
+        detail = (inspected.stderr or inspected.stdout).strip()[:1000]
+        raise RuntimeError(
+            f"built Compose image is missing for storage: {image}"
+            + (f": {detail}" if detail else "")
+        )
+    code = (
+        "import greenlet; "
+        "from sqlalchemy.ext.asyncio import create_async_engine; "
+        "assert callable(create_async_engine)"
+    )
+    run(["docker", "run", "--rm", "--entrypoint", "python", image, "-c", code])
+
+
 def verify_manifests(root: Path) -> None:
+    verify_storage_runtime(root)
+    verify_registry_manifest_pin(root)
     image = compose_service_image(root, "kali-workstation-controller")
     inspected = run(["docker", "image", "inspect", image], check=False, capture=True)
     if inspected.returncode != 0:

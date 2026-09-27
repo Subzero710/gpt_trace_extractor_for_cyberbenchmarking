@@ -5,6 +5,7 @@ import os
 import platform
 import pwd
 import shutil
+import socket
 import subprocess
 import sys
 import tomllib
@@ -27,6 +28,23 @@ def probe(*args):
         return result.returncode == 0, result.stderr.strip()[:240] or result.stdout.strip()[:240]
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
+
+
+
+def broker_health(path: Path) -> tuple[bool, str]:
+    if not path.is_socket():
+        return False, 'broker socket absent; run make up'
+    request = b'GET /healthz HTTP/1.1\r\nHost: broker\r\nConnection: close\r\n\r\n'
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(3)
+            conn.connect(str(path))
+            conn.sendall(request)
+            response = conn.recv(4096)
+    except OSError as exc:
+        return False, f'broker socket unhealthy: {exc}'
+    status = response.split(b'\r\n', 1)[0]
+    return b' 200 ' in status, status.decode('ascii', errors='replace')
 
 
 def accessible(path: Path, user, bit: int) -> bool:
@@ -79,7 +97,8 @@ def main():
     else:
         checks.append(check('QEMU service account', False, 'libvirt-qemu or qemu user required'))
     broker_socket = ROOT/'state/broker/broker.sock'
-    print(f'INFO broker socket: {"running" if broker_socket.is_socket() else "not started"}; make up starts it')
+    broker_ok, broker_detail = broker_health(broker_socket)
+    checks.append(check('broker health', broker_ok, broker_detail))
     return 0 if all(checks) else 1
 
 

@@ -87,9 +87,16 @@ def ensure_generated_token(path: Path, label: str) -> None:
             raise SystemExit(f"refusing unsafe {label} token path: {path}")
         if len(path.read_text(encoding="utf-8").strip()) < 32:
             raise SystemExit(f"existing {label} token is too short")
-        os.chmod(path, 0o600)
+        # These generated tokens are bind-mounted by Docker Compose as file
+        # secrets. A container may use a remapped UID, so host mode 0600 can
+        # make the individual bind mount unreadable. The parent .secrets
+        # directory remains 0700, so mode 0444 on these files does not expose
+        # them to other host users while allowing the container bind mount to
+        # be read.
+        os.chmod(path, 0o444)
         return
     atomic_secret(path, secrets.token_urlsafe(48) + "\n")
+    os.chmod(path, 0o444)
 
 
 def ensure_control_tokens() -> None:

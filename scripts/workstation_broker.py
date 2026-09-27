@@ -46,15 +46,33 @@ def start():
     with (STATE/'broker.log').open('ab') as log:
         process=subprocess.Popen([str(PYTHON),'-m','workstation_broker.server'],env=env,stdout=log,stderr=log,start_new_session=True)
     PID.write_text(str(process.pid))
-    for _ in range(100):
-        if process.poll() is not None:raise RuntimeError(f'broker exited: {(STATE/"broker.log").read_text()[-2000:]}')
+    # Broker initialization hashes/verifies the golden image and can take
+    # longer than 10 seconds on nested-virtualization development hosts.
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            tail = (STATE/'broker.log').read_text(errors='replace')[-4000:]
+            PID.unlink(missing_ok=True)
+            SOCKET.unlink(missing_ok=True)
+            raise RuntimeError(f'broker exited during startup: {tail}')
         if SOCKET.is_socket():
             try:
                 send('probe')
                 return
-            except OSError: pass
-        time.sleep(.1)
-    raise RuntimeError('broker did not bind its socket')
+            except (OSError, RuntimeError):
+                pass
+        time.sleep(.2)
+
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    tail = (STATE/'broker.log').read_text(errors='replace')[-4000:]
+    PID.unlink(missing_ok=True)
+    SOCKET.unlink(missing_ok=True)
+    raise RuntimeError(f'broker did not become ready within 120s: {tail}')
 
 def stop():
     if SOCKET.is_socket():send('destroy_all')

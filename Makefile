@@ -9,9 +9,9 @@ build:
 up:
 	python3 scripts/project_state.py core
 	python3 scripts/workstation_broker.py start
-	docker compose up -d postgres storage teacher-browser kali-workstation-controller workstation-gateway
+	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser kali-workstation-controller workstation-gateway
 
-doctor:
+doctor: up
 	python3 scripts/host_doctor.py
 	docker compose run --rm --no-deps runner doctor
 
