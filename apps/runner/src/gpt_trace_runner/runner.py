@@ -142,7 +142,7 @@ class BenchmarkRunner:
     async def _ensure_session(self) -> None:
         if self._session_prepared:
             return
-        await self.chatgpt.prepare_session(fresh_home=True)
+        await self.chatgpt.prepare_session(fresh_home=False)
         self._session_prepared = True
 
     @staticmethod

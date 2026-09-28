@@ -5,7 +5,11 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from ..browser import BrowserClient
-from ..exceptions import BatchCircuitBreaker, RecoveryIncomplete
+from ..exceptions import (
+    AuthenticationRequired,
+    BatchCircuitBreaker,
+    RecoveryIncomplete,
+)
 from ..journal import JournalStore
 from ..lock import RunnerLock
 from ..models import task_app_provenance, task_fingerprint
@@ -57,8 +61,15 @@ async def _connect_chatgpt(*, settings, make_chatgpt, bt):
     session = await browser.connect(require_existing_page=False)
     try:
         chatgpt = make_chatgpt(settings, session.page)
-        await chatgpt.wait_until_authenticated(settings.chatgpt_site_ready_timeout_seconds)
-        await chatgpt.verify_apps_available(bt.tools)
+        try:
+            await chatgpt.assert_authenticated_current_page()
+        except AuthenticationRequired:
+            await chatgpt.wait_until_authenticated(
+                settings.chatgpt_site_ready_timeout_seconds
+            )
+        await chatgpt.ensure_extended_thinking_effort_setting()
+        await chatgpt.goto_home()
+        await chatgpt.prepare_session(fresh_home=False)
         return session, chatgpt
     except BaseException:
         await session.disconnect()

@@ -207,6 +207,49 @@ class ChatGPTClient:
                 f"{self._thinking_effort_stream_requests}"
             )
 
+    async def ensure_extended_thinking_effort_setting(self) -> None:
+        """Persist the HAR-observed High setting before benchmark execution."""
+        if not self._expected_model:
+            raise FatalUIState(
+                "cannot set ChatGPT thinking effort without an expected model slug"
+            )
+        try:
+            result = await self._page.evaluate(
+                """async ([modelSlug, effort]) => {
+                    const url = new URL(
+                        '/backend-api/settings/user_last_used_model_config',
+                        window.location.origin
+                    );
+                    url.searchParams.set('model_slug', modelSlug);
+                    url.searchParams.set('thinking_effort', effort);
+                    const response = await fetch(url.pathname + url.search, {
+                        method: 'PATCH',
+                        credentials: 'include',
+                        cache: 'no-store',
+                    });
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        statusText: response.statusText,
+                    };
+                }""",
+                [self._expected_model, REQUIRED_THINKING_EFFORT],
+            )
+        except Exception as exc:
+            raise FatalUIState(
+                "could not persist ChatGPT High/extended thinking setting"
+            ) from exc
+
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            status = result.get("status") if isinstance(result, dict) else None
+            status_text = (
+                result.get("statusText") if isinstance(result, dict) else None
+            )
+            raise FatalUIState(
+                "ChatGPT rejected High/extended thinking setting "
+                f"(HTTP {status} {status_text or ''})"
+            )
+
     async def _navigate(self, url: str) -> None:
         # BrowserClient applies cloakbrowser.human.patch_browser_async() to the
         # connected Browser before this Page reaches ChatGPTClient. Calling the
@@ -583,6 +626,19 @@ class ChatGPTClient:
                 "conversation using the persisted user_message_id"
             ) from exc
 
+    def _validate_requested_app_transport(self, task: BenchmarkTask) -> None:
+        if not task.tools:
+            return
+        if len(task.tools) != 1:
+            raise FatalUIState(
+                "runtime supports exactly one model-facing App per benchmark task"
+            )
+        if not self._traffic.app_system_hints:
+            raise AmbiguousSubmission(
+                "ChatGPT conversation POST did not contain an App system hint "
+                f"for requested App {task.tools[0].name!r}"
+            )
+
     def _validate_submitted_model(self) -> None:
         model = self._traffic.submitted_model
         if self._expected_model and model != self._expected_model:
@@ -639,6 +695,7 @@ class ChatGPTClient:
 
         self._traffic.validate_single_stream_request()
         self._validate_thinking_effort_enforcement()
+        self._validate_requested_app_transport(prepared.task)
         self._validate_submitted_model()
         user_message_id = self._traffic.submitted_user_message_id()
         on_user_message_id(user_message_id)

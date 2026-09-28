@@ -76,7 +76,7 @@ def test_navigation_never_bypasses_cloakbrowser_page_wrapper() -> None:
     assert 'wait_until="commit"' in source
 
 
-def test_auth_and_superbench_execution_validate_apps_before_task_execution() -> None:
+def test_auth_command_preflights_apps_but_runtime_uses_real_task_selection() -> None:
     from pathlib import Path
 
     package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
@@ -86,7 +86,7 @@ def test_auth_and_superbench_execution_validate_apps_before_task_execution() -> 
     ).read_text(encoding="utf-8")
 
     assert "await chatgpt.verify_apps_available(task.tools)" in cli_source
-    assert "await chatgpt.verify_apps_available(bt.tools)" in execution_source
+    assert "await chatgpt.verify_apps_available(bt.tools)" not in execution_source
 
 
 class AuthTrafficDouble:
@@ -305,3 +305,32 @@ def test_superbench_auth_reports_success_after_app_verification() -> None:
     assert verify in auth
     assert success in auth
     assert auth.index(verify) < auth.index(success)
+
+def test_superbench_runtime_bootstrap_sets_high_once_and_avoids_app_scratch_preflight() -> None:
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    execution = (
+        package / "superbench" / "execution.py"
+    ).read_text(encoding="utf-8")
+    connect = execution.split("async def _connect_chatgpt(", 1)[1].split(
+        "async def _cleanup_task", 1
+    )[0]
+
+    assert "assert_authenticated_current_page()" in connect
+    assert "wait_until_authenticated(" in connect
+    assert "ensure_extended_thinking_effort_setting()" in connect
+    assert "await chatgpt.goto_home()" in connect
+    assert "verify_apps_available(bt.tools)" not in connect
+
+
+def test_runner_session_bootstrap_does_not_force_second_home_navigation() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "runner.py"
+    ).read_text(encoding="utf-8")
+    ensure = source.split("async def _ensure_session", 1)[1].split(
+        "@staticmethod", 1
+    )[0]
+    assert "prepare_session(fresh_home=False)" in ensure
+    assert "prepare_session(fresh_home=True)" not in ensure

@@ -69,10 +69,11 @@ def _annotator_tool_text(row: dict[str, Any]) -> str:
 
 
 def _runtime_tools(*, file_path: str | None, annotator_tools: str) -> tuple[str, ...]:
-    normalized = re.sub(r"\s+", " ", annotator_tools).casefold()
-    if file_path or any(hint in normalized for hint in _BROWSER_TOOL_HINTS + _WORKSPACE_TOOL_HINTS):
-        return ("kali-workstation",)
-    return ()
+    # The benchmark contract exposes the single model-facing workstation App
+    # on every GAIA task. File/annotator hints still remain source metadata; they
+    # no longer decide whether the model is allowed to use the workstation.
+    _ = (file_path, annotator_tools)
+    return ("kali-workstation",)
 
 
 def _sha256_file(path: Path) -> str:
@@ -176,7 +177,7 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "6"
+    adapter_version = "7"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}

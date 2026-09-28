@@ -27,29 +27,6 @@ def test_conversation_url_decodes_local_chatgpt_route() -> None:
     assert is_transient_conversation_id("6ab97601-700c-83eb-9513-5982fd98bce3") is False
 
 
-def test_extended_thinking_payload_overrides_frontend_value() -> None:
-    payload = {
-        "model": "gpt-5-6-thinking",
-        "thinking_effort": "medium",
-        "messages": [{"id": "u1"}],
-    }
-    rewritten = json.loads(ChatGPTClient._extended_thinking_post_data(payload))
-    assert REQUIRED_THINKING_EFFORT == "extended"
-    assert rewritten["thinking_effort"] == "extended"
-    assert rewritten["model"] == "gpt-5-6-thinking"
-    assert rewritten["messages"] == [{"id": "u1"}]
-    assert payload["thinking_effort"] == "medium"
-
-
-def test_extended_thinking_payload_adds_field_when_frontend_omits_it() -> None:
-    rewritten = json.loads(
-        ChatGPTClient._extended_thinking_post_data(
-            {"model": "gpt-5-6-thinking", "messages": [{"id": "u1"}]}
-        )
-    )
-    assert rewritten["thinking_effort"] == "extended"
-
-
 class _AbortedStream:
     async def wait(self):
         raise ConversationStreamAborted("conversation SSE failed: net::ERR_ABORTED")
@@ -126,6 +103,7 @@ def test_protocol_source_enforces_both_contracts() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'rewritten["thinking_effort"] = REQUIRED_THINKING_EFFORT' in source
+    assert "ensure_extended_thinking_effort_setting" in source
     assert "self._validate_thinking_effort_enforcement()" in source
     assert "is_transient_conversation_id(candidate)" in source
     assert "await self._conversation.fetch(candidate)" in source
@@ -188,3 +166,42 @@ async def test_recovery_snapshot_retries_readback_429() -> None:
 
     assert payload == {"messages": []}
     assert client._conversation.calls == 2
+
+class _ThinkingSettingPage:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def evaluate(self, script, arg):
+        self.calls.append((script, arg))
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_high_setting_uses_har_observed_backend_contract() -> None:
+    page = _ThinkingSettingPage({"ok": True, "status": 200, "statusText": "OK"})
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._page = page
+    client._expected_model = "gpt-5-6-thinking"
+
+    await client.ensure_extended_thinking_effort_setting()
+
+    assert len(page.calls) == 1
+    script, arg = page.calls[0]
+    assert "/backend-api/settings/user_last_used_model_config" in script
+    assert "method: 'PATCH'" in script
+    assert "thinking_effort" in script
+    assert arg == ["gpt-5-6-thinking", "extended"]
+
+
+def test_submit_requires_app_transport_hint_for_requested_app() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "chatgpt.py"
+    ).read_text(encoding="utf-8")
+    submit = source.split("async def submit_task(", 1)[1].split(
+        "def _validate_message_models(", 1
+    )[0]
+    assert "self._validate_requested_app_transport(prepared.task)" in submit
