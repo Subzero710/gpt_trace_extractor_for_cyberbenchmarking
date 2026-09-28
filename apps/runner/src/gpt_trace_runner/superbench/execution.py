@@ -67,7 +67,6 @@ async def _connect_chatgpt(*, settings, make_chatgpt, bt):
             await chatgpt.wait_until_authenticated(
                 settings.chatgpt_site_ready_timeout_seconds
             )
-        await chatgpt.ensure_extended_thinking_effort_setting()
         await chatgpt.goto_home()
         await chatgpt.prepare_session(fresh_home=False)
         return session, chatgpt

@@ -60,6 +60,7 @@ UPLOAD_MENU_LABELS = (
 )
 
 REQUIRED_THINKING_EFFORT = "extended"
+REQUIRED_UI_THINKING_EFFORT = "high"
 
 def _thinking_effort_route_pattern(base_url: str):
     return re.compile(
@@ -71,7 +72,11 @@ def _thinking_effort_route_pattern(base_url: str):
 def check_chatgpt_protocol_contracts(base_url: str) -> None:
     if REQUIRED_THINKING_EFFORT != "extended":
         raise RuntimeError(
-            "ChatGPT benchmark thinking effort must remain forced to 'extended'"
+            "ChatGPT benchmark wire thinking_effort must remain 'extended'"
+        )
+    if REQUIRED_UI_THINKING_EFFORT != "high":
+        raise RuntimeError(
+            "ChatGPT benchmark UI thinking effort must remain 'high'"
         )
     pattern = _thinking_effort_route_pattern(base_url)
     expected = (
@@ -140,23 +145,12 @@ class ChatGPTClient:
         self._active_turn: SubmittedTurn | None = None
         self._environment_baseline: dict[str, Any] | None = None
         self._environment_hash: str | None = None
-        self._thinking_effort_route_installed = False
-        self._thinking_effort_stream_requests = 0
-        self._thinking_effort_force_error: str | None = None
+        self._thinking_effort_observer_installed = False
+        self._thinking_effort_verified_requests = 0
+        self._thinking_effort_observer_error: str | None = None
 
-    @staticmethod
-    def _extended_thinking_post_data(payload: Any) -> str:
-        if not isinstance(payload, dict):
-            raise ValueError("ChatGPT conversation request body is not a JSON object")
-        rewritten = dict(payload)
-        rewritten["thinking_effort"] = REQUIRED_THINKING_EFFORT
-        return json.dumps(
-            rewritten,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    async def _force_extended_thinking_effort(self, route, request) -> None:
+    async def _observe_required_thinking_effort(self, route, request) -> None:
+        """Observe generation traffic and fail closed without mutating its payload."""
         request_url = request.url.split("?", 1)[0].rstrip("/")
         conversation_url = f"{self._base_url}/backend-api/f/conversation"
         prepare_url = f"{conversation_url}/prepare"
@@ -168,87 +162,165 @@ class ChatGPTClient:
             await route.continue_()
             return
 
+        # /prepare is not treated as a generation request. Its payload contract
+        # is deliberately not assumed to match /conversation.
+        if request_url == prepare_url:
+            await route.continue_()
+            return
+
         try:
-            post_data = self._extended_thinking_post_data(request.post_data_json)
+            payload = request.post_data_json
         except Exception as exc:
-            self._thinking_effort_force_error = (
-                "could not force ChatGPT thinking_effort="
-                f"{REQUIRED_THINKING_EFFORT!r}: {exc}"
+            self._thinking_effort_observer_error = (
+                "could not inspect ChatGPT generation thinking_effort: "
+                f"{exc}"
             )
             await route.abort()
             return
 
-        try:
-            await route.continue_(post_data=post_data)
-        except Exception as exc:
-            self._thinking_effort_force_error = (
-                "failed to continue ChatGPT request after forcing "
-                f"thinking_effort={REQUIRED_THINKING_EFFORT}: {exc}"
+        if not isinstance(payload, dict):
+            self._thinking_effort_observer_error = (
+                "ChatGPT generation request body is not a JSON object"
             )
-            raise
-        else:
-            if request_url == conversation_url:
-                self._thinking_effort_stream_requests += 1
+            await route.abort()
+            return
 
-    async def _ensure_thinking_effort_enforcer(self) -> None:
-        if self._thinking_effort_route_installed:
+        observed = payload.get("thinking_effort")
+
+        if observed != REQUIRED_THINKING_EFFORT:
+            self._thinking_effort_observer_error = (
+                "ChatGPT generation request did not use required High thinking: "
+                f"thinking_effort={observed!r}, "
+                f"expected={REQUIRED_THINKING_EFFORT!r}, url={request_url!r}"
+            )
+            await route.abort()
+            return
+
+        await route.continue_()
+        if request_url == conversation_url:
+            self._thinking_effort_verified_requests += 1
+
+    async def _ensure_thinking_effort_observer(self) -> None:
+        if self._thinking_effort_observer_installed:
             return
         pattern = _thinking_effort_route_pattern(self._base_url)
-        await self._page.route(pattern, self._force_extended_thinking_effort)
-        self._thinking_effort_route_installed = True
+        await self._page.route(pattern, self._observe_required_thinking_effort)
+        self._thinking_effort_observer_installed = True
 
-    def _validate_thinking_effort_enforcement(self) -> None:
-        if self._thinking_effort_force_error is not None:
-            raise FatalUIState(self._thinking_effort_force_error)
-        if self._thinking_effort_stream_requests != 1:
+    def _validate_thinking_effort_observation(self) -> None:
+        if self._thinking_effort_observer_error is not None:
+            raise FatalUIState(self._thinking_effort_observer_error)
+        if self._thinking_effort_verified_requests != 1:
             raise AmbiguousSubmission(
-                "expected exactly one ChatGPT conversation POST rewritten with "
+                "expected exactly one ChatGPT conversation POST verified with "
                 f"thinking_effort={REQUIRED_THINKING_EFFORT!r}; observed "
-                f"{self._thinking_effort_stream_requests}"
+                f"{self._thinking_effort_verified_requests}"
             )
 
-    async def ensure_extended_thinking_effort_setting(self) -> None:
-        """Persist the HAR-observed High setting before benchmark execution."""
-        if not self._expected_model:
-            raise FatalUIState(
-                "cannot set ChatGPT thinking effort without an expected model slug"
-            )
+    async def ensure_high_thinking_effort(self) -> None:
+        """Select UI High via the real reasoning slider and verify the result."""
+        trigger = self._page.locator(
+            'button[data-composer-navigation-target="reasoning"]'
+        )
+        picker_open = False
         try:
-            result = await self._page.evaluate(
-                """async ([modelSlug, effort]) => {
-                    const url = new URL(
-                        '/backend-api/settings/user_last_used_model_config',
-                        window.location.origin
-                    );
-                    url.searchParams.set('model_slug', modelSlug);
-                    url.searchParams.set('thinking_effort', effort);
-                    const response = await fetch(url.pathname + url.search, {
-                        method: 'PATCH',
-                        credentials: 'include',
-                        cache: 'no-store',
-                    });
-                    return {
-                        ok: response.ok,
-                        status: response.status,
-                        statusText: response.statusText,
-                    };
-                }""",
-                [self._expected_model, REQUIRED_THINKING_EFFORT],
+            await trigger.wait_for(state="visible")
+            current = await trigger.get_attribute("data-selected-reasoning-effort")
+            if current == REQUIRED_UI_THINKING_EFFORT:
+                return
+
+            await self._interaction.ensure_page_focus()
+            await self._page.keyboard.press("Control+Shift+M")
+            picker_open = True
+
+            active = await self._page.evaluate(
+                """() => ({
+                    role: document.activeElement?.getAttribute('role') || null,
+                    label: document.activeElement?.getAttribute('aria-label') || null,
+                })"""
             )
+            if active != {"role": "menuitem", "label": "Select model"}:
+                raise FatalUIState(
+                    "unexpected model-picker focus after Ctrl+Shift+M: "
+                    f"{active!r}"
+                )
+
+            await self._page.keyboard.press("ArrowDown")
+            active = await self._page.evaluate(
+                """() => ({
+                    role: document.activeElement?.getAttribute('role') || null,
+                    label: document.activeElement?.getAttribute('aria-label') || null,
+                    reasoningSlider:
+                        document.activeElement?.getAttribute('data-reasoning-slider') || null,
+                })"""
+            )
+            if active != {
+                "role": "menuitem",
+                "label": "Power",
+                "reasoningSlider": "true",
+            }:
+                raise FatalUIState(
+                    "ChatGPT reasoning slider did not receive focus: "
+                    f"{active!r}"
+                )
+
+            slider = self._page.locator(
+                '[data-reasoning-slider="true"] [role="slider"]'
+            )
+            await slider.wait_for(state="attached")
+
+            raw_now = await slider.get_attribute("aria-valuenow")
+            raw_max = await slider.get_attribute("aria-valuemax")
+            if raw_now is None or raw_max is None:
+                raise FatalUIState(
+                    "ChatGPT reasoning slider is missing aria-valuenow/aria-valuemax"
+                )
+            try:
+                value_now = int(raw_now)
+                value_max = int(raw_max)
+            except ValueError as exc:
+                raise FatalUIState(
+                    "ChatGPT reasoning slider exposed non-integer ARIA values: "
+                    f"now={raw_now!r}, max={raw_max!r}"
+                ) from exc
+            if value_now < 0 or value_max < 0 or value_now > value_max:
+                raise FatalUIState(
+                    "ChatGPT reasoning slider exposed invalid bounds: "
+                    f"now={value_now}, max={value_max}"
+                )
+
+            for _ in range(value_max - value_now):
+                await self._page.keyboard.press("ArrowRight")
+
+            final_raw = await slider.get_attribute("aria-valuenow")
+            final_effort = await trigger.get_attribute(
+                "data-selected-reasoning-effort"
+            )
+            try:
+                final_value = int(final_raw) if final_raw is not None else -1
+            except ValueError:
+                final_value = -1
+
+            if (
+                final_value != value_max
+                or final_effort != REQUIRED_UI_THINKING_EFFORT
+            ):
+                raise FatalUIState(
+                    "failed to select ChatGPT High thinking effort: "
+                    f"effort={final_effort!r}, slider={final_value}/{value_max}"
+                )
+        except FatalUIState:
+            raise
         except Exception as exc:
             raise FatalUIState(
-                "could not persist ChatGPT High/extended thinking setting"
+                f"could not select ChatGPT High thinking effort via UI: {exc}"
             ) from exc
-
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            status = result.get("status") if isinstance(result, dict) else None
-            status_text = (
-                result.get("statusText") if isinstance(result, dict) else None
-            )
-            raise FatalUIState(
-                "ChatGPT rejected High/extended thinking setting "
-                f"(HTTP {status} {status_text or ''})"
-            )
+        finally:
+            if picker_open:
+                try:
+                    await self._page.keyboard.press("Escape")
+                except Exception:
+                    pass
 
     async def _navigate(self, url: str) -> None:
         # BrowserClient applies cloakbrowser.human.patch_browser_async() to the
@@ -514,12 +586,13 @@ class ChatGPTClient:
         if self._active_turn is not None:
             raise ConcurrentTurnError("another ChatGPT turn is already active")
         self._traffic.begin_task()
-        self._thinking_effort_stream_requests = 0
-        self._thinking_effort_force_error = None
-        await self._ensure_thinking_effort_enforcer()
+        self._thinking_effort_verified_requests = 0
+        self._thinking_effort_observer_error = None
+        await self._ensure_thinking_effort_observer()
         await self._check_environment()
         try:
             await self._new_chat_if_needed()
+            await self.ensure_high_thinking_effort()
             await self._upload(task.attachments)
             await self._compose(task)
             await self._interaction.ensure_page_focus()
@@ -675,6 +748,8 @@ class ChatGPTClient:
         before_send: Callable[[], None],
         on_user_message_id: Callable[[str], None],
     ) -> SubmittedTurn:
+        if self._thinking_effort_observer_error is not None:
+            raise FatalUIState(self._thinking_effort_observer_error)
         try:
             async with self._page.expect_response(
                 is_conversation_stream_response,
@@ -683,6 +758,8 @@ class ChatGPTClient:
                 await self._click_send(before_send)
             response = await response_info.value
         except Exception as exc:
+            if self._thinking_effort_observer_error is not None:
+                raise FatalUIState(self._thinking_effort_observer_error) from exc
             if self._traffic.saw_backend_429:
                 raise RateLimited("ChatGPT returned HTTP 429 during submit") from exc
             if self._traffic.saw_backend_403:
@@ -694,7 +771,7 @@ class ChatGPTClient:
             ) from exc
 
         self._traffic.validate_single_stream_request()
-        self._validate_thinking_effort_enforcement()
+        self._validate_thinking_effort_observation()
         self._validate_requested_app_transport(prepared.task)
         self._validate_submitted_model()
         user_message_id = self._traffic.submitted_user_message_id()
@@ -974,9 +1051,10 @@ class ChatGPTClient:
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
                 "required_thinking_effort": REQUIRED_THINKING_EFFORT,
-                "thinking_effort_forced_requests": getattr(
+                "required_ui_thinking_effort": REQUIRED_UI_THINKING_EFFORT,
+                "thinking_effort_verified_requests": getattr(
                     self,
-                    "_thinking_effort_stream_requests",
+                    "_thinking_effort_verified_requests",
                     0,
                 ),
                 "requested_tools": [
@@ -1055,6 +1133,7 @@ class ChatGPTClient:
                 "environment_sha256": self._environment_hash,
                 "expected_model": self._expected_model,
                 "required_thinking_effort": REQUIRED_THINKING_EFFORT,
+                "required_ui_thinking_effort": REQUIRED_UI_THINKING_EFFORT,
                 "requested_tools": [
                     {"type": t.type, "name": t.name}
                     for t in task.tools
