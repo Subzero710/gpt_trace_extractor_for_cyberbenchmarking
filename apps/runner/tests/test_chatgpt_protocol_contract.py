@@ -164,3 +164,27 @@ async def test_thinking_effort_enforcer_installs_runtime_route() -> None:
     assert pattern.fullmatch(
         "https://chatgpt.com/backend-api/f/conversation/prepare"
     )
+
+@pytest.mark.asyncio
+async def test_recovery_snapshot_retries_readback_429() -> None:
+    from gpt_trace_runner.exceptions import RateLimited
+
+    class RateLimitedOnce:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch(self, conversation_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimited("snapshot 429")
+            return {"messages": []}
+
+    client = ChatGPTClient.__new__(ChatGPTClient)
+    client._conversation = RateLimitedOnce()
+    client._durable_poll_rate_limit_backoff_seconds = 0.01
+    client._durable_error_recovery_seconds = 1.0
+
+    payload = await client._fetch_recovery_snapshot("conv-1")
+
+    assert payload == {"messages": []}
+    assert client._conversation.calls == 2

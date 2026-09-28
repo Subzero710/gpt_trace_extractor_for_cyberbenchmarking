@@ -297,3 +297,19 @@ def test_app_system_hints_are_captured_from_init_and_prepare() -> None:
         "plugin:asdk_app_browser",
         "plugin:asdk_app_workspace",
     )
+
+def test_conversation_readback_429_is_counted_but_not_sticky() -> None:
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    monitor.begin_task()
+
+    request = FakeRequest(
+        "https://chatgpt.com/backend-api/conversations/conv-1?num_turns=100"
+    )
+    page.handlers["request"](request)
+    page.handlers["response"](
+        FakeResponse(request.url, status=429, request=request)
+    )
+
+    assert monitor.runtime_metadata()["responses_429"] == 1
+    assert monitor.saw_backend_429 is False

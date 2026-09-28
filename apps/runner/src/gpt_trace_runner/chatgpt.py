@@ -677,52 +677,155 @@ class ChatGPTClient:
         self,
         submitted: SubmittedTurn,
     ):
-        """Race the SSE transport against durable conversation completion."""
+        """Race SSE completion against low-rate durable completion checks.
+
+        Current ChatGPT can finish a turn while the frontend SSE remains open or
+        ends as net::ERR_ABORTED. Durable polling is intentionally sparse so the
+        runner cannot create its own /conversations readback rate limit.
+        """
         stream_task = asyncio.create_task(submitted.stream.wait())
-        await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        turn_timeout = float(getattr(self, "_turn_timeout", 1800.0))
+        deadline = loop.time() + turn_timeout
+        poll_delay = float(
+            getattr(self, "_durable_poll_initial_seconds", 10.0)
+        )
+        poll_max = float(
+            getattr(self, "_durable_poll_max_seconds", 30.0)
+        )
+        rate_limit_backoff = float(
+            getattr(self, "_durable_poll_rate_limit_backoff_seconds", 30.0)
+        )
+        stream_error: (
+            ConversationStreamIncomplete | ConversationStreamAborted | None
+        ) = None
+        stream_error_deadline: float | None = None
 
         async def durable_snapshot():
+            # First consume a snapshot the frontend already fetched. This creates
+            # no additional ChatGPT request.
+            natural = None
+            natural_snapshot = getattr(self._traffic, "natural_snapshot", None)
+            if callable(natural_snapshot):
+                natural = await natural_snapshot(
+                    submitted.conversation_id,
+                    wait_seconds=0,
+                )
+            if natural is not None:
+                try:
+                    messages = self._validated_messages(
+                        natural,
+                        submitted.user_message_id,
+                    )
+                except ConversationError:
+                    pass
+                else:
+                    self._traffic.mark_natural_snapshot_used()
+                    return natural, messages, False
+
+            # Only then perform one explicit readback.
             self._traffic.mark_fallback_snapshot()
             try:
                 conversation = await self._conversation.fetch(
                     submitted.conversation_id
                 )
             except ConversationNotFound:
-                return None, None
+                return None, None, False
+            except RateLimited:
+                # A readback 429 is not evidence that the teacher generation was
+                # rate-limited. Back off and keep the already-submitted turn.
+                return None, None, True
+
             try:
                 messages = self._validated_messages(
                     conversation,
                     submitted.user_message_id,
                 )
             except ConversationError:
-                return conversation, None
-            return conversation, messages
+                return conversation, None, False
+            return conversation, messages, False
 
         try:
             while True:
-                if stream_task.done():
+                now = loop.time()
+                if now >= deadline:
+                    if stream_error is not None:
+                        raise stream_error
+                    raise RecoveryIncomplete(
+                        "ChatGPT turn did not become durably complete before timeout"
+                    )
+
+                if stream_task.done() and stream_error is None:
                     try:
                         return stream_task.result(), None, None, None
                     except (
                         ConversationStreamIncomplete,
                         ConversationStreamAborted,
                     ) as exc:
-                        conversation, messages = await durable_snapshot()
-                        if messages is not None:
-                            return None, exc, conversation, messages
-                        raise exc
+                        stream_error = exc
+                        stream_error_deadline = min(
+                            deadline,
+                            loop.time()
+                            + float(
+                                getattr(
+                                    self,
+                                    "_durable_error_recovery_seconds",
+                                    120.0,
+                                )
+                            ),
+                        )
 
-                conversation, messages = await durable_snapshot()
+                if stream_error is not None:
+                    conversation, messages, readback_limited = (
+                        await durable_snapshot()
+                    )
+                    if messages is not None:
+                        return None, stream_error, conversation, messages
+                    if not readback_limited:
+                        raise stream_error
+
+                    assert stream_error_deadline is not None
+                    remaining = stream_error_deadline - loop.time()
+                    if remaining <= 0:
+                        raise stream_error
+                    await asyncio.sleep(
+                        min(rate_limit_backoff, remaining)
+                    )
+                    continue
+
+                remaining = deadline - loop.time()
+                done, _pending = await asyncio.wait(
+                    {stream_task},
+                    timeout=min(poll_delay, remaining),
+                )
+                if done:
+                    continue
+
+                conversation, messages, readback_limited = (
+                    await durable_snapshot()
+                )
                 if messages is not None:
                     stream_task.cancel()
-                    await asyncio.gather(stream_task, return_exceptions=True)
+                    await asyncio.gather(
+                        stream_task,
+                        return_exceptions=True,
+                    )
                     return None, None, conversation, messages
 
-                await asyncio.wait({stream_task}, timeout=0.5)
+                if readback_limited:
+                    poll_delay = min(
+                        max(rate_limit_backoff, poll_delay * 2.0),
+                        max(rate_limit_backoff, poll_max),
+                    )
+                else:
+                    poll_delay = min(poll_delay * 2.0, poll_max)
         finally:
             if not stream_task.done():
                 stream_task.cancel()
-                await asyncio.gather(stream_task, return_exceptions=True)
+                await asyncio.gather(
+                    stream_task,
+                    return_exceptions=True,
+                )
 
     async def wait_for_completion(self, submitted: SubmittedTurn) -> CapturedConversation:
         if self._active_turn is not submitted:
@@ -834,6 +937,27 @@ class ChatGPTClient:
         finally:
             self._active_turn = None
 
+    async def _fetch_recovery_snapshot(self, conversation_id: str):
+        """Retry only durable readback 429s during crash recovery."""
+        loop = asyncio.get_running_loop()
+        timeout_seconds = float(
+            getattr(self, "_durable_error_recovery_seconds", 120.0)
+        )
+        deadline = loop.time() + timeout_seconds
+        delay = float(
+            getattr(self, "_durable_poll_rate_limit_backoff_seconds", 30.0)
+        )
+
+        while True:
+            try:
+                return await self._conversation.fetch(conversation_id)
+            except RateLimited:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(delay, remaining))
+                delay = min(max(delay * 2.0, 1.0), 30.0)
+
     async def recover(
         self,
         conversation_id: str,
@@ -851,7 +975,7 @@ class ChatGPTClient:
         await self._site.wait_ready()
         await self._check_environment()
         try:
-            conversation = await self._conversation.fetch(conversation_id)
+            conversation = await self._fetch_recovery_snapshot(conversation_id)
         except ConversationNotFound as exc:
             raise RecoveryIncomplete(
                 f"conversation {conversation_id!r} no longer exists; "

@@ -283,10 +283,8 @@ class ConversationStream:
             )
 
         try:
-            finished_error = await asyncio.wait_for(
-                self._response.finished(),
-                timeout=self._timeout_seconds,
-            )
+            async with asyncio.timeout(self._timeout_seconds):
+                finished_error = await self._response.finished()
         except TimeoutError as exc:
             raise ConversationStreamTimeout(
                 "conversation SSE did not finish within "

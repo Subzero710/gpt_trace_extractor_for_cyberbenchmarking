@@ -243,9 +243,17 @@ class TrafficMonitor:
                 self._auth_me_event.clear()
         if self._is_backend_path(path):
             if response.status == 429:
-                self._sticky_429 = True
                 if current:
                     self._stats.responses_429 += 1
+                # Conversation readback endpoints are auxiliary verification
+                # traffic. A 429 there can be caused by our own snapshot reads
+                # and must not poison the whole batch as a teacher/model limit.
+                is_readback = (
+                    path == "/backend-api/conversations"
+                    or path.startswith("/backend-api/conversations/")
+                )
+                if not is_readback:
+                    self._sticky_429 = True
             elif response.status == 403 and current:
                 self._task_403 = True
                 self._stats.responses_403 += 1
