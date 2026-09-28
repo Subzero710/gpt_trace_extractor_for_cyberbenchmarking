@@ -18,7 +18,24 @@ def raw_row(task_id, verdict):
         "evaluation": evaluation,
         "messages": [
             {"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["q"]}},
-            {"author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["a"]}},
+            {
+                "author": {"role": "assistant"},
+                "content": {
+                    "content_type": "thoughts",
+                    "thoughts": [
+                        {"summary": "Checking", "content": "Useful reasoning summary."},
+                        {"summary": "Checked", "content": ""},
+                    ],
+                },
+                "metadata": {"summary_type": "raw_cot"},
+            },
+            {
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "end_turn": True,
+                "content": {"content_type": "text", "parts": ["a"]},
+                "metadata": {"reasoning_title": "Answering"},
+            },
         ],
         "app_provenance": [],
         "runtime_metadata": {},
@@ -38,6 +55,14 @@ async def test_corpus_keeps_all_rows_and_sft_defaults_to_pass(tmp_path):
     table = pq.read_table(corpus)
     assert table.schema == SCHEMA
     assert table.num_rows == 3
+    first_messages = table.column("messages")[0].as_py()
+    assert [message["kind"] for message in first_messages] == [
+        "user_prompt",
+        "reasoning_summary",
+        "assistant_final",
+    ]
+    assert first_messages[1]["content"] == "Useful reasoning summary."
+    assert first_messages[2]["reasoning_title"] == "Answering"
 
     sft = tmp_path / "sft.parquet"
     assert derive_sft(corpus, sft) == 1

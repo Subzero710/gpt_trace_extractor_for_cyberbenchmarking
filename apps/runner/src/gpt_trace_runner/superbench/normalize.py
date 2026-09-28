@@ -32,6 +32,61 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _reasoning_summary_text(content: Any) -> str:
+    """Extract only non-empty raw_cot thoughts[].content text."""
+    if not isinstance(content, dict):
+        return ""
+    thoughts = content.get("thoughts")
+    if not isinstance(thoughts, list):
+        return ""
+    parts: list[str] = []
+    for thought in thoughts:
+        if not isinstance(thought, dict):
+            continue
+        value = thought.get("content")
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    return "\n".join(parts)
+
+
+def _reasoning_title(metadata: dict[str, Any]) -> str | None:
+    value = metadata.get("reasoning_title")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _message_kind(
+    raw: dict[str, Any],
+    *,
+    role: str,
+    calls: list[dict[str, str]],
+) -> str:
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    content = raw.get("content")
+    content_type = content.get("content_type") if isinstance(content, dict) else None
+
+    if (
+        role == "assistant"
+        and metadata.get("summary_type") == "raw_cot"
+        and content_type == "thoughts"
+    ):
+        return "reasoning_summary"
+    if role == "user":
+        return "user_prompt"
+    if role == "tool":
+        return "tool_result"
+    if role == "system":
+        return "system"
+    if role == "assistant" and calls:
+        return "assistant_tool_call"
+    if role == "assistant" and (
+        raw.get("channel") == "final" or raw.get("end_turn") is True
+    ):
+        return "assistant_final"
+    return "assistant_message"
+
+
 def _identity_maps(used_tool_calls, app_provenance):
     aliases: dict[str, set[str]] = defaultdict(set)
     call_names: dict[str, str] = {}
@@ -222,10 +277,22 @@ def normalize_messages(
         if normalized_name is None and raw_name:
             normalized_name = resolve_alias(raw_name)
 
+        kind = _message_kind(raw, role=role, calls=calls)
+        if kind == "reasoning_summary":
+            normalized_content = _reasoning_summary_text(raw.get("content"))
+            # raw_cot sometimes contains a closing thought with content="" only.
+            # It carries no training signal, so omit that normalized message.
+            if not normalized_content:
+                continue
+        else:
+            normalized_content = _text(raw.get("content"))
+
         out.append(
             {
                 "role": role,
-                "content": _text(raw.get("content")),
+                "kind": kind,
+                "content": normalized_content,
+                "reasoning_title": _reasoning_title(metadata),
                 "name": normalized_name or None,
                 "tool_call_id": str(tool_call_id) if tool_call_id else None,
                 "tool_calls": calls,

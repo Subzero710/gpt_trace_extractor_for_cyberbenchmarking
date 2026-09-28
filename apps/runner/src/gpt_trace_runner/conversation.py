@@ -29,23 +29,32 @@ def is_transient_conversation_id(value: str | None) -> bool:
     normalized = unquote(value).strip().casefold()
     return normalized.startswith("web:") or normalized.startswith("local-chatgpt:")
 
-def _hidden_raw_cot(message: dict[str, Any]) -> bool:
-    metadata = message.get("metadata")
-    return isinstance(metadata, dict) and metadata.get("summary_type") == "raw_cot"
-
-
 def extract_dataset_messages(conversation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep the complete durable message trajectory, including exposed reasoning summaries.
+
+    ChatGPT currently marks user-visible reasoning progress messages with
+    metadata.summary_type == "raw_cot". They are not treated as hidden/internal
+    chain-of-thought here: the backend explicitly returned them in messages[], and
+    the ML normalizer decides which useful fields to retain.
+    """
     messages = conversation.get("messages")
     if not isinstance(messages, list):
         raise ConversationError("conversation JSON has no messages[]")
-    return [m for m in messages if isinstance(m, dict) and not _hidden_raw_cot(m)]
+    return [m for m in messages if isinstance(m, dict)]
 
 
 def is_complete(messages: list[dict[str, Any]]) -> bool:
+    # Reasoning/tool messages may occur around the final answer and have
+    # end_turn=false/null. Completion therefore means that *some* assistant
+    # message in the durable trajectory is the terminal end_turn=true message.
     for message in reversed(messages):
         author = message.get("author")
-        if isinstance(author, dict) and author.get("role") == "assistant":
-            return message.get("end_turn") is True
+        if (
+            isinstance(author, dict)
+            and author.get("role") == "assistant"
+            and message.get("end_turn") is True
+        ):
+            return True
     return False
 
 

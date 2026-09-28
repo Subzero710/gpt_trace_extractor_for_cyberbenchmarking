@@ -57,3 +57,58 @@ def test_global_tool_identity_and_multi_call_pairing():
 def test_exported_tool_name_uses_shared_global_identity():
     apps = [{"app_id": "code-workspace", "tool_manifest": {"tools": [{"name": "read_file"}]}}]
     assert tools_from_provenance(apps)[0]["name"] == stable_tool_name("code-workspace", "read_file")
+
+def test_reasoning_summary_kind_and_reasoning_title_are_preserved():
+    raw = [
+        {
+            "id": "u",
+            "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": ["question"]},
+        },
+        {
+            "id": "cot",
+            "author": {"role": "assistant"},
+            "content": {
+                "content_type": "thoughts",
+                "thoughts": [
+                    {"summary": "Checking", "content": "First useful detail."},
+                    {"summary": "Checked", "content": ""},
+                    {"summary": "Next", "content": "Second useful detail."},
+                ],
+            },
+            "metadata": {"summary_type": "raw_cot"},
+        },
+        {
+            "id": "call",
+            "author": {"role": "assistant"},
+            "content": {"content_type": "code", "text": "{}"},
+            "recipient": "x.tool",
+            "metadata": {"reasoning_title": "Inspecting target"},
+        },
+        {
+            "id": "result",
+            "author": {"role": "tool", "name": "x.tool"},
+            "metadata": {"parent_id": "call"},
+            "content": {"content_type": "text", "parts": ["ok"]},
+        },
+        {
+            "id": "final",
+            "author": {"role": "assistant"},
+            "channel": "final",
+            "end_turn": True,
+            "content": {"content_type": "text", "parts": ["answer"]},
+        },
+    ]
+
+    messages = normalize_messages(raw)
+
+    assert [message["kind"] for message in messages] == [
+        "user_prompt",
+        "reasoning_summary",
+        "assistant_tool_call",
+        "tool_result",
+        "assistant_final",
+    ]
+    assert messages[1]["content"] == "First useful detail.\nSecond useful detail."
+    assert messages[1]["reasoning_title"] is None
+    assert messages[2]["reasoning_title"] == "Inspecting target"

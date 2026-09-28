@@ -14,20 +14,28 @@ from gpt_trace_runner.conversation import (
 from gpt_trace_runner.exceptions import AuthenticationRequired, ConversationNotFound
 
 
-def test_extract_filters_explicit_raw_cot() -> None:
-    visible = {
-        "id": "visible",
+def test_extract_preserves_raw_cot_and_completion_ignores_nonterminal_reasoning() -> None:
+    final = {
+        "id": "final",
         "author": {"role": "assistant"},
+        "channel": "final",
         "end_turn": True,
         "metadata": {},
     }
-    hidden = {
-        "id": "hidden",
+    reasoning = {
+        "id": "reasoning",
         "author": {"role": "assistant"},
+        "end_turn": False,
+        "content": {
+            "content_type": "thoughts",
+            "thoughts": [{"summary": "Checking", "content": "Useful progress detail."}],
+        },
         "metadata": {"summary_type": "raw_cot"},
     }
-    messages = extract_dataset_messages({"messages": [hidden, visible]})
-    assert messages == [visible]
+    # Put reasoning after final to ensure completion detection searches for the
+    # actual terminal assistant message instead of trusting the last assistant.
+    messages = extract_dataset_messages({"messages": [final, reasoning]})
+    assert messages == [final, reasoning]
     assert is_complete(messages)
 
 
