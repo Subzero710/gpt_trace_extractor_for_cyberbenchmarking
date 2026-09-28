@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 import json
 
@@ -93,8 +95,6 @@ async def test_err_aborted_stream_can_complete_from_verified_durable_snapshot() 
 
 
 def test_protocol_source_enforces_both_contracts() -> None:
-    from pathlib import Path
-
     source = (
         Path(__file__).resolve().parents[1]
         / "src"

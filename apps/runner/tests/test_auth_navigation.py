@@ -306,7 +306,7 @@ def test_superbench_auth_reports_success_after_app_verification() -> None:
     assert success in auth
     assert auth.index(verify) < auth.index(success)
 
-def test_superbench_runtime_bootstrap_sets_high_once_and_avoids_app_scratch_preflight() -> None:
+def test_superbench_runtime_bootstrap_avoids_private_thinking_patch_and_app_scratch_preflight() -> None:
     package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
     execution = (
         package / "superbench" / "execution.py"
@@ -317,9 +317,16 @@ def test_superbench_runtime_bootstrap_sets_high_once_and_avoids_app_scratch_pref
 
     assert "assert_authenticated_current_page()" in connect
     assert "wait_until_authenticated(" in connect
-    assert "ensure_extended_thinking_effort_setting()" in connect
+    assert "ensure_extended_thinking_effort_setting()" not in connect
+    assert "ensure_high_thinking_effort()" not in connect
     assert "await chatgpt.goto_home()" in connect
     assert "verify_apps_available(bt.tools)" not in connect
+
+    chatgpt = (package / "chatgpt.py").read_text(encoding="utf-8")
+    prepare_task = chatgpt.split("async def prepare_task(", 1)[1].split(
+        "async def _click_send", 1
+    )[0]
+    assert "await self.ensure_high_thinking_effort()" in prepare_task
 
 
 def test_runner_session_bootstrap_does_not_force_second_home_navigation() -> None:
