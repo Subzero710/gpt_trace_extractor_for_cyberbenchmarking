@@ -424,6 +424,10 @@ class ChatGPTClient:
                         status: response.status,
                         object: payload && payload.object,
                         id: payload && payload.id,
+                        retryAfter: response.headers.get('retry-after'),
+                        requestId:
+                            response.headers.get('x-request-id') ||
+                            response.headers.get('openai-request-id') || null,
                     };
                 }"""
             )
@@ -432,6 +436,32 @@ class ChatGPTClient:
                 "could not verify the existing ChatGPT session during resume"
             ) from exc
 
+        if isinstance(value, dict) and value.get("status") == 429:
+            retry_raw = value.get("retryAfter")
+            retry_after = None
+            if isinstance(retry_raw, str):
+                try:
+                    retry_after = max(0.0, float(retry_raw.strip()))
+                except ValueError:
+                    retry_after = None
+            request_id_raw = value.get("requestId")
+            request_id = (
+                request_id_raw.strip()
+                if isinstance(request_id_raw, str) and request_id_raw.strip()
+                else None
+            )
+            detail = "ChatGPT /backend-api/me returned HTTP 429 during resume"
+            if retry_after is not None:
+                detail += f"; retry_after={retry_after:.3f}s"
+            if request_id is not None:
+                detail += f"; request_id={request_id}"
+            raise RateLimited(
+                detail,
+                retry_after_seconds=retry_after,
+                endpoint="/backend-api/me",
+                method="GET",
+                request_id=request_id,
+            )
         if (
             not isinstance(value, dict)
             or value.get("status") != 200
@@ -642,39 +672,157 @@ class ChatGPTClient:
         return True
 
     async def _wait_for_conversation_id(self, user_message_id: str) -> str:
-        """Resolve only a durable conversation identity for the submitted message."""
-        deadline = asyncio.get_running_loop().time() + self._stream_start_timeout
+        """Resolve a durable ID without hammering conversation readback endpoints."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stream_start_timeout
+        route_grace = max(
+            0.0,
+            float(getattr(self, "_conversation_id_route_grace_seconds", 1.0)),
+        )
+        route_check = max(
+            0.05,
+            float(getattr(self, "_conversation_id_route_check_seconds", 0.1)),
+        )
+        poll_delay = max(
+            0.1,
+            float(getattr(self, "_conversation_id_poll_initial_seconds", 1.0)),
+        )
+        poll_max = max(
+            poll_delay,
+            float(getattr(self, "_conversation_id_poll_max_seconds", 8.0)),
+        )
+        rate_limit_default = max(
+            poll_delay,
+            float(getattr(self, "_conversation_id_rate_limit_backoff_seconds", 10.0)),
+        )
+        rate_limit_recovery = max(
+            0.0,
+            float(getattr(self, "_durable_error_recovery_seconds", 120.0)),
+        )
+        candidate_budget = max(
+            1,
+            int(getattr(self, "_conversation_id_candidate_fetches_per_poll", 2)),
+        )
+
         last_route: str | None = None
         last_error: str | None = None
+        last_rate_limit: RateLimited | None = None
+        rate_limit_deadline_extended = False
+        rejected_ids: set[str] = set()
+        route_next_fetch_at: dict[str, float] = {}
+        route_rate_limited: set[str] = set()
+
+        def extend_deadline_for_rate_limit(now: float) -> None:
+            nonlocal deadline, rate_limit_deadline_extended
+            if rate_limit_deadline_extended or rate_limit_recovery <= 0:
+                return
+            deadline = max(deadline, now + rate_limit_recovery)
+            rate_limit_deadline_extended = True
+
+        async def try_route_candidate(now: float) -> tuple[str | None, float | None]:
+            nonlocal last_route, last_error, last_rate_limit
+            candidate = conversation_id_from_url(self._page.url)
+            if not candidate:
+                return None, None
+            last_route = candidate
+            if is_transient_conversation_id(candidate):
+                return None, None
+            next_fetch_at = route_next_fetch_at.get(candidate, 0.0)
+            if now < next_fetch_at:
+                if candidate in route_rate_limited:
+                    return None, next_fetch_at - now
+                return None, None
+            try:
+                conversation = await self._conversation.fetch(candidate)
+                if self._conversation_has_exact_user_message(
+                    conversation,
+                    user_message_id,
+                ):
+                    last_rate_limit = None
+                    return candidate, None
+            except RateLimited as exc:
+                last_rate_limit = exc
+                last_error = f"{type(exc).__name__}: {exc}"
+                extend_deadline_for_rate_limit(now)
+                delay = max(
+                    poll_delay,
+                    exc.retry_delay(
+                        rate_limit_default,
+                        maximum_seconds=max(30.0, poll_max),
+                    ),
+                )
+                route_rate_limited.add(candidate)
+                route_next_fetch_at[candidate] = now + delay
+                return None, delay
+            except (ConversationError, AmbiguousSubmission) as exc:
+                route_rate_limited.discard(candidate)
+                last_error = f"{type(exc).__name__}: {exc}"
+                route_next_fetch_at[candidate] = now + poll_delay
+            else:
+                route_rate_limited.discard(candidate)
+                # Durable route exists but the backend snapshot is not populated yet.
+                route_next_fetch_at[candidate] = now + poll_delay
+            return None, None
+
+        # First give ChatGPT's own navigation a chance to expose the durable ID.
+        # Reading page.url is local and creates no backend traffic.
+        grace_deadline = min(deadline, loop.time() + route_grace)
+        while loop.time() < grace_deadline:
+            resolved, route_rate_delay = await try_route_candidate(loop.time())
+            if resolved is not None:
+                return resolved
+            remaining = grace_deadline - loop.time()
+            if remaining <= 0:
+                break
+            sleep_for = route_rate_delay if route_rate_delay is not None else route_check
+            await asyncio.sleep(min(sleep_for, remaining))
 
         while True:
-            candidate = conversation_id_from_url(self._page.url)
-            if candidate:
-                last_route = candidate
-                if not is_transient_conversation_id(candidate):
-                    try:
-                        conversation = await self._conversation.fetch(candidate)
-                        if self._conversation_has_exact_user_message(
-                            conversation,
-                            user_message_id,
-                        ):
-                            return candidate
-                    except (ConversationError, AmbiguousSubmission) as exc:
-                        last_error = f"{type(exc).__name__}: {exc}"
+            now = loop.time()
+            resolved, route_rate_delay = await try_route_candidate(now)
+            if resolved is not None:
+                return resolved
+
+            if route_rate_delay is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0 or route_rate_delay > remaining:
+                    assert last_rate_limit is not None
+                    raise last_rate_limit
+                await asyncio.sleep(route_rate_delay)
+                continue
 
             try:
                 resolved = await self._conversation.find_recent_conversation_id_by_user_message_id(
                     user_message_id,
                     limit=5,
+                    exclude_ids=rejected_ids,
+                    max_candidate_fetches=candidate_budget,
                 )
+            except RateLimited as exc:
+                last_rate_limit = exc
+                last_error = f"{type(exc).__name__}: {exc}"
+                extend_deadline_for_rate_limit(loop.time())
+                retry_wait = exc.retry_delay(
+                    rate_limit_default,
+                    maximum_seconds=max(30.0, poll_max),
+                )
+                sleep_for = max(poll_delay, retry_wait)
+                poll_delay = min(max(poll_delay * 2.0, sleep_for), poll_max)
             except ConversationError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                sleep_for = poll_delay
+                poll_delay = min(poll_delay * 2.0, poll_max)
             else:
+                last_rate_limit = None
                 if resolved is not None:
                     return resolved
+                sleep_for = poll_delay
+                poll_delay = min(poll_delay * 2.0, poll_max)
 
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
+                if last_rate_limit is not None:
+                    raise last_rate_limit
                 detail = f"; last route={last_route!r}"
                 if last_error is not None:
                     detail += f"; last error={last_error}"
@@ -682,7 +830,11 @@ class ChatGPTClient:
                     "conversation SSE started but no verified durable conversation ID "
                     "was resolved" + detail
                 )
-            await asyncio.sleep(min(0.25, remaining))
+            if last_rate_limit is not None and sleep_for > remaining:
+                # Retry-After is authoritative. Do not shorten it to fit the local
+                # resolver window and then hit the same endpoint too early.
+                raise last_rate_limit
+            await asyncio.sleep(min(sleep_for, remaining))
 
     async def _resolve_durable_conversation_id(
         self,

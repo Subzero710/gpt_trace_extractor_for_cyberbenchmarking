@@ -48,7 +48,7 @@ async def test_natural_snapshot_is_observed_without_marking_used_until_validated
     assert monitor.runtime_metadata()["natural_snapshot_used"] is True
 
 
-def test_429_is_sticky_across_task_boundaries() -> None:
+def test_429_is_task_scoped_and_does_not_poison_next_task() -> None:
     page = FakePage()
     monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
     monitor.begin_task()
@@ -57,7 +57,7 @@ def test_429_is_sticky_across_task_boundaries() -> None:
     page.handlers["response"](FakeResponse(request.url, status=429, request=request))
     assert monitor.saw_backend_429 is True
     monitor.begin_task()
-    assert monitor.saw_backend_429 is True
+    assert monitor.saw_backend_429 is False
 
 
 def test_late_response_is_not_counted_in_next_task() -> None:

@@ -268,12 +268,16 @@ async def test_wait_for_conversation_id_resolves_transient_route_by_message_iden
     client._page = page
     client._conversation = conversation
     client._stream_start_timeout = 17.0
+    client._conversation_id_route_grace_seconds = 0.0
 
     result = await client._wait_for_conversation_id("user-1")
 
     assert result == stable
     conversation.find_recent_conversation_id_by_user_message_id.assert_awaited_once_with(
-        "user-1", limit=5
+        "user-1",
+        limit=5,
+        exclude_ids=set(),
+        max_candidate_fetches=2,
     )
 
 

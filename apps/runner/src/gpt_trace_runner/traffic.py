@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Page, Response
 
-from .exceptions import AuthenticationRequired
+from .exceptions import AuthenticationRequired, RateLimited
 
 
 _CONVERSATION_SNAPSHOT = re.compile(r"^/backend-api/conversations/([^/]+)$")
@@ -26,6 +26,10 @@ class TrafficStats:
     requests_failed: int = 0
     responses_403: int = 0
     responses_429: int = 0
+    last_429_method: str | None = None
+    last_429_path: str | None = None
+    last_429_retry_after: str | None = None
+    last_429_request_id: str | None = None
     responses_5xx: int = 0
     challenge_seen: bool = False
     challenge_resolved: bool = False
@@ -68,8 +72,8 @@ class TrafficMonitor:
         self._snapshots = {}
         self._snapshot_events = {}
         self._task_403 = False
+        self._sticky_429 = False
         self._submitted_user_messages = ()
-        # sticky 429 intentionally survives task boundaries.
 
     def _is_chatgpt_host(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
@@ -101,6 +105,12 @@ class TrafficMonitor:
         """Require exact-origin GET /backend-api/me -> valid user JSON."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while True:
+            if self._auth_me_last_status == 429:
+                raise RateLimited(
+                    "ChatGPT /backend-api/me returned HTTP 429 while waiting for authentication",
+                    endpoint="/backend-api/me",
+                    method="GET",
+                )
             response = self._auth_me_response
             if response is not None:
                 try:
@@ -240,19 +250,35 @@ class TrafficMonitor:
                 self._auth_me_event.set()
             else:
                 self._auth_me_response = None
-                self._auth_me_event.clear()
+                if response.status == 429:
+                    self._auth_me_event.set()
+                else:
+                    self._auth_me_event.clear()
         if self._is_backend_path(path):
             if response.status == 429:
                 if current:
                     self._stats.responses_429 += 1
-                # Conversation readback endpoints are auxiliary verification
-                # traffic. A 429 there can be caused by our own snapshot reads
-                # and must not poison the whole batch as a teacher/model limit.
-                is_readback = (
-                    path == "/backend-api/conversations"
+                    parsed = urlparse(response.url)
+                    self._stats.last_429_method = response.request.method.upper()
+                    self._stats.last_429_path = parsed.path + (
+                        f"?{parsed.query}" if parsed.query else ""
+                    )
+                    headers = getattr(response, "headers", {}) or {}
+                    self._stats.last_429_retry_after = headers.get("retry-after")
+                    self._stats.last_429_request_id = (
+                        headers.get("x-request-id")
+                        or headers.get("openai-request-id")
+                    )
+                # Auxiliary verification/auth/cleanup traffic has its own
+                # explicit error handling and retries. Only a current task's
+                # non-auxiliary backend 429 is a teacher/model circuit breaker.
+                is_auxiliary = (
+                    path == "/backend-api/me"
+                    or path == "/backend-api/conversations"
                     or path.startswith("/backend-api/conversations/")
+                    or path.startswith("/backend-api/conversation/id/")
                 )
-                if not is_readback:
+                if current and not is_auxiliary:
                     self._sticky_429 = True
             elif response.status == 403 and current:
                 self._task_403 = True

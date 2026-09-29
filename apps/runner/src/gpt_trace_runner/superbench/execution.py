@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from dataclasses import replace
+import time
 from pathlib import Path
 
 from ..browser import BrowserClient
 from ..exceptions import (
     AuthenticationRequired,
     BatchCircuitBreaker,
+    RateLimited,
     RecoveryIncomplete,
 )
 from ..journal import JournalStore
@@ -99,6 +102,31 @@ async def _cleanup_task(
         # The batch is already stopping for primary_error. Do not mask it.
 
 
+def _persist_rate_limit_defer(journal: JournalStore, pending, exc: RateLimited) -> None:
+    delay = exc.retry_after_seconds
+    if pending is None or delay is None or delay <= 0:
+        return
+    not_before = time.time() + float(delay)
+    previous = pending.retry_not_before
+    if previous is not None:
+        not_before = max(not_before, float(previous))
+    journal.write(replace(pending, retry_not_before=not_before))
+
+
+def _raise_if_recovery_deferred(pending) -> None:
+    not_before = pending.retry_not_before
+    if not_before is None:
+        return
+    remaining = float(not_before) - time.time()
+    if remaining > 0:
+        raise RateLimited(
+            "ChatGPT recovery is deferred by server Retry-After",
+            retry_after_seconds=remaining,
+            endpoint="recovery-journal",
+            method="RECOVER",
+        )
+
+
 async def _recover_pending_journal(
     *,
     settings,
@@ -116,6 +144,10 @@ async def _recover_pending_journal(
     pending = journal.load()
     if pending is None:
         return
+    # This check occurs before materialization, browser connection, lifecycle
+    # recovery, or any ChatGPT request. An early manual resume therefore cannot
+    # violate a persisted server Retry-After.
+    _raise_if_recovery_deferred(pending)
 
     catalog_entry = next(
         (
@@ -435,6 +467,13 @@ async def run_pending(
                         and latest.status == "completed"
                         and pending_for_task
                     ):
+                        if isinstance(exc, RateLimited):
+                            # Cleanup is already durably journaled. Do not issue an
+                            # immediate second DELETE after a 429; persist the
+                            # server cooldown and let a later resume reconcile it.
+                            _persist_rate_limit_defer(journal, pending, exc)
+                            recovery_required = True
+                            raise
                         try:
                             await runner.reconcile_journal([bt])
                         except BaseException:
@@ -464,6 +503,8 @@ async def run_pending(
                     ):
                         # This includes BatchCircuitBreaker subclasses raised after
                         # submission. Preserve both App/evaluator state and journal.
+                        if isinstance(exc, RateLimited):
+                            _persist_rate_limit_defer(journal, pending, exc)
                         recovery_required = True
                         if console is not None:
                             console.print(
