@@ -13,7 +13,7 @@ import gpt_trace_runner.cli as cli_module
 import gpt_trace_runner.storage_client as storage_client_module
 import gpt_trace_runner.superbench.execution as execution_module
 import gpt_trace_runner.superbench.lifecycle as lifecycle_module
-from gpt_trace_runner.exceptions import RecoveryIncomplete
+from gpt_trace_runner.exceptions import RateLimited, RecoveryIncomplete
 from gpt_trace_runner.journal import JournalStore
 from gpt_trace_runner.models import (
     BenchmarkTask,
@@ -603,3 +603,44 @@ async def test_evaluator_fail_is_completed_and_batch_continues(tmp_path):
         ("one", {"verdict": "fail", "score": 0.0}),
         ("two", {"verdict": "pass", "score": 1.0}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_persists_active_run_cooldown(
+    tmp_path,
+    monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    store = RunControlStore(settings.superbench_active_run_path)
+    _, state = freeze(settings, MutableAdapter(), limit=1)
+    store.create(state)
+
+    monkeypatch.setattr(lifecycle_module.signal, "getsignal", lambda _sig: object())
+    monkeypatch.setattr(lifecycle_module.signal, "signal", lambda *_args: None)
+
+    async def fail_with_429(**_kwargs):
+        raise RateLimited(
+            "bootstrap 429",
+            retry_after_seconds=120.0,
+            endpoint="/backend-api/me",
+            method="GET",
+        )
+
+    monkeypatch.setattr(lifecycle_module, "run_pending", fail_with_429)
+
+    with pytest.raises(RateLimited):
+        await lifecycle_module._execute_locked(
+            settings,
+            EmptyRegistry(),
+            AdapterRegistry([]),
+            store,
+            tuple(task.run_task_id for task in state.selected_tasks),
+            None,
+            None,
+            None,
+        )
+
+    persisted = store.load()
+    assert persisted.status == "paused"
+    assert persisted.intervention_reason == "rate_limited"
+    assert persisted.retry_not_before is not None

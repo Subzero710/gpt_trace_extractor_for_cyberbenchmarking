@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable, Literal
 
-from ..exceptions import RecoveryIncomplete
+from ..exceptions import RateLimited, RecoveryIncomplete
 
 
 RunStatus = Literal[
@@ -50,6 +52,7 @@ class ActiveRun:
     intervention_reason: str | None = None
     exception_type: str | None = None
     intervention_message: str | None = None
+    retry_not_before: float | None = None
 
     @property
     def message(self) -> str | None:
@@ -167,6 +170,38 @@ class RunControlStore:
             self._write(new_state)
             return new_state
 
+    def defer_rate_limit(self, retry_after_seconds: float) -> ActiveRun:
+        delay = float(retry_after_seconds)
+        if not math.isfinite(delay) or delay < 0:
+            raise RecoveryIncomplete(f"invalid rate-limit delay: {retry_after_seconds!r}")
+        not_before = time.time() + delay
+
+        def transition(state: ActiveRun) -> ActiveRun:
+            previous = state.retry_not_before
+            return replace(
+                state,
+                retry_not_before=max(previous or 0.0, not_before),
+            )
+
+        return self._mutate(transition)
+
+    def enforce_rate_limit_defer(self) -> ActiveRun:
+        state = self.load()
+        if state is None:
+            raise RecoveryIncomplete("no active Superbench run")
+        if state.retry_not_before is None:
+            return state
+
+        remaining = state.retry_not_before - time.time()
+        if remaining > 0:
+            raise RateLimited(
+                "ChatGPT resume deferred by Retry-After",
+                retry_after_seconds=remaining,
+                endpoint="active-run",
+                method="RESUME",
+            )
+        return state
+
     @staticmethod
     def _signal_pause_transition(state: ActiveRun) -> ActiveRun:
         if state.status in {"running", "resuming"}:
@@ -234,6 +269,7 @@ class RunControlStore:
                 intervention_reason=None,
                 exception_type=None,
                 intervention_message=None,
+                retry_not_before=None,
             )
 
         return self._mutate(transition)
@@ -326,6 +362,7 @@ class RunControlStore:
                 intervention_reason=None,
                 exception_type=None,
                 intervention_message=None,
+                retry_not_before=None,
             )
 
         return self._mutate(transition)
