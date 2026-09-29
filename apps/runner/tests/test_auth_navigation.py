@@ -278,6 +278,7 @@ async def test_wait_for_conversation_id_resolves_transient_route_by_message_iden
         limit=5,
         exclude_ids=set(),
         max_candidate_fetches=2,
+        candidate_attempts={},
     )
 
 

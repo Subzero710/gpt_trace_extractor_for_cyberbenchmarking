@@ -163,7 +163,7 @@ async def test_recovery_snapshot_retries_readback_429() -> None:
     client = ChatGPTClient.__new__(ChatGPTClient)
     client._conversation = RateLimitedOnce()
     client._durable_poll_rate_limit_backoff_seconds = 0.01
-    client._durable_error_recovery_seconds = 1.0
+    client._durable_error_recovery_seconds = 2.0
 
     payload = await client._fetch_recovery_snapshot("conv-1")
 
