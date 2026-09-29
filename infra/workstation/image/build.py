@@ -2,7 +2,9 @@
 """Build a verified immutable Kali qcow2, customized with the guest agent."""
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -49,6 +51,166 @@ def digest(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _hash_component(
+    hasher,
+    label: str,
+    payload: bytes,
+) -> None:
+    encoded = label.encode("utf-8")
+    hasher.update(len(encoded).to_bytes(8, "big"))
+    hasher.update(encoded)
+    hasher.update(len(payload).to_bytes(8, "big"))
+    hasher.update(payload)
+
+
+def golden_build_input_sha256() -> str:
+    """Fingerprint repo/upstream inputs that change guest runtime semantics."""
+    hasher = hashlib.sha256()
+    _hash_component(hasher, "source", (SOURCE + ARCHIVE).encode("utf-8"))
+    _hash_component(hasher, "archive_sha256", ARCHIVE_SHA256.encode("ascii"))
+    _hash_component(hasher, "firstboot_script", firstboot_script().encode("utf-8"))
+    _hash_component(
+        hasher,
+        "prepare_offline",
+        inspect.getsource(prepare_offline).encode("utf-8"),
+    )
+    _hash_component(
+        hasher,
+        "provision_in_real_guest",
+        inspect.getsource(provision_in_real_guest).encode("utf-8"),
+    )
+
+    files = (
+        ROOT / "apps/kali-workstation/pyproject.toml",
+        ROOT / "infra/workstation/image/requirements.lock",
+        ROOT / "infra/workstation/systemd/gpt-trace-workstation-agent.service",
+    )
+    for path in files:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"invalid Kali golden input: {path}")
+        _hash_component(
+            hasher,
+            path.relative_to(ROOT).as_posix(),
+            path.read_bytes(),
+        )
+
+    source_root = ROOT / "apps/kali-workstation/src/kali_workstation"
+    source_entries = sorted(source_root.rglob("*"))
+    for path in source_entries:
+        if path.is_symlink():
+            raise RuntimeError(
+                f"Kali workstation guest source contains symlink: {path}"
+            )
+    source_files = [path for path in source_entries if path.is_file()]
+    if not source_files:
+        raise RuntimeError("Kali workstation guest source tree is empty")
+    for path in source_files:
+        _hash_component(
+            hasher,
+            path.relative_to(ROOT).as_posix(),
+            path.read_bytes(),
+        )
+    return hasher.hexdigest()
+
+
+def _builder_semantic_sha256(source: str) -> str:
+    """Hash image-building semantics, ignoring fingerprint/verify plumbing."""
+    tree = ast.parse(source)
+    wanted_assignments = {"SOURCE", "ARCHIVE", "ARCHIVE_SHA256", "GUEST_PACKAGES"}
+    wanted_functions = {
+        "firstboot_script",
+        "prepare_offline",
+        "provision_in_real_guest",
+    }
+    selected: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = {
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            for name in sorted(names & wanted_assignments):
+                selected[name] = node
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in wanted_functions:
+                selected[node.name] = node
+    missing = (wanted_assignments | wanted_functions) - set(selected)
+    if missing:
+        raise RuntimeError(
+            f"cannot fingerprint Kali builder semantics; missing {sorted(missing)!r}"
+        )
+    payload = "\n".join(
+        name + "=" + ast.dump(selected[name], include_attributes=False)
+        for name in sorted(selected)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _legacy_golden_matches_current_inputs(metadata: dict) -> bool:
+    """Migrate old provenance only when original guest inputs still match."""
+    commit = metadata.get("repo_commit")
+    if not isinstance(commit, str) or not commit:
+        return False
+
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if exists.returncode != 0:
+        return False
+
+    input_paths = (
+        "apps/kali-workstation/src/kali_workstation",
+        "apps/kali-workstation/pyproject.toml",
+        "infra/workstation/image/requirements.lock",
+        "infra/workstation/systemd/gpt-trace-workstation-agent.service",
+    )
+    diff = subprocess.run(
+        ["git", "diff", "--quiet", commit, "--", *input_paths],
+        cwd=ROOT,
+    )
+    if diff.returncode == 1:
+        return False
+    if diff.returncode != 0:
+        raise RuntimeError("git diff failed while checking legacy Kali provenance")
+
+    untracked = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", *input_paths],
+        cwd=ROOT,
+        text=True,
+    )
+    if untracked.strip():
+        return False
+
+    try:
+        old_builder = subprocess.check_output(
+            ["git", "show", f"{commit}:infra/workstation/image/build.py"],
+            cwd=ROOT,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    current_builder = Path(__file__).read_text(encoding="utf-8")
+    return _builder_semantic_sha256(old_builder) == _builder_semantic_sha256(
+        current_builder
+    )
+
+
+def _discard_stale_golden(reason: BaseException | str) -> None:
+    print(f"Discarding stale Kali golden image: {reason}", flush=True)
+    for path in (
+        DEST,
+        DEST.with_suffix(".tmp"),
+        DEST.with_suffix(".provenance.json"),
+        DEST.parent / "kali-packages.txt",
+        DEST.parent / "kali-python-packages.txt",
+    ):
+        path.unlink(missing_ok=True)
 
 
 def run(*cmd: str, timeout: int = 7200, **kwargs) -> subprocess.CompletedProcess:
@@ -295,8 +457,18 @@ def provision_in_real_guest(image: Path) -> None:
 
 def build() -> None:
     if DEST.exists():
-        verify()
-        return
+        try:
+            verify()
+        except (
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            _discard_stale_golden(exc)
+        else:
+            return
 
     require_host_build_runtime()
     DEST.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +506,7 @@ def build() -> None:
             "source": SOURCE + ARCHIVE,
             "source_sha256": ARCHIVE_SHA256,
             "base_sha256": digest(DEST),
+            "build_input_sha256": golden_build_input_sha256(),
             "repo_commit": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
             ).strip(),
@@ -356,9 +529,25 @@ def build() -> None:
 
 
 def verify() -> None:
-    metadata = json.loads(DEST.with_suffix(".provenance.json").read_text())
+    provenance = DEST.with_suffix(".provenance.json")
+    metadata = json.loads(provenance.read_text())
     if metadata["source_sha256"] != ARCHIVE_SHA256 or metadata["source"] != SOURCE + ARCHIVE:
         raise RuntimeError("Kali archive provenance differs from the pinned source")
+    current_build_input = golden_build_input_sha256()
+    stored_build_input = metadata.get("build_input_sha256")
+    migrate_legacy = False
+    if stored_build_input is None:
+        if not _legacy_golden_matches_current_inputs(metadata):
+            raise RuntimeError(
+                "legacy Kali golden image predates build-input fingerprints and "
+                "its original guest inputs differ from the current tree"
+            )
+        migrate_legacy = True
+    elif stored_build_input != current_build_input:
+        raise RuntimeError(
+            "Kali golden image inputs changed "
+            f"(stored={stored_build_input!r}, current={current_build_input!r})"
+        )
     if metadata["python_lock_sha256"] != digest(
         ROOT / "infra/workstation/image/requirements.lock"
     ):
@@ -376,6 +565,13 @@ def verify() -> None:
     )
     if info.get("format") != "qcow2" or info.get("backing-filename"):
         raise RuntimeError("base is not an independent qcow2")
+    if migrate_legacy:
+        metadata["build_input_sha256"] = current_build_input
+        provenance.write_text(json.dumps(metadata, indent=2) + "\n")
+        print(
+            "Stamped legacy Kali provenance with current build-input fingerprint",
+            flush=True,
+        )
     print("Kali image:", DEST, "sha256:", metadata["base_sha256"])
 
 
