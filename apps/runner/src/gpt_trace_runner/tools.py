@@ -116,7 +116,7 @@ async def _find_app_candidate(
     tool: BenchmarkTool,
     timeout_seconds: float,
 ) -> Locator:
-    """Resolve the visible autocomplete row itself instead of guessing Enter state."""
+    """Resolve the visible autocomplete row that actually receives pointer events."""
     try:
         await page.wait_for_function(
             _APP_CANDIDATE_VISIBLE_JS,
@@ -136,11 +136,11 @@ async def _find_app_candidate(
     best_distance = float("inf")
 
     for index in range(await matches.count()):
-        candidate = matches.nth(index)
+        text_candidate = matches.nth(index)
         try:
-            if not await candidate.is_visible():
+            if not await text_candidate.is_visible():
                 continue
-            inside_composer = await candidate.evaluate(
+            inside_composer = await text_candidate.evaluate(
                 """el => Boolean(el.closest(
                     '#prompt-textarea, '
                     + '[contenteditable="true"][data-lexical-editor="true"], '
@@ -149,6 +149,30 @@ async def _find_app_candidate(
             )
             if inside_composer:
                 continue
+
+            # get_by_text() often resolves the label/span inside the autocomplete
+            # row. CloakBrowser correctly rejects clicking that leaf when a sibling
+            # overlay inside the row receives pointer events. Target the nearest
+            # interactive row instead, so a descendant hit still bubbles to the
+            # intended control.
+            row = text_candidate.locator(
+                "xpath=ancestor-or-self::*["
+                "self::button or @role='option' or @role='menuitem' "
+                "or @role='button' or @data-radix-collection-item"
+                "][1]"
+            )
+            if await row.count() and await row.is_visible():
+                candidate = row
+            else:
+                # Some ChatGPT picker revisions use a plain DIV row without an
+                # explicit ARIA role. Its immediate parent is acceptable only when
+                # its normalized text is still exactly the requested App name.
+                parent = text_candidate.locator("xpath=..")
+                if await parent.count() and await parent.is_visible():
+                    parent_text = " ".join((await parent.inner_text()).split())
+                    candidate = parent if parent_text == tool.name else text_candidate
+                else:
+                    candidate = text_candidate
 
             box = await candidate.bounding_box()
             if box is None:
@@ -172,7 +196,7 @@ async def _find_app_candidate(
     if best is None:
         raise AppUnavailable(
             f"ChatGPT app {tool.name!r} autocomplete text became visible but "
-            "no selectable candidate locator could be resolved"
+            "no selectable candidate row could be resolved"
         )
     return best
 
