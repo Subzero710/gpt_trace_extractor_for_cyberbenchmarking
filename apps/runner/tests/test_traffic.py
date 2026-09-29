@@ -22,11 +22,12 @@ class FakeRequest:
 
 
 class FakeResponse:
-    def __init__(self, url: str, *, status: int = 200, method: str = "GET", payload=None, request=None) -> None:
+    def __init__(self, url: str, *, status: int = 200, method: str = "GET", payload=None, request=None, headers=None) -> None:
         self.url = url
         self.status = status
         self.request = request or FakeRequest(url, method)
         self._payload = payload or {}
+        self.headers = headers or {}
 
     async def body(self):
         return json.dumps(self._payload).encode()
@@ -58,6 +59,35 @@ def test_429_is_task_scoped_and_does_not_poison_next_task() -> None:
     assert monitor.saw_backend_429 is True
     monitor.begin_task()
     assert monitor.saw_backend_429 is False
+
+
+@pytest.mark.asyncio
+async def test_auth_session_429_is_visible_and_not_misreported_as_auth_loss() -> None:
+    from gpt_trace_runner.exceptions import RateLimited
+    from gpt_trace_runner.site_guard import SiteGuard
+
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    request = FakeRequest("https://chatgpt.com/api/auth/session")
+    page.handlers["request"](request)
+    page.handlers["response"](FakeResponse(
+        request.url, request=request, status=429, headers={"retry-after": "120"},
+    ))
+    assert monitor.runtime_metadata()["responses_429"] == 1
+    assert monitor.saw_backend_429 is False
+    with pytest.raises(RateLimited) as raised:
+        await monitor.wait_for_authenticated_user(timeout_seconds=0.01)
+    assert raised.value.retry_after_seconds == 120.0
+
+    guard = SiteGuard(page, interaction=object(), traffic=monitor,
+                      ready_timeout_seconds=0.01, challenge_timeout_seconds=0.01)
+    with pytest.raises(RateLimited):
+        await guard.wait_ready()
+
+    request2 = FakeRequest(request.url)
+    page.handlers["request"](request2)
+    page.handlers["response"](FakeResponse(request.url, request=request2, status=200))
+    assert monitor.auth_session_rate_limit is None
 
 
 def test_late_response_is_not_counted_in_next_task() -> None:

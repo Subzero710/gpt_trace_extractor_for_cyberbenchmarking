@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Response
 
+from .conversation import _parse_retry_after
 from .exceptions import (
     AccessDenied,
     ConversationStreamAborted,
@@ -262,11 +263,28 @@ class ConversationStream:
         self._timeout_seconds = timeout_seconds
         self._started_at = datetime.now(timezone.utc)
 
-    async def wait(self) -> ConversationStreamResult:
+    async def raise_for_initial_status(self) -> None:
+        """Reject terminal HTTP errors before any auxiliary conversation readback."""
         if self._response.status == 429:
-            raise RateLimited("ChatGPT conversation stream returned HTTP 429")
+            retry_after = _parse_retry_after(
+                await self._response.header_value("retry-after")
+            )
+            request_id = (
+                await self._response.header_value("x-request-id")
+                or await self._response.header_value("openai-request-id")
+            )
+            raise RateLimited(
+                "ChatGPT conversation stream returned HTTP 429",
+                retry_after_seconds=retry_after,
+                endpoint="/backend-api/f/conversation",
+                method="POST",
+                request_id=request_id,
+            )
         if self._response.status == 403:
             raise AccessDenied("ChatGPT conversation stream returned HTTP 403")
+
+    async def wait(self) -> ConversationStreamResult:
+        await self.raise_for_initial_status()
 
         content_type = (
             await self._response.header_value("content-type") or ""

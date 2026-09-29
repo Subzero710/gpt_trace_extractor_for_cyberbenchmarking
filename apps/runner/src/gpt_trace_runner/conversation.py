@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -23,7 +24,8 @@ def _parse_retry_after(value: object) -> float | None:
         return None
     raw = value.strip()
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         pass
     try:
@@ -296,6 +298,7 @@ class ConversationClient:
         limit: int = 5,
         exclude_ids: set[str] | None = None,
         max_candidate_fetches: int | None = None,
+        candidate_attempts: dict[str, int] | None = None,
     ) -> str | None:
         """Resolve a submitted message while avoiding repeated candidate snapshots."""
         if not isinstance(user_message_id, str) or not user_message_id.strip():
@@ -304,25 +307,24 @@ class ConversationClient:
             raise ValueError("max_candidate_fetches must be >= 1")
 
         rejected = exclude_ids if exclude_ids is not None else set()
+        attempts = candidate_attempts if candidate_attempts is not None else {}
         fetched = 0
-        for conversation_id in await self.recent_conversation_ids(limit=limit):
-            if conversation_id in rejected:
-                continue
+        recent = await self.recent_conversation_ids(limit=limit)
+        # A 404 or unreadable snapshot can be temporary. Rotate the bounded
+        # fetch budget across all candidates without forgetting any of them.
+        candidates = sorted(
+            (cid for cid in dict.fromkeys(recent) if cid not in rejected),
+            key=lambda cid: attempts.get(cid, 0),
+        )
+        for conversation_id in candidates:
             if max_candidate_fetches is not None and fetched >= max_candidate_fetches:
                 break
             fetched += 1
+            attempts[conversation_id] = attempts.get(conversation_id, 0) + 1
             try:
                 payload = await self.fetch(conversation_id)
                 messages = extract_dataset_messages(payload)
-            except ConversationNotFound:
-                # A 404 is a stable negative for this list entry. Mark it rejected
-                # so the next bounded poll advances to later candidates instead
-                # of spending its whole budget on the same missing IDs forever.
-                rejected.add(conversation_id)
-                continue
             except ConversationError:
-                # Other read errors may be transient; do not permanently exclude
-                # the candidate from a later poll.
                 continue
             user_ids = [
                 message.get("id")

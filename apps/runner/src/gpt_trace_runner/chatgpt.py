@@ -12,6 +12,7 @@ from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeou
 
 from .conversation import (
     ConversationClient,
+    _parse_retry_after,
     assistant_model_slugs,
     conversation_id_from_url,
     extract_dataset_messages,
@@ -148,6 +149,8 @@ class ChatGPTClient:
         self._thinking_effort_observer_installed = False
         self._thinking_effort_verified_requests = 0
         self._thinking_effort_observer_error: str | None = None
+        self._readback_allowed_at = 0.0
+        self._readback_rate_limit: RateLimited | None = None
 
     async def _observe_required_thinking_effort(self, route, request) -> None:
         """Observe generation traffic and fail closed without mutating its payload."""
@@ -437,13 +440,7 @@ class ChatGPTClient:
             ) from exc
 
         if isinstance(value, dict) and value.get("status") == 429:
-            retry_raw = value.get("retryAfter")
-            retry_after = None
-            if isinstance(retry_raw, str):
-                try:
-                    retry_after = max(0.0, float(retry_raw.strip()))
-                except ValueError:
-                    retry_after = None
+            retry_after = _parse_retry_after(value.get("retryAfter"))
             request_id_raw = value.get("requestId")
             request_id = (
                 request_id_raw.strip()
@@ -709,6 +706,7 @@ class ChatGPTClient:
         last_rate_limit: RateLimited | None = None
         rate_limit_deadline_extended = False
         rejected_ids: set[str] = set()
+        candidate_attempts: dict[str, int] = {}
         route_next_fetch_at: dict[str, float] = {}
         route_rate_limited: set[str] = set()
 
@@ -732,6 +730,10 @@ class ChatGPTClient:
                 if candidate in route_rate_limited:
                     return None, next_fetch_at - now
                 return None, None
+            # Count this explicit route snapshot in the same fairness map used
+            # by the list fallback. Otherwise the list can immediately spend its
+            # bounded budget fetching the exact route candidate a second time.
+            candidate_attempts[candidate] = candidate_attempts.get(candidate, 0) + 1
             try:
                 conversation = await self._conversation.fetch(candidate)
                 if self._conversation_has_exact_user_message(
@@ -751,15 +753,19 @@ class ChatGPTClient:
                         maximum_seconds=max(30.0, poll_max),
                     ),
                 )
+                if delay > deadline - loop.time():
+                    raise exc
                 route_rate_limited.add(candidate)
                 route_next_fetch_at[candidate] = now + delay
                 return None, delay
             except (ConversationError, AmbiguousSubmission) as exc:
                 route_rate_limited.discard(candidate)
+                last_rate_limit = None
                 last_error = f"{type(exc).__name__}: {exc}"
                 route_next_fetch_at[candidate] = now + poll_delay
             else:
                 route_rate_limited.discard(candidate)
+                last_rate_limit = None
                 # Durable route exists but the backend snapshot is not populated yet.
                 route_next_fetch_at[candidate] = now + poll_delay
             return None, None
@@ -779,6 +785,16 @@ class ChatGPTClient:
 
         while True:
             now = loop.time()
+            if now >= deadline:
+                if last_rate_limit is not None:
+                    raise last_rate_limit
+                detail = f"; last route={last_route!r}"
+                if last_error is not None:
+                    detail += f"; last error={last_error}"
+                raise AmbiguousSubmission(
+                    "conversation SSE started but no verified durable conversation ID "
+                    "was resolved" + detail
+                )
             resolved, route_rate_delay = await try_route_candidate(now)
             if resolved is not None:
                 return resolved
@@ -791,12 +807,16 @@ class ChatGPTClient:
                 await asyncio.sleep(route_rate_delay)
                 continue
 
+            if loop.time() >= deadline:
+                continue
+
             try:
                 resolved = await self._conversation.find_recent_conversation_id_by_user_message_id(
                     user_message_id,
                     limit=5,
                     exclude_ids=rejected_ids,
                     max_candidate_fetches=candidate_budget,
+                    candidate_attempts=candidate_attempts,
                 )
             except RateLimited as exc:
                 last_rate_limit = exc
@@ -809,6 +829,7 @@ class ChatGPTClient:
                 sleep_for = max(poll_delay, retry_wait)
                 poll_delay = min(max(poll_delay * 2.0, sleep_for), poll_max)
             except ConversationError as exc:
+                last_rate_limit = None
                 last_error = f"{type(exc).__name__}: {exc}"
                 sleep_for = poll_delay
                 poll_delay = min(poll_delay * 2.0, poll_max)
@@ -928,11 +949,19 @@ class ChatGPTClient:
         self._validate_submitted_model()
         user_message_id = self._traffic.submitted_user_message_id()
         on_user_message_id(user_message_id)
+
+        # The POST response itself is authoritative. A direct 429/403 must stop
+        # here, before conversation-ID resolution can generate any auxiliary
+        # /conversations or /api/auth/session traffic. Persisting the frontend
+        # user_message_id first keeps the already-submitted attempt recoverable.
+        stream = ConversationStream(response, timeout_seconds=self._turn_timeout)
+        await stream.raise_for_initial_status()
+
         conversation_id = await self._wait_for_conversation_id(user_message_id)
         submitted = SubmittedTurn(
             conversation_id=conversation_id,
             user_message_id=user_message_id,
-            stream=ConversationStream(response, timeout_seconds=self._turn_timeout),
+            stream=stream,
             task=prepared.task,
         )
         self._active_turn = submitted
@@ -1007,7 +1036,12 @@ class ChatGPTClient:
                     pass
                 else:
                     self._traffic.mark_natural_snapshot_used()
-                    return natural, messages, False
+                    self._readback_allowed_at = 0.0
+                    self._readback_rate_limit = None
+                    return natural, messages, None
+
+            if loop.time() < getattr(self, "_readback_allowed_at", 0.0):
+                return None, None, self._readback_rate_limit
 
             # Only then perform one explicit readback.
             self._traffic.mark_fallback_snapshot()
@@ -1016,11 +1050,22 @@ class ChatGPTClient:
                     submitted.conversation_id
                 )
             except ConversationNotFound:
-                return None, None, False
-            except RateLimited:
+                self._readback_allowed_at = 0.0
+                self._readback_rate_limit = None
+                return None, None, None
+            except RateLimited as exc:
                 # A readback 429 is not evidence that the teacher generation was
                 # rate-limited. Back off and keep the already-submitted turn.
-                return None, None, True
+                delay = max(
+                    1.0,
+                    exc.retry_delay(rate_limit_backoff, maximum_seconds=rate_limit_backoff),
+                )
+                self._readback_allowed_at = loop.time() + delay
+                self._readback_rate_limit = exc
+                return None, None, exc
+
+            self._readback_allowed_at = 0.0
+            self._readback_rate_limit = None
 
             try:
                 messages = self._validated_messages(
@@ -1028,13 +1073,15 @@ class ChatGPTClient:
                     submitted.user_message_id,
                 )
             except ConversationError:
-                return conversation, None, False
-            return conversation, messages, False
+                return conversation, None, None
+            return conversation, messages, None
 
         try:
             while True:
                 now = loop.time()
                 if now >= deadline:
+                    if self._readback_rate_limit is not None:
+                        raise self._readback_rate_limit
                     if stream_error is not None:
                         raise stream_error
                     raise RecoveryIncomplete(
@@ -1062,21 +1109,26 @@ class ChatGPTClient:
                         )
 
                 if stream_error is not None:
-                    conversation, messages, readback_limited = (
+                    assert stream_error_deadline is not None
+                    if loop.time() >= stream_error_deadline:
+                        if self._readback_rate_limit is not None:
+                            raise self._readback_rate_limit
+                        raise stream_error
+                    conversation, messages, readback_limit = (
                         await durable_snapshot()
                     )
                     if messages is not None:
                         return None, stream_error, conversation, messages
-                    if not readback_limited:
+                    if readback_limit is None:
                         raise stream_error
 
-                    assert stream_error_deadline is not None
                     remaining = stream_error_deadline - loop.time()
                     if remaining <= 0:
-                        raise stream_error
-                    await asyncio.sleep(
-                        min(rate_limit_backoff, remaining)
-                    )
+                        raise readback_limit
+                    cooldown = max(0.0, self._readback_allowed_at - loop.time())
+                    if cooldown > remaining:
+                        raise readback_limit
+                    await asyncio.sleep(cooldown)
                     continue
 
                 remaining = deadline - loop.time()
@@ -1087,7 +1139,7 @@ class ChatGPTClient:
                 if done:
                     continue
 
-                conversation, messages, readback_limited = (
+                conversation, messages, readback_limit = (
                     await durable_snapshot()
                 )
                 if messages is not None:
@@ -1098,10 +1150,10 @@ class ChatGPTClient:
                     )
                     return None, None, conversation, messages
 
-                if readback_limited:
-                    poll_delay = min(
-                        max(rate_limit_backoff, poll_delay * 2.0),
-                        max(rate_limit_backoff, poll_max),
+                if readback_limit is not None:
+                    poll_delay = max(
+                        min(poll_delay * 2.0, max(rate_limit_backoff, poll_max)),
+                        self._readback_allowed_at - loop.time(),
                     )
                 else:
                     poll_delay = min(poll_delay * 2.0, poll_max)
@@ -1158,7 +1210,7 @@ class ChatGPTClient:
             if messages is None:
                 self._traffic.mark_fallback_snapshot()
                 try:
-                    conversation = await self._conversation.fetch(
+                    conversation = await self._fetch_recovery_snapshot(
                         submitted.conversation_id
                     )
                     messages = self._validated_messages(
@@ -1234,15 +1286,34 @@ class ChatGPTClient:
         delay = float(
             getattr(self, "_durable_poll_rate_limit_backoff_seconds", 30.0)
         )
+        attempted = False
 
         while True:
+            if attempted and loop.time() >= deadline:
+                raise self._readback_rate_limit
+            cooldown = max(0.0, getattr(self, "_readback_allowed_at", 0.0) - loop.time())
+            if cooldown:
+                if cooldown > deadline - loop.time():
+                    raise self._readback_rate_limit
+                await asyncio.sleep(cooldown)
+                if loop.time() >= deadline:
+                    raise self._readback_rate_limit
             try:
-                return await self._conversation.fetch(conversation_id)
-            except RateLimited:
+                attempted = True
+                snapshot = await self._conversation.fetch(conversation_id)
+                self._readback_allowed_at = 0.0
+                self._readback_rate_limit = None
+                return snapshot
+            except RateLimited as exc:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise
-                await asyncio.sleep(min(delay, remaining))
+                wait = max(1.0, exc.retry_delay(delay, maximum_seconds=30.0))
+                self._readback_allowed_at = loop.time() + wait
+                self._readback_rate_limit = exc
+                if wait > remaining:
+                    raise
+                await asyncio.sleep(wait)
                 delay = min(max(delay * 2.0, 1.0), 30.0)
 
     async def recover(

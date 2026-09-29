@@ -103,9 +103,9 @@ async def _cleanup_task(
 
 
 def _persist_rate_limit_defer(journal: JournalStore, pending, exc: RateLimited) -> None:
-    delay = exc.retry_after_seconds
-    if pending is None or delay is None or delay <= 0:
+    if pending is None:
         return
+    delay = max(1.0, exc.retry_delay(30.0, maximum_seconds=30.0))
     not_before = time.time() + float(delay)
     previous = pending.retry_not_before
     if previous is not None:
@@ -213,6 +213,9 @@ async def _recover_pending_journal(
                 )
             # Recovery failures are technical failures: never continue the batch.
             raise
+    except RateLimited as exc:
+        _persist_rate_limit_defer(journal, journal.load(), exc)
+        raise
     finally:
         if session is not None:
             await session.disconnect()
@@ -266,6 +269,7 @@ async def run_pending(
     staging = Path("/data/state/superbench/staging")
     staging.mkdir(parents=True, exist_ok=True)
     attempted = 0
+    last_completed_task_at: float | None = None
 
     try:
         await storage.health()
@@ -279,8 +283,9 @@ async def run_pending(
             # completed-run skip or new task scheduling. This prevents a stale
             # cleanup_pending journal from poisoning the next task.
             if executor is None:
+                pending_before_recovery = JournalStore(settings.journal_path).load()
                 if selected_run_task_ids is not None:
-                    pending = JournalStore(settings.journal_path).load()
+                    pending = pending_before_recovery
                     if pending is not None and pending.task_id not in set(selected_run_task_ids):
                         raise RecoveryIncomplete(
                             f"pending journal task {pending.task_id!r} is outside frozen active-run selection"
@@ -297,6 +302,11 @@ async def run_pending(
                     storage=storage,
                     staging=staging,
                 )
+                if pending_before_recovery is not None:
+                    # Successful journal reconciliation used the ChatGPT session
+                    # (auth/navigation/readback/delete). Apply the same pacing
+                    # before starting a fresh task as after a normal completion.
+                    last_completed_task_at = asyncio.get_running_loop().time()
             if control_store is not None:
                 active = control_store.confirm_running()
                 if active.status == "pause_requested":
@@ -392,6 +402,12 @@ async def run_pending(
                         if latest is not None and latest.status == "completed":
                             control_store.finish_task(run_id)
                     continue
+
+                if last_completed_task_at is not None:
+                    pause = settings.chatgpt_inter_task_pause_seconds
+                    remaining = pause - (asyncio.get_running_loop().time() - last_completed_task_at)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
 
                 prepared = None
                 lifecycle = None
@@ -558,6 +574,7 @@ async def run_pending(
                     if control_store.load().status == "pause_requested":
                         control_store.pause_if_requested()
                         break
+                last_completed_task_at = asyncio.get_running_loop().time()
     except asyncio.CancelledError:
         if control_store is not None:
             state = control_store.load()

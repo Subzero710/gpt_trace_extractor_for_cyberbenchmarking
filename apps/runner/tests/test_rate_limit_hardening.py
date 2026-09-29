@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import pytest
 
 from gpt_trace_runner.chatgpt import ChatGPTClient
-from gpt_trace_runner.conversation import ConversationClient
-from gpt_trace_runner.exceptions import RateLimited
+from gpt_trace_runner.conversation import ConversationClient, _parse_retry_after
+from gpt_trace_runner.exceptions import ConversationError, ConversationNotFound, ConversationStreamAborted, RateLimited
+from gpt_trace_runner.stream import ConversationStream
+from gpt_trace_runner.superbench.execution import _persist_rate_limit_defer, _raise_if_recovery_deferred
+from gpt_trace_runner.journal import JournalStore, SubmissionJournal
 from gpt_trace_runner.traffic import TrafficMonitor
 
 
@@ -246,24 +250,175 @@ async def test_recent_resolution_advances_past_two_404s_on_next_poll() -> None:
 
     client.fetch = AsyncMock(side_effect=fetch)
     rejected: set[str] = set()
+    attempts: dict[str, int] = {}
 
     first = await client.find_recent_conversation_id_by_user_message_id(
         "user-wanted",
         exclude_ids=rejected,
+        candidate_attempts=attempts,
         max_candidate_fetches=2,
     )
     second = await client.find_recent_conversation_id_by_user_message_id(
         "user-wanted",
         exclude_ids=rejected,
+        candidate_attempts=attempts,
         max_candidate_fetches=2,
     )
 
     assert first is None
     assert second == "wanted"
-    assert rejected == {"gone-1", "gone-2"}
+    assert rejected == set()
     assert [call.args[0] for call in client.fetch.await_args_list] == [
         "gone-1", "gone-2", "wanted"
     ]
+
+
+@pytest.mark.asyncio
+async def test_recent_resolution_rotates_transient_errors_and_retries_404() -> None:
+    client = object.__new__(ConversationClient)
+    client.recent_conversation_ids = AsyncMock(return_value=("first", "second", "third"))
+    first_calls = 0
+
+    async def fetch(candidate):
+        nonlocal first_calls
+        if candidate == "first":
+            first_calls += 1
+            if first_calls == 1:
+                raise ConversationNotFound("not visible yet")
+            return {"messages": [{"id": "wanted", "author": {"role": "user"}}]}
+        if candidate == "second":
+            raise ConversationError("temporary invalid JSON")
+        return {"messages": [{"id": "other", "author": {"role": "user"}}]}
+
+    client.fetch = AsyncMock(side_effect=fetch)
+    rejected: set[str] = set()
+    attempts: dict[str, int] = {}
+    calls = [
+        await client.find_recent_conversation_id_by_user_message_id(
+            "wanted", exclude_ids=rejected, candidate_attempts=attempts,
+            max_candidate_fetches=2,
+        )
+        for _ in range(2)
+    ]
+    assert calls == [None, "first"]
+    assert [call.args[0] for call in client.fetch.await_args_list] == [
+        "first", "second", "third", "first"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recent_resolution_reaches_later_candidate_after_repeated_errors() -> None:
+    client = object.__new__(ConversationClient)
+    client.recent_conversation_ids = AsyncMock(return_value=("broken-1", "broken-2", "wanted"))
+
+    async def fetch(candidate):
+        if candidate != "wanted":
+            raise ConversationError("temporary read failure")
+        return {"messages": [{"id": "user-wanted", "author": {"role": "user"}}]}
+
+    client.fetch = AsyncMock(side_effect=fetch)
+    attempts: dict[str, int] = {}
+    first = await client.find_recent_conversation_id_by_user_message_id(
+        "user-wanted", candidate_attempts=attempts, max_candidate_fetches=2,
+    )
+    second = await client.find_recent_conversation_id_by_user_message_id(
+        "user-wanted", candidate_attempts=attempts, max_candidate_fetches=2,
+    )
+    assert first is None
+    assert second == "wanted"
+    assert [call.args[0] for call in client.fetch.await_args_list] == [
+        "broken-1", "broken-2", "wanted"
+    ]
+
+
+def test_retry_after_rejects_nonfinite_values() -> None:
+    assert _parse_retry_after("NaN") is None
+    assert _parse_retry_after("Infinity") is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_snapshot_does_not_poll_before_retry_after() -> None:
+    client = object.__new__(ChatGPTClient)
+    client._conversation = SimpleNamespace(fetch=AsyncMock(side_effect=RateLimited(
+        "snapshot 429", retry_after_seconds=120.0,
+    )))
+    client._durable_error_recovery_seconds = 0.02
+    client._durable_poll_rate_limit_backoff_seconds = 0.01
+    with pytest.raises(RateLimited):
+        await client._fetch_recovery_snapshot("conv")
+    assert client._conversation.fetch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_active_stream_readback_observes_retry_after() -> None:
+    class Stream:
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    client = object.__new__(ChatGPTClient)
+    client._conversation = SimpleNamespace(fetch=AsyncMock(side_effect=RateLimited(
+        "snapshot 429", retry_after_seconds=120.0,
+    )))
+    client._traffic = SimpleNamespace(
+        natural_snapshot=AsyncMock(return_value=None),
+        mark_fallback_snapshot=lambda: None,
+    )
+    client._turn_timeout = 0.05
+    client._durable_poll_initial_seconds = 0.001
+    client._durable_poll_max_seconds = 0.01
+    client._durable_poll_rate_limit_backoff_seconds = 0.001
+    submitted = SimpleNamespace(stream=Stream(), conversation_id="conv", user_message_id="wanted")
+    with pytest.raises(RateLimited):
+        await client._wait_stream_or_durable_completion(submitted)
+    assert client._conversation.fetch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_aborted_stream_readback_429_preserves_submitted_turn() -> None:
+    class Stream:
+        async def wait(self):
+            raise ConversationStreamAborted("transport aborted")
+
+    client = object.__new__(ChatGPTClient)
+    client._conversation = SimpleNamespace(fetch=AsyncMock(side_effect=RateLimited(
+        "snapshot 429", retry_after_seconds=120.0,
+    )))
+    client._traffic = SimpleNamespace(
+        natural_snapshot=AsyncMock(return_value=None),
+        mark_fallback_snapshot=lambda: None,
+    )
+    client._turn_timeout = 1.0
+    client._durable_error_recovery_seconds = 0.02
+    client._durable_poll_rate_limit_backoff_seconds = 0.001
+    submitted = SimpleNamespace(stream=Stream(), conversation_id="conv", user_message_id="wanted")
+    with pytest.raises(RateLimited):
+        await client._wait_stream_or_durable_completion(submitted)
+    assert client._conversation.fetch.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_429_preserves_retry_after_and_request_id() -> None:
+    class Response:
+        status = 429
+
+        async def header_value(self, name):
+            return {"retry-after": "120", "x-request-id": "req-stream"}.get(name)
+
+    with pytest.raises(RateLimited) as raised:
+        await ConversationStream(Response(), timeout_seconds=1).wait()
+    assert raised.value.retry_after_seconds == 120.0
+    assert raised.value.request_id == "req-stream"
+    assert raised.value.method == "POST"
+
+
+def test_recovery_journal_persists_backoff_without_server_hint(tmp_path) -> None:
+    journal = JournalStore(tmp_path / "journal.json")
+    pending = SubmissionJournal(task_id="task", runner_id="runner", attempt=1, phase="cleanup_pending")
+    journal.write(pending)
+    _persist_rate_limit_defer(journal, pending, RateLimited("429"))
+    assert journal.load().retry_not_before is not None
+    with pytest.raises(RateLimited):
+        _raise_if_recovery_deferred(journal.load())
 
 
 @pytest.mark.asyncio
@@ -299,3 +454,134 @@ async def test_conversation_id_resolver_does_not_truncate_long_retry_after() -> 
 
     assert raised.value.retry_after_seconds == 120.0
     assert client._conversation.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_429_is_raised_before_conversation_id_readback() -> None:
+    class Response:
+        status = 429
+
+        async def header_value(self, name):
+            return {
+                "retry-after": "120",
+                "x-request-id": "req-submit",
+            }.get(name)
+
+    class ResponseInfo:
+        def __init__(self, response):
+            loop = asyncio.get_running_loop()
+            self.value = loop.create_future()
+            self.value.set_result(response)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+    class Page:
+        def expect_response(self, *_args, **_kwargs):
+            return ResponseInfo(Response())
+
+    class Traffic:
+        saw_backend_429 = True
+        saw_backend_403 = False
+        submitted_model = None
+        submitted_timezone = None
+        submitted_timezone_offset_min = None
+        app_system_hints = ()
+
+        def validate_single_stream_request(self):
+            return None
+
+        def submitted_user_message_id(self):
+            return "user-1"
+
+    client = object.__new__(ChatGPTClient)
+    client._page = Page()
+    client._traffic = Traffic()
+    client._turn_timeout = 10.0
+    client._stream_start_timeout = 1.0
+    client._thinking_effort_observer_error = None
+    client._validate_thinking_effort_observation = lambda: None
+    client._validate_requested_app_transport = lambda _task: None
+    client._validate_submitted_model = lambda: None
+    client._click_send = AsyncMock()
+    client._wait_for_conversation_id = AsyncMock(
+        side_effect=AssertionError("429 submit must not trigger conversation readback")
+    )
+
+    persisted = []
+    prepared = type("Prepared", (), {"task": type("Task", (), {"tools": ()})()})()
+
+    with pytest.raises(RateLimited) as raised:
+        await client.submit_task(
+            prepared,
+            before_send=lambda: None,
+            on_user_message_id=persisted.append,
+        )
+
+    assert persisted == ["user-1"]
+    assert raised.value.endpoint == "/backend-api/f/conversation"
+    assert raised.value.method == "POST"
+    assert raised.value.retry_after_seconds == 120.0
+    assert raised.value.request_id == "req-submit"
+    client._wait_for_conversation_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_route_snapshot_counts_against_candidate_fairness_before_list_fallback() -> None:
+    class Page:
+        url = "https://chatgpt.com/c/route-candidate"
+
+    class Conversation:
+        def __init__(self) -> None:
+            self.route_calls = 0
+            self.list_calls = 0
+
+        async def fetch(self, conversation_id):
+            assert conversation_id == "route-candidate"
+            self.route_calls += 1
+            from gpt_trace_runner.exceptions import ConversationNotFound
+            raise ConversationNotFound("route candidate not populated yet")
+
+        async def find_recent_conversation_id_by_user_message_id(
+            self, _user_message_id, **kwargs
+        ):
+            self.list_calls += 1
+            assert kwargs["candidate_attempts"].get("route-candidate") == 1
+            return "different-candidate"
+
+    client = object.__new__(ChatGPTClient)
+    client._page = Page()
+    client._conversation = Conversation()
+    client._stream_start_timeout = 1.0
+    client._durable_error_recovery_seconds = 0.0
+    client._conversation_id_route_grace_seconds = 0.0
+    client._conversation_id_poll_initial_seconds = 0.01
+    client._conversation_id_poll_max_seconds = 0.01
+    client._conversation_id_rate_limit_backoff_seconds = 0.01
+
+    resolved = await client._wait_for_conversation_id("user-1")
+
+    assert resolved == "different-candidate"
+    assert client._conversation.route_calls == 1
+    assert client._conversation.list_calls == 1
+
+
+def test_successful_journal_recovery_arms_inter_task_pause() -> None:
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "superbench"
+        / "execution.py"
+    ).read_text(encoding="utf-8")
+
+    recovery = source.split("await _recover_pending_journal(", 1)[1].split(
+        "if control_store is not None:", 1
+    )[0]
+    assert "pending_before_recovery is not None" in recovery
+    assert "last_completed_task_at = asyncio.get_running_loop().time()" in recovery
