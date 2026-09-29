@@ -111,19 +111,77 @@ def remove_volume(name: str) -> None:
         raise ThrowError(f"failed to remove Docker volume {name}")
 
 
-def clear_directory(path: Path) -> None:
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-        return
+def tracked_files_under(path: Path) -> set[Path]:
+    try:
+        relative = path.relative_to(ROOT).as_posix()
+    except ValueError as exc:
+        raise ThrowError(f"path is outside repository root: {path}") from exc
+
+    proc = run(
+        ["git", "ls-files", "-z", "--", relative],
+        capture=True,
+    )
+    tracked: set[Path] = set()
+    for item in proc.stdout.split("\0"):
+        if not item:
+            continue
+        candidate = ROOT / item
+        try:
+            candidate.relative_to(path)
+        except ValueError as exc:
+            raise ThrowError(
+                f"git returned tracked path outside requested directory: {item}"
+            ) from exc
+        tracked.add(candidate)
+    return tracked
+
+
+def clear_generated_directory(path: Path) -> None:
+    # Delete generated entries while preserving every Git-tracked file.
+    path.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise ThrowError(f"refusing to clear non-directory path: {path}")
-    for child in path.iterdir():
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        elif child.is_dir():
-            shutil.rmtree(child)
+
+    tracked = tracked_files_under(path)
+    entries = sorted(
+        path.rglob("*"),
+        key=lambda entry: (len(entry.relative_to(path).parts), str(entry)),
+        reverse=True,
+    )
+    for entry in entries:
+        if entry in tracked:
+            continue
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            try:
+                entry.rmdir()
+            except OSError:
+                # It still contains a tracked file or one of its parent directories.
+                pass
         else:
-            raise ThrowError(f"refusing to remove special filesystem entry: {child}")
+            raise ThrowError(
+                f"refusing to remove special filesystem entry: {entry}"
+            )
+
+
+def verify_generated_directory_clean(path: Path) -> None:
+    # Fail if any non-tracked file/symlink/special entry survived the wipe.
+    if not path.is_dir() or path.is_symlink():
+        raise ThrowError(f"expected repository directory after wipe: {path}")
+
+    tracked = tracked_files_under(path)
+    unexpected: list[str] = []
+    for entry in sorted(path.rglob("*")):
+        if entry.is_dir() and not entry.is_symlink():
+            continue
+        if entry not in tracked:
+            unexpected.append(str(entry.relative_to(ROOT)))
+
+    if unexpected:
+        raise ThrowError(
+            "generated entries survived wipe: " + ", ".join(unexpected)
+        )
 
 
 def remove_tree(path: Path) -> None:
@@ -182,15 +240,6 @@ def verify_attempts_empty() -> None:
         )
 
 
-def verify_empty_directory(path: Path) -> None:
-    if not path.is_dir():
-        raise ThrowError(f"expected directory after wipe: {path}")
-    remaining = list(path.iterdir())
-    if remaining:
-        raise ThrowError(
-            f"{path} is not empty after wipe: "
-            + ", ".join(sorted(item.name for item in remaining))
-        )
 
 
 def main() -> int:
@@ -229,7 +278,7 @@ def main() -> int:
             print(f"removing {logical}: {actual}", flush=True)
             remove_volume(actual)
 
-    clear_directory(ROOT / "exports")
+    clear_generated_directory(ROOT / "exports")
     remove_tree(ROOT / "state")
     remove_tree(ROOT / ".venv-workstation-broker")
 
@@ -255,7 +304,7 @@ def main() -> int:
                 f"preserved upstream cache volume disappeared: {logical} ({actual})"
             )
 
-    verify_empty_directory(ROOT / "exports")
+    verify_generated_directory_clean(ROOT / "exports")
     if (ROOT / "state").exists():
         raise ThrowError("host runtime state directory survived wipe")
     if (ROOT / ".venv-workstation-broker").exists():
