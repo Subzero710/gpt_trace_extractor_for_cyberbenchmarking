@@ -30,6 +30,7 @@ from .exceptions import (
     ConversationNotFound,
     ConversationStreamAborted,
     ConversationStreamIncomplete,
+    DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
     EnvironmentDrift,
     FatalUIState,
     ModelMismatch,
@@ -690,7 +691,7 @@ class ChatGPTClient:
         )
         rate_limit_default = max(
             poll_delay,
-            float(getattr(self, "_conversation_id_rate_limit_backoff_seconds", 10.0)),
+            float(getattr(self, "_conversation_id_rate_limit_backoff_seconds", DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)),
         )
         rate_limit_recovery = max(
             0.0,
@@ -1009,7 +1010,7 @@ class ChatGPTClient:
             getattr(self, "_durable_poll_max_seconds", 30.0)
         )
         rate_limit_backoff = float(
-            getattr(self, "_durable_poll_rate_limit_backoff_seconds", 30.0)
+            getattr(self, "_durable_poll_rate_limit_backoff_seconds", DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)
         )
         stream_error: (
             ConversationStreamIncomplete | ConversationStreamAborted | None
@@ -1284,7 +1285,7 @@ class ChatGPTClient:
         )
         deadline = loop.time() + timeout_seconds
         delay = float(
-            getattr(self, "_durable_poll_rate_limit_backoff_seconds", 30.0)
+            getattr(self, "_durable_poll_rate_limit_backoff_seconds", DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)
         )
         attempted = False
 
@@ -1308,13 +1309,13 @@ class ChatGPTClient:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise
-                wait = max(1.0, exc.retry_delay(delay, maximum_seconds=30.0))
+                wait = max(1.0, exc.retry_delay(delay, maximum_seconds=DEFAULT_RATE_LIMIT_FALLBACK_SECONDS))
                 self._readback_allowed_at = loop.time() + wait
                 self._readback_rate_limit = exc
                 if wait > remaining:
                     raise
                 await asyncio.sleep(wait)
-                delay = min(max(delay * 2.0, 1.0), 30.0)
+                delay = min(max(delay * 2.0, 1.0), DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)
 
     async def recover(
         self,

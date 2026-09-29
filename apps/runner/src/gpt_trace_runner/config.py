@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     chatgpt_site_ready_timeout_seconds: float = Field(default=15.0, gt=0)
     chatgpt_challenge_timeout_seconds: float = Field(default=180.0, gt=0)
     chatgpt_natural_snapshot_wait_seconds: float = Field(default=0.0, ge=0)
-    chatgpt_inter_task_pause_seconds: float = Field(default=10.0, ge=0, le=3600)
+    chatgpt_inter_task_pause_seconds: float = Field(default=2.0, ge=0, le=3600)
     chatgpt_expected_model_slug: str = "gpt-5-6-thinking"
 
     runner_id: str = ""

@@ -9,6 +9,9 @@ class BatchCircuitBreaker(TraceRunnerError):
 class BrowserConnectionError(BatchCircuitBreaker): pass
 class BrowserIdentityError(BatchCircuitBreaker): pass
 class AuthenticationRequired(BatchCircuitBreaker): pass
+DEFAULT_RATE_LIMIT_FALLBACK_SECONDS = 10.0
+
+
 class RateLimited(BatchCircuitBreaker):
     def __init__(
         self,

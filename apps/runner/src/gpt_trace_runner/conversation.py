@@ -15,6 +15,7 @@ from .exceptions import (
     AuthenticationRequired,
     ConversationError,
     ConversationNotFound,
+    DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
     RateLimited,
 )
 
@@ -460,8 +461,8 @@ class ConversationClient:
     async def delete(self, conversation_id: str) -> None:
         endpoint = f"/backend-api/conversation/id/{conversation_id}"
         max_attempts = max(1, int(getattr(self, "_delete_rate_limit_max_attempts", 3)))
-        base_delay = max(0.0, float(getattr(self, "_delete_rate_limit_backoff_seconds", 1.0)))
-        max_delay = max(base_delay, float(getattr(self, "_delete_rate_limit_backoff_max_seconds", 8.0)))
+        base_delay = max(0.0, float(getattr(self, "_delete_rate_limit_backoff_seconds", DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)))
+        max_delay = max(base_delay, float(getattr(self, "_delete_rate_limit_backoff_max_seconds", DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)))
         recovery_window = max(
             0.0,
             float(getattr(self, "_delete_rate_limit_recovery_seconds", max_delay)),

@@ -10,6 +10,7 @@ from ..browser import BrowserClient
 from ..exceptions import (
     AuthenticationRequired,
     BatchCircuitBreaker,
+    DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
     RateLimited,
     RecoveryIncomplete,
 )
@@ -105,7 +106,13 @@ async def _cleanup_task(
 def _persist_rate_limit_defer(journal: JournalStore, pending, exc: RateLimited) -> None:
     if pending is None:
         return
-    delay = max(1.0, exc.retry_delay(30.0, maximum_seconds=30.0))
+    delay = max(
+        1.0,
+        exc.retry_delay(
+            DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+            maximum_seconds=DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+        ),
+    )
     not_before = time.time() + float(delay)
     previous = pending.retry_not_before
     if previous is not None:
