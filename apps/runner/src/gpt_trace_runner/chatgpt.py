@@ -699,7 +699,7 @@ class ChatGPTClient:
         )
         candidate_budget = max(
             1,
-            int(getattr(self, "_conversation_id_candidate_fetches_per_poll", 2)),
+            int(getattr(self, "_conversation_id_candidate_fetches_per_poll", 1)),
         )
 
         last_route: str | None = None
@@ -709,7 +709,6 @@ class ChatGPTClient:
         rejected_ids: set[str] = set()
         candidate_attempts: dict[str, int] = {}
         route_next_fetch_at: dict[str, float] = {}
-        route_rate_limited: set[str] = set()
 
         def extend_deadline_for_rate_limit(now: float) -> None:
             nonlocal deadline, rate_limit_deadline_extended
@@ -718,22 +717,21 @@ class ChatGPTClient:
             deadline = max(deadline, now + rate_limit_recovery)
             rate_limit_deadline_extended = True
 
-        async def try_route_candidate(now: float) -> tuple[str | None, float | None]:
+        async def try_route_candidate(
+            now: float,
+        ) -> tuple[str | None, float | None, bool]:
             nonlocal last_route, last_error, last_rate_limit
             candidate = conversation_id_from_url(self._page.url)
             if not candidate:
-                return None, None
+                return None, None, False
             last_route = candidate
             if is_transient_conversation_id(candidate):
-                return None, None
+                return None, None, False
+
             next_fetch_at = route_next_fetch_at.get(candidate, 0.0)
             if now < next_fetch_at:
-                if candidate in route_rate_limited:
-                    return None, next_fetch_at - now
-                return None, None
-            # Count this explicit route snapshot in the same fairness map used
-            # by the list fallback. Otherwise the list can immediately spend its
-            # bounded budget fetching the exact route candidate a second time.
+                return None, next_fetch_at - now, True
+
             candidate_attempts[candidate] = candidate_attempts.get(candidate, 0) + 1
             try:
                 conversation = await self._conversation.fetch(candidate)
@@ -742,7 +740,7 @@ class ChatGPTClient:
                     user_message_id,
                 ):
                     last_rate_limit = None
-                    return candidate, None
+                    return candidate, None, True
             except RateLimited as exc:
                 last_rate_limit = exc
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -756,32 +754,37 @@ class ChatGPTClient:
                 )
                 if delay > deadline - loop.time():
                     raise exc
-                route_rate_limited.add(candidate)
-                route_next_fetch_at[candidate] = now + delay
-                return None, delay
+                route_next_fetch_at[candidate] = loop.time() + delay
+                return None, delay, True
             except (ConversationError, AmbiguousSubmission) as exc:
-                route_rate_limited.discard(candidate)
                 last_rate_limit = None
                 last_error = f"{type(exc).__name__}: {exc}"
-                route_next_fetch_at[candidate] = now + poll_delay
+                route_next_fetch_at[candidate] = loop.time() + poll_delay
             else:
-                route_rate_limited.discard(candidate)
                 last_rate_limit = None
-                # Durable route exists but the backend snapshot is not populated yet.
-                route_next_fetch_at[candidate] = now + poll_delay
-            return None, None
+                route_next_fetch_at[candidate] = loop.time() + poll_delay
+
+            return (
+                None,
+                max(0.0, route_next_fetch_at[candidate] - loop.time()),
+                True,
+            )
 
         # First give ChatGPT's own navigation a chance to expose the durable ID.
         # Reading page.url is local and creates no backend traffic.
         grace_deadline = min(deadline, loop.time() + route_grace)
         while loop.time() < grace_deadline:
-            resolved, route_rate_delay = await try_route_candidate(loop.time())
+            resolved, route_delay, route_owned = await try_route_candidate(loop.time())
             if resolved is not None:
                 return resolved
             remaining = grace_deadline - loop.time()
             if remaining <= 0:
                 break
-            sleep_for = route_rate_delay if route_rate_delay is not None else route_check
+            sleep_for = (
+                route_delay
+                if route_owned and route_delay is not None
+                else route_check
+            )
             await asyncio.sleep(min(sleep_for, remaining))
 
         while True:
@@ -796,16 +799,20 @@ class ChatGPTClient:
                     "conversation SSE started but no verified durable conversation ID "
                     "was resolved" + detail
                 )
-            resolved, route_rate_delay = await try_route_candidate(now)
+            resolved, route_delay, route_owned = await try_route_candidate(now)
             if resolved is not None:
                 return resolved
 
-            if route_rate_delay is not None:
+            if route_owned:
                 remaining = deadline - loop.time()
-                if remaining <= 0 or route_rate_delay > remaining:
-                    assert last_rate_limit is not None
+                if remaining <= 0:
+                    if last_rate_limit is not None:
+                        raise last_rate_limit
+                    continue
+                sleep_for = route_delay if route_delay is not None else poll_delay
+                if last_rate_limit is not None and sleep_for > remaining:
                     raise last_rate_limit
-                await asyncio.sleep(route_rate_delay)
+                await asyncio.sleep(min(sleep_for, remaining))
                 continue
 
             if loop.time() >= deadline:
@@ -818,6 +825,7 @@ class ChatGPTClient:
                     exclude_ids=rejected_ids,
                     max_candidate_fetches=candidate_budget,
                     candidate_attempts=candidate_attempts,
+                    candidate_fetch_delay_seconds=max(1.0, poll_delay),
                 )
             except RateLimited as exc:
                 last_rate_limit = exc

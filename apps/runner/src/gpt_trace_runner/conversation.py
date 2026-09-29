@@ -228,6 +228,7 @@ class ConversationClient:
                             text: ''
                         };
                     }
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                     const r = await fetch(endpoint, {
                         credentials: 'include',
                         cache: 'no-store',
@@ -300,12 +301,16 @@ class ConversationClient:
         exclude_ids: set[str] | None = None,
         max_candidate_fetches: int | None = None,
         candidate_attempts: dict[str, int] | None = None,
+        candidate_fetch_delay_seconds: float = 0.0,
     ) -> str | None:
         """Resolve a submitted message while avoiding repeated candidate snapshots."""
         if not isinstance(user_message_id, str) or not user_message_id.strip():
             raise ConversationError("expected user_message_id is missing")
         if max_candidate_fetches is not None and max_candidate_fetches < 1:
             raise ValueError("max_candidate_fetches must be >= 1")
+        fetch_delay = float(candidate_fetch_delay_seconds)
+        if not math.isfinite(fetch_delay) or fetch_delay < 0:
+            raise ValueError("candidate_fetch_delay_seconds must be finite and >= 0")
 
         rejected = exclude_ids if exclude_ids is not None else set()
         attempts = candidate_attempts if candidate_attempts is not None else {}
@@ -320,6 +325,8 @@ class ConversationClient:
         for conversation_id in candidates:
             if max_candidate_fetches is not None and fetched >= max_candidate_fetches:
                 break
+            if fetch_delay > 0:
+                await asyncio.sleep(fetch_delay)
             fetched += 1
             attempts[conversation_id] = attempts.get(conversation_id, 0) + 1
             try:
@@ -391,6 +398,7 @@ class ConversationClient:
                         };
                     }
 
+                    await new Promise(resolve => setTimeout(resolve, 1000));
                     const r = await fetch(endpoint, {
                         credentials: 'include',
                         cache: 'no-store',
@@ -520,6 +528,7 @@ class ConversationClient:
                             };
                         }
 
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                         const r = await fetch(endpoint, {
                             method: 'DELETE',
                             credentials: 'include',

@@ -73,6 +73,37 @@ async def test_recent_resolution_caps_fetches_and_never_refetches_known_negative
 
 
 @pytest.mark.asyncio
+async def test_recent_resolution_paces_list_before_candidate_fetch(monkeypatch) -> None:
+    client = object.__new__(ConversationClient)
+    client.recent_conversation_ids = AsyncMock(return_value=("wanted",))
+    client.fetch = AsyncMock(
+        return_value={"messages": [{"id": "user-wanted", "author": {"role": "user"}}]}
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    resolved = await client.find_recent_conversation_id_by_user_message_id(
+        "user-wanted",
+        max_candidate_fetches=1,
+        candidate_fetch_delay_seconds=1.0,
+    )
+
+    assert resolved == "wanted"
+    sleep.assert_awaited_once_with(1.0)
+
+
+def test_explicit_conversation_http_pairs_are_spaced() -> None:
+    source = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "conversation.py"
+    ).read_text(encoding="utf-8")
+
+    assert source.count("setTimeout(resolve, 1000)") >= 3
+
+
+@pytest.mark.asyncio
 async def test_conversation_id_resolver_backs_off_429_and_recovers() -> None:
     class Page:
         url = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
@@ -530,7 +561,7 @@ async def test_submit_429_is_raised_before_conversation_id_readback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_snapshot_counts_against_candidate_fairness_before_list_fallback() -> None:
+async def test_durable_route_retries_without_same_cycle_list_fallback() -> None:
     class Page:
         url = "https://chatgpt.com/c/route-candidate"
 
@@ -542,15 +573,15 @@ async def test_route_snapshot_counts_against_candidate_fairness_before_list_fall
         async def fetch(self, conversation_id):
             assert conversation_id == "route-candidate"
             self.route_calls += 1
-            from gpt_trace_runner.exceptions import ConversationNotFound
-            raise ConversationNotFound("route candidate not populated yet")
+            if self.route_calls == 1:
+                raise ConversationNotFound("route candidate not populated yet")
+            return {"messages": [{"id": "user-1", "author": {"role": "user"}}]}
 
         async def find_recent_conversation_id_by_user_message_id(
-            self, _user_message_id, **kwargs
+            self, _user_message_id, **_kwargs
         ):
             self.list_calls += 1
-            assert kwargs["candidate_attempts"].get("route-candidate") == 1
-            return "different-candidate"
+            raise AssertionError("durable route must be retried before list fallback")
 
     client = object.__new__(ChatGPTClient)
     client._page = Page()
@@ -564,9 +595,44 @@ async def test_route_snapshot_counts_against_candidate_fairness_before_list_fall
 
     resolved = await client._wait_for_conversation_id("user-1")
 
-    assert resolved == "different-candidate"
-    assert client._conversation.route_calls == 1
-    assert client._conversation.list_calls == 1
+    assert resolved == "route-candidate"
+    assert client._conversation.route_calls == 2
+    assert client._conversation.list_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_route_fallback_is_single_candidate_and_paced() -> None:
+    class Page:
+        url = "https://chatgpt.com/c/local-chatgpt%3Atemporary"
+
+    class Conversation:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        async def fetch(self, _conversation_id):
+            raise AssertionError("transient route must not be fetched")
+
+        async def find_recent_conversation_id_by_user_message_id(
+            self, _user_message_id, **kwargs
+        ):
+            self.kwargs = kwargs
+            return "durable-1"
+
+    client = object.__new__(ChatGPTClient)
+    client._page = Page()
+    client._conversation = Conversation()
+    client._stream_start_timeout = 1.0
+    client._durable_error_recovery_seconds = 0.0
+    client._conversation_id_route_grace_seconds = 0.0
+    client._conversation_id_poll_initial_seconds = 0.01
+    client._conversation_id_poll_max_seconds = 0.01
+    client._conversation_id_rate_limit_backoff_seconds = 0.01
+
+    resolved = await client._wait_for_conversation_id("user-1")
+
+    assert resolved == "durable-1"
+    assert client._conversation.kwargs["max_candidate_fetches"] == 1
+    assert client._conversation.kwargs["candidate_fetch_delay_seconds"] == pytest.approx(1.0)
 
 
 def test_successful_journal_recovery_arms_inter_task_pause() -> None:
