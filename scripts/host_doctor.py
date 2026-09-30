@@ -78,9 +78,9 @@ def main():
         checks.append(check('nftables access', ok, detail))
     quota = cfg['overlay_quota_gb'] * 1024 ** 3
     disk = shutil.disk_usage(BASE.parent if BASE.parent.exists() else ROOT)
-    needed = quota + 15 * 1024 ** 3
-    checks.append(check('reserved disk headroom', disk.free >= needed,
-                        f'{disk.free // 1024**3} GiB free; {needed // 1024**3} GiB minimum for one attempt + build'))
+    needed = quota
+    checks.append(check('attempt disk reservation', disk.free >= needed,
+                        f'{disk.free // 1024**3} GiB free; {needed // 1024**3} GiB required by one attempt'))
     checks.append(check('golden image', BASE.is_file(), str(BASE)))
     for name in ('libvirt-qemu', 'qemu'):
         try:

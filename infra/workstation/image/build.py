@@ -2,6 +2,7 @@
 """Build a verified immutable Kali qcow2, customized with the guest agent."""
 from __future__ import annotations
 
+import argparse
 import ast
 import hashlib
 import inspect
@@ -9,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,8 @@ DEST = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
 PROVISION_TIMEOUT_SECONDS = 7200
+GOLDEN_IMAGE_REPOSITORY = "aad7xppz4fd4r8emr/gpt-trace-kali-golden"
+GOLDEN_IMAGE_ROOT = Path("/opt/gpt-trace-golden")
 
 GUEST_PACKAGES = (
     "qemu-guest-agent",
@@ -456,6 +460,7 @@ def provision_in_real_guest(image: Path) -> None:
 
 
 def build() -> None:
+    """Build the golden image locally. Intended for the publishing machine only."""
     if DEST.exists():
         try:
             verify()
@@ -528,8 +533,25 @@ def build() -> None:
     verify()
 
 
-def verify() -> None:
-    provenance = DEST.with_suffix(".provenance.json")
+def artifact_paths(base: Path | None = None) -> tuple[Path, Path, Path, Path]:
+    base = DEST if base is None else base
+    return (
+        base,
+        base.with_suffix(".provenance.json"),
+        base.parent / "kali-packages.txt",
+        base.parent / "kali-python-packages.txt",
+    )
+
+
+def golden_image_ref() -> str:
+    # Full semantic input hash makes the Docker tag deterministic for exactly the
+    # guest contents expected by this checkout, without a hand-maintained version.
+    return f"{GOLDEN_IMAGE_REPOSITORY}:input-{golden_build_input_sha256()}"
+
+
+def verify(base: Path | None = None) -> None:
+    base = DEST if base is None else base
+    provenance = base.with_suffix(".provenance.json")
     metadata = json.loads(provenance.read_text())
     if metadata["source_sha256"] != ARCHIVE_SHA256 or metadata["source"] != SOURCE + ARCHIVE:
         raise RuntimeError("Kali archive provenance differs from the pinned source")
@@ -537,7 +559,8 @@ def verify() -> None:
     stored_build_input = metadata.get("build_input_sha256")
     migrate_legacy = False
     if stored_build_input is None:
-        if not _legacy_golden_matches_current_inputs(metadata):
+        # Legacy migration is only meaningful for the installed canonical image.
+        if base != DEST or not _legacy_golden_matches_current_inputs(metadata):
             raise RuntimeError(
                 "legacy Kali golden image predates build-input fingerprints and "
                 "its original guest inputs differ from the current tree"
@@ -552,16 +575,16 @@ def verify() -> None:
         ROOT / "infra/workstation/image/requirements.lock"
     ):
         raise RuntimeError("Python dependency lock differs from the built image")
-    for name, key in (
-        ("kali-packages.txt", "apt_package_manifest_sha256"),
-        ("kali-python-packages.txt", "python_package_manifest_sha256"),
+    for path, key in (
+        (base.parent / "kali-packages.txt", "apt_package_manifest_sha256"),
+        (base.parent / "kali-python-packages.txt", "python_package_manifest_sha256"),
     ):
-        if hashlib.sha256((DEST.parent / name).read_bytes()).hexdigest() != metadata[key]:
-            raise RuntimeError(f"{name} provenance differs from the built image")
-    if metadata["base_sha256"] != digest(DEST):
+        if hashlib.sha256(path.read_bytes()).hexdigest() != metadata[key]:
+            raise RuntimeError(f"{path.name} provenance differs from the built image")
+    if metadata["base_sha256"] != digest(base):
         raise RuntimeError("Kali base image mutated")
     info = json.loads(
-        subprocess.check_output(["qemu-img", "info", "--output=json", str(DEST)])
+        subprocess.check_output(["qemu-img", "info", "--output=json", str(base)])
     )
     if info.get("format") != "qcow2" or info.get("backing-filename"):
         raise RuntimeError("base is not an independent qcow2")
@@ -572,8 +595,148 @@ def verify() -> None:
             "Stamped legacy Kali provenance with current build-input fingerprint",
             flush=True,
         )
-    print("Kali image:", DEST, "sha256:", metadata["base_sha256"])
+    physical = base.stat().st_blocks * 512
+    print(
+        "Kali image:", base,
+        "sha256:", metadata["base_sha256"],
+        "physical_bytes:", physical,
+        flush=True,
+    )
+
+
+def install_from_image() -> None:
+    """Install the prebuilt golden image published on Docker Hub."""
+    if DEST.exists():
+        try:
+            verify()
+        except (
+            OSError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            _discard_stale_golden(exc)
+        else:
+            return
+
+    image_ref = golden_image_ref()
+    DEST.parent.mkdir(parents=True, exist_ok=True)
+    run("docker", "pull", image_ref)
+    container_id = ""
+    try:
+        container_id = subprocess.check_output(
+            ["docker", "create", image_ref, "/not-run"], text=True
+        ).strip()
+        if not container_id:
+            raise RuntimeError("docker create returned an empty container id")
+        with tempfile.TemporaryDirectory(prefix="kali-golden-pull-", dir=DEST.parent) as raw:
+            temp = Path(raw)
+            run(
+                "docker", "cp",
+                f"{container_id}:{GOLDEN_IMAGE_ROOT}/.",
+                str(temp),
+            )
+            staged = temp / DEST.name
+            expected = (
+                staged,
+                temp / "kali-base.provenance.json",
+                temp / "kali-packages.txt",
+                temp / "kali-python-packages.txt",
+            )
+            for path in expected:
+                if path.is_symlink() or not path.is_file():
+                    raise RuntimeError(f"golden image artifact missing or unsafe: {path.name}")
+            verify(staged)
+
+            final_paths = artifact_paths()
+            for source, target in zip(expected, final_paths, strict=True):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+            DEST.chmod(0o444)
+            verify()
+    finally:
+        if container_id:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        # The qcow2 has been copied to libvirt storage. Keeping the Docker image
+        # would duplicate several GiB on the benchmark host.
+        subprocess.run(
+            ["docker", "image", "rm", image_ref],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def publish_image() -> None:
+    """Build locally once, then publish the verified golden as a Docker image."""
+    requirements = ROOT / "scripts/host_requirements.py"
+    run(sys.executable, str(requirements), "--build", "--golden-build")
+    build()
+    verify()
+    image_ref = golden_image_ref()
+    metadata = json.loads(DEST.with_suffix(".provenance.json").read_text())
+    exists = subprocess.run(
+        ["docker", "buildx", "imagetools", "inspect", image_ref],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if exists.returncode == 0:
+        raise RuntimeError(
+            f"refusing to overwrite existing immutable golden tag: {image_ref}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="kali-golden-docker-") as raw:
+        context = Path(raw)
+        for source in artifact_paths():
+            shutil.copy2(source, context / source.name)
+        dockerfile = context / "Dockerfile"
+        dockerfile.write_text(
+            "FROM scratch\n"
+            f"LABEL org.opencontainers.image.title=\"gpt-trace-kali-golden\"\n"
+            f"LABEL io.gpttrace.build-input-sha256=\"{metadata['build_input_sha256']}\"\n"
+            f"LABEL io.gpttrace.base-sha256=\"{metadata['base_sha256']}\"\n"
+            "COPY kali-base.qcow2 /opt/gpt-trace-golden/kali-base.qcow2\n"
+            "COPY kali-base.provenance.json /opt/gpt-trace-golden/kali-base.provenance.json\n"
+            "COPY kali-packages.txt /opt/gpt-trace-golden/kali-packages.txt\n"
+            "COPY kali-python-packages.txt /opt/gpt-trace-golden/kali-python-packages.txt\n",
+            encoding="utf-8",
+        )
+        run(
+            "docker", "buildx", "build",
+            "--platform", "linux/amd64",
+            "--push",
+            "--tag", image_ref,
+            str(context),
+        )
+    run("docker", "buildx", "imagetools", "inspect", image_ref)
+    print(f"Published Kali golden image: {image_ref}", flush=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Build, publish, install, or verify the Kali golden workstation image."
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--local", action="store_true", help="build the qcow2 locally")
+    mode.add_argument("--publish", action="store_true", help="build and push the Docker Hub golden image")
+    mode.add_argument("--verify", action="store_true", help="verify the installed qcow2")
+    mode.add_argument("--install", action="store_true", help="pull and install the prebuilt Docker Hub golden (default)")
+    args = parser.parse_args()
+
+    if args.local:
+        build()
+    elif args.publish:
+        publish_image()
+    elif args.verify:
+        verify()
+    else:
+        install_from_image()
+    return 0
 
 
 if __name__ == "__main__":
-    build()
+    raise SystemExit(main())
