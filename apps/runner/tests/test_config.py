@@ -104,3 +104,8 @@ def test_invalid_workstation_resources_and_empty_model_are_rejected() -> None:
 def test_runner_has_no_localhost_operator_browser_url() -> None:
     settings = Settings()
     assert not hasattr(settings, "browser_novnc_url")
+
+
+def test_runner_has_no_absolute_chatgpt_turn_timeout() -> None:
+    settings = Settings()
+    assert not hasattr(settings, "chatgpt_turn_timeout_seconds")

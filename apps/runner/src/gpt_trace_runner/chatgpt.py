@@ -114,7 +114,6 @@ class ChatGPTClient:
         *,
         base_url: str,
         conversation_turns: int,
-        turn_timeout_seconds: float,
         stream_start_timeout_seconds: float,
         tool_select_timeout_seconds: float,
         upload_timeout_seconds: float,
@@ -127,7 +126,6 @@ class ChatGPTClient:
     ) -> None:
         self._page = page
         self._base_url = base_url.rstrip("/")
-        self._turn_timeout = turn_timeout_seconds
         self._stream_start_timeout = stream_start_timeout_seconds
         self._tool_select_timeout = tool_select_timeout_seconds
         self._upload_timeout = upload_timeout_seconds
@@ -998,7 +996,10 @@ class ChatGPTClient:
         # here, before conversation-ID resolution can generate any auxiliary
         # /conversations or /api/auth/session traffic. Persisting the frontend
         # user_message_id first keeps the already-submitted attempt recoverable.
-        stream = ConversationStream(response, timeout_seconds=self._turn_timeout)
+        stream = ConversationStream(
+            response,
+            timeout_seconds=getattr(self, "_turn_timeout", None),
+        )
         await stream.raise_for_initial_status()
 
         conversation_id = await self._wait_for_conversation_id(user_message_id)
@@ -1044,8 +1045,12 @@ class ChatGPTClient:
         """
         stream_task = asyncio.create_task(submitted.stream.wait())
         loop = asyncio.get_running_loop()
-        turn_timeout = float(getattr(self, "_turn_timeout", 1800.0))
-        deadline = loop.time() + turn_timeout
+        configured_turn_timeout = getattr(self, "_turn_timeout", None)
+        deadline = (
+            None
+            if configured_turn_timeout is None
+            else loop.time() + float(configured_turn_timeout)
+        )
         poll_delay = float(
             getattr(self, "_durable_poll_initial_seconds", 10.0)
         )
@@ -1126,13 +1131,13 @@ class ChatGPTClient:
         try:
             while True:
                 now = loop.time()
-                if now >= deadline:
+                if deadline is not None and now >= deadline:
                     if self._readback_rate_limit is not None:
                         raise self._readback_rate_limit
                     if stream_error is not None:
                         raise stream_error
                     raise RecoveryIncomplete(
-                        "ChatGPT turn did not become durably complete before timeout"
+                        "ChatGPT turn did not become durably complete before diagnostic timeout"
                     )
 
                 if stream_task.done() and stream_error is None:
@@ -1143,8 +1148,7 @@ class ChatGPTClient:
                         ConversationStreamAborted,
                     ) as exc:
                         stream_error = exc
-                        stream_error_deadline = min(
-                            deadline,
+                        recovery_deadline = (
                             loop.time()
                             + float(
                                 getattr(
@@ -1152,7 +1156,12 @@ class ChatGPTClient:
                                     "_durable_error_recovery_seconds",
                                     120.0,
                                 )
-                            ),
+                            )
+                        )
+                        stream_error_deadline = (
+                            recovery_deadline
+                            if deadline is None
+                            else min(deadline, recovery_deadline)
                         )
 
                 if stream_error is not None:
@@ -1178,10 +1187,17 @@ class ChatGPTClient:
                     await asyncio.sleep(cooldown)
                     continue
 
-                remaining = deadline - loop.time()
+                remaining = (
+                    None if deadline is None else deadline - loop.time()
+                )
+                wait_timeout = (
+                    poll_delay
+                    if remaining is None
+                    else min(poll_delay, remaining)
+                )
                 done, _pending = await asyncio.wait(
                     {stream_task},
-                    timeout=min(poll_delay, remaining),
+                    timeout=wait_timeout,
                 )
                 if done:
                     continue

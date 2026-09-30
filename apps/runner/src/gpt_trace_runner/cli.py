@@ -34,7 +34,6 @@ def make_chatgpt(settings: Settings, page) -> ChatGPTClient:
         page,
         base_url=settings.chatgpt_base_url,
         conversation_turns=settings.chatgpt_conversation_turns,
-        turn_timeout_seconds=settings.chatgpt_turn_timeout_seconds,
         stream_start_timeout_seconds=settings.chatgpt_stream_start_timeout_seconds,
         tool_select_timeout_seconds=settings.chatgpt_tool_select_timeout_seconds,
         upload_timeout_seconds=settings.chatgpt_upload_timeout_seconds,

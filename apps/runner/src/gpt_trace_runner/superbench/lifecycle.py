@@ -38,7 +38,6 @@ def config_fp(settings) -> str:
     keys = (
         "chatgpt_expected_model_slug",
         "chatgpt_conversation_turns",
-        "chatgpt_turn_timeout_seconds",
         "chatgpt_stream_start_timeout_seconds",
         "chatgpt_tool_select_timeout_seconds",
         "chatgpt_upload_timeout_seconds",

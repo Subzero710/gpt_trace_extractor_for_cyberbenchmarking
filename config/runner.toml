@@ -13,7 +13,6 @@ app_registry_path = "/data/apps/registry/apps.json"
 app_control_token_file = "/run/secrets/app_control_token"
 chatgpt_base_url = "https://chatgpt.com"
 chatgpt_conversation_turns = 100
-chatgpt_turn_timeout_seconds = 1800.0
 chatgpt_stream_start_timeout_seconds = 60.0
 chatgpt_tool_select_timeout_seconds = 15.0
 chatgpt_upload_timeout_seconds = 60.0

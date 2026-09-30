@@ -86,7 +86,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-vncserver "$display" -fg -noxstartup > /home/browser/.vnc/kasmvnc.log 2>&1 &
+cat > /home/browser/.vnc/xstartup <<'EOF'
+#!/usr/bin/env sh
+set -eu
+exec openbox
+EOF
+chmod 0755 /home/browser/.vnc/xstartup
+
+# With -fg, vncserver stays attached to xstartup. Keeping Openbox as the
+# foreground xstartup process gives the container one supervised Kasm session:
+# when Openbox exits, vncserver tears down Xvnc and exits as well.
+vncserver "$display" -fg -xstartup /home/browser/.vnc/xstartup > /home/browser/.vnc/kasmvnc.log 2>&1 &
 kasm_pid=$!
 children+=("$kasm_pid")
 
@@ -126,10 +136,6 @@ done
   exit 70
 }
 
-DISPLAY="$display" openbox > /home/browser/.vnc/openbox.log 2>&1 &
-openbox_pid=$!
-children+=("$openbox_pid")
-
 python /usr/local/bin/clipboard-server --port "${BROWSER_CLIPBOARD_PORT:-8765}" &
 clipboard_pid=$!
 children+=("$clipboard_pid")
@@ -139,7 +145,7 @@ cloak_pid=$!
 children+=("$cloak_pid")
 
 set +e
-wait -n "$kasm_pid" "$openbox_pid" "$clipboard_pid" "$cloak_pid"
+wait -n "$kasm_pid" "$clipboard_pid" "$cloak_pid"
 status=$?
 set -e
 

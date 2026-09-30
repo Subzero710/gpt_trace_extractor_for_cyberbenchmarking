@@ -155,10 +155,12 @@ async def test_stream_protection_statuses_are_batch_breakers(status, expected) -
     with pytest.raises(error_type):
         await ConversationStream(response, timeout_seconds=1).wait()
 
-def test_conversation_stream_wait_does_not_wrap_response_finished_in_wait_for() -> None:
+def test_conversation_stream_wait_has_unbounded_default_and_no_wait_for_wrapper() -> None:
     import inspect
     from gpt_trace_runner.stream import ConversationStream
 
+    signature = inspect.signature(ConversationStream)
+    assert signature.parameters["timeout_seconds"].default is None
     source = inspect.getsource(ConversationStream.wait)
-    assert "asyncio.timeout(" in source
+    assert "if self._timeout_seconds is None" in source
     assert "asyncio.wait_for(" not in source

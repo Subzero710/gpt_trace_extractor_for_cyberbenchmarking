@@ -68,7 +68,6 @@ class Settings(BaseSettings):
 
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_conversation_turns: int = Field(default=100, ge=1, le=1000)
-    chatgpt_turn_timeout_seconds: float = Field(default=1800.0, gt=0)
     chatgpt_stream_start_timeout_seconds: float = Field(default=180.0, gt=0)
     chatgpt_tool_select_timeout_seconds: float = Field(default=20.0, gt=0)
     chatgpt_upload_timeout_seconds: float = Field(default=60.0, gt=0)
