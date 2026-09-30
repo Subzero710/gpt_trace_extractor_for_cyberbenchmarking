@@ -15,6 +15,7 @@ from .exceptions import AuthenticationRequired, RateLimited
 
 
 _CONVERSATION_SNAPSHOT = re.compile(r"^/backend-api/conversations/([^/]+)$")
+_PROCESS_LAST_BACKEND_REQUEST_AT: float | None = None
 
 
 @dataclass(slots=True)
@@ -69,7 +70,7 @@ class TrafficMonitor:
         # Global browser-side pacing signal. This deliberately survives
         # begin_task(): a fresh benchmark must not burst immediately after
         # cleanup/navigation traffic from the previous one.
-        self._last_backend_request_at: float | None = None
+        self._last_backend_request_at: float | None = _PROCESS_LAST_BACKEND_REQUEST_AT
         self._backend_request_event = asyncio.Event()
         page.on("request", self._on_request)
         page.on("response", self._on_response)
@@ -177,34 +178,43 @@ class TrafficMonitor:
     def _is_backend_path(path: str) -> bool:
         return path.startswith("/backend-api/") or path.startswith("/backend-anon/")
 
+    def _latest_backend_request_at(self) -> float | None:
+        local = self._last_backend_request_at
+        process = _PROCESS_LAST_BACKEND_REQUEST_AT
+        if local is None:
+            return process
+        if process is None:
+            return local
+        return max(local, process)
+
     async def wait_for_backend_quiet(self, *, quiet_seconds: float) -> None:
-        """Wait until ChatGPT has emitted no backend/auth request for a full gap."""
+        """Wait only for the unsatisfied remainder of the backend request gap."""
         quiet = max(0.0, float(quiet_seconds))
         if quiet <= 0:
             return
 
-        # Always observe a fresh full quiet window. A UI action may schedule a
-        # backend request just after its visible state changes, so an old
-        # last-request timestamp is not enough to declare the page settled.
-        anchor = time.monotonic()
-
         while True:
-            last = self._last_backend_request_at
-            if last is not None and last > anchor:
-                anchor = last
-            remaining = quiet - (time.monotonic() - anchor)
+            last = self._latest_backend_request_at()
+            if last is None:
+                return
+
+            remaining = quiet - (time.monotonic() - last)
             if remaining <= 0:
                 return
 
             self._backend_request_event.clear()
+            observed = self._latest_backend_request_at()
+            if observed != last:
+                continue
+
             try:
                 await asyncio.wait_for(
                     self._backend_request_event.wait(),
                     timeout=remaining,
                 )
             except TimeoutError:
-                # No request arrived for the rest of the required quiet window.
-                return
+                if self._latest_backend_request_at() == observed:
+                    return
 
     def _on_request(self, request) -> None:
         if not self._is_chatgpt_host(request.url):
@@ -214,7 +224,10 @@ class TrafficMonitor:
         self._stats.chatgpt_requests += 1
         auth_session = self._is_exact_base_origin(request.url) and path == "/api/auth/session"
         if self._is_backend_path(path) or auth_session:
-            self._last_backend_request_at = time.monotonic()
+            global _PROCESS_LAST_BACKEND_REQUEST_AT
+            now = time.monotonic()
+            self._last_backend_request_at = now
+            _PROCESS_LAST_BACKEND_REQUEST_AT = now
             self._backend_request_event.set()
         if self._is_backend_path(path):
             self._stats.backend_requests += 1

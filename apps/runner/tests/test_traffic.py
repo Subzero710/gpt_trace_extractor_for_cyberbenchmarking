@@ -51,10 +51,57 @@ async def test_natural_snapshot_is_observed_without_marking_used_until_validated
 
 
 @pytest.mark.asyncio
-async def test_backend_quiet_window_restarts_after_observed_request() -> None:
+async def test_backend_quiet_returns_immediately_without_request_history(monkeypatch) -> None:
+    import gpt_trace_runner.traffic as traffic_module
+
+    monkeypatch.setattr(traffic_module, "_PROCESS_LAST_BACKEND_REQUEST_AT", None)
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+
+    async def unexpected_wait_for(*_args, **_kwargs):
+        raise AssertionError("no wait expected")
+
+    monkeypatch.setattr(asyncio, "wait_for", unexpected_wait_for)
+
+    await monitor.wait_for_backend_quiet(quiet_seconds=1.25)
+
+
+@pytest.mark.asyncio
+async def test_backend_quiet_waits_only_for_remaining_gap(monkeypatch) -> None:
+    import time
+    import gpt_trace_runner.traffic as traffic_module
+
+    monkeypatch.setattr(traffic_module, "_PROCESS_LAST_BACKEND_REQUEST_AT", None)
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    last = time.monotonic() - 0.4
+    monitor._last_backend_request_at = last
+    monkeypatch.setattr(traffic_module, "_PROCESS_LAST_BACKEND_REQUEST_AT", last)
+
+    observed_timeouts = []
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        observed_timeouts.append(timeout)
+        raise TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+
+    await monitor.wait_for_backend_quiet(quiet_seconds=1.0)
+
+    assert len(observed_timeouts) == 1
+    assert 0.45 <= observed_timeouts[0] <= 0.70
+
+
+@pytest.mark.asyncio
+async def test_backend_quiet_restarts_from_new_observed_request(monkeypatch) -> None:
+    import gpt_trace_runner.traffic as traffic_module
+
+    monkeypatch.setattr(traffic_module, "_PROCESS_LAST_BACKEND_REQUEST_AT", None)
     page = FakePage()
     monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
     quiet = 0.03
+    page.handlers["request"](FakeRequest("https://chatgpt.com/backend-api/me"))
     loop = asyncio.get_running_loop()
 
     async def emit_request() -> None:
@@ -70,8 +117,23 @@ async def test_backend_quiet_window_restarts_after_observed_request() -> None:
     )
     elapsed = loop.time() - start
 
-    # The request at ~10ms restarts the full 30ms quiet window.
     assert elapsed >= 0.035
+
+
+def test_new_monitor_inherits_process_backend_request_time(monkeypatch) -> None:
+    import gpt_trace_runner.traffic as traffic_module
+
+    monkeypatch.setattr(traffic_module, "_PROCESS_LAST_BACKEND_REQUEST_AT", None)
+    first_page = FakePage()
+    first = TrafficMonitor(first_page, base_url="https://chatgpt.com")
+    first_page.handlers["request"](
+        FakeRequest("https://chatgpt.com/backend-api/me")
+    )
+
+    second = TrafficMonitor(FakePage(), base_url="https://chatgpt.com")
+
+    assert first._last_backend_request_at is not None
+    assert second._last_backend_request_at == first._last_backend_request_at
 
 
 def test_begin_task_keeps_global_backend_pacing_state() -> None:

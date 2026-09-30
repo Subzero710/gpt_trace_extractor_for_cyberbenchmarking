@@ -133,8 +133,8 @@ class ChatGPTClient:
         self._upload_timeout = upload_timeout_seconds
         self._backend_quiet_seconds = max(0.0, float(backend_quiet_seconds))
         self._natural_snapshot_wait = max(
-            max(0.0, float(natural_snapshot_wait_seconds)),
-            self._backend_quiet_seconds,
+            0.0,
+            float(natural_snapshot_wait_seconds),
         )
         self._expected_model = expected_model_slug.strip()
         self._traffic = TrafficMonitor(page, base_url=self._base_url)
@@ -516,15 +516,7 @@ class ChatGPTClient:
             # through an OpenAI auth origin. Do not hammer or navigate over that
             # flow; just wait for the browser to return to ChatGPT.
             if not self._page.url.startswith(self._base_url):
-                await asyncio.sleep(
-                    min(
-                        max(
-                            0.25,
-                            float(getattr(self, "_backend_quiet_seconds", 0.0)),
-                        ),
-                        remaining,
-                    )
-                )
+                await asyncio.sleep(min(0.25, remaining))
                 continue
 
             try:
