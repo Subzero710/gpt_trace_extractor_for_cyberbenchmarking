@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -65,6 +66,11 @@ class TrafficMonitor:
         self._auth_me_event = asyncio.Event()
         self._auth_me_rate_limit: RateLimited | None = None
         self._auth_session_rate_limit: RateLimited | None = None
+        # Global browser-side pacing signal. This deliberately survives
+        # begin_task(): a fresh benchmark must not burst immediately after
+        # cleanup/navigation traffic from the previous one.
+        self._last_backend_request_at: float | None = None
+        self._backend_request_event = asyncio.Event()
         page.on("request", self._on_request)
         page.on("response", self._on_response)
         page.on("requestfailed", self._on_request_failed)
@@ -171,12 +177,45 @@ class TrafficMonitor:
     def _is_backend_path(path: str) -> bool:
         return path.startswith("/backend-api/") or path.startswith("/backend-anon/")
 
+    async def wait_for_backend_quiet(self, *, quiet_seconds: float) -> None:
+        """Wait until ChatGPT has emitted no backend/auth request for a full gap."""
+        quiet = max(0.0, float(quiet_seconds))
+        if quiet <= 0:
+            return
+
+        # Always observe a fresh full quiet window. A UI action may schedule a
+        # backend request just after its visible state changes, so an old
+        # last-request timestamp is not enough to declare the page settled.
+        anchor = time.monotonic()
+
+        while True:
+            last = self._last_backend_request_at
+            if last is not None and last > anchor:
+                anchor = last
+            remaining = quiet - (time.monotonic() - anchor)
+            if remaining <= 0:
+                return
+
+            self._backend_request_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._backend_request_event.wait(),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                # No request arrived for the rest of the required quiet window.
+                return
+
     def _on_request(self, request) -> None:
         if not self._is_chatgpt_host(request.url):
             return
         self._request_generation[id(request)] = self._generation
         path = urlparse(request.url).path.rstrip("/")
         self._stats.chatgpt_requests += 1
+        auth_session = self._is_exact_base_origin(request.url) and path == "/api/auth/session"
+        if self._is_backend_path(path) or auth_session:
+            self._last_backend_request_at = time.monotonic()
+            self._backend_request_event.set()
         if self._is_backend_path(path):
             self._stats.backend_requests += 1
         if "/sentinel/" in path:

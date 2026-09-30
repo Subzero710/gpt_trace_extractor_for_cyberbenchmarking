@@ -41,6 +41,7 @@ def make_chatgpt(settings: Settings, page) -> ChatGPTClient:
         site_ready_timeout_seconds=settings.chatgpt_site_ready_timeout_seconds,
         challenge_timeout_seconds=settings.chatgpt_challenge_timeout_seconds,
         natural_snapshot_wait_seconds=settings.chatgpt_natural_snapshot_wait_seconds,
+        backend_quiet_seconds=settings.chatgpt_backend_quiet_seconds,
         clipboard_url=settings.validate_clipboard_url(),
         expected_model_slug=settings.chatgpt_expected_model_slug,
     )

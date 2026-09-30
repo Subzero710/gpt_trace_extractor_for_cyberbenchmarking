@@ -102,21 +102,26 @@ class AuthTrafficDouble:
 
 
 @pytest.mark.asyncio
-async def test_auth_wait_reloads_chatgpt_and_uses_backend_me_oracle() -> None:
+async def test_auth_wait_polls_backend_me_without_forced_reload() -> None:
     page = type("PageDouble", (), {})()
     page.url = "https://chatgpt.com/"
-    page.reload = AsyncMock(return_value=None)
+    page.reload = AsyncMock()
+    page.evaluate = AsyncMock(
+        side_effect=[
+            {"status": 401, "object": None, "id": None},
+            {"status": 200, "object": "user", "id": "user-1"},
+        ]
+    )
 
     client = ChatGPTClient.__new__(ChatGPTClient)
     client._page = page
     client._base_url = "https://chatgpt.com"
-    client._traffic = AuthTrafficDouble()
+    client._backend_quiet_seconds = 0.0
 
     await client.wait_until_authenticated(17.0)
 
-    assert client._traffic.reset_calls == 1
-    assert client._traffic.wait_calls == [17.0]
-    page.reload.assert_awaited_once_with(wait_until="commit", timeout=60_000)
+    assert page.evaluate.await_count == 2
+    page.reload.assert_not_awaited()
 
 
 def test_auth_waiter_does_not_use_frontend_auth_selectors() -> None:
@@ -132,7 +137,8 @@ def test_auth_waiter_does_not_use_frontend_auth_selectors() -> None:
     waiter = source.split("async def wait_until_authenticated", 1)[1].split(
         "async def _new_chat_if_needed", 1
     )[0]
-    assert "/backend-api/me" in waiter
+    assert "assert_authenticated_current_page()" in waiter
+    assert ".reload(" not in waiter
     assert "AUTH_SELECTORS" not in waiter
     assert "PROMPT_SELECTORS" not in waiter
 
@@ -277,9 +283,25 @@ async def test_wait_for_conversation_id_resolves_transient_route_by_message_iden
         "user-1",
         limit=5,
         exclude_ids=set(),
-        max_candidate_fetches=2,
+        max_candidate_fetches=1,
         candidate_attempts={},
+        candidate_fetch_delay_seconds=0.0,
     )
+
+
+def test_recovery_does_not_navigate_to_conversation_before_readback() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "chatgpt.py"
+    ).read_text(encoding="utf-8")
+    recover = source.split("async def recover(", 1)[1].split(
+        "async def recover_current_candidate", 1
+    )[0]
+
+    assert "self._navigate(" not in recover
+    assert "self._fetch_recovery_snapshot(conversation_id)" in recover
 
 
 def test_completion_still_requires_stable_url_id_to_equal_sse_id() -> None:
@@ -324,7 +346,7 @@ def test_superbench_runtime_bootstrap_avoids_private_thinking_patch_and_app_scra
     assert "wait_until_authenticated(" in connect
     assert "ensure_extended_thinking_effort_setting()" not in connect
     assert "ensure_high_thinking_effort()" not in connect
-    assert "await chatgpt.goto_home()" in connect
+    assert "await chatgpt.goto_home()" not in connect
     assert "verify_apps_available(bt.tools)" not in connect
 
     chatgpt = (package / "chatgpt.py").read_text(encoding="utf-8")

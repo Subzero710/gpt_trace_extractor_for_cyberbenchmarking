@@ -5,6 +5,7 @@ import json
 import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import unquote
 
@@ -181,19 +182,36 @@ def invoked_app_names(messages: list[dict[str, Any]]) -> set[str]:
 
 
 class ConversationClient:
-    def __init__(self, page: Page, turns: int = 100) -> None:
+    def __init__(
+        self,
+        page: Page,
+        turns: int = 100,
+        *,
+        before_backend_request: Callable[[], Awaitable[None]] | None = None,
+        inter_request_gap_seconds: float = 1.25,
+    ) -> None:
         self._page = page
         self._turns = turns
+        self._before_backend_request = before_backend_request
+        self._inter_request_gap_seconds = max(0.0, float(inter_request_gap_seconds))
 
+    async def _pace_backend_request(self) -> None:
+        if self._before_backend_request is not None:
+            await self._before_backend_request()
+
+    @property
+    def _inter_request_gap_ms(self) -> int:
+        return max(0, int(round(self._inter_request_gap_seconds * 1000.0)))
 
     async def recent_conversation_ids(self, *, limit: int = 5) -> tuple[str, ...]:
         """Return only recent durable backend IDs; never expose the bearer token."""
         if limit < 1:
             raise ValueError("limit must be >= 1")
         endpoint = f"/backend-api/conversations?offset=0&limit={limit}&order=updated"
+        await self._pace_backend_request()
         try:
             result = await self._page.evaluate(
-                """async (endpoint) => {
+                """async ({endpoint, delayMs}) => {
                     const session = await fetch(
                         '/api/auth/session',
                         {credentials:'include', cache:'no-store'}
@@ -228,7 +246,9 @@ class ConversationClient:
                             text: ''
                         };
                     }
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    if (delayMs > 0) {
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                    }
                     const r = await fetch(endpoint, {
                         credentials: 'include',
                         cache: 'no-store',
@@ -247,7 +267,7 @@ class ConversationClient:
                         text: await r.text()
                     };
                 }""",
-                endpoint,
+                {"endpoint": endpoint, "delayMs": self._inter_request_gap_ms},
             )
         except Exception as exc:
             raise ConversationError(f"conversation list fetch failed: {exc}") from exc
@@ -354,9 +374,10 @@ class ConversationClient:
             f"/backend-api/conversations/{conversation_id}"
             f"?include_has_versions=true&num_turns={self._turns}"
         )
+        await self._pace_backend_request()
         try:
             result = await self._page.evaluate(
-                """async (endpoint) => {
+                """async ({endpoint, delayMs}) => {
                     // Current ChatGPT backend conversation reads use a short-lived
                     // bearer token in addition to the browser session cookie.
                     // Keep that token entirely in page JavaScript: never return it
@@ -398,7 +419,9 @@ class ConversationClient:
                         };
                     }
 
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    if (delayMs > 0) {
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                    }
                     const r = await fetch(endpoint, {
                         credentials: 'include',
                         cache: 'no-store',
@@ -419,7 +442,7 @@ class ConversationClient:
                         text: await r.text()
                     };
                 }""",
-                endpoint,
+                {"endpoint": endpoint, "delayMs": self._inter_request_gap_ms},
             )
         except Exception as exc:
             raise ConversationError(f"fetch {conversation_id} failed: {exc}") from exc
@@ -489,9 +512,10 @@ class ConversationClient:
                 await asyncio.sleep(delay)
 
         for attempt in range(max_attempts):
+            await self._pace_backend_request()
             try:
                 result = await self._page.evaluate(
-                    """async (endpoint) => {
+                    """async ({endpoint, delayMs}) => {
                         const session = await fetch(
                             '/api/auth/session',
                             {credentials:'include', cache:'no-store'}
@@ -528,7 +552,9 @@ class ConversationClient:
                             };
                         }
 
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        if (delayMs > 0) {
+                            await new Promise(resolve => setTimeout(resolve, delayMs));
+                        }
                         const r = await fetch(endpoint, {
                             method: 'DELETE',
                             credentials: 'include',
@@ -549,7 +575,7 @@ class ConversationClient:
                                 r.headers.get('openai-request-id') || null
                         };
                     }""",
-                    endpoint,
+                    {"endpoint": endpoint, "delayMs": self._inter_request_gap_ms},
                 )
             except Exception as exc:
                 raise ConversationError(

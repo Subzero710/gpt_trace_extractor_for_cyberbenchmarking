@@ -71,7 +71,9 @@ async def _connect_chatgpt(*, settings, make_chatgpt, bt):
             await chatgpt.wait_until_authenticated(
                 settings.chatgpt_site_ready_timeout_seconds
             )
-        await chatgpt.goto_home()
+        # Do not force a second navigation after the auth probe/reload. The
+        # task preparation path will navigate home only if the current page
+        # actually needs it, and all ChatGPT network actions are centrally paced.
         await chatgpt.prepare_session(fresh_home=False)
         return session, chatgpt
     except BaseException:

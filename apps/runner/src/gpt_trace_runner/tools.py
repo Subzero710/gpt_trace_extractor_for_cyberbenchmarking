@@ -22,6 +22,7 @@ from .models import BenchmarkTool
 # No artificial keyboard delay is added here. CloakBrowser owns humanization.
 
 EditorGetter = Callable[[], Awaitable[Locator]]
+NetworkQuiet = Callable[[], Awaitable[None]]
 
 
 # A visually empty contenteditable is not guaranteed to have innerText == "".
@@ -362,6 +363,7 @@ async def assert_apps_available(
     tools: tuple[BenchmarkTool, ...],
     interaction: InteractionGuard,
     timeout_seconds: float,
+    network_quiet: NetworkQuiet | None = None,
 ) -> None:
     """Verify configured Apps by resolving each one through '@'."""
     seen: set[str] = set()
@@ -373,6 +375,8 @@ async def assert_apps_available(
         seen.add(tool.name)
 
         try:
+            if network_quiet is not None:
+                await network_quiet()
             await _select_app_via_mention(
                 page,
                 get_editor=get_editor,
@@ -380,6 +384,8 @@ async def assert_apps_available(
                 interaction=interaction,
                 timeout_seconds=timeout_seconds,
             )
+            if network_quiet is not None:
+                await network_quiet()
         finally:
             # Escape is only for transient autocomplete UI. Cleanup itself is
             # mandatory and runs against the current composer.
@@ -396,11 +402,14 @@ async def select_apps(
     tools: tuple[BenchmarkTool, ...],
     interaction: InteractionGuard,
     timeout_seconds: float,
+    network_quiet: NetworkQuiet | None = None,
 ) -> None:
     """Append Apps, retrying once only while still safely pre-submission."""
     for attempt in range(2):
         try:
             for tool in tools:
+                if network_quiet is not None:
+                    await network_quiet()
                 await _select_app_via_mention(
                     page,
                     get_editor=get_editor,
@@ -408,6 +417,8 @@ async def select_apps(
                     interaction=interaction,
                     timeout_seconds=timeout_seconds,
                 )
+                if network_quiet is not None:
+                    await network_quiet()
             return
         except AppUnavailable:
             if attempt:

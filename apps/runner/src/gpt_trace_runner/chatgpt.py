@@ -121,19 +121,29 @@ class ChatGPTClient:
         site_ready_timeout_seconds: float,
         challenge_timeout_seconds: float,
         natural_snapshot_wait_seconds: float,
+        backend_quiet_seconds: float,
         clipboard_url: str,
         expected_model_slug: str,
     ) -> None:
         self._page = page
         self._base_url = base_url.rstrip("/")
-        self._conversation = ConversationClient(page, turns=conversation_turns)
         self._turn_timeout = turn_timeout_seconds
         self._stream_start_timeout = stream_start_timeout_seconds
         self._tool_select_timeout = tool_select_timeout_seconds
         self._upload_timeout = upload_timeout_seconds
-        self._natural_snapshot_wait = natural_snapshot_wait_seconds
+        self._backend_quiet_seconds = max(0.0, float(backend_quiet_seconds))
+        self._natural_snapshot_wait = max(
+            max(0.0, float(natural_snapshot_wait_seconds)),
+            self._backend_quiet_seconds,
+        )
         self._expected_model = expected_model_slug.strip()
         self._traffic = TrafficMonitor(page, base_url=self._base_url)
+        self._conversation = ConversationClient(
+            page,
+            turns=conversation_turns,
+            before_backend_request=self._wait_for_backend_quiet,
+            inter_request_gap_seconds=self._backend_quiet_seconds,
+        )
         self._interaction = InteractionGuard(
             page, clipboard_url=clipboard_url, timeout_seconds=site_ready_timeout_seconds
         )
@@ -326,6 +336,15 @@ class ChatGPTClient:
                 except Exception:
                     pass
 
+    async def _wait_for_backend_quiet(self) -> None:
+        quiet = max(0.0, float(getattr(self, "_backend_quiet_seconds", 0.0)))
+        if quiet <= 0:
+            return
+        traffic = getattr(self, "_traffic", None)
+        if traffic is None:
+            return
+        await traffic.wait_for_backend_quiet(quiet_seconds=quiet)
+
     async def _navigate(self, url: str) -> None:
         # BrowserClient applies cloakbrowser.human.patch_browser_async() to the
         # connected Browser before this Page reaches ChatGPTClient. Calling the
@@ -337,6 +356,7 @@ class ChatGPTClient:
         # proves the navigation response was received; SiteGuard or the auth
         # waiter then handles login pages, interstitials/challenges and the
         # final actionable ChatGPT UI.
+        await self._wait_for_backend_quiet()
         try:
             await self._page.goto(
                 url,
@@ -402,6 +422,7 @@ class ChatGPTClient:
             await self.goto_home()
         await self._site.wait_ready()
         await self._check_environment()
+        await self._wait_for_backend_quiet()
 
     async def assert_authenticated_current_page(self) -> None:
         """Verify the current ChatGPT page without navigation or reload."""
@@ -411,6 +432,7 @@ class ChatGPTClient:
                 f"current URL is {self._page.url!r}"
             )
 
+        await self._wait_for_backend_quiet()
         try:
             value = await self._page.evaluate(
                 """async () => {
@@ -473,31 +495,45 @@ class ChatGPTClient:
             )
 
     async def wait_until_authenticated(self, timeout_seconds: float) -> None:
-        """Use ChatGPT's own backend identity request as the auth oracle.
+        """Poll ChatGPT's backend identity endpoint without forcing a page reload."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
 
-        The supplied HAR shows authenticated frontend startup issuing:
-        GET /backend-api/me -> HTTP 200 with
-        {"object": "user", "id": "<non-empty>", ...}.
-        """
-        self._traffic.reset_auth_probe()
-
-        # TrafficMonitor is already listening before this navigation. Refreshing
-        # once makes an existing persistent session emit a fresh /backend-api/me;
-        # an unauthenticated session can then complete login normally in noVNC,
-        # after which the frontend emits the successful /me response.
-        if self._page.url.startswith(self._base_url):
-            try:
-                await self._page.reload(wait_until="commit", timeout=60_000)
-            except PlaywrightTimeoutError as exc:
-                raise FatalUIState(
-                    "ChatGPT authentication probe reload did not commit within 60 seconds"
-                ) from exc
-        else:
+        # A blank/non-ChatGPT tab must first reach the real site so the operator
+        # can log in. Once there, never reload merely to manufacture an auth
+        # observation: low-rate /backend-api/me polling is enough.
+        if not self._page.url.startswith(self._base_url):
             await self.goto_home()
 
-        await self._traffic.wait_for_authenticated_user(
-            timeout_seconds=timeout_seconds
-        )
+        last_error: AuthenticationRequired | None = None
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise AuthenticationRequired(
+                    "ChatGPT backend session was not authenticated before timeout"
+                ) from last_error
+
+            # During an interactive login ChatGPT may temporarily send the tab
+            # through an OpenAI auth origin. Do not hammer or navigate over that
+            # flow; just wait for the browser to return to ChatGPT.
+            if not self._page.url.startswith(self._base_url):
+                await asyncio.sleep(
+                    min(
+                        max(
+                            0.25,
+                            float(getattr(self, "_backend_quiet_seconds", 0.0)),
+                        ),
+                        remaining,
+                    )
+                )
+                continue
+
+            try:
+                await self.assert_authenticated_current_page()
+                return
+            except RateLimited:
+                raise
+            except AuthenticationRequired as exc:
+                last_error = exc
 
     async def _new_chat_if_needed(self) -> None:
         # Successful benchmark conversations are deleted explicitly after
@@ -537,6 +573,7 @@ class ChatGPTClient:
     async def _upload(self, attachments: tuple[Path, ...]) -> None:
         if not attachments:
             return
+        await self._wait_for_backend_quiet()
         payloads = build_file_payloads(attachments)
         attach = await first_visible(self._page, ATTACH_BUTTON_SELECTORS)
         if attach is None:
@@ -585,6 +622,7 @@ class ChatGPTClient:
             tools=tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
+            network_quiet=self._wait_for_backend_quiet,
         )
         await self._site.wait_ready()
 
@@ -598,6 +636,7 @@ class ChatGPTClient:
             tools=task.tools,
             interaction=self._interaction,
             timeout_seconds=self._tool_select_timeout,
+            network_quiet=self._wait_for_backend_quiet,
         )
 
         # App mentions are structured nodes. Append the exact benchmark prompt
@@ -620,6 +659,7 @@ class ChatGPTClient:
         await self._check_environment()
         try:
             await self._new_chat_if_needed()
+            await self._wait_for_backend_quiet()
             await self.ensure_high_thinking_effort()
             await self._upload(task.attachments)
             await self._compose(task)
@@ -643,6 +683,9 @@ class ChatGPTClient:
             raise
         except Exception as exc:
             raise FatalUIState("could not inspect Send button state") from exc
+        # Do not stack the generation POST on top of App-selection, upload,
+        # navigation, auth, or other frontend backend traffic.
+        await self._wait_for_backend_quiet()
         # Durable submission marker is committed only after a concrete Send
         # control is found, immediately before the potentially-successful click.
         before_send()
@@ -825,7 +868,7 @@ class ChatGPTClient:
                     exclude_ids=rejected_ids,
                     max_candidate_fetches=candidate_budget,
                     candidate_attempts=candidate_attempts,
-                    candidate_fetch_delay_seconds=max(1.0, poll_delay),
+                    candidate_fetch_delay_seconds=0.0,
                 )
             except RateLimited as exc:
                 last_rate_limit = exc
@@ -1033,7 +1076,10 @@ class ChatGPTClient:
             if callable(natural_snapshot):
                 natural = await natural_snapshot(
                     submitted.conversation_id,
-                    wait_seconds=0,
+                    wait_seconds=max(
+                        0.0,
+                        float(getattr(self, "_natural_snapshot_wait", 0.0)),
+                    ),
                 )
             if natural is not None:
                 try:
@@ -1338,8 +1384,10 @@ class ChatGPTClient:
             conversation_id,
             user_message_id,
         )
-        await self._navigate(f"{self._base_url}/c/{conversation_id}")
+        # Recovery only needs the durable backend snapshot; navigating the
+        # teacher browser to /c/<id> would create an unnecessary frontend burst.
         await self._site.wait_ready()
+        await self._wait_for_backend_quiet()
         await self._check_environment()
         try:
             conversation = await self._fetch_recovery_snapshot(conversation_id)

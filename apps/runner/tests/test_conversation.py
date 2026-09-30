@@ -89,8 +89,10 @@ async def test_conversation_fetch_uses_in_page_bearer_without_returning_token() 
     payload = await client.fetch("conv")
     assert payload == {"messages": []}
 
-    javascript, endpoint = page.evaluate.await_args.args
+    javascript, request = page.evaluate.await_args.args
+    endpoint = request["endpoint"]
     assert endpoint.startswith("/backend-api/conversations/conv?")
+    assert request["delayMs"] == 1250
     assert "/api/auth/session" in javascript
     assert "payload.accessToken" in javascript
     assert "authorization: `Bearer ${accessToken}`" in javascript
@@ -152,8 +154,10 @@ async def test_conversation_delete_uses_bearer_and_exact_delete_endpoint() -> No
 
     await client.delete("conv-123")
 
-    javascript, endpoint = page.evaluate.await_args.args
+    javascript, request = page.evaluate.await_args.args
+    endpoint = request["endpoint"]
     assert endpoint == "/backend-api/conversation/id/conv-123"
+    assert request["delayMs"] == 1250
     assert "method: 'DELETE'" in javascript
     assert "/api/auth/session" in javascript
     assert "authorization: `Bearer ${accessToken}`" in javascript
@@ -189,7 +193,9 @@ async def test_recent_conversation_resolution_uses_exact_user_message_identity()
     stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
     page = type("PageDouble", (), {})()
 
-    def result_for_call(_javascript, endpoint):
+    def result_for_call(_javascript, request):
+        endpoint = request["endpoint"]
+        assert request["delayMs"] == 1250
         if endpoint.startswith("/backend-api/conversations?offset=0&limit=5"):
             return {
                 "sessionStatus": 200,

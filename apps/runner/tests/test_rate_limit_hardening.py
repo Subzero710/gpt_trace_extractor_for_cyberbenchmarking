@@ -92,7 +92,7 @@ async def test_recent_resolution_paces_list_before_candidate_fetch(monkeypatch) 
     sleep.assert_awaited_once_with(1.0)
 
 
-def test_explicit_conversation_http_pairs_are_spaced() -> None:
+def test_explicit_conversation_http_pairs_use_configured_gap() -> None:
     source = (
         __import__("pathlib").Path(__file__).resolve().parents[1]
         / "src"
@@ -100,7 +100,9 @@ def test_explicit_conversation_http_pairs_are_spaced() -> None:
         / "conversation.py"
     ).read_text(encoding="utf-8")
 
-    assert source.count("setTimeout(resolve, 1000)") >= 3
+    assert "setTimeout(resolve, 1000)" not in source
+    assert source.count("setTimeout(resolve, delayMs)") >= 3
+    assert "_inter_request_gap_ms" in source
 
 
 @pytest.mark.asyncio
@@ -632,7 +634,7 @@ async def test_transient_route_fallback_is_single_candidate_and_paced() -> None:
 
     assert resolved == "durable-1"
     assert client._conversation.kwargs["max_candidate_fetches"] == 1
-    assert client._conversation.kwargs["candidate_fetch_delay_seconds"] == pytest.approx(1.0)
+    assert client._conversation.kwargs["candidate_fetch_delay_seconds"] == pytest.approx(0.0)
 
 
 def test_successful_journal_recovery_arms_inter_task_pause() -> None:
@@ -651,3 +653,47 @@ def test_successful_journal_recovery_arms_inter_task_pause() -> None:
     )[0]
     assert "pending_before_recovery is not None" in recovery
     assert "last_completed_task_at = asyncio.get_running_loop().time()" in recovery
+
+def test_all_runner_chatgpt_control_paths_are_paced() -> None:
+    from pathlib import Path
+
+    package = Path(__file__).resolve().parents[1] / "src" / "gpt_trace_runner"
+    chatgpt = (package / "chatgpt.py").read_text(encoding="utf-8")
+    conversation = (package / "conversation.py").read_text(encoding="utf-8")
+    tools = (package / "tools.py").read_text(encoding="utf-8")
+    execution = (
+        package / "superbench" / "execution.py"
+    ).read_text(encoding="utf-8")
+
+    navigate = chatgpt.split("async def _navigate(", 1)[1].split(
+        "async def goto_home", 1
+    )[0]
+    auth = chatgpt.split("async def assert_authenticated_current_page", 1)[1].split(
+        "async def wait_until_authenticated", 1
+    )[0]
+    auth_wait = chatgpt.split("async def wait_until_authenticated", 1)[1].split(
+        "async def _new_chat_if_needed", 1
+    )[0]
+    send = chatgpt.split("async def _click_send", 1)[1].split(
+        "@staticmethod", 1
+    )[0]
+    recover = chatgpt.split("async def recover(", 1)[1].split(
+        "async def recover_current_candidate", 1
+    )[0]
+    connect = execution.split("async def _connect_chatgpt(", 1)[1].split(
+        "async def _cleanup_task", 1
+    )[0]
+
+    assert "await self._wait_for_backend_quiet()" in navigate
+    assert "await self._wait_for_backend_quiet()" in auth
+    assert ".reload(" not in auth_wait
+    assert "assert_authenticated_current_page()" in auth_wait
+    assert "await self._wait_for_backend_quiet()" in send
+    assert "self._navigate(" not in recover
+    assert "await chatgpt.goto_home()" not in connect
+
+    assert "before_backend_request=self._wait_for_backend_quiet" in chatgpt
+    assert chatgpt.count("network_quiet=self._wait_for_backend_quiet") == 2
+    assert conversation.count("await self._pace_backend_request()") == 3
+    assert conversation.count("setTimeout(resolve, delayMs)") == 3
+    assert "network_quiet: NetworkQuiet | None = None" in tools

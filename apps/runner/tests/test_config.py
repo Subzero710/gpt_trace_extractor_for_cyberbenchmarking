@@ -97,3 +97,5 @@ def test_invalid_workstation_resources_and_empty_model_are_rejected() -> None:
         Settings(workstation_memory_mb=128)
     with pytest.raises(ValidationError):
         Settings(chatgpt_expected_model_slug="   ")
+    with pytest.raises(ValidationError):
+        Settings(chatgpt_backend_quiet_seconds=0.5)

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -47,6 +48,43 @@ async def test_natural_snapshot_is_observed_without_marking_used_until_validated
     assert monitor.runtime_metadata()["natural_snapshot_used"] is False
     monitor.mark_natural_snapshot_used()
     assert monitor.runtime_metadata()["natural_snapshot_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_backend_quiet_window_restarts_after_observed_request() -> None:
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    quiet = 0.03
+    loop = asyncio.get_running_loop()
+
+    async def emit_request() -> None:
+        await asyncio.sleep(0.01)
+        page.handlers["request"](
+            FakeRequest("https://chatgpt.com/backend-api/me")
+        )
+
+    start = loop.time()
+    await asyncio.gather(
+        monitor.wait_for_backend_quiet(quiet_seconds=quiet),
+        emit_request(),
+    )
+    elapsed = loop.time() - start
+
+    # The request at ~10ms restarts the full 30ms quiet window.
+    assert elapsed >= 0.035
+
+
+def test_begin_task_keeps_global_backend_pacing_state() -> None:
+    page = FakePage()
+    monitor = TrafficMonitor(page, base_url="https://chatgpt.com")
+    request = FakeRequest("https://chatgpt.com/backend-api/me")
+    page.handlers["request"](request)
+    last = monitor._last_backend_request_at
+
+    monitor.begin_task()
+
+    assert last is not None
+    assert monitor._last_backend_request_at == last
 
 
 def test_429_is_task_scoped_and_does_not_poison_next_task() -> None:
