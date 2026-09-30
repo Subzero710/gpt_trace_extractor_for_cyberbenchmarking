@@ -382,3 +382,16 @@ def test_runner_session_bootstrap_does_not_force_second_home_navigation() -> Non
     )[0]
     assert "prepare_session(fresh_home=False)" in ensure
     assert "prepare_session(fresh_home=True)" not in ensure
+
+
+def test_auth_command_directs_operator_to_kasm_authwall() -> None:
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    cli_source = (package / "cli.py").read_text(encoding="utf-8")
+    auth_block = cli_source.split('@app.command("superbench-auth")', 1)[1].split(
+        '@app.command("superbench-reset-recovery")', 1
+    )[0]
+
+    assert "https://<server>:6901/" in auth_block
+    assert "kasm_user" in auth_block
+    assert "noVNC" not in auth_block
+    assert "browser_novnc_url" not in auth_block

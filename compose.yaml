@@ -105,14 +105,19 @@ services:
     environment:
       DISPLAY: :99
       BROWSER_CLIPBOARD_PORT: '8765'
+      BROWSER_KASM_USERNAME: kasm_user
+      BROWSER_KASM_PASSWORD_FILE: /run/secrets/teacher_browser_password
     volumes:
     - browser_profile:/profile
+    secrets:
+    - source: teacher_browser_password
+      target: teacher_browser_password
     networks:
     - core_internal
     - ui_egress
     ports:
     - 127.0.0.1:9222:9222
-    - 127.0.0.1:7900:7900
+    - 6901:6901
     shm_size: 2gb
     security_opt:
     - seccomp=./infra/browser/seccomp_profile.json
@@ -248,3 +253,5 @@ secrets:
     file: ./.secrets/workstation_broker_admin_token
   workstation_broker_controller_token:
     file: ./.secrets/workstation_broker_controller_token
+  teacher_browser_password:
+    file: ./.secrets/teacher_browser_password

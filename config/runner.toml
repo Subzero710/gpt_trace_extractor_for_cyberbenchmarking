@@ -5,7 +5,6 @@ storage_base_url = "http://storage:8080"
 browser_cdp_url = ""
 browser_cdp_base_url = "http://teacher-browser:9222"
 browser_profile_identity_path = "/browser-profile/.gpt-trace-identity"
-browser_novnc_url = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
 browser_humanize = true
 browser_humanize_preset = "default"
 browser_clipboard_url = "http://teacher-browser:8765/clipboard"

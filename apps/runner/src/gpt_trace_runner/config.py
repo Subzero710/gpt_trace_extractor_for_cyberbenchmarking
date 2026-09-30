@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     browser_cdp_url: str = ""
     browser_cdp_base_url: str = "http://teacher-browser:9222"
     browser_profile_identity_path: Path = Path("/browser-profile/.gpt-trace-identity")
-    browser_novnc_url: str = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
     browser_humanize: bool = True
     browser_humanize_preset: Literal["default", "careful"] = "default"
     browser_clipboard_url: str = "http://teacher-browser:8765/clipboard"

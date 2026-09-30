@@ -92,8 +92,34 @@ def verify_storage_runtime(root: Path) -> None:
     run(["docker", "run", "--rm", "--entrypoint", "python", image, "-c", code])
 
 
+
+def verify_teacher_browser_runtime(root: Path) -> None:
+    image = compose_service_image(root, "teacher-browser")
+    inspected = run(["docker", "image", "inspect", image], check=False, capture=True)
+    if inspected.returncode != 0:
+        detail = (inspected.stderr or inspected.stdout).strip()[:1000]
+        raise RuntimeError(
+            f"built Compose image is missing for teacher-browser: {image}"
+            + (f": {detail}" if detail else "")
+        )
+    probe = r"""
+set -eu
+command -v Xvnc >/dev/null
+command -v kasmvncpasswd >/dev/null
+version="$(Xvnc -version 2>&1 || true)"
+printf '%s\n' "$version" | grep -F 'KasmVNC 1.5.0' >/dev/null
+! command -v x11vnc >/dev/null 2>&1
+! command -v websockify >/dev/null 2>&1
+test ! -d /usr/share/novnc
+grep -Eq '^  websocket_port: 6901$' /etc/kasmvnc/kasmvnc.yaml
+grep -Eq '^    require_ssl: true$' /etc/kasmvnc/kasmvnc.yaml
+test -x /usr/local/bin/kasm-healthcheck
+"""
+    run(["docker", "run", "--rm", "--entrypoint", "sh", image, "-ec", probe])
+
 def verify_manifests(root: Path) -> None:
     verify_storage_runtime(root)
+    verify_teacher_browser_runtime(root)
     verify_registry_manifest_pin(root)
     image = compose_service_image(root, "kali-workstation-controller")
     inspected = run(["docker", "image", "inspect", image], check=False, capture=True)

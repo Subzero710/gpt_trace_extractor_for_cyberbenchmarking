@@ -15,11 +15,13 @@ SECRETS_DIR = ROOT / ".secrets"
 CONTROL_TOKEN = SECRETS_DIR / "app_control_token"
 BROKER_ADMIN_TOKEN = SECRETS_DIR / "workstation_broker_admin_token"
 BROKER_CONTROLLER_TOKEN = SECRETS_DIR / "workstation_broker_controller_token"
+TEACHER_BROWSER_PASSWORD = SECRETS_DIR / "teacher_browser_password"
 
 KNOWN_SECRET_KEYS = {
     "POSTGRES_PASSWORD",
     "CONTROL_PLANE_API_KEY",
     "APP_KALI_WORKSTATION_TUNNEL_ID",
+    "TEACHER_BROWSER_PASSWORD",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -112,6 +114,20 @@ def ensure_control_tokens() -> None:
         raise SystemExit("generated control tokens must be distinct")
 
 
+
+def materialize_teacher_browser_password(values: dict[str, str]) -> None:
+    password = values.get("TEACHER_BROWSER_PASSWORD", "")
+    if not 12 <= len(password) <= 128:
+        raise SystemExit("TEACHER_BROWSER_PASSWORD must be 12..128 characters in .env")
+    if "\n" in password or "\r" in password:
+        raise SystemExit("TEACHER_BROWSER_PASSWORD must be a single line")
+    SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(SECRETS_DIR, 0o700)
+    atomic_secret(TEACHER_BROWSER_PASSWORD, password + "\n")
+    # Docker Compose bind-mounts file secrets. Keep the directory private while
+    # allowing the remapped non-root browser uid to read this one secret.
+    os.chmod(TEACHER_BROWSER_PASSWORD, 0o444)
+
 def validate_tunnels(values: dict[str, str]) -> None:
     tunnel_keys = ("APP_KALI_WORKSTATION_TUNNEL_ID",)
     for key in tunnel_keys:
@@ -130,6 +146,7 @@ def main() -> int:
     validate_secret_only_env(values)
     os.chmod(ENV_PATH, 0o600)
     ensure_control_tokens()
+    materialize_teacher_browser_password(values)
 
     if args.mode in ("doctor", "tools"):
         validate_tunnels(values)

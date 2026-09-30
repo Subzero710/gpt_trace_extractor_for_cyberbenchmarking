@@ -306,7 +306,7 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
             if active is not None and active.status != "completed":
                 raise RecoveryIncomplete(
                     f"auth refused while active Superbench run {active.run_id} is "
-                    f"{active.status}; resolve via noVNC then make resume"
+                    f"{active.status}; resolve in the teacher-browser KasmVNC session then make resume"
                 )
 
             storage = StorageClient(settings.storage_base_url)
@@ -331,7 +331,9 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
             try:
                 chatgpt = make_chatgpt(settings, session.page)
                 console.print(
-                    f"Open noVNC and log in:\n [bold]{settings.browser_novnc_url}[/]"
+                    "Open the teacher-browser KasmVNC endpoint at "
+                    "[bold]https://<server>:6901/[/] (user [bold]kasm_user[/]), "
+                    "then log in to ChatGPT."
                 )
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
                 await chatgpt.verify_apps_available(task.tools)
@@ -376,5 +378,5 @@ def superbench_reset_recovery(task_id: str = typer.Argument(...), yes: bool = ty
     control.paused_error('recovery','RecoveryReset','operator abandoned recovery; resume retries same frozen task')
   finally:
    await lifecycle.close(); await storage.close()
-  console.print(f"[yellow]recovery reset[/] {task_id}; run sudo make resume")
+  console.print(f"[yellow]recovery reset[/] {task_id}; run make resume")
  asyncio.run(main())
