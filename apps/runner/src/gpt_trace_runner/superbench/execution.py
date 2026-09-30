@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
+from dataclasses import replace
+import time
 from pathlib import Path
 
 from ..browser import BrowserClient
-from ..exceptions import BatchCircuitBreaker, RecoveryIncomplete
+from ..exceptions import (
+    AuthenticationRequired,
+    BatchCircuitBreaker,
+    DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+    RateLimited,
+    RecoveryIncomplete,
+)
 from ..journal import JournalStore
 from ..lock import RunnerLock
 from ..models import task_app_provenance, task_fingerprint
@@ -48,7 +56,7 @@ async def _record_pre_runner_failure(
     )
 
 
-async def _connect_chatgpt(*, settings, make_chatgpt, bt):
+async def _connect_chatgpt(*, settings, make_chatgpt):
     browser = BrowserClient(
         settings.effective_browser_cdp_url(),
         humanize=settings.browser_humanize,
@@ -57,8 +65,16 @@ async def _connect_chatgpt(*, settings, make_chatgpt, bt):
     session = await browser.connect(require_existing_page=False)
     try:
         chatgpt = make_chatgpt(settings, session.page)
-        await chatgpt.wait_until_authenticated(settings.chatgpt_site_ready_timeout_seconds)
-        await chatgpt.verify_apps_available(bt.tools)
+        try:
+            await chatgpt.assert_authenticated_current_page()
+        except AuthenticationRequired:
+            await chatgpt.wait_until_authenticated(
+                settings.chatgpt_site_ready_timeout_seconds
+            )
+        # Do not force a second navigation after the auth probe/reload. The
+        # task preparation path will navigate home only if the current page
+        # actually needs it, and all ChatGPT network actions are centrally paced.
+        await chatgpt.prepare_session(fresh_home=False)
         return session, chatgpt
     except BaseException:
         await session.disconnect()
@@ -89,23 +105,58 @@ async def _cleanup_task(
         # The batch is already stopping for primary_error. Do not mask it.
 
 
+def _persist_rate_limit_defer(journal: JournalStore, pending, exc: RateLimited) -> None:
+    if pending is None:
+        return
+    delay = max(
+        1.0,
+        exc.retry_delay(
+            DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+            maximum_seconds=DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+        ),
+    )
+    not_before = time.time() + float(delay)
+    previous = pending.retry_not_before
+    if previous is not None:
+        not_before = max(not_before, float(previous))
+    journal.write(replace(pending, retry_not_before=not_before))
+
+
+def _raise_if_recovery_deferred(pending) -> None:
+    not_before = pending.retry_not_before
+    if not_before is None:
+        return
+    remaining = float(not_before) - time.time()
+    if remaining > 0:
+        raise RateLimited(
+            "ChatGPT recovery is deferred by server Retry-After",
+            retry_after_seconds=remaining,
+            endpoint="recovery-journal",
+            method="RECOVER",
+        )
+
+
 async def _recover_pending_journal(
     *,
     settings,
     registry,
     make_lifecycle,
-    make_chatgpt,
     console,
     adapters,
     entries,
     camp,
     storage,
     staging: Path,
+    get_chatgpt,
 ) -> None:
     journal = JournalStore(settings.journal_path)
     pending = journal.load()
     if pending is None:
         return
+    # This check occurs before materialization, browser connection, lifecycle
+    # recovery, or any ChatGPT request. An early manual resume therefore cannot
+    # violate a persisted server Retry-After.
+    _raise_if_recovery_deferred(pending)
 
     catalog_entry = next(
         (
@@ -135,12 +186,9 @@ async def _recover_pending_journal(
         app_environments=dict(pending.app_environments),
     )
     lifecycle = make_lifecycle(settings, [bt])
-    session = None
     recovery_error: BaseException | None = None
     try:
-        session, chatgpt = await _connect_chatgpt(
-            settings=settings, make_chatgpt=make_chatgpt, bt=bt
-        )
+        chatgpt = await get_chatgpt()
 
         async def evaluate(captured):
             result = await adapter.evaluate(task, prepared=prepared, captured=captured)
@@ -171,9 +219,10 @@ async def _recover_pending_journal(
                 )
             # Recovery failures are technical failures: never continue the batch.
             raise
+    except RateLimited as exc:
+        _persist_rate_limit_defer(journal, journal.load(), exc)
+        raise
     finally:
-        if session is not None:
-            await session.disconnect()
         # Never destroy evaluator-side state while recovery is still pending.
         if journal.load() is None:
             await _cleanup_task(
@@ -224,6 +273,18 @@ async def run_pending(
     staging = Path("/data/state/superbench/staging")
     staging.mkdir(parents=True, exist_ok=True)
     attempted = 0
+    last_completed_task_at: float | None = None
+    browser_session = None
+    chatgpt_client = None
+
+    async def get_chatgpt():
+        nonlocal browser_session, chatgpt_client
+        if chatgpt_client is None:
+            browser_session, chatgpt_client = await _connect_chatgpt(
+                settings=settings,
+                make_chatgpt=make_chatgpt,
+            )
+        return chatgpt_client
 
     try:
         await storage.health()
@@ -237,8 +298,9 @@ async def run_pending(
             # completed-run skip or new task scheduling. This prevents a stale
             # cleanup_pending journal from poisoning the next task.
             if executor is None:
+                pending_before_recovery = JournalStore(settings.journal_path).load()
                 if selected_run_task_ids is not None:
-                    pending = JournalStore(settings.journal_path).load()
+                    pending = pending_before_recovery
                     if pending is not None and pending.task_id not in set(selected_run_task_ids):
                         raise RecoveryIncomplete(
                             f"pending journal task {pending.task_id!r} is outside frozen active-run selection"
@@ -247,14 +309,19 @@ async def run_pending(
                     settings=settings,
                     registry=registry,
                     make_lifecycle=make_lifecycle,
-                    make_chatgpt=make_chatgpt,
                     console=console,
                     adapters=adapters,
                     entries=entries,
                     camp=camp,
                     storage=storage,
                     staging=staging,
+                    get_chatgpt=get_chatgpt,
                 )
+                if pending_before_recovery is not None:
+                    # Successful journal reconciliation used the ChatGPT session
+                    # (auth/navigation/readback/delete). Apply the same pacing
+                    # before starting a fresh task as after a normal completion.
+                    last_completed_task_at = asyncio.get_running_loop().time()
             if control_store is not None:
                 active = control_store.confirm_running()
                 if active.status == "pause_requested":
@@ -351,9 +418,14 @@ async def run_pending(
                             control_store.finish_task(run_id)
                     continue
 
+                if last_completed_task_at is not None:
+                    pause = settings.chatgpt_inter_task_pause_seconds
+                    remaining = pause - (asyncio.get_running_loop().time() - last_completed_task_at)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+
                 prepared = None
                 lifecycle = None
-                session = None
                 runner = None
                 runner_started = False
                 recovery_required = False
@@ -363,9 +435,7 @@ async def run_pending(
                 try:
                     prepared = await adapter.prepare(task)
                     lifecycle = make_lifecycle(settings, [bt])
-                    session, chatgpt = await _connect_chatgpt(
-                        settings=settings, make_chatgpt=make_chatgpt, bt=bt
-                    )
+                    chatgpt = await get_chatgpt()
 
                     async def evaluate(captured):
                         result = await adapter.evaluate(
@@ -425,6 +495,13 @@ async def run_pending(
                         and latest.status == "completed"
                         and pending_for_task
                     ):
+                        if isinstance(exc, RateLimited):
+                            # Cleanup is already durably journaled. Do not issue an
+                            # immediate second DELETE after a 429; persist the
+                            # server cooldown and let a later resume reconcile it.
+                            _persist_rate_limit_defer(journal, pending, exc)
+                            recovery_required = True
+                            raise
                         try:
                             await runner.reconcile_journal([bt])
                         except BaseException:
@@ -454,6 +531,8 @@ async def run_pending(
                     ):
                         # This includes BatchCircuitBreaker subclasses raised after
                         # submission. Preserve both App/evaluator state and journal.
+                        if isinstance(exc, RateLimited):
+                            _persist_rate_limit_defer(journal, pending, exc)
                         recovery_required = True
                         if console is not None:
                             console.print(
@@ -485,8 +564,6 @@ async def run_pending(
 
                 finally:
                     attempted += 1
-                    if session is not None:
-                        await session.disconnect()
                     if not recovery_required:
                         await _cleanup_task(
                             adapter=adapter,
@@ -507,6 +584,7 @@ async def run_pending(
                     if control_store.load().status == "pause_requested":
                         control_store.pause_if_requested()
                         break
+                last_completed_task_at = asyncio.get_running_loop().time()
     except asyncio.CancelledError:
         if control_store is not None:
             state = control_store.load()
@@ -518,6 +596,8 @@ async def run_pending(
                 return attempted, camp.campaign_id
         raise
     finally:
+        if browser_session is not None:
+            await browser_session.disconnect()
         if owned_storage:
             await storage.close()
 

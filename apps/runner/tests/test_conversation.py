@@ -9,24 +9,33 @@ from gpt_trace_runner.conversation import (
     extract_dataset_messages,
     invoked_app_names,
     is_complete,
+    is_transient_conversation_id,
 )
 from gpt_trace_runner.exceptions import AuthenticationRequired, ConversationNotFound
 
 
-def test_extract_filters_explicit_raw_cot() -> None:
-    visible = {
-        "id": "visible",
+def test_extract_preserves_raw_cot_and_completion_ignores_nonterminal_reasoning() -> None:
+    final = {
+        "id": "final",
         "author": {"role": "assistant"},
+        "channel": "final",
         "end_turn": True,
         "metadata": {},
     }
-    hidden = {
-        "id": "hidden",
+    reasoning = {
+        "id": "reasoning",
         "author": {"role": "assistant"},
+        "end_turn": False,
+        "content": {
+            "content_type": "thoughts",
+            "thoughts": [{"summary": "Checking", "content": "Useful progress detail."}],
+        },
         "metadata": {"summary_type": "raw_cot"},
     }
-    messages = extract_dataset_messages({"messages": [hidden, visible]})
-    assert messages == [visible]
+    # Put reasoning after final to ensure completion detection searches for the
+    # actual terminal assistant message instead of trusting the last assistant.
+    messages = extract_dataset_messages({"messages": [final, reasoning]})
+    assert messages == [final, reasoning]
     assert is_complete(messages)
 
 
@@ -80,8 +89,10 @@ async def test_conversation_fetch_uses_in_page_bearer_without_returning_token() 
     payload = await client.fetch("conv")
     assert payload == {"messages": []}
 
-    javascript, endpoint = page.evaluate.await_args.args
+    javascript, request = page.evaluate.await_args.args
+    endpoint = request["endpoint"]
     assert endpoint.startswith("/backend-api/conversations/conv?")
+    assert request["delayMs"] == 1250
     assert "/api/auth/session" in javascript
     assert "payload.accessToken" in javascript
     assert "authorization: `Bearer ${accessToken}`" in javascript
@@ -143,8 +154,10 @@ async def test_conversation_delete_uses_bearer_and_exact_delete_endpoint() -> No
 
     await client.delete("conv-123")
 
-    javascript, endpoint = page.evaluate.await_args.args
+    javascript, request = page.evaluate.await_args.args
+    endpoint = request["endpoint"]
     assert endpoint == "/backend-api/conversation/id/conv-123"
+    assert request["delayMs"] == 1250
     assert "method: 'DELETE'" in javascript
     assert "/api/auth/session" in javascript
     assert "authorization: `Bearer ${accessToken}`" in javascript
@@ -166,4 +179,52 @@ async def test_conversation_delete_404_is_idempotent_success() -> None:
     client = ConversationClient(page)
 
     await client.delete("already-gone")
+
+
+def test_transient_conversation_ids_include_encoded_local_chatgpt_routes() -> None:
+    assert is_transient_conversation_id("WEB:abc")
+    assert is_transient_conversation_id("local-chatgpt:abc")
+    assert is_transient_conversation_id("local-chatgpt%3Aabc")
+    assert not is_transient_conversation_id("6aaf0c08-96f0-83eb-8994-4584094a99b3")
+
+
+@pytest.mark.asyncio
+async def test_recent_conversation_resolution_uses_exact_user_message_identity() -> None:
+    stable = "6aaf0c08-96f0-83eb-8994-4584094a99b3"
+    page = type("PageDouble", (), {})()
+
+    def result_for_call(_javascript, request):
+        endpoint = request["endpoint"]
+        assert request["delayMs"] == 1250
+        if endpoint.startswith("/backend-api/conversations?offset=0&limit=5"):
+            return {
+                "sessionStatus": 200,
+                "tokenPresent": True,
+                "status": 200,
+                "ok": True,
+                "statusText": "OK",
+                "text": '{"items":[{"id":"' + stable + '"}]}',
+            }
+        assert endpoint.startswith(f"/backend-api/conversations/{stable}?")
+        return {
+            "sessionStatus": 200,
+            "tokenPresent": True,
+            "status": 200,
+            "ok": True,
+            "statusText": "OK",
+            "text": (
+                '{"messages":['
+                '{"id":"user-1","author":{"role":"user"},"content":{"parts":["q"]}},'
+                '{"id":"assistant-1","author":{"role":"assistant"},"end_turn":true}'
+                ']}'
+            ),
+        }
+
+    page.evaluate = AsyncMock(side_effect=result_for_call)
+    client = ConversationClient(page)
+
+    result = await client.find_recent_conversation_id_by_user_message_id("user-1", limit=5)
+
+    assert result == stable
+    assert page.evaluate.await_count == 2
 

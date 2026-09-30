@@ -29,6 +29,9 @@ class SubmissionJournal:
     app_environments: dict[str, str] = field(default_factory=dict)
     resolved_app_names: dict[str, str] = field(default_factory=dict)
     user_message_id: str | None = None
+    # Wall-clock epoch before which recovery must not call ChatGPT again after a
+    # server Retry-After. Optional for backward compatibility with old journals.
+    retry_not_before: float | None = None
 
 
 class JournalStore:

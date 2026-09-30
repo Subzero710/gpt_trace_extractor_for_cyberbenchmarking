@@ -23,3 +23,25 @@ def test_squashed_schema_keeps_run_integrity_constraints() -> None:
 
 def test_squashed_schema_contains_app_provenance() -> None:
     assert '"app_provenance"' in initial_migration_text()
+
+def trace_json_migration_text() -> str:
+    migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0002_trace_payload_json.py"
+    )
+    return migration.read_text(encoding="utf-8")
+
+
+def test_trace_payload_migration_uses_json_not_jsonb() -> None:
+    text = trace_json_migration_text()
+    for column in (
+        "messages",
+        "runtime_metadata",
+        "dataset_metadata",
+        "evaluation",
+    ):
+        assert f'"{column}"' in text
+    assert "postgresql.JSON(astext_type=sa.Text())" in text
+    assert "postgresql_using=f\"{column}::json\"" in text

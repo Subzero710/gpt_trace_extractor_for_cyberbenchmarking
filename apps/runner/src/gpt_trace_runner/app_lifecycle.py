@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .docker_runtime import AttemptRuntime, DockerRuntime, RuntimeResource
+from .workstation_provider import AttemptRuntime, WorkstationProvider, RuntimeResource
 from .exceptions import AppInfrastructureError
 from .models import BenchmarkTask
 from .workspace_seed import build_workspace_archive
@@ -19,7 +19,7 @@ class AppLifecycle:
         self,
         token_file: Path,
         *,
-        runtime: DockerRuntime,
+        runtime: WorkstationProvider,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.token_file = token_file
@@ -64,10 +64,8 @@ class AppLifecycle:
 
     @staticmethod
     def _expected_gateway_host(app_id: str) -> str:
-        if app_id == "code-workspace":
-            return "workspace-gateway"
-        if app_id == "browser":
-            return "browser-gateway"
+        if app_id == "kali-workstation":
+            return "workstation-gateway"
         raise AppInfrastructureError(f"unsupported local App gateway: {app_id!r}")
 
     @classmethod
@@ -205,12 +203,12 @@ class AppLifecycle:
             await asyncio.sleep(0.5)
 
     async def _seed_workspace(self, task: BenchmarkTask, tool) -> None:
-        if tool.app_id != "code-workspace":
+        if tool.app_id != "kali-workstation":
             return
         if task.initial_workspace is None and not task.attachments:
             return
         if not tool.control_endpoint:
-            raise AppInfrastructureError("local App 'code-workspace' has no control endpoint")
+            raise AppInfrastructureError("local App 'kali-workstation' has no control endpoint")
         self._validate_control_endpoint(tool.app_id, tool.control_endpoint)
         archive = build_workspace_archive(task.initial_workspace, task.attachments)
         digest = hashlib.sha256(archive).hexdigest()
@@ -222,24 +220,24 @@ class AppLifecycle:
                 timeout=180.0,
             )
         except httpx.HTTPError as exc:
-            raise AppInfrastructureError("code-workspace gateway transport failed for /control/seed") from exc
+            raise AppInfrastructureError("kali-workstation gateway transport failed for /control/seed") from exc
         if response.status_code != 200:
             raise AppInfrastructureError(
-                f"code-workspace gateway /control/seed failed: HTTP {response.status_code}: "
+                f"kali-workstation gateway /control/seed failed: HTTP {response.status_code}: "
                 f"{response.text[:1000]}"
             )
         try:
             value = response.json()
         except ValueError as exc:
-            raise AppInfrastructureError("code-workspace seed returned invalid JSON") from exc
+            raise AppInfrastructureError("kali-workstation seed returned invalid JSON") from exc
         if not isinstance(value, dict):
-            raise AppInfrastructureError("code-workspace seed returned a non-object")
+            raise AppInfrastructureError("kali-workstation seed returned a non-object")
         if (
             value.get("status") != "seeded"
             or value.get("archive_bytes") != len(archive)
             or value.get("sha256") != digest
         ):
-            raise AppInfrastructureError("code-workspace seed integrity response mismatch")
+            raise AppInfrastructureError("kali-workstation seed integrity response mismatch")
 
     async def _operation(
         self,
@@ -248,11 +246,13 @@ class AppLifecycle:
         environment_id: str,
         fingerprint: str,
         operation: str,
+        attempt: int,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "task_id": task.task_id,
             "environment_id": environment_id,
             "task_fingerprint": fingerprint,
+            "attempt": attempt,
         }
         value = await self._post_gateway(tool, f"/control/{operation}", payload)
         for key in ("task_id", "environment_id", "task_fingerprint"):
@@ -291,17 +291,24 @@ class AppLifecycle:
                 )
                 activated.append(tool)
                 await self._wait_backend(tool)
-                await self._seed_workspace(task, tool)
                 await self._operation(
                     task,
                     tool,
                     resource.environment_id,
                     fingerprint,
                     "prepare",
+                    attempt,
                 )
+                await self._seed_workspace(task, tool)
             return runtime
-        except Exception:
+        except Exception as prepare_error:
+            cleanup_errors: list[str] = []
             for tool in reversed(activated):
+                try:
+                    await self._operation(task, tool, environments[tool.app_id],
+                                          fingerprint, "reset", attempt)
+                except Exception as exc:
+                    cleanup_errors.append(f"{tool.app_id} controller reset: {exc}")
                 try:
                     await self._deactivate(
                         task,
@@ -310,8 +317,8 @@ class AppLifecycle:
                         fingerprint,
                         attempt=attempt,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    cleanup_errors.append(f"{tool.app_id} gateway deactivation: {exc}")
             try:
                 await self.runtime.destroy(
                     task,
@@ -319,8 +326,12 @@ class AppLifecycle:
                     fingerprint,
                     attempt=attempt,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                cleanup_errors.append(f"workstation destroy: {exc}")
+            if cleanup_errors:
+                raise AppInfrastructureError(
+                    f"prepare failed: {prepare_error}; cleanup incomplete: {'; '.join(cleanup_errors)}"
+                ) from prepare_error
             raise
 
     async def assert_resume(
@@ -357,6 +368,7 @@ class AppLifecycle:
                 resource.environment_id,
                 fingerprint,
                 "resume",
+                attempt,
             )
         return runtime
 
@@ -383,6 +395,10 @@ class AppLifecycle:
         for tool in reversed(task.tools):
             if tool.kind != "local_mcp":
                 continue
+            try:
+                await self._operation(task, tool, environments[tool.app_id], fingerprint, "reset", attempt)
+            except AppInfrastructureError as exc:
+                errors.append(str(exc))
             try:
                 await self._deactivate(
                     task,

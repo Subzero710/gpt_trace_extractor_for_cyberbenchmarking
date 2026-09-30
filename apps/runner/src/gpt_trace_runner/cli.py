@@ -12,9 +12,9 @@ from rich.table import Table
 
 from .app_lifecycle import AppLifecycle
 from .browser import BrowserClient
-from .chatgpt import ChatGPTClient
+from .chatgpt import ChatGPTClient, check_chatgpt_protocol_contracts
 from .config import Settings
-from .docker_runtime import DockerRuntime
+from .workstation_provider import LibvirtWorkstationProvider
 from .exceptions import RecoveryIncomplete
 from .journal import JournalStore
 from .lock import RunnerLock
@@ -41,6 +41,7 @@ def make_chatgpt(settings: Settings, page) -> ChatGPTClient:
         site_ready_timeout_seconds=settings.chatgpt_site_ready_timeout_seconds,
         challenge_timeout_seconds=settings.chatgpt_challenge_timeout_seconds,
         natural_snapshot_wait_seconds=settings.chatgpt_natural_snapshot_wait_seconds,
+        backend_quiet_seconds=settings.chatgpt_backend_quiet_seconds,
         clipboard_url=settings.validate_clipboard_url(),
         expected_model_slug=settings.chatgpt_expected_model_slug,
     )
@@ -52,30 +53,8 @@ def make_lifecycle(
     *,
     browser_blocked_hosts: tuple[str, ...] = (),
 ) -> AppLifecycle:
-    needs_browser_app = any(
-        tool.app_id == "browser" and tool.kind == "local_mcp"
-        for task in tasks
-        for tool in task.tools
-    )
-    runtime = DockerRuntime(
-        settings.docker_socket_path,
-        workspace_image=settings.app_code_workspace_image,
-        browser_image=settings.app_browser_image,
-        file_relay_image=settings.app_file_relay_image,
-        file_transfer_limits={
-            "max_file_bytes": settings.file_transfer_max_file_bytes,
-            "max_total_bytes": settings.file_transfer_max_total_bytes,
-            "max_objects": settings.file_transfer_max_objects,
-            "max_concurrent_uploads": settings.file_transfer_max_concurrent_uploads,
-            "max_concurrent_downloads": settings.file_transfer_max_concurrent_downloads,
-            "ttl_seconds": settings.file_transfer_ttl_seconds,
-        },
-        workspace_gateway_container=settings.workspace_gateway_container,
-        browser_gateway_container=settings.browser_gateway_container,
-        browser_environment=(
-            settings.dynamic_browser_environment() if needs_browser_app else {}
-        ),
-        browser_blocked_hosts=browser_blocked_hosts,
+    runtime = LibvirtWorkstationProvider(
+        settings.workstation_broker_socket, settings.workstation_broker_token_file,
     )
     return AppLifecycle(
         settings.app_control_token_file,
@@ -95,7 +74,7 @@ def internal_local_apps_task(
     prompt: str,
 ) -> BenchmarkTask:
     tools: list[BenchmarkTool] = []
-    for app_id in ("code-workspace", "browser"):
+    for app_id in ("kali-workstation",):
         resolved = registry.resolve_id(app_id)
         if resolved.kind != "local_mcp":
             raise RuntimeError(f"{app_id!r} must resolve to a local_mcp App")
@@ -150,6 +129,8 @@ def doctor() -> None:
         console.print("[green]CloakBrowser humanize API: ok[/]")
         check_playwright_ui_contracts()
         console.print("[green]Playwright UI API contracts: ok[/]")
+        check_chatgpt_protocol_contracts(settings.chatgpt_base_url)
+        console.print("[green]ChatGPT protocol contracts: ok[/]")
         async with httpx.AsyncClient(timeout=10) as client:
             (await client.get(settings.browser_version_url())).raise_for_status()
             console.print("[green]operator browser CDP: ok[/]")
@@ -212,14 +193,13 @@ def register_apps() -> None:
                 prepared = True
                 console.print("[green]registration backends: ready[/]")
                 console.print(
-                    "[bold]Keep this command running while creating the two ChatGPT Plugins.[/]"
+                    "[bold]Keep this command running while creating the Kali Workstation App.[/]"
                 )
                 console.print(
-                    "Code Workspace gateway: http://workspace-gateway:8000/mcp"
+                    "Kali Workstation gateway: http://workstation-gateway:8000/mcp"
                 )
-                console.print("Browser gateway: http://browser-gateway:8000/mcp")
                 console.print(
-                    "Press Enter after both Plugins have been created and their tools are visible."
+                    "Press Enter after the App and its tools are visible."
                 )
                 await asyncio.to_thread(input)
         finally:
@@ -355,6 +335,7 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
                 )
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
                 await chatgpt.verify_apps_available(task.tools)
+                console.print("[green]auth detected; Kali Workstation available[/]")
             finally:
                 await session.disconnect()
 

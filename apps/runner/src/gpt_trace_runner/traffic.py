@@ -3,16 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 from playwright.async_api import Page, Response
 
-from .exceptions import AuthenticationRequired
+from .conversation import _parse_retry_after
+from .exceptions import AuthenticationRequired, RateLimited
 
 
 _CONVERSATION_SNAPSHOT = re.compile(r"^/backend-api/conversations/([^/]+)$")
+_PROCESS_LAST_BACKEND_REQUEST_AT: float | None = None
 
 
 @dataclass(slots=True)
@@ -26,6 +29,10 @@ class TrafficStats:
     requests_failed: int = 0
     responses_403: int = 0
     responses_429: int = 0
+    last_429_method: str | None = None
+    last_429_path: str | None = None
+    last_429_retry_after: str | None = None
+    last_429_request_id: str | None = None
     responses_5xx: int = 0
     challenge_seen: bool = False
     challenge_resolved: bool = False
@@ -58,6 +65,13 @@ class TrafficMonitor:
         self._auth_me_response: Response | None = None
         self._auth_me_last_status: int | None = None
         self._auth_me_event = asyncio.Event()
+        self._auth_me_rate_limit: RateLimited | None = None
+        self._auth_session_rate_limit: RateLimited | None = None
+        # Global browser-side pacing signal. This deliberately survives
+        # begin_task(): a fresh benchmark must not burst immediately after
+        # cleanup/navigation traffic from the previous one.
+        self._last_backend_request_at: float | None = _PROCESS_LAST_BACKEND_REQUEST_AT
+        self._backend_request_event = asyncio.Event()
         page.on("request", self._on_request)
         page.on("response", self._on_response)
         page.on("requestfailed", self._on_request_failed)
@@ -68,8 +82,9 @@ class TrafficMonitor:
         self._snapshots = {}
         self._snapshot_events = {}
         self._task_403 = False
+        self._sticky_429 = False
         self._submitted_user_messages = ()
-        # sticky 429 intentionally survives task boundaries.
+        self._auth_session_rate_limit = None
 
     def _is_chatgpt_host(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
@@ -92,6 +107,12 @@ class TrafficMonitor:
         self._auth_me_response = None
         self._auth_me_last_status = None
         self._auth_me_event.clear()
+        self._auth_me_rate_limit = None
+        self._auth_session_rate_limit = None
+
+    @property
+    def auth_session_rate_limit(self) -> RateLimited | None:
+        return getattr(self, "_auth_session_rate_limit", None)
 
     @property
     def auth_me_last_status(self) -> int | None:
@@ -101,6 +122,14 @@ class TrafficMonitor:
         """Require exact-origin GET /backend-api/me -> valid user JSON."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while True:
+            if self.auth_session_rate_limit is not None:
+                raise self.auth_session_rate_limit
+            if self._auth_me_last_status == 429:
+                raise getattr(self, "_auth_me_rate_limit", None) or RateLimited(
+                    "ChatGPT /backend-api/me returned HTTP 429 while waiting for authentication",
+                    endpoint="/backend-api/me",
+                    method="GET",
+                )
             response = self._auth_me_response
             if response is not None:
                 try:
@@ -149,12 +178,57 @@ class TrafficMonitor:
     def _is_backend_path(path: str) -> bool:
         return path.startswith("/backend-api/") or path.startswith("/backend-anon/")
 
+    def _latest_backend_request_at(self) -> float | None:
+        local = self._last_backend_request_at
+        process = _PROCESS_LAST_BACKEND_REQUEST_AT
+        if local is None:
+            return process
+        if process is None:
+            return local
+        return max(local, process)
+
+    async def wait_for_backend_quiet(self, *, quiet_seconds: float) -> None:
+        """Wait only for the unsatisfied remainder of the backend request gap."""
+        quiet = max(0.0, float(quiet_seconds))
+        if quiet <= 0:
+            return
+
+        while True:
+            last = self._latest_backend_request_at()
+            if last is None:
+                return
+
+            remaining = quiet - (time.monotonic() - last)
+            if remaining <= 0:
+                return
+
+            self._backend_request_event.clear()
+            observed = self._latest_backend_request_at()
+            if observed != last:
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    self._backend_request_event.wait(),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                if self._latest_backend_request_at() == observed:
+                    return
+
     def _on_request(self, request) -> None:
         if not self._is_chatgpt_host(request.url):
             return
         self._request_generation[id(request)] = self._generation
         path = urlparse(request.url).path.rstrip("/")
         self._stats.chatgpt_requests += 1
+        auth_session = self._is_exact_base_origin(request.url) and path == "/api/auth/session"
+        if self._is_backend_path(path) or auth_session:
+            global _PROCESS_LAST_BACKEND_REQUEST_AT
+            now = time.monotonic()
+            self._last_backend_request_at = now
+            _PROCESS_LAST_BACKEND_REQUEST_AT = now
+            self._backend_request_event.set()
         if self._is_backend_path(path):
             self._stats.backend_requests += 1
         if "/sentinel/" in path:
@@ -228,6 +302,30 @@ class TrafficMonitor:
             return
         current = self._belongs_to_current(response.request)
         path = urlparse(response.url).path.rstrip("/")
+        auth_session = self._is_exact_base_origin(response.url) and path == "/api/auth/session"
+        headers = getattr(response, "headers", {}) or {}
+
+        if current and response.status == 429 and (self._is_backend_path(path) or auth_session):
+            self._stats.responses_429 += 1
+            parsed = urlparse(response.url)
+            self._stats.last_429_method = response.request.method.upper()
+            self._stats.last_429_path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            self._stats.last_429_retry_after = headers.get("retry-after")
+            self._stats.last_429_request_id = (
+                headers.get("x-request-id") or headers.get("openai-request-id")
+            )
+        if current and auth_session:
+            self._auth_session_rate_limit = (
+                RateLimited(
+                    "ChatGPT /api/auth/session returned HTTP 429",
+                    retry_after_seconds=_parse_retry_after(headers.get("retry-after")),
+                    endpoint="/api/auth/session",
+                    method=response.request.method.upper(),
+                    request_id=headers.get("x-request-id") or headers.get("openai-request-id"),
+                )
+                if response.status == 429 else None
+            )
+            self._auth_me_event.set()
 
         if (
             self._is_exact_base_origin(response.url)
@@ -236,16 +334,36 @@ class TrafficMonitor:
         ):
             self._auth_me_last_status = response.status
             if response.status == 200:
+                self._auth_me_rate_limit = None
+                self._auth_session_rate_limit = None
                 self._auth_me_response = response
                 self._auth_me_event.set()
             else:
                 self._auth_me_response = None
-                self._auth_me_event.clear()
+                if response.status == 429:
+                    self._auth_me_rate_limit = RateLimited(
+                        "ChatGPT /backend-api/me returned HTTP 429",
+                        retry_after_seconds=_parse_retry_after(headers.get("retry-after")),
+                        endpoint="/backend-api/me",
+                        method="GET",
+                        request_id=headers.get("x-request-id") or headers.get("openai-request-id"),
+                    )
+                    self._auth_me_event.set()
+                else:
+                    self._auth_me_event.clear()
         if self._is_backend_path(path):
             if response.status == 429:
-                self._sticky_429 = True
-                if current:
-                    self._stats.responses_429 += 1
+                # Auxiliary verification/auth/cleanup traffic has its own
+                # explicit error handling and retries. Only a current task's
+                # non-auxiliary backend 429 is a teacher/model circuit breaker.
+                is_auxiliary = (
+                    path == "/backend-api/me"
+                    or path == "/backend-api/conversations"
+                    or path.startswith("/backend-api/conversations/")
+                    or path.startswith("/backend-api/conversation/id/")
+                )
+                if current and not is_auxiliary:
+                    self._sticky_429 = True
             elif response.status == 403 and current:
                 self._task_403 = True
                 self._stats.responses_403 += 1

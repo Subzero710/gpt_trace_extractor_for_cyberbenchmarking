@@ -12,7 +12,9 @@ from .normalize import normalize_messages, tools_from_provenance
 
 MESSAGE = pa.struct([
     ("role", pa.string()),
+    ("kind", pa.string()),
     ("content", pa.string()),
+    ("reasoning_title", pa.string()),
     ("name", pa.string()),
     ("tool_call_id", pa.string()),
     ("tool_calls", pa.list_(pa.struct([

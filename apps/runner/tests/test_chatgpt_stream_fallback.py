@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from gpt_trace_runner.chatgpt import ChatGPTClient, SubmittedTurn
@@ -134,3 +136,75 @@ async def test_incomplete_sse_still_requires_durable_end_turn_proof():
     assert client._conversation.fetches == 1
     assert client._traffic.fallback_snapshots == 1
     assert client._active_turn is None
+
+class HangingStream:
+    def __init__(self):
+        self.cancelled = False
+
+    async def wait(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+@pytest.mark.asyncio
+async def test_open_sse_does_not_block_after_durable_conversation_is_complete():
+    client = make_client(conversation(complete=True))
+    client._durable_poll_initial_seconds = 0.01
+    client._durable_poll_max_seconds = 0.02
+    stream = HangingStream()
+    submitted = SubmittedTurn(
+        conversation_id="conv-1",
+        user_message_id="user-1",
+        stream=stream,
+        task=BenchmarkTask("task", "question", ()),
+    )
+    client._active_turn = submitted
+
+    async def stable_environment():
+        return None
+
+    client._check_environment = stable_environment
+
+    captured = await asyncio.wait_for(
+        client.wait_for_completion(submitted),
+        timeout=2.0,
+    )
+
+    assert captured.messages[-1]["end_turn"] is True
+    assert captured.runtime_metadata["stream_completed_via_durable_snapshot"] is True
+    assert captured.runtime_metadata["stream_transport_finished"] is False
+    assert client._conversation.fetches >= 1
+    assert client._traffic.fallback_snapshots == 1
+    assert stream.cancelled is True
+    assert client._active_turn is None
+
+@pytest.mark.asyncio
+async def test_hanging_sse_uses_sparse_durable_polling():
+    client = make_client(conversation(complete=True))
+    client._durable_poll_initial_seconds = 0.01
+    client._durable_poll_max_seconds = 0.02
+    stream = HangingStream()
+    submitted = SubmittedTurn(
+        conversation_id="conv-1",
+        user_message_id="user-1",
+        stream=stream,
+        task=BenchmarkTask("task", "question", ()),
+    )
+    client._active_turn = submitted
+
+    async def stable_environment():
+        return None
+
+    client._check_environment = stable_environment
+
+    captured = await asyncio.wait_for(
+        client.wait_for_completion(submitted),
+        timeout=1.0,
+    )
+
+    assert captured.messages[-1]["end_turn"] is True
+    assert client._conversation.fetches == 1
+    assert stream.cancelled is True

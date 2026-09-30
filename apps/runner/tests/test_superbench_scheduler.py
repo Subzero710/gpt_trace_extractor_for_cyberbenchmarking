@@ -236,10 +236,6 @@ async def test_recovery_technical_failure_stops_even_if_journal_was_cleared(
         async def close(self):
             return None
 
-    class FakeSession:
-        async def disconnect(self):
-            return None
-
     settings = RecoverySettings()
     adapter = A()
     adapters = AdapterRegistry([adapter])
@@ -277,21 +273,16 @@ async def test_recovery_technical_failure_stops_even_if_journal_was_cleared(
         FakeRunner,
     )
 
-    async def fake_connect_chatgpt(**kwargs):
-        return FakeSession(), object()
+    chatgpt = object()
 
-    monkeypatch.setattr(
-        execution_module,
-        "_connect_chatgpt",
-        fake_connect_chatgpt,
-    )
+    async def get_chatgpt():
+        return chatgpt
 
     with pytest.raises(ValueError, match="recovery-tech"):
         await execution_module._recover_pending_journal(
             settings=settings,
             registry=Registry(),
             make_lifecycle=lambda _settings, _tasks: FakeLifecycle(),
-            make_chatgpt=None,
             console=None,
             adapters=adapters,
             entries=[
@@ -303,4 +294,5 @@ async def test_recovery_technical_failure_stops_even_if_journal_was_cleared(
             camp=camp,
             storage=object(),
             staging=tmp_path,
+            get_chatgpt=get_chatgpt,
         )

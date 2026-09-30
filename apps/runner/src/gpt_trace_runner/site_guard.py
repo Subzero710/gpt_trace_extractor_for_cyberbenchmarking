@@ -11,6 +11,7 @@ from .traffic import TrafficMonitor
 PROMPT_SELECTORS = (
     "#prompt-textarea",
     '[contenteditable="true"][data-lexical-editor="true"]',
+    '[contenteditable="true"][role="textbox"]',
 )
 AUTH_SELECTORS = (
     'button:has-text("Log in")',
@@ -60,6 +61,8 @@ class SiteGuard:
         return candidate
 
     async def wait_ready(self) -> Locator:
+        if self._traffic.auth_session_rate_limit is not None:
+            raise self._traffic.auth_session_rate_limit
         if self._traffic.saw_backend_429:
             raise RateLimited("ChatGPT returned HTTP 429")
         if await self._auth_marker_visible():
@@ -68,6 +71,8 @@ class SiteGuard:
         async def wait_for(seconds: float) -> Locator | None:
             deadline = asyncio.get_running_loop().time() + seconds
             while asyncio.get_running_loop().time() < deadline:
+                if self._traffic.auth_session_rate_limit is not None:
+                    raise self._traffic.auth_session_rate_limit
                 if self._traffic.saw_backend_429:
                     raise RateLimited("ChatGPT returned HTTP 429")
                 if await self._auth_marker_visible():

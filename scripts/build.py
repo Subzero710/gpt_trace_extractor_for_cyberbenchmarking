@@ -2,14 +2,126 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 BUILDER_NAME = "gpt-trace-extractor-builder"
 PROJECT_IMAGE_LABEL = "io.gpttrace.project=gpt-trace-extractor"
-PROFILES = ("runner", "runtime-images")
+PROFILES = ("runner",)
+
+
+def verify_host_requirements(root: Path) -> None:
+    run([sys.executable, str(root / "scripts/host_requirements.py"), "--build"])
+
+
+def build_host_broker(root: Path) -> None:
+    venv = root / ".venv-workstation-broker"
+    python = venv / "bin/python"
+    if venv.exists() and not python.is_file():
+        shutil.rmtree(venv)
+    run([sys.executable, "-m", "venv", str(venv)])
+    run([str(python), "-m", "pip", "install", "--disable-pip-version-check",
+         "-e", str(root / "apps/workstation-broker")])
+
+
+def compose_service_image(root: Path, service: str) -> str:
+    rendered = run(["docker", "compose", "config", "--format", "json"], capture=True).stdout
+    try:
+        config = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("docker compose config returned invalid JSON") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError("docker compose config did not return an object")
+    project = config.get("name")
+    services = config.get("services")
+    if not isinstance(project, str) or not project or not isinstance(services, dict):
+        raise RuntimeError("docker compose config is missing project/services metadata")
+    service_config = services.get(service)
+    if not isinstance(service_config, dict):
+        raise RuntimeError(f"docker compose service is missing: {service}")
+    image = service_config.get("image")
+    if image is None:
+        image = f"{project}-{service}"
+    if not isinstance(image, str) or not image.strip():
+        raise RuntimeError(f"cannot resolve image name for Compose service {service}")
+    return image.strip()
+
+
+
+def verify_registry_manifest_pin(root: Path) -> None:
+    manifest = json.loads(
+        (root / 'apps/kali-workstation/tool-manifest.json').read_text(encoding='utf-8')
+    )
+    registry = json.loads(
+        (root / 'apps/registry/apps.json').read_text(encoding='utf-8')
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+        ).encode('utf-8')
+    ).hexdigest()
+    matches = [
+        app for app in registry.get('apps', [])
+        if isinstance(app, dict) and app.get('id') == 'kali-workstation'
+    ]
+    if len(matches) != 1 or matches[0].get('manifest_sha256') != digest:
+        raise RuntimeError(
+            f'kali-workstation registry manifest pin is stale; expected {digest}'
+        )
+
+
+
+def verify_storage_runtime(root: Path) -> None:
+    image = compose_service_image(root, "storage")
+    inspected = run(["docker", "image", "inspect", image], check=False, capture=True)
+    if inspected.returncode != 0:
+        detail = (inspected.stderr or inspected.stdout).strip()[:1000]
+        raise RuntimeError(
+            f"built Compose image is missing for storage: {image}"
+            + (f": {detail}" if detail else "")
+        )
+    code = (
+        "import greenlet; "
+        "from sqlalchemy.ext.asyncio import create_async_engine; "
+        "assert callable(create_async_engine)"
+    )
+    run(["docker", "run", "--rm", "--entrypoint", "python", image, "-c", code])
+
+
+def verify_manifests(root: Path) -> None:
+    verify_storage_runtime(root)
+    verify_registry_manifest_pin(root)
+    image = compose_service_image(root, "kali-workstation-controller")
+    inspected = run(["docker", "image", "inspect", image], check=False, capture=True)
+    if inspected.returncode != 0:
+        detail = (inspected.stderr or inspected.stdout).strip()[:1000]
+        raise RuntimeError(
+            f"built Compose image is missing for kali-workstation-controller: {image}"
+            + (f": {detail}" if detail else "")
+        )
+    code = (
+        "from kali_workstation.contracts import manifest,canonical_bytes; "
+        "import json,pathlib; "
+        "p=pathlib.Path('/app/tool-manifest.json'); "
+        "assert canonical_bytes(manifest())==canonical_bytes(json.loads(p.read_text()))"
+    )
+    run(["docker", "run", "--rm", "--entrypoint", "python", image, "-c", code])
+
+
+def build_workstation_base_image(root: Path) -> None:
+    run([sys.executable, str(root / "infra/workstation/image/build.py")])
+
+
+def verify_workstation_image(root: Path) -> None:
+    run([sys.executable, str(root / "infra/workstation/image/build.py")])
+
+
+def build_control_plane(root: Path) -> None:
+    build(root)
 
 
 def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -183,7 +295,7 @@ def status(root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Project-isolated Docker build/cache lifecycle."
+        description="Hybrid host/KVM plus project-isolated Docker build/cache lifecycle."
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--clean", action="store_true")
@@ -196,7 +308,12 @@ def main() -> int:
     elif args.status:
         status(root)
     else:
-        build(root)
+        verify_host_requirements(root)
+        build_host_broker(root)
+        build_control_plane(root)
+        verify_manifests(root)
+        build_workstation_base_image(root)
+        verify_workstation_image(root)
     return 0
 
 

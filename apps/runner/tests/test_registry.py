@@ -34,13 +34,13 @@ def test_external_connector_requires_explicit_ui_name_and_manifest(tmp_path: Pat
 
 def test_manifest_hash_mismatch_is_rejected(tmp_path: Path) -> None:
     registry = make_registry(tmp_path)
-    definition = registry._by_id["browser"]
+    definition = registry._by_id["kali-workstation"]
     definition_path = Path(definition.raw["manifest_path_default"])
     payload = json.loads(definition_path.read_text())
     payload["tools"][0]["description"] += " drift"
     definition_path.write_text(json.dumps(payload))
     with pytest.raises(AppRegistryError, match="hash mismatch"):
-        registry.resolve_id("browser")
+        registry.resolve_id("kali-workstation")
 
 
 def test_duplicate_ids_and_aliases_are_rejected(tmp_path: Path) -> None:

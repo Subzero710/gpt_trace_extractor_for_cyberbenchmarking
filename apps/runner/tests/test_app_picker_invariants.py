@@ -10,7 +10,7 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_selection_types_query_and_clicks_visible_candidate() -> None:
+def test_app_selection_types_query_and_clicks_visible_candidate_row() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
@@ -25,6 +25,15 @@ def test_app_selection_types_query_and_clicks_visible_candidate() -> None:
     assert 'page.keyboard.type("@")' not in select
     assert "page.keyboard.type(tool.name)" not in select
     assert "delay=20" not in source
+
+    find_candidate = source.split("async def _find_app_candidate", 1)[1].split(
+        "async def _wait_app_accepted", 1
+    )[0]
+    assert "text_candidate = matches.nth(index)" in find_candidate
+    assert "ancestor-or-self::*" in find_candidate
+    assert "@role='option'" in find_candidate
+    assert "@role='menuitem'" in find_candidate
+    assert 'text_candidate.locator("xpath=..")' in find_candidate
 
 def test_app_selection_waits_for_candidate_click_then_acceptance() -> None:
     source = _source("tools.py")

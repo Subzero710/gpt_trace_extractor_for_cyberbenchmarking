@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, Integer, String, Text, func, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSON, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -23,16 +23,16 @@ class Run(Base):
     task_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
-    messages: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    runtime_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    messages: Mapped[list | None] = mapped_column(JSON(astext_type=Text()), nullable=True)
+    runtime_metadata: Mapped[dict | None] = mapped_column(JSON(astext_type=Text()), nullable=True)
     app_provenance: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     dataset_metadata: Mapped[dict] = mapped_column(
-        JSONB,
+        JSON(astext_type=Text()),
         nullable=False,
         default=dict,
-        server_default=text("'{}'::jsonb"),
+        server_default=text("'{}'::json"),
     )
-    evaluation: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    evaluation: Mapped[dict | None] = mapped_column(JSON(astext_type=Text()), nullable=True)
     error_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

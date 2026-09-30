@@ -22,6 +22,18 @@ from .models import BenchmarkTool
 # No artificial keyboard delay is added here. CloakBrowser owns humanization.
 
 EditorGetter = Callable[[], Awaitable[Locator]]
+NetworkQuiet = Callable[[], Awaitable[None]]
+
+
+# A visually empty contenteditable is not guaranteed to have innerText == "".
+# Chromium/ChatGPT can leave line-break whitespace or zero-width formatting
+# characters after the last structured mention is removed.
+_EMPTY_COMPOSER_FORMAT_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff")
+
+
+def _composer_text_is_empty(text: str) -> bool:
+    visible = "".join(ch for ch in text if ch not in _EMPTY_COMPOSER_FORMAT_CHARS)
+    return not visible.strip()
 
 
 _COMPOSER_ACCEPTED_JS = r"""
@@ -29,6 +41,7 @@ _COMPOSER_ACCEPTED_JS = r"""
     const selectors = [
         "#prompt-textarea",
         '[contenteditable="true"][data-lexical-editor="true"]',
+        '[contenteditable="true"][role="textbox"]',
     ];
     const seen = new Set();
 
@@ -65,6 +78,9 @@ _APP_CANDIDATE_VISIBLE_JS = r"""
         document.querySelector("#prompt-textarea") ||
         document.querySelector(
             '[contenteditable="true"][data-lexical-editor="true"]'
+        ) ||
+        document.querySelector(
+            '[contenteditable="true"][role="textbox"]'
         );
 
     const visible = (el) => {
@@ -101,7 +117,7 @@ async def _find_app_candidate(
     tool: BenchmarkTool,
     timeout_seconds: float,
 ) -> Locator:
-    """Resolve the visible autocomplete row itself instead of guessing Enter state."""
+    """Resolve the visible autocomplete row that actually receives pointer events."""
     try:
         await page.wait_for_function(
             _APP_CANDIDATE_VISIBLE_JS,
@@ -121,18 +137,43 @@ async def _find_app_candidate(
     best_distance = float("inf")
 
     for index in range(await matches.count()):
-        candidate = matches.nth(index)
+        text_candidate = matches.nth(index)
         try:
-            if not await candidate.is_visible():
+            if not await text_candidate.is_visible():
                 continue
-            inside_composer = await candidate.evaluate(
+            inside_composer = await text_candidate.evaluate(
                 """el => Boolean(el.closest(
                     '#prompt-textarea, '
-                    + '[contenteditable="true"][data-lexical-editor="true"]'
+                    + '[contenteditable="true"][data-lexical-editor="true"], '
+                    + '[contenteditable="true"][role="textbox"]'
                 ))"""
             )
             if inside_composer:
                 continue
+
+            # get_by_text() often resolves the label/span inside the autocomplete
+            # row. CloakBrowser correctly rejects clicking that leaf when a sibling
+            # overlay inside the row receives pointer events. Target the nearest
+            # interactive row instead, so a descendant hit still bubbles to the
+            # intended control.
+            row = text_candidate.locator(
+                "xpath=ancestor-or-self::*["
+                "self::button or @role='option' or @role='menuitem' "
+                "or @role='button' or @data-radix-collection-item"
+                "][1]"
+            )
+            if await row.count() and await row.is_visible():
+                candidate = row
+            else:
+                # Some ChatGPT picker revisions use a plain DIV row without an
+                # explicit ARIA role. Its immediate parent is acceptable only when
+                # its normalized text is still exactly the requested App name.
+                parent = text_candidate.locator("xpath=..")
+                if await parent.count() and await parent.is_visible():
+                    parent_text = " ".join((await parent.inner_text()).split())
+                    candidate = parent if parent_text == tool.name else text_candidate
+                else:
+                    candidate = text_candidate
 
             box = await candidate.bounding_box()
             if box is None:
@@ -156,7 +197,7 @@ async def _find_app_candidate(
     if best is None:
         raise AppUnavailable(
             f"ChatGPT app {tool.name!r} autocomplete text became visible but "
-            "no selectable candidate locator could be resolved"
+            "no selectable candidate row could be resolved"
         )
     return best
 
@@ -293,7 +334,7 @@ async def _clear_auth_editor(
     max_backspaces = max(32, len(rendered) * 4 + 32)
 
     for _ in range(max_backspaces):
-        if rendered == "":
+        if _composer_text_is_empty(rendered):
             return
 
         # Never click during cleanup. If context_change did not leave keyboard
@@ -322,6 +363,7 @@ async def assert_apps_available(
     tools: tuple[BenchmarkTool, ...],
     interaction: InteractionGuard,
     timeout_seconds: float,
+    network_quiet: NetworkQuiet | None = None,
 ) -> None:
     """Verify configured Apps by resolving each one through '@'."""
     seen: set[str] = set()
@@ -333,6 +375,8 @@ async def assert_apps_available(
         seen.add(tool.name)
 
         try:
+            if network_quiet is not None:
+                await network_quiet()
             await _select_app_via_mention(
                 page,
                 get_editor=get_editor,
@@ -340,6 +384,8 @@ async def assert_apps_available(
                 interaction=interaction,
                 timeout_seconds=timeout_seconds,
             )
+            if network_quiet is not None:
+                await network_quiet()
         finally:
             # Escape is only for transient autocomplete UI. Cleanup itself is
             # mandatory and runs against the current composer.
@@ -356,11 +402,14 @@ async def select_apps(
     tools: tuple[BenchmarkTool, ...],
     interaction: InteractionGuard,
     timeout_seconds: float,
+    network_quiet: NetworkQuiet | None = None,
 ) -> None:
     """Append Apps, retrying once only while still safely pre-submission."""
     for attempt in range(2):
         try:
             for tool in tools:
+                if network_quiet is not None:
+                    await network_quiet()
                 await _select_app_via_mention(
                     page,
                     get_editor=get_editor,
@@ -368,6 +417,8 @@ async def select_apps(
                     interaction=interaction,
                     timeout_seconds=timeout_seconds,
                 )
+                if network_quiet is not None:
+                    await network_quiet()
             return
         except AppUnavailable:
             if attempt:

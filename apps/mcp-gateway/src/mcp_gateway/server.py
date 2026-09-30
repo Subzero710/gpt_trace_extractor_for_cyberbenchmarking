@@ -70,28 +70,12 @@ class GatewayState:
             raise ValueError("backend_url must be a non-empty string")
         parsed = urlparse(value)
         hostname = parsed.hostname or ""
-        expected_name = re.fullmatch(
-            re.escape(self.backend_prefix) + r"[0-9a-f]{20}", hostname
-        )
-        private_backend_ip = False
-        try:
-            candidate_ip = ipaddress.ip_address(hostname)
-        except ValueError:
-            candidate_ip = None
-        if candidate_ip is not None:
-            private_backend_ip = (
-                candidate_ip.version == 4
-                and candidate_ip.is_private
-                and not candidate_ip.is_loopback
-                and not candidate_ip.is_unspecified
-                and not candidate_ip.is_multicast
-                and not candidate_ip.is_link_local
-            )
+        expected_name = hostname == "kali-workstation-controller"
         if (
             parsed.scheme != "http"
             or parsed.port != 8000
             or parsed.hostname is None
-            or (expected_name is None and not private_backend_ip)
+            or not expected_name
             or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
@@ -99,8 +83,7 @@ class GatewayState:
             or parsed.password is not None
         ):
             raise ValueError(
-                "backend_url must be an internal task backend at port 8000 "
-                f"(Docker name {self.backend_prefix}* or private IPv4)"
+                "backend_url must be the trusted workstation controller at port 8000"
             )
         return value.rstrip("/")
 
@@ -264,7 +247,7 @@ def create_app(state: GatewayState) -> Starlette:
     async def seed_proxy(request: Request) -> JSONResponse:
         if not state.authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if state.app_id != "code-workspace":
+        if state.app_id != "kali-workstation":
             return JSONResponse({"detail": "not found"}, status_code=404)
         active = state.active
         if active is None:
@@ -307,6 +290,43 @@ def create_app(state: GatewayState) -> Starlette:
         except ValueError:
             data = {"detail": response.text[:1000]}
         return JSONResponse(data, status_code=response.status_code)
+
+    async def artifact_proxy(request: Request):
+        if not state.authorized(request):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        active = state.active
+        if state.app_id != "kali-workstation" or active is None:
+            return JSONResponse({"detail": "no active workstation"}, status_code=503)
+        suffix = request.path_params.get("artifact_id")
+        if suffix is not None and not re.fullmatch(r"[0-9a-f]{64}", suffix):
+            return JSONResponse({"detail": "invalid artifact ID"}, status_code=400)
+        url = f"{active.backend_url}/control/artifacts" + (f"/{suffix}" if suffix else "")
+        headers = {"authorization": f"Bearer {active.backend_token}"}
+        try:
+            if request.method == "POST":
+                declared = request.headers.get("content-length")
+                if declared is not None and int(declared) > MAX_SEED_UPLOAD_BYTES:
+                    return JSONResponse({"detail": "artifact too large"}, status_code=413)
+                async def body():
+                    total = 0
+                    async for chunk in request.stream():
+                        total += len(chunk)
+                        if total > MAX_SEED_UPLOAD_BYTES:
+                            raise ValueError("artifact too large")
+                        yield chunk
+                response = await state.client.post(url, headers=headers, content=body(), timeout=180)
+                return JSONResponse(response.json(), status_code=response.status_code)
+            outbound = state.client.build_request("GET", url, headers=headers)
+            response = await state.client.send(outbound, stream=True)
+            if response.status_code != 200:
+                data = await response.aread()
+                await response.aclose()
+                return JSONResponse({"detail": data.decode(errors="replace")[:1000]}, status_code=response.status_code)
+            return StreamingResponse(response.aiter_bytes(), media_type="application/octet-stream",
+                headers={k: v for k, v in response.headers.items() if k in {"content-length", "x-artifact-sha256"}},
+                background=BackgroundTask(response.aclose))
+        except (httpx.HTTPError, ValueError) as exc:
+            return JSONResponse({"detail": str(exc)[:1000]}, status_code=503)
 
     async def control_proxy(request: Request) -> JSONResponse:
         if not state.authorized(request):
@@ -417,6 +437,8 @@ def create_app(state: GatewayState) -> Starlette:
             Route("/control/deactivate", deactivate, methods=["POST"]),
             Route("/control/backend-health", backend_health, methods=["GET"]),
             Route("/control/seed", seed_proxy, methods=["POST"]),
+            Route("/control/artifacts", artifact_proxy, methods=["POST"]),
+            Route("/control/artifacts/{artifact_id}", artifact_proxy, methods=["GET"]),
             Route("/control/{operation}", control_proxy, methods=["POST"]),
             Route("/mcp", mcp_proxy, methods=["GET", "POST", "DELETE"]),
             Route("/mcp/{path:path}", mcp_proxy, methods=["GET", "POST", "DELETE"]),
@@ -434,8 +456,8 @@ def create_app(state: GatewayState) -> Starlette:
 def main() -> None:
     app_id = os.environ.get("GATEWAY_APP_ID", "").strip()
     prefix = os.environ.get("GATEWAY_BACKEND_PREFIX", "").strip()
-    if app_id not in {"code-workspace", "browser"}:
-        raise RuntimeError("GATEWAY_APP_ID must be code-workspace or browser")
+    if app_id != "kali-workstation":
+        raise RuntimeError("GATEWAY_APP_ID must be kali-workstation")
     if not prefix or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-." for ch in prefix):
         raise RuntimeError("GATEWAY_BACKEND_PREFIX is invalid")
     state = GatewayState(app_id=app_id, backend_prefix=prefix, control_token=_token())

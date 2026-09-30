@@ -69,13 +69,11 @@ def _annotator_tool_text(row: dict[str, Any]) -> str:
 
 
 def _runtime_tools(*, file_path: str | None, annotator_tools: str) -> tuple[str, ...]:
-    normalized = re.sub(r"\s+", " ", annotator_tools).casefold()
-    tools: list[str] = []
-    if any(hint in normalized for hint in _BROWSER_TOOL_HINTS):
-        tools.append("browser")
-    if file_path or any(hint in normalized for hint in _WORKSPACE_TOOL_HINTS):
-        tools.append("code-workspace")
-    return tuple(tools)
+    # The benchmark contract exposes the single model-facing workstation App
+    # on every GAIA task. File/annotator hints still remain source metadata; they
+    # no longer decide whether the model is allowed to use the workstation.
+    _ = (file_path, annotator_tools)
+    return ("kali-workstation",)
 
 
 def _sha256_file(path: Path) -> str:
@@ -179,7 +177,7 @@ class GAIAAdapter(BenchmarkAdapter):
     """Pinned GAIA 2023 Level-1 validation adapter."""
 
     adapter_id = "gaia"
-    adapter_version = "6"
+    adapter_version = "7"
 
     def __init__(self) -> None:
         self._answers: dict[str, str] = {}
@@ -328,10 +326,10 @@ class GAIAAdapter(BenchmarkAdapter):
             )
 
         available_apps = {app_id for task in tasks for app_id in task.tools}
-        expected_apps = {"browser", "code-workspace"}
+        expected_apps = {"kali-workstation"}
         if not expected_apps <= available_apps:
             raise RuntimeError(
-                "pinned GAIA smoke split no longer exposes both MCP Apps when "
+                "pinned GAIA smoke split no longer exposes the workstation App when "
                 f"the upstream task annotations call for them: found {sorted(available_apps)!r}"
             )
 

@@ -13,13 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SECRETS_DIR = ROOT / ".secrets"
 CONTROL_TOKEN = SECRETS_DIR / "app_control_token"
+BROKER_ADMIN_TOKEN = SECRETS_DIR / "workstation_broker_admin_token"
+BROKER_CONTROLLER_TOKEN = SECRETS_DIR / "workstation_broker_controller_token"
 
 KNOWN_SECRET_KEYS = {
     "POSTGRES_PASSWORD",
-    "CLOAKBROWSER_LICENSE_KEY",
     "CONTROL_PLANE_API_KEY",
-    "APP_CODE_WORKSPACE_TUNNEL_ID",
-    "APP_BROWSER_TUNNEL_ID",
+    "APP_KALI_WORKSTATION_TUNNEL_ID",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -78,35 +78,47 @@ def atomic_secret(path: Path, content: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def ensure_control_token() -> None:
+def ensure_generated_token(path: Path, label: str) -> None:
     SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(SECRETS_DIR, 0o700)
-    if CONTROL_TOKEN.exists():
-        info = CONTROL_TOKEN.lstat()
-        if CONTROL_TOKEN.is_symlink() or not stat.S_ISREG(info.st_mode):
-            raise SystemExit(f"refusing unsafe control token path: {CONTROL_TOKEN}")
-        if len(CONTROL_TOKEN.read_text(encoding="utf-8").strip()) < 32:
-            raise SystemExit("existing App control token is too short")
-        os.chmod(CONTROL_TOKEN, 0o600)
+    if path.exists():
+        info = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"refusing unsafe {label} token path: {path}")
+        if len(path.read_text(encoding="utf-8").strip()) < 32:
+            raise SystemExit(f"existing {label} token is too short")
+        # These generated tokens are bind-mounted by Docker Compose as file
+        # secrets. A container may use a remapped UID, so host mode 0600 can
+        # make the individual bind mount unreadable. The parent .secrets
+        # directory remains 0700, so mode 0444 on these files does not expose
+        # them to other host users while allowing the container bind mount to
+        # be read.
+        os.chmod(path, 0o444)
         return
-    atomic_secret(CONTROL_TOKEN, secrets.token_urlsafe(48) + "\n")
+    atomic_secret(path, secrets.token_urlsafe(48) + "\n")
+    os.chmod(path, 0o444)
+
+
+def ensure_control_tokens() -> None:
+    ensure_generated_token(CONTROL_TOKEN, "App control")
+    ensure_generated_token(BROKER_ADMIN_TOKEN, "workstation broker admin")
+    ensure_generated_token(BROKER_CONTROLLER_TOKEN, "workstation broker controller")
+    values = {
+        CONTROL_TOKEN.read_text(encoding="utf-8").strip(),
+        BROKER_ADMIN_TOKEN.read_text(encoding="utf-8").strip(),
+        BROKER_CONTROLLER_TOKEN.read_text(encoding="utf-8").strip(),
+    }
+    if len(values) != 3:
+        raise SystemExit("generated control tokens must be distinct")
 
 
 def validate_tunnels(values: dict[str, str]) -> None:
-    tunnel_keys = (
-        "APP_CODE_WORKSPACE_TUNNEL_ID",
-        "APP_BROWSER_TUNNEL_ID",
-    )
+    tunnel_keys = ("APP_KALI_WORKSTATION_TUNNEL_ID",)
     for key in tunnel_keys:
         value = values.get(key, "")
         if not TUNNEL_ID.fullmatch(value):
             raise SystemExit(f"invalid/missing {key} in .env")
 
-    if values[tunnel_keys[0]] == values[tunnel_keys[1]]:
-        raise SystemExit(
-            "invalid tunnel configuration: code-workspace and browser must use "
-            "different tunnel IDs"
-        )
 
 
 def main() -> int:
@@ -117,7 +129,7 @@ def main() -> int:
     values = parse_env(ENV_PATH)
     validate_secret_only_env(values)
     os.chmod(ENV_PATH, 0o600)
-    ensure_control_token()
+    ensure_control_tokens()
 
     if args.mode in ("doctor", "tools"):
         validate_tunnels(values)

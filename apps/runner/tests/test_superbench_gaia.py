@@ -11,6 +11,7 @@ from gpt_trace_runner.superbench.adapters.gaia import (
     GAIA_METADATA_FILE,
     GAIA_REVISION,
     gaia_question_scorer,
+    _runtime_tools,
 )
 
 
@@ -76,9 +77,9 @@ def test_discover_exposes_only_annotated_or_attachment_tools_without_forcing(
     )
     file_task = next(task for task in tasks if task.metadata["upstream_task_id"] == "task-file")
 
-    assert web.tools == ("browser",)
-    assert direct.tools == ()
-    assert file_task.tools == ("code-workspace",)
+    assert web.tools == ("kali-workstation",)
+    assert direct.tools == ("kali-workstation",)
+    assert file_task.tools == ("kali-workstation",)
 
     assert "Use Browser" not in web.prompt
     assert "Use Code Workspace" not in file_task.prompt
@@ -141,3 +142,8 @@ async def test_file_task_is_seeded_only_into_code_workspace(tmp_path, monkeypatc
     materialized_root = materialized.initial_workspace.parent
     await adapter.cleanup(materialized, prepared=prepared)
     assert not materialized_root.exists()
+
+def test_every_gaia_task_exposes_kali_workstation() -> None:
+    assert _runtime_tools(file_path=None, annotator_tools="") == ("kali-workstation",)
+    assert _runtime_tools(file_path=None, annotator_tools="web browser") == ("kali-workstation",)
+    assert _runtime_tools(file_path="attachment.pdf", annotator_tools="") == ("kali-workstation",)

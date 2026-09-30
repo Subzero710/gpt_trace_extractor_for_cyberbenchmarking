@@ -9,6 +9,7 @@ import signal
 from ..exceptions import (
     AccessDenied,
     AuthenticationRequired,
+    DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
     RateLimited,
     RecoveryIncomplete,
     SiteChallengeFailed,
@@ -46,11 +47,9 @@ def config_fp(settings) -> str:
         "chatgpt_natural_snapshot_wait_seconds",
         "browser_humanize",
         "browser_humanize_preset",
-        "app_browser_humanize",
-        "app_browser_humanize_preset",
-        "app_browser_timezone",
-        "app_browser_locale",
-        "app_browser_geoip",
+        "workstation_provider",
+        "workstation_memory_mb",
+        "workstation_vcpus",
     )
     return _hash_json({key: getattr(settings, key) for key in keys})
 
@@ -233,6 +232,8 @@ async def execute_active(
                 "no unfinished active Superbench run"
             )
 
+        store.enforce_rate_limit_defer()
+
         validate_frozen(
             state,
             settings,
@@ -246,6 +247,8 @@ async def execute_active(
                 raise RecoveryIncomplete(
                     "active run is no longer resumable"
                 )
+
+            store.enforce_rate_limit_defer()
 
             selected_ids = validate_frozen(
                 state,
@@ -393,6 +396,16 @@ async def _execute_locked(
         reason, needs_intervention = classify_incident(exc)
         state = store.load()
         if state is not None and state.status != "completed":
+            if isinstance(exc, RateLimited):
+                delay = max(
+                    1.0,
+                    exc.retry_delay(
+                        DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+                        maximum_seconds=DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+                    ),
+                )
+                store.defer_rate_limit(delay)
+
             if needs_intervention:
                 store.intervention(
                     reason,

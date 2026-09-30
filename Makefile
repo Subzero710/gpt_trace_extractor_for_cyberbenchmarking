@@ -1,15 +1,18 @@
-.PHONY: build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: requirements build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+
+requirements:
+	python3 scripts/host_requirements.py
 
 build:
 	python3 scripts/build.py
 
 up:
 	python3 scripts/project_state.py core
-	docker compose up -d postgres storage browser workspace-gateway browser-gateway
+	python3 scripts/workstation_broker.py start
+	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser kali-workstation-controller workstation-gateway
 
-doctor:
-	python3 scripts/project_state.py doctor
-	# Doctor is observational: never start/recreate persistent dependencies.
+doctor: up
+	python3 scripts/host_doctor.py
 	docker compose run --rm --no-deps runner doctor
 
 tools:
@@ -41,14 +44,7 @@ reset-recovery:
 	docker compose run --rm --no-deps runner superbench-reset-recovery "$(TASK)" --yes
 
 throw_volumes:
-	@echo "WARNING: permanently deletes benchmark database/state volumes (postgres_data, runner_state and benchmark_sources)."
-	@printf "Type THROW to continue: "; read answer; test "$$answer" = "THROW"
-	docker compose stop storage postgres
-	docker compose rm -f storage postgres
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=postgres_data)" 2>/dev/null || true
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=runner_state)" 2>/dev/null || true
-	docker volume rm -f "$$(docker volume ls -q --filter label=com.docker.compose.project=$$(docker compose ls --format json | python3 -c 'import json,sys; x=json.load(sys.stdin); print(next((i["Name"] for i in x if i.get("ConfigFiles","").endswith("compose.yaml")), "gpt-trace-extractor"))') --filter label=com.docker.compose.volume=benchmark_sources)" 2>/dev/null || true
-	@echo "postgres_data + runner_state + benchmark_sources removed; browser_profile preserved."
+	python3 scripts/throw_volumes.py
 
 down:
 	python3 scripts/down.py

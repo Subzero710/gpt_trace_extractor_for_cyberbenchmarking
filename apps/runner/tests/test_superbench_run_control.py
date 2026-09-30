@@ -5,7 +5,7 @@ from dataclasses import asdict, replace
 
 import pytest
 
-from gpt_trace_runner.exceptions import ConcurrentRunnerError, RecoveryIncomplete
+from gpt_trace_runner.exceptions import ConcurrentRunnerError, RateLimited, RecoveryIncomplete
 from gpt_trace_runner.lock import RunnerLock
 from gpt_trace_runner.superbench.lifecycle import SigintPause, classify_incident
 from gpt_trace_runner.superbench.run_control import (
@@ -355,3 +355,34 @@ def test_rate_limit_is_paused_not_human_intervention():
     assert classify_incident(
         RateLimited("slow down")
     ) == ("rate_limited", False)
+
+
+def test_rate_limit_defer_survives_reload_and_blocks_early_resume(
+    tmp_path,
+    monkeypatch,
+):
+    import gpt_trace_runner.superbench.run_control as run_control_module
+
+    monkeypatch.setattr(run_control_module.time, "time", lambda: 1000.0)
+    path = tmp_path / "active.json"
+
+    store = RunControlStore(path)
+    store.create(make_run())
+    store.defer_rate_limit(120.0)
+
+    resumed = RunControlStore(path)
+    with pytest.raises(RateLimited) as raised:
+        resumed.enforce_rate_limit_defer()
+
+    assert raised.value.retry_after_seconds == 120.0
+    assert resumed.load().retry_not_before == 1120.0
+
+
+def test_legacy_v3_without_retry_not_before_still_loads(tmp_path):
+    payload = asdict(make_run())
+    payload.pop("retry_not_before", None)
+    path = tmp_path / "active.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = RunControlStore(path).load()
+    assert loaded.retry_not_before is None

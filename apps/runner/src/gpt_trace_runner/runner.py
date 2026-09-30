@@ -142,7 +142,7 @@ class BenchmarkRunner:
     async def _ensure_session(self) -> None:
         if self._session_prepared:
             return
-        await self.chatgpt.prepare_session(fresh_home=True)
+        await self.chatgpt.prepare_session(fresh_home=False)
         self._session_prepared = True
 
     @staticmethod
@@ -201,6 +201,10 @@ class BenchmarkRunner:
             task=recovery_task,
             user_message_id=user_message_id,
         )
+        # Recovery may replace a frontend-local local-chatgpt/WEB route handle
+        # with the durable backend conversation ID. Persist and clean up only
+        # that resolved identity from this point onward.
+        conversation_id = captured.conversation_id
         app_runtime = await self.lifecycle.runtime_metadata(
             recovery_task,
             environments,
