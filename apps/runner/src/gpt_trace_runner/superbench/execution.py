@@ -56,7 +56,7 @@ async def _record_pre_runner_failure(
     )
 
 
-async def _connect_chatgpt(*, settings, make_chatgpt, bt):
+async def _connect_chatgpt(*, settings, make_chatgpt):
     browser = BrowserClient(
         settings.effective_browser_cdp_url(),
         humanize=settings.browser_humanize,
@@ -141,13 +141,13 @@ async def _recover_pending_journal(
     settings,
     registry,
     make_lifecycle,
-    make_chatgpt,
     console,
     adapters,
     entries,
     camp,
     storage,
     staging: Path,
+    get_chatgpt,
 ) -> None:
     journal = JournalStore(settings.journal_path)
     pending = journal.load()
@@ -186,12 +186,9 @@ async def _recover_pending_journal(
         app_environments=dict(pending.app_environments),
     )
     lifecycle = make_lifecycle(settings, [bt])
-    session = None
     recovery_error: BaseException | None = None
     try:
-        session, chatgpt = await _connect_chatgpt(
-            settings=settings, make_chatgpt=make_chatgpt, bt=bt
-        )
+        chatgpt = await get_chatgpt()
 
         async def evaluate(captured):
             result = await adapter.evaluate(task, prepared=prepared, captured=captured)
@@ -226,8 +223,6 @@ async def _recover_pending_journal(
         _persist_rate_limit_defer(journal, journal.load(), exc)
         raise
     finally:
-        if session is not None:
-            await session.disconnect()
         # Never destroy evaluator-side state while recovery is still pending.
         if journal.load() is None:
             await _cleanup_task(
@@ -279,6 +274,17 @@ async def run_pending(
     staging.mkdir(parents=True, exist_ok=True)
     attempted = 0
     last_completed_task_at: float | None = None
+    browser_session = None
+    chatgpt_client = None
+
+    async def get_chatgpt():
+        nonlocal browser_session, chatgpt_client
+        if chatgpt_client is None:
+            browser_session, chatgpt_client = await _connect_chatgpt(
+                settings=settings,
+                make_chatgpt=make_chatgpt,
+            )
+        return chatgpt_client
 
     try:
         await storage.health()
@@ -303,13 +309,13 @@ async def run_pending(
                     settings=settings,
                     registry=registry,
                     make_lifecycle=make_lifecycle,
-                    make_chatgpt=make_chatgpt,
                     console=console,
                     adapters=adapters,
                     entries=entries,
                     camp=camp,
                     storage=storage,
                     staging=staging,
+                    get_chatgpt=get_chatgpt,
                 )
                 if pending_before_recovery is not None:
                     # Successful journal reconciliation used the ChatGPT session
@@ -420,7 +426,6 @@ async def run_pending(
 
                 prepared = None
                 lifecycle = None
-                session = None
                 runner = None
                 runner_started = False
                 recovery_required = False
@@ -430,9 +435,7 @@ async def run_pending(
                 try:
                     prepared = await adapter.prepare(task)
                     lifecycle = make_lifecycle(settings, [bt])
-                    session, chatgpt = await _connect_chatgpt(
-                        settings=settings, make_chatgpt=make_chatgpt, bt=bt
-                    )
+                    chatgpt = await get_chatgpt()
 
                     async def evaluate(captured):
                         result = await adapter.evaluate(
@@ -561,8 +564,6 @@ async def run_pending(
 
                 finally:
                     attempted += 1
-                    if session is not None:
-                        await session.disconnect()
                     if not recovery_required:
                         await _cleanup_task(
                             adapter=adapter,
@@ -595,6 +596,8 @@ async def run_pending(
                 return attempted, camp.campaign_id
         raise
     finally:
+        if browser_session is not None:
+            await browser_session.disconnect()
         if owned_storage:
             await storage.close()
 

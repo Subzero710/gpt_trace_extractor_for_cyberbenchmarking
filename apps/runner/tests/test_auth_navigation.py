@@ -223,7 +223,7 @@ def test_superbench_recovery_is_centralized_in_execution_path() -> None:
     )[0]
     scheduler = source.split("async def run_pending", 1)[1]
 
-    assert "await _connect_chatgpt(" in recovery
+    assert "chatgpt = await get_chatgpt()" in recovery
     assert "await runner.reconcile_journal([bt])" in recovery
     assert "await _recover_pending_journal(" in scheduler
     assert "pending.task_id not in set(selected_run_task_ids)" in scheduler
@@ -332,6 +332,20 @@ def test_superbench_auth_reports_success_after_app_verification() -> None:
     assert verify in auth
     assert success in auth
     assert auth.index(verify) < auth.index(success)
+
+def test_superbench_keeps_one_browser_attachment_for_the_batch() -> None:
+    package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"
+    execution = (
+        package / "superbench" / "execution.py"
+    ).read_text(encoding="utf-8")
+    scheduler = execution.split("async def run_pending", 1)[1]
+
+    assert scheduler.count("await _connect_chatgpt(") == 1
+    assert "chatgpt = await get_chatgpt()" in scheduler
+    assert "await browser_session.disconnect()" in scheduler
+    per_task_finally = scheduler.split("finally:", 1)[1]
+    assert "await session.disconnect()" not in per_task_finally
+
 
 def test_superbench_runtime_bootstrap_avoids_private_thinking_patch_and_app_scratch_preflight() -> None:
     package = Path(__file__).parents[1] / "src" / "gpt_trace_runner"

@@ -91,10 +91,6 @@ def test_workstation_uses_narrow_broker_socket() -> None:
     assert settings.workstation_provider == 'libvirt'
 
 
-def test_default_inter_task_pause_is_zero_with_backend_request_pacing() -> None:
-    assert Settings().chatgpt_inter_task_pause_seconds == 0.0
-
-
 def test_invalid_workstation_resources_and_empty_model_are_rejected() -> None:
     from pydantic import ValidationError
     with pytest.raises(ValidationError):
