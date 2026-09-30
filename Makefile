@@ -20,7 +20,9 @@ tools:
 
 auth:
 	python3 scripts/project_state.py core
-	docker compose run --rm --no-deps runner superbench-auth
+	@host_ip="$$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<=NF; i++) if ($$i == "src") {print $$(i+1); exit}}')"; \
+		test -n "$$host_ip" || { echo "could not determine host IPv4 address from default route" >&2; exit 1; }; \
+		TEACHER_BROWSER_HOST_IP="$$host_ip" docker compose run --rm --no-deps -e TEACHER_BROWSER_HOST_IP runner superbench-auth
 
 run:
 	python3 scripts/project_state.py core
