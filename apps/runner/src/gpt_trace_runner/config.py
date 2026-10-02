@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     browser_humanize: bool = True
     browser_humanize_preset: Literal["default", "careful"] = "default"
     browser_clipboard_url: str = "http://teacher-browser:8765/clipboard"
+    teacher_browser_public_url: str = ""
 
     runner_state_root: Path = Path("/data/state")
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
@@ -203,6 +204,24 @@ class Settings(BaseSettings):
                 "browser_clipboard_url must be the internal http://teacher-browser:<port>/clipboard helper"
             )
         return self.browser_clipboard_url
+
+    def validate_teacher_browser_public_url(self) -> str:
+        value = self.teacher_browser_public_url.strip()
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise BrowserIdentityError(
+                "teacher_browser_public_url must be an HTTPS origin URL such as "
+                "https://kasm.example.com"
+            )
+        return value.rstrip("/") + "/"
 
     def effective_runner_id(self) -> str:
         label = self.runner_id.strip() or socket.gethostname()

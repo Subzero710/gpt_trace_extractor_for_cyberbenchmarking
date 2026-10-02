@@ -12,7 +12,7 @@ publish-kali-golden:
 up:
 	python3 scripts/project_state.py core
 	python3 scripts/workstation_broker.py start
-	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser kali-workstation-controller workstation-gateway
+	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser teacher-browser-tunnel kali-workstation-controller workstation-gateway
 
 doctor: up
 	python3 scripts/host_doctor.py
@@ -23,9 +23,7 @@ tools:
 
 auth:
 	python3 scripts/project_state.py core
-	@host_ip="$$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<=NF; i++) if ($$i == "src") {print $$(i+1); exit}}')"; \
-		test -n "$$host_ip" || { echo "could not determine host IPv4 address from default route" >&2; exit 1; }; \
-		TEACHER_BROWSER_HOST_IP="$$host_ip" docker compose run --rm --no-deps -e TEACHER_BROWSER_HOST_IP runner superbench-auth
+	docker compose run --rm --no-deps runner superbench-auth
 
 run:
 	python3 scripts/project_state.py core

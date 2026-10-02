@@ -1,5 +1,5 @@
 # Versioned non-secret runtime configuration.
-# .env is intentionally reserved for secrets only.
+# Deployment-local values such as the public Kasm URL come from .env.
 [runner]
 storage_base_url = "http://storage:8080"
 browser_cdp_url = ""

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
-import os
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -66,19 +64,6 @@ def make_lifecycle(
 def clipboard_health_url(settings: Settings) -> str:
     parsed = urlparse(settings.validate_clipboard_url())
     return urlunparse(parsed._replace(path="/healthz", query=""))
-
-
-def teacher_browser_kasm_url() -> str:
-    raw = os.environ.get("TEACHER_BROWSER_HOST_IP", "").strip()
-    try:
-        host_ip = ipaddress.ip_address(raw)
-    except ValueError as exc:
-        raise RecoveryIncomplete(
-            "TEACHER_BROWSER_HOST_IP must be a valid IPv4 address passed by the host Makefile"
-        ) from exc
-    if host_ip.version != 4:
-        raise RecoveryIncomplete("TEACHER_BROWSER_HOST_IP must be IPv4")
-    return f"https://{host_ip}:6901/"
 
 
 def internal_local_apps_task(
@@ -346,7 +331,7 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
                 chatgpt = make_chatgpt(settings, session.page)
                 console.print(
                     "Open the teacher-browser KasmVNC endpoint at "
-                    f"[bold]{teacher_browser_kasm_url()}[/] "
+                    f"[bold]{settings.validate_teacher_browser_public_url()}[/] "
                     "(user [bold]kasm_user[/]), then log in to ChatGPT."
                 )
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)

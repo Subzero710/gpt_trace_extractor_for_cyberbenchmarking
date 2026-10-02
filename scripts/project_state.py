@@ -8,6 +8,7 @@ import secrets
 import stat
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
@@ -22,6 +23,10 @@ KNOWN_SECRET_KEYS = {
     "CONTROL_PLANE_API_KEY",
     "APP_KALI_WORKSTATION_TUNNEL_ID",
     "TEACHER_BROWSER_PASSWORD",
+    "TEACHER_BROWSER_TUNNEL_TOKEN",
+}
+KNOWN_LOCAL_CONFIG_KEYS = {
+    "TEACHER_BROWSER_PUBLIC_URL",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -53,16 +58,39 @@ def is_secret_key(key: str) -> bool:
     return key in KNOWN_SECRET_KEYS or bool(SECRET_NAME.search(key))
 
 
-def validate_secret_only_env(values: dict[str, str]) -> None:
-    invalid = sorted(key for key in values if not is_secret_key(key))
+def validate_env(values: dict[str, str]) -> None:
+    invalid = sorted(
+        key
+        for key in values
+        if not is_secret_key(key) and key not in KNOWN_LOCAL_CONFIG_KEYS
+    )
     if invalid:
         raise SystemExit(
-            ".env contains non-secret configuration keys: "
+            ".env contains unsupported non-secret configuration keys: "
             + ", ".join(invalid)
-            + ". Move configuration to config/ or state/."
+            + ". Move versioned configuration to config/ or explicitly allow "
+            "deployment-local keys in scripts/project_state.py."
         )
     if not values.get("POSTGRES_PASSWORD"):
         raise SystemExit("POSTGRES_PASSWORD is required in .env")
+    if not values.get("TEACHER_BROWSER_TUNNEL_TOKEN"):
+        raise SystemExit("TEACHER_BROWSER_TUNNEL_TOKEN is required in .env")
+
+    public_url = values.get("TEACHER_BROWSER_PUBLIC_URL", "").strip()
+    parsed = urlparse(public_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise SystemExit(
+            "TEACHER_BROWSER_PUBLIC_URL must be an HTTPS origin URL such as "
+            "https://kasm.example.com"
+        )
 
 
 def atomic_secret(path: Path, content: str) -> None:
@@ -143,7 +171,7 @@ def main() -> int:
     args = parser.parse_args()
 
     values = parse_env(ENV_PATH)
-    validate_secret_only_env(values)
+    validate_env(values)
     os.chmod(ENV_PATH, 0o600)
     ensure_control_tokens()
     materialize_teacher_browser_password(values)
