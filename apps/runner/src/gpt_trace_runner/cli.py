@@ -330,9 +330,9 @@ def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
             try:
                 chatgpt = make_chatgpt(settings, session.page)
                 console.print(
-                    "Open the teacher-browser KasmVNC endpoint at "
-                    f"[bold]{settings.validate_teacher_browser_public_url()}[/] "
-                    "(user [bold]kasm_user[/]), then log in to ChatGPT."
+                    "Open the teacher-browser endpoint at "
+                    f"[bold]{settings.validate_teacher_browser_public_url()}[/], "
+                    "authenticate with TEACHER_BROWSER_PASSWORD, then log in to ChatGPT."
                 )
                 await chatgpt.wait_until_authenticated(timeout_minutes * 60)
                 await chatgpt.verify_apps_available(task.tools)

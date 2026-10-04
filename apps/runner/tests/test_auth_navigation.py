@@ -87,6 +87,8 @@ def test_auth_command_preflights_apps_but_runtime_uses_real_task_selection() -> 
 
     assert "await chatgpt.verify_apps_available(task.tools)" in cli_source
     assert "await chatgpt.verify_apps_available(bt.tools)" not in execution_source
+    assert "authenticate with TEACHER_BROWSER_PASSWORD" in cli_source
+    assert "user [bold]kasm_user" not in cli_source
 
 
 class AuthTrafficDouble:
@@ -102,14 +104,14 @@ class AuthTrafficDouble:
 
 
 @pytest.mark.asyncio
-async def test_auth_wait_polls_backend_me_without_forced_reload() -> None:
+async def test_auth_wait_polls_cookie_session_without_forced_reload() -> None:
     page = type("PageDouble", (), {})()
     page.url = "https://chatgpt.com/"
     page.reload = AsyncMock()
     page.evaluate = AsyncMock(
         side_effect=[
-            {"status": 401, "object": None, "id": None},
-            {"status": 200, "object": "user", "id": "user-1"},
+            {"status": 200, "id": None, "hasAccessToken": False},
+            {"status": 200, "id": "user-1", "hasAccessToken": True},
         ]
     )
 
@@ -122,6 +124,22 @@ async def test_auth_wait_polls_backend_me_without_forced_reload() -> None:
 
     assert page.evaluate.await_count == 2
     page.reload.assert_not_awaited()
+
+
+def test_auth_probe_uses_cookie_session_not_bearer_only_backend_me() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "gpt_trace_runner"
+        / "chatgpt.py"
+    ).read_text(encoding="utf-8")
+
+    probe = source.split("async def assert_authenticated_current_page", 1)[1].split(
+        "async def wait_until_authenticated", 1
+    )[0]
+    assert "fetch('/api/auth/session'" in probe
+    assert "fetch('/backend-api/me'" not in probe
+    assert 'value.get("hasAccessToken") is not True' in probe
 
 
 def test_auth_waiter_does_not_use_frontend_auth_selectors() -> None:
@@ -146,7 +164,9 @@ def test_auth_waiter_does_not_use_frontend_auth_selectors() -> None:
 async def test_resume_auth_check_is_non_mutating() -> None:
     page = type("PageDouble", (), {})()
     page.url = "https://chatgpt.com/c/existing"
-    page.evaluate = AsyncMock(return_value={"status": 200, "object": "user", "id": "user-1"})
+    page.evaluate = AsyncMock(
+        return_value={"status": 200, "id": "user-1", "hasAccessToken": True}
+    )
     page.reload = AsyncMock()
     page.goto = AsyncMock()
 
@@ -165,7 +185,9 @@ async def test_resume_auth_check_is_non_mutating() -> None:
 async def test_resume_auth_check_rejects_missing_session_without_reload() -> None:
     page = type("PageDouble", (), {})()
     page.url = "https://chatgpt.com/c/existing"
-    page.evaluate = AsyncMock(return_value={"status": 401, "object": None, "id": None})
+    page.evaluate = AsyncMock(
+        return_value={"status": 200, "id": None, "hasAccessToken": False}
+    )
     page.reload = AsyncMock()
 
     client = ChatGPTClient.__new__(ChatGPTClient)

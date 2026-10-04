@@ -434,7 +434,11 @@ class ChatGPTClient:
         try:
             value = await self._page.evaluate(
                 """async () => {
-                    const response = await fetch('/backend-api/me', {
+                    // /backend-api/* now requires a Bearer access token.  The
+                    // browser's cookie-authenticated session endpoint remains
+                    // the authoritative same-origin login probe and exposes
+                    // the access token used by the ChatGPT SPA.
+                    const response = await fetch('/api/auth/session', {
                         method: 'GET',
                         credentials: 'include',
                         cache: 'no-store',
@@ -444,10 +448,18 @@ class ChatGPTClient:
                         payload = await response.json();
                     } catch (_) {
                     }
+                    const user =
+                        payload && typeof payload.user === 'object'
+                            ? payload.user
+                            : null;
+                    const accessToken =
+                        payload && typeof payload.accessToken === 'string'
+                            ? payload.accessToken
+                            : '';
                     return {
                         status: response.status,
-                        object: payload && payload.object,
-                        id: payload && payload.id,
+                        id: user && user.id,
+                        hasAccessToken: Boolean(accessToken),
                         retryAfter: response.headers.get('retry-after'),
                         requestId:
                             response.headers.get('x-request-id') ||
@@ -468,7 +480,7 @@ class ChatGPTClient:
                 if isinstance(request_id_raw, str) and request_id_raw.strip()
                 else None
             )
-            detail = "ChatGPT /backend-api/me returned HTTP 429 during resume"
+            detail = "ChatGPT /api/auth/session returned HTTP 429 during resume"
             if retry_after is not None:
                 detail += f"; retry_after={retry_after:.3f}s"
             if request_id is not None:
@@ -476,16 +488,16 @@ class ChatGPTClient:
             raise RateLimited(
                 detail,
                 retry_after_seconds=retry_after,
-                endpoint="/backend-api/me",
+                endpoint="/api/auth/session",
                 method="GET",
                 request_id=request_id,
             )
         if (
             not isinstance(value, dict)
             or value.get("status") != 200
-            or value.get("object") != "user"
             or not isinstance(value.get("id"), str)
             or not value["id"]
+            or value.get("hasAccessToken") is not True
         ):
             raise AuthenticationRequired(
                 "existing ChatGPT browser session is not authenticated; "
@@ -493,12 +505,12 @@ class ChatGPTClient:
             )
 
     async def wait_until_authenticated(self, timeout_seconds: float) -> None:
-        """Poll ChatGPT's backend identity endpoint without forcing a page reload."""
+        """Poll ChatGPT's cookie-authenticated session endpoint without reloading."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
 
         # A blank/non-ChatGPT tab must first reach the real site so the operator
         # can log in. Once there, never reload merely to manufacture an auth
-        # observation: low-rate /backend-api/me polling is enough.
+        # observation: low-rate /api/auth/session polling is enough.
         if not self._page.url.startswith(self._base_url):
             await self.goto_home()
 
@@ -524,6 +536,10 @@ class ChatGPTClient:
                 raise
             except AuthenticationRequired as exc:
                 last_error = exc
+                # Keep this a low-rate observer.  A tight loop can create enough
+                # auth traffic to trigger rate limiting while the operator is
+                # completing an interactive login.
+                await asyncio.sleep(min(1.0, remaining))
 
     async def _new_chat_if_needed(self) -> None:
         # Successful benchmark conversations are deleted explicitly after
