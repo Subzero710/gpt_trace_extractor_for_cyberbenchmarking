@@ -170,6 +170,7 @@ _APP_KEYBOARD_ACTIVE_JS = r"""
     }
 
     const highlighted = document.querySelectorAll([
+        '[data-list-navigation-item="true"][aria-current="true"]',
         '[role="option"][aria-selected="true"]',
         '[role="menuitem"][aria-selected="true"]',
         '[role="option"][data-highlighted]',
