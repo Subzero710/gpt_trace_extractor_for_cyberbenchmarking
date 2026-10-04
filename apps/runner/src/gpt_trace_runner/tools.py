@@ -72,6 +72,12 @@ _COMPOSER_ACCEPTED_JS = r"""
 """
 
 
+_APP_INTERACTIVE_ROW_SELECTOR = (
+    "button, [role='option'], [role='menuitem'], [role='button'], "
+    "[data-radix-collection-item]"
+)
+
+
 _APP_CANDIDATE_VISIBLE_JS = r"""
 ([appName]) => {
     const editor =
@@ -117,7 +123,7 @@ async def _find_app_candidate(
     tool: BenchmarkTool,
     timeout_seconds: float,
 ) -> Locator:
-    """Resolve the visible autocomplete row that actually receives pointer events."""
+    """Resolve a humanize-compatible visible App autocomplete target."""
     try:
         await page.wait_for_function(
             _APP_CANDIDATE_VISIBLE_JS,
@@ -130,18 +136,13 @@ async def _find_app_candidate(
             "candidate"
         ) from exc
 
-    matches = page.get_by_text(tool.name, exact=True)
     editor_box = await editor.bounding_box()
 
-    best: Locator | None = None
-    best_distance = float("inf")
-
-    for index in range(await matches.count()):
-        text_candidate = matches.nth(index)
+    async def score(candidate: Locator) -> float | None:
         try:
-            if not await text_candidate.is_visible():
-                continue
-            inside_composer = await text_candidate.evaluate(
+            if not await candidate.is_visible():
+                return None
+            inside_composer = await candidate.evaluate(
                 """el => Boolean(el.closest(
                     '#prompt-textarea, '
                     + '[contenteditable="true"][data-lexical-editor="true"], '
@@ -149,50 +150,72 @@ async def _find_app_candidate(
                 ))"""
             )
             if inside_composer:
-                continue
-
-            # get_by_text() often resolves the label/span inside the autocomplete
-            # row. CloakBrowser correctly rejects clicking that leaf when a sibling
-            # overlay inside the row receives pointer events. Target the nearest
-            # interactive row instead, so a descendant hit still bubbles to the
-            # intended control.
-            row = text_candidate.locator(
-                "xpath=ancestor-or-self::*["
-                "self::button or @role='option' or @role='menuitem' "
-                "or @role='button' or @data-radix-collection-item"
-                "][1]"
-            )
-            if await row.count() and await row.is_visible():
-                candidate = row
-            else:
-                # Some ChatGPT picker revisions use a plain DIV row without an
-                # explicit ARIA role. Its immediate parent is acceptable only when
-                # its normalized text is still exactly the requested App name.
-                parent = text_candidate.locator("xpath=..")
-                if await parent.count() and await parent.is_visible():
-                    parent_text = " ".join((await parent.inner_text()).split())
-                    candidate = parent if parent_text == tool.name else text_candidate
-                else:
-                    candidate = text_candidate
+                return None
 
             box = await candidate.bounding_box()
             if box is None:
-                continue
-
+                return None
             if editor_box is None:
-                return candidate
+                return 0.0
 
             candidate_x = box["x"] + box["width"] / 2
             candidate_y = box["y"] + box["height"] / 2
             editor_x = editor_box["x"] + editor_box["width"] / 2
             editor_y = editor_box["y"] + editor_box["height"] / 2
-            distance = abs(candidate_x - editor_x) + abs(candidate_y - editor_y)
+            return abs(candidate_x - editor_x) + abs(candidate_y - editor_y)
+        except Exception:
+            return None
 
-            if distance < best_distance:
-                best = candidate
-                best_distance = distance
+    # CloakBrowser's humanized click resolver accepts a plain CSS locator with a
+    # trailing .nth(), but not Playwright locator chains such as
+    # get_by_text(...).nth(...).locator("xpath=..."). Search the interactive rows
+    # directly so the returned locator stays within that supported subset.
+    rows = page.locator(_APP_INTERACTIVE_ROW_SELECTOR)
+    best: Locator | None = None
+    best_distance = float("inf")
+    for index in range(await rows.count()):
+        candidate = rows.nth(index)
+        try:
+            has_exact_label = await candidate.evaluate(
+                """(el, appName) => {
+                    const normalize = (value) => (value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    if (normalize(el.innerText || el.textContent) === appName) {
+                        return true;
+                    }
+                    for (const child of el.querySelectorAll('*')) {
+                        if (normalize(child.innerText || child.textContent) === appName) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                tool.name,
+            )
         except Exception:
             continue
+        if not has_exact_label:
+            continue
+
+        distance = await score(candidate)
+        if distance is not None and distance < best_distance:
+            best = candidate
+            best_distance = distance
+
+    if best is not None:
+        return best
+
+    # Picker revisions can expose a plain text leaf without an ARIA/button row.
+    # get_by_text(...).nth(...) is also supported by CloakBrowser humanization, so
+    # use that leaf directly rather than creating a chained parent/xpath locator.
+    matches = page.get_by_text(tool.name, exact=True)
+    for index in range(await matches.count()):
+        candidate = matches.nth(index)
+        distance = await score(candidate)
+        if distance is not None and distance < best_distance:
+            best = candidate
+            best_distance = distance
 
     if best is None:
         raise AppUnavailable(

@@ -29,11 +29,12 @@ def test_app_selection_types_query_and_clicks_visible_candidate_row() -> None:
     find_candidate = source.split("async def _find_app_candidate", 1)[1].split(
         "async def _wait_app_accepted", 1
     )[0]
-    assert "text_candidate = matches.nth(index)" in find_candidate
-    assert "ancestor-or-self::*" in find_candidate
-    assert "@role='option'" in find_candidate
-    assert "@role='menuitem'" in find_candidate
-    assert 'text_candidate.locator("xpath=..")' in find_candidate
+    assert "rows = page.locator(_APP_INTERACTIVE_ROW_SELECTOR)" in find_candidate
+    assert "candidate = rows.nth(index)" in find_candidate
+    assert "matches = page.get_by_text(tool.name, exact=True)" in find_candidate
+    assert "candidate = matches.nth(index)" in find_candidate
+    assert ".locator(\"xpath=ancestor-or-self" not in find_candidate
+    assert "ancestor-or-self::*" not in find_candidate
 
 def test_app_selection_waits_for_candidate_click_then_acceptance() -> None:
     source = _source("tools.py")
