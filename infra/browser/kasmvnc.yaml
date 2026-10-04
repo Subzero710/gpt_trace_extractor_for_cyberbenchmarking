@@ -8,7 +8,7 @@ desktop:
 network:
   protocol: http
   interface: 0.0.0.0
-  websocket_port: 6901
+  websocket_port: 6902
   use_ipv4: true
   use_ipv6: false
   udp:

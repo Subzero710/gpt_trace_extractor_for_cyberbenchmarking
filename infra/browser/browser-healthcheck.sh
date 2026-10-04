@@ -18,6 +18,7 @@ xdpyinfo -display "$display" >/dev/null
 pgrep -f 'X(kasm)?vnc.*:99' >/dev/null
 pgrep -x openbox >/dev/null
 python /usr/local/bin/kasm-healthcheck >/dev/null
+/usr/local/bin/auth-proxy-healthcheck >/dev/null
 curl -fsS "http://localhost:${BROWSER_CLIPBOARD_PORT:-8765}/healthz" >/dev/null
 
 args=(--data-urlencode "fingerprint=$seed")

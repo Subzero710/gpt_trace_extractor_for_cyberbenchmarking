@@ -43,7 +43,7 @@ PY
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl openssl xclip x11-utils x11-xserver-utils xdotool openbox gosu util-linux; \
+      ca-certificates curl openssl xclip x11-utils x11-xserver-utils xdotool openbox gosu util-linux python3-aiohttp; \
     case "$TARGETARCH" in \
       amd64) kasm_arch=amd64; kasm_sha=80b241de7dfe53bba2b7e1cc5ac8c5246d72271efa16be2d4f76607f30fab1c4 ;; \
       arm64) kasm_arch=arm64; kasm_sha=fbb11589958a2acccd2d67f67944be79ac1e8e3a1d6172c0e6db6dc59e55a919 ;; \
@@ -58,7 +58,8 @@ RUN set -eux; \
     rm -f "$kasm_deb"; \
     rm -rf /var/lib/apt/lists/*; \
     command -v Xvnc >/dev/null; \
-    command -v kasmvncpasswd >/dev/null
+    command -v kasmvncpasswd >/dev/null; \
+    /usr/bin/python3 -c 'import aiohttp; assert aiohttp.__version__'
 
 RUN command -v unshare >/dev/null
 
@@ -67,6 +68,8 @@ COPY start-browser.sh /usr/local/bin/start-browser
 COPY browser-healthcheck.sh /usr/local/bin/browser-healthcheck
 COPY clipboard_server.py /usr/local/bin/clipboard-server
 COPY kasm_healthcheck.py /usr/local/bin/kasm-healthcheck
+COPY kasm_auth_proxy.py /usr/local/bin/kasm-auth-proxy
+COPY auth_proxy_healthcheck.py /usr/local/bin/auth-proxy-healthcheck
 COPY kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 
 RUN chmod +x \
@@ -74,7 +77,9 @@ RUN chmod +x \
     /usr/local/bin/start-browser \
     /usr/local/bin/browser-healthcheck \
     /usr/local/bin/clipboard-server \
-    /usr/local/bin/kasm-healthcheck
+    /usr/local/bin/kasm-healthcheck \
+    /usr/local/bin/kasm-auth-proxy \
+    /usr/local/bin/auth-proxy-healthcheck
 
 RUN python - <<'PY'
 from pathlib import Path

@@ -136,6 +136,30 @@ done
   exit 70
 }
 
+/usr/local/bin/kasm-auth-proxy \
+  --upstream https://127.0.0.1:6902 \
+  --password-file "$kasm_password_file" \
+  --username "$kasm_user" \
+  --cert /home/browser/.vnc/self.pem &
+auth_proxy_pid=$!
+children+=("$auth_proxy_pid")
+
+auth_proxy_ready=false
+for _ in $(seq 1 100); do
+  if /usr/local/bin/auth-proxy-healthcheck >/dev/null 2>&1; then
+    auth_proxy_ready=true
+    break
+  fi
+  if ! kill -0 "$auth_proxy_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+[[ "$auth_proxy_ready" == "true" ]] || {
+  echo "teacher browser HTML auth proxy did not become ready" >&2
+  exit 71
+}
+
 python /usr/local/bin/clipboard-server --port "${BROWSER_CLIPBOARD_PORT:-8765}" &
 clipboard_pid=$!
 children+=("$clipboard_pid")
@@ -145,7 +169,7 @@ cloak_pid=$!
 children+=("$cloak_pid")
 
 set +e
-wait -n "$kasm_pid" "$clipboard_pid" "$cloak_pid"
+wait -n "$kasm_pid" "$auth_proxy_pid" "$clipboard_pid" "$cloak_pid"
 status=$?
 set -e
 

@@ -111,9 +111,12 @@ printf '%s\n' "$version" | grep -F 'KasmVNC 1.5.0' >/dev/null
 ! command -v x11vnc >/dev/null 2>&1
 ! command -v websockify >/dev/null 2>&1
 test ! -d /usr/share/novnc
-grep -Eq '^  websocket_port: 6901$' /etc/kasmvnc/kasmvnc.yaml
+grep -Eq '^  websocket_port: 6902$' /etc/kasmvnc/kasmvnc.yaml
 grep -Eq '^    require_ssl: true$' /etc/kasmvnc/kasmvnc.yaml
 test -x /usr/local/bin/kasm-healthcheck
+test -x /usr/local/bin/kasm-auth-proxy
+test -x /usr/local/bin/auth-proxy-healthcheck
+/usr/bin/python3 -c 'import aiohttp'
 """
     run(["docker", "run", "--rm", "--entrypoint", "sh", image, "-ec", probe])
 

@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-URL = "https://127.0.0.1:6901/"
+URL = "https://127.0.0.1:6902/"
 
 
 def _credentials() -> tuple[str, str]:
