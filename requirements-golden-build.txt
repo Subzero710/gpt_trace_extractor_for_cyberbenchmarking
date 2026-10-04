@@ -1,0 +1,4 @@
+# Extra Ubuntu/Debian packages needed only on the machine that builds/publishes
+# the Kali golden image. Benchmark runtime hosts pull the prebuilt image instead.
+libguestfs-tools
+p7zip-full

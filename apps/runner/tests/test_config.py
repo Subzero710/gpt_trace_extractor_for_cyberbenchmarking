@@ -76,6 +76,21 @@ def test_external_clipboard_host_is_rejected() -> None:
         settings.validate_clipboard_url()
 
 
+def test_teacher_browser_public_url_requires_https_origin() -> None:
+    settings = Settings(teacher_browser_public_url="https://kasm.example.com")
+    assert settings.validate_teacher_browser_public_url() == "https://kasm.example.com/"
+
+    for invalid in (
+        "",
+        "http://kasm.example.com",
+        "https://user:pass@kasm.example.com",
+        "https://kasm.example.com/path",
+        "https://kasm.example.com/?token=bad",
+    ):
+        with pytest.raises(BrowserIdentityError):
+            Settings(teacher_browser_public_url=invalid).validate_teacher_browser_public_url()
+
+
 def test_runner_id_is_unique_even_with_fixed_label() -> None:
     settings = Settings(runner_id="worker")
     first = settings.effective_runner_id()
@@ -99,3 +114,13 @@ def test_invalid_workstation_resources_and_empty_model_are_rejected() -> None:
         Settings(chatgpt_expected_model_slug="   ")
     with pytest.raises(ValidationError):
         Settings(chatgpt_backend_quiet_seconds=0.5)
+
+
+def test_runner_has_no_localhost_operator_browser_url() -> None:
+    settings = Settings()
+    assert not hasattr(settings, "browser_novnc_url")
+
+
+def test_runner_has_no_absolute_chatgpt_turn_timeout() -> None:
+    settings = Settings()
+    assert not hasattr(settings, "chatgpt_turn_timeout_seconds")

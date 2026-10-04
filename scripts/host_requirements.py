@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements.txt"
+GOLDEN_BUILD_REQUIREMENTS = ROOT / "requirements-golden-build.txt"
 PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
 
 # Commands supplied by packages in requirements.txt. Keep this mapping focused on
@@ -22,10 +23,7 @@ COMMAND_PACKAGES = {
     "qemu-system-x86_64": "qemu-system-x86",
     "qemu-img": "qemu-utils",
     "virsh": "libvirt-clients",
-    "virt-customize": "libguestfs-tools",
-    "virt-cat": "libguestfs-tools",
     "xorriso": "xorriso",
-    "7z": "p7zip-full",
     "nft": "nftables",
     "mkfs.ext4": "e2fsprogs",
     "fallocate": "util-linux",
@@ -34,6 +32,12 @@ COMMAND_PACKAGES = {
     "ip": "iproute2",
     "curl": "curl",
     "git": "git",
+}
+
+GOLDEN_BUILD_COMMAND_PACKAGES = {
+    "virt-customize": "libguestfs-tools",
+    "virt-cat": "libguestfs-tools",
+    "7z": "p7zip-full",
 }
 
 
@@ -113,7 +117,7 @@ def _probe_venv() -> tuple[bool, str]:
         return False, str(exc)
 
 
-def verify_host_requirements(*, require_root: bool = False, verbose: bool = True) -> bool:
+def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True) -> bool:
     failures: list[str] = []
     missing_packages: list[str] = []
 
@@ -126,14 +130,19 @@ def verify_host_requirements(*, require_root: bool = False, verbose: bool = True
 
     packages: tuple[str, ...] = ()
     try:
-        packages = load_packages()
+        base_packages = load_packages()
+        extra_packages = load_packages(GOLDEN_BUILD_REQUIREMENTS) if golden_build else ()
+        packages = tuple(dict.fromkeys((*base_packages, *extra_packages)))
     except RuntimeError as exc:
         failures.append(str(exc))
 
     if packages and shutil.which("dpkg-query") is not None:
         missing_packages = [package for package in packages if not _package_installed(package)]
 
-    for command, package in COMMAND_PACKAGES.items():
+    command_packages = dict(COMMAND_PACKAGES)
+    if golden_build:
+        command_packages.update(GOLDEN_BUILD_COMMAND_PACKAGES)
+    for command, package in command_packages.items():
         if shutil.which(command) is None and package not in missing_packages:
             failures.append(f"{command} is missing even though {package} is installed")
 
@@ -166,7 +175,7 @@ def verify_host_requirements(*, require_root: bool = False, verbose: bool = True
         failures.append("hybrid build must run as root; use `sudo make build`")
 
     if missing_packages:
-        print("Missing host packages from requirements.txt:", file=sys.stderr)
+        print("Missing host packages from requirements manifests:", file=sys.stderr)
         for package in missing_packages:
             print(f"  - {package}", file=sys.stderr)
         print("Install them with:", file=sys.stderr)
@@ -195,10 +204,18 @@ def main() -> int:
     parser.add_argument(
         "--build",
         action="store_true",
-        help="also require root privileges needed by the host image/broker build path",
+        help="also require root privileges needed by the host broker/runtime build path",
+    )
+    parser.add_argument(
+        "--golden-build",
+        action="store_true",
+        help="also require packages used only when locally building/publishing the Kali golden",
     )
     args = parser.parse_args()
-    return 0 if verify_host_requirements(require_root=args.build) else 2
+    return 0 if verify_host_requirements(
+        require_root=args.build or args.golden_build,
+        golden_build=args.golden_build,
+    ) else 2
 
 
 if __name__ == "__main__":

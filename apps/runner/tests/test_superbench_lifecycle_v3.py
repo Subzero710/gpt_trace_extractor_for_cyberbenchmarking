@@ -38,7 +38,6 @@ class V3Settings:
     storage_base_url: str = "http://storage"
     chatgpt_expected_model_slug: str = "m"
     chatgpt_conversation_turns: int = 1
-    chatgpt_turn_timeout_seconds: int = 10
     chatgpt_stream_start_timeout_seconds: int = 10
     chatgpt_tool_select_timeout_seconds: int = 10
     chatgpt_upload_timeout_seconds: int = 10
@@ -157,7 +156,9 @@ def test_validate_frozen_rejects_configuration_drift(tmp_path):
 
     drifted = replace(
         settings,
-        chatgpt_turn_timeout_seconds=settings.chatgpt_turn_timeout_seconds + 1,
+        chatgpt_stream_start_timeout_seconds=(
+            settings.chatgpt_stream_start_timeout_seconds + 1
+        ),
     )
 
     with pytest.raises(

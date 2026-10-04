@@ -1,4 +1,4 @@
-.PHONY: requirements build up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: requirements build publish-kali-golden up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
 
 requirements:
 	python3 scripts/host_requirements.py
@@ -6,10 +6,13 @@ requirements:
 build:
 	python3 scripts/build.py
 
+publish-kali-golden:
+	python3 infra/workstation/image/build.py --publish
+
 up:
 	python3 scripts/project_state.py core
 	python3 scripts/workstation_broker.py start
-	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser kali-workstation-controller workstation-gateway
+	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser teacher-browser-tunnel kali-workstation-controller workstation-gateway
 
 doctor: up
 	python3 scripts/host_doctor.py

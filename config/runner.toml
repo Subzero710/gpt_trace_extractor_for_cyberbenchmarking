@@ -1,11 +1,10 @@
 # Versioned non-secret runtime configuration.
-# .env is intentionally reserved for secrets only.
+# Deployment-local values such as the public Kasm URL come from .env.
 [runner]
 storage_base_url = "http://storage:8080"
 browser_cdp_url = ""
 browser_cdp_base_url = "http://teacher-browser:9222"
 browser_profile_identity_path = "/browser-profile/.gpt-trace-identity"
-browser_novnc_url = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
 browser_humanize = true
 browser_humanize_preset = "default"
 browser_clipboard_url = "http://teacher-browser:8765/clipboard"
@@ -14,7 +13,6 @@ app_registry_path = "/data/apps/registry/apps.json"
 app_control_token_file = "/run/secrets/app_control_token"
 chatgpt_base_url = "https://chatgpt.com"
 chatgpt_conversation_turns = 100
-chatgpt_turn_timeout_seconds = 1800.0
 chatgpt_stream_start_timeout_seconds = 60.0
 chatgpt_tool_select_timeout_seconds = 15.0
 chatgpt_upload_timeout_seconds = 60.0
@@ -33,8 +31,8 @@ broker_socket = "/run/workstation-broker/broker.sock"
 gateway_container = "gpt-trace-workstation-gateway"
 boot_timeout_seconds = 120
 guest_agent_timeout_seconds = 60
-memory_mb = 8192
-vcpus = 4
+memory_mb = 4608
+vcpus = 3
 overlay_quota_gb = 16
 screenshot_max_bytes = 8388608
 max_terminals = 8

@@ -257,7 +257,7 @@ class ConversationStream:
         self,
         response: Response,
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None = None,
     ) -> None:
         self._response = response
         self._timeout_seconds = timeout_seconds
@@ -300,14 +300,17 @@ class ConversationStream:
                 f"{self._response.status} {self._response.status_text}"
             )
 
-        try:
-            async with asyncio.timeout(self._timeout_seconds):
-                finished_error = await self._response.finished()
-        except TimeoutError as exc:
-            raise ConversationStreamTimeout(
-                "conversation SSE did not finish within "
-                f"{self._timeout_seconds:.0f}s"
-            ) from exc
+        if self._timeout_seconds is None:
+            finished_error = await self._response.finished()
+        else:
+            try:
+                async with asyncio.timeout(self._timeout_seconds):
+                    finished_error = await self._response.finished()
+            except TimeoutError as exc:
+                raise ConversationStreamTimeout(
+                    "conversation SSE did not finish within diagnostic timeout "
+                    f"{self._timeout_seconds:.0f}s"
+                ) from exc
 
         if finished_error:
             raise ConversationStreamAborted(

@@ -5,15 +5,13 @@
 # Application/control-plane Python dependencies stay inside Docker images.
 # Guest Python dependencies stay in infra/workstation/image/requirements.lock.
 # The packages below are needed by the trusted host broker, libvirt/KVM boundary,
-# host-side golden-image customization, or host filesystem/firewall lifecycle.
+# golden-image installation, or host filesystem/firewall lifecycle.
 python3-venv
 qemu-system-x86
 qemu-utils
 libvirt-daemon-system
 libvirt-clients
-libguestfs-tools
 xorriso
-p7zip-full
 nftables
 e2fsprogs
 util-linux

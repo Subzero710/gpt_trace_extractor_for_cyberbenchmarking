@@ -8,6 +8,7 @@ import secrets
 import stat
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
@@ -15,11 +16,17 @@ SECRETS_DIR = ROOT / ".secrets"
 CONTROL_TOKEN = SECRETS_DIR / "app_control_token"
 BROKER_ADMIN_TOKEN = SECRETS_DIR / "workstation_broker_admin_token"
 BROKER_CONTROLLER_TOKEN = SECRETS_DIR / "workstation_broker_controller_token"
+TEACHER_BROWSER_PASSWORD = SECRETS_DIR / "teacher_browser_password"
 
 KNOWN_SECRET_KEYS = {
     "POSTGRES_PASSWORD",
     "CONTROL_PLANE_API_KEY",
     "APP_KALI_WORKSTATION_TUNNEL_ID",
+    "TEACHER_BROWSER_PASSWORD",
+    "TEACHER_BROWSER_TUNNEL_TOKEN",
+}
+KNOWN_LOCAL_CONFIG_KEYS = {
+    "TEACHER_BROWSER_PUBLIC_URL",
 }
 SECRET_NAME = re.compile(
     r"(?:^|_)(?:PASSWORD|SECRET|TOKEN|API_KEY|LICENSE_KEY|PRIVATE_KEY)$"
@@ -51,16 +58,39 @@ def is_secret_key(key: str) -> bool:
     return key in KNOWN_SECRET_KEYS or bool(SECRET_NAME.search(key))
 
 
-def validate_secret_only_env(values: dict[str, str]) -> None:
-    invalid = sorted(key for key in values if not is_secret_key(key))
+def validate_env(values: dict[str, str]) -> None:
+    invalid = sorted(
+        key
+        for key in values
+        if not is_secret_key(key) and key not in KNOWN_LOCAL_CONFIG_KEYS
+    )
     if invalid:
         raise SystemExit(
-            ".env contains non-secret configuration keys: "
+            ".env contains unsupported non-secret configuration keys: "
             + ", ".join(invalid)
-            + ". Move configuration to config/ or state/."
+            + ". Move versioned configuration to config/ or explicitly allow "
+            "deployment-local keys in scripts/project_state.py."
         )
     if not values.get("POSTGRES_PASSWORD"):
         raise SystemExit("POSTGRES_PASSWORD is required in .env")
+    if not values.get("TEACHER_BROWSER_TUNNEL_TOKEN"):
+        raise SystemExit("TEACHER_BROWSER_TUNNEL_TOKEN is required in .env")
+
+    public_url = values.get("TEACHER_BROWSER_PUBLIC_URL", "").strip()
+    parsed = urlparse(public_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise SystemExit(
+            "TEACHER_BROWSER_PUBLIC_URL must be an HTTPS origin URL such as "
+            "https://kasm.example.com"
+        )
 
 
 def atomic_secret(path: Path, content: str) -> None:
@@ -112,6 +142,20 @@ def ensure_control_tokens() -> None:
         raise SystemExit("generated control tokens must be distinct")
 
 
+
+def materialize_teacher_browser_password(values: dict[str, str]) -> None:
+    password = values.get("TEACHER_BROWSER_PASSWORD", "")
+    if not 12 <= len(password) <= 128:
+        raise SystemExit("TEACHER_BROWSER_PASSWORD must be 12..128 characters in .env")
+    if "\n" in password or "\r" in password:
+        raise SystemExit("TEACHER_BROWSER_PASSWORD must be a single line")
+    SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(SECRETS_DIR, 0o700)
+    atomic_secret(TEACHER_BROWSER_PASSWORD, password + "\n")
+    # Docker Compose bind-mounts file secrets. Keep the directory private while
+    # allowing the remapped non-root browser uid to read this one secret.
+    os.chmod(TEACHER_BROWSER_PASSWORD, 0o444)
+
 def validate_tunnels(values: dict[str, str]) -> None:
     tunnel_keys = ("APP_KALI_WORKSTATION_TUNNEL_ID",)
     for key in tunnel_keys:
@@ -127,9 +171,10 @@ def main() -> int:
     args = parser.parse_args()
 
     values = parse_env(ENV_PATH)
-    validate_secret_only_env(values)
+    validate_env(values)
     os.chmod(ENV_PATH, 0o600)
     ensure_control_tokens()
+    materialize_teacher_browser_password(values)
 
     if args.mode in ("doctor", "tools"):
         validate_tunnels(values)

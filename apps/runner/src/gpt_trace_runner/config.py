@@ -41,10 +41,10 @@ class Settings(BaseSettings):
     browser_cdp_url: str = ""
     browser_cdp_base_url: str = "http://teacher-browser:9222"
     browser_profile_identity_path: Path = Path("/browser-profile/.gpt-trace-identity")
-    browser_novnc_url: str = "http://localhost:7900/vnc.html?autoconnect=1&resize=scale"
     browser_humanize: bool = True
     browser_humanize_preset: Literal["default", "careful"] = "default"
     browser_clipboard_url: str = "http://teacher-browser:8765/clipboard"
+    teacher_browser_public_url: str = ""
 
     runner_state_root: Path = Path("/data/state")
     app_registry_path: Path = Path("/data/apps/registry/apps.json")
@@ -69,7 +69,6 @@ class Settings(BaseSettings):
 
     chatgpt_base_url: str = "https://chatgpt.com"
     chatgpt_conversation_turns: int = Field(default=100, ge=1, le=1000)
-    chatgpt_turn_timeout_seconds: float = Field(default=1800.0, gt=0)
     chatgpt_stream_start_timeout_seconds: float = Field(default=180.0, gt=0)
     chatgpt_tool_select_timeout_seconds: float = Field(default=20.0, gt=0)
     chatgpt_upload_timeout_seconds: float = Field(default=60.0, gt=0)
@@ -205,6 +204,24 @@ class Settings(BaseSettings):
                 "browser_clipboard_url must be the internal http://teacher-browser:<port>/clipboard helper"
             )
         return self.browser_clipboard_url
+
+    def validate_teacher_browser_public_url(self) -> str:
+        value = self.teacher_browser_public_url.strip()
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise BrowserIdentityError(
+                "teacher_browser_public_url must be an HTTPS origin URL such as "
+                "https://kasm.example.com"
+            )
+        return value.rstrip("/") + "/"
 
     def effective_runner_id(self) -> str:
         label = self.runner_id.strip() or socket.gethostname()
