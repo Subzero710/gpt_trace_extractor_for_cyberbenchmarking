@@ -72,12 +72,6 @@ _COMPOSER_ACCEPTED_JS = r"""
 """
 
 
-_APP_INTERACTIVE_ROW_SELECTOR = (
-    "button, [role='option'], [role='menuitem'], [role='button'], "
-    "[data-radix-collection-item]"
-)
-
-
 _APP_CANDIDATE_VISIBLE_JS = r"""
 ([appName]) => {
     const editor =
@@ -106,7 +100,7 @@ _APP_CANDIDATE_VISIBLE_JS = r"""
         if (editor && editor.contains(el)) continue;
 
         const text = (el.innerText || el.textContent || "")
-            .replace(/\s+/g, " ")
+            .replace(/\\s+/g, " ")
             .trim();
         if (text === appName) return true;
     }
@@ -116,14 +110,94 @@ _APP_CANDIDATE_VISIBLE_JS = r"""
 """
 
 
-async def _find_app_candidate(
+_APP_KEYBOARD_ACTIVE_JS = r"""
+([appName]) => {
+    const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
+    const editor =
+        document.querySelector("#prompt-textarea") ||
+        document.querySelector(
+            '[contenteditable="true"][data-lexical-editor="true"]'
+        ) ||
+        document.querySelector(
+            '[contenteditable="true"][role="textbox"]'
+        );
+
+    const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none"
+        );
+    };
+
+    const describe = (el, source) => {
+        if (!visible(el)) return null;
+        if (editor && editor.contains(el)) return null;
+
+        const ownText = normalize(el.innerText || el.textContent);
+        let exact = ownText === appName;
+        if (!exact) {
+            for (const child of el.querySelectorAll("*")) {
+                if (normalize(child.innerText || child.textContent) === appName) {
+                    exact = true;
+                    break;
+                }
+            }
+        }
+
+        return {
+            exact,
+            source,
+            text: ownText,
+            id: el.id || null,
+            role: el.getAttribute("role") || null,
+            key: [source, el.id || "", el.getAttribute("role") || "", ownText].join("|"),
+        };
+    };
+
+    const active = document.activeElement;
+    const activeDescendant = active && active.getAttribute
+        ? active.getAttribute("aria-activedescendant")
+        : null;
+    if (activeDescendant) {
+        const target = document.getElementById(activeDescendant);
+        const state = describe(target, "aria-activedescendant");
+        if (state) return state;
+    }
+
+    const highlighted = document.querySelectorAll([
+        '[role="option"][aria-selected="true"]',
+        '[role="menuitem"][aria-selected="true"]',
+        '[role="option"][data-highlighted]',
+        '[role="menuitem"][data-highlighted]',
+        '[data-radix-collection-item][data-highlighted]',
+    ].join(","));
+
+    let first = null;
+    for (const el of highlighted) {
+        const state = describe(el, "highlighted");
+        if (!state) continue;
+        if (state.exact) return state;
+        if (!first) first = state;
+    }
+    if (first) return first;
+
+    const focused = describe(active, "focus");
+    return focused;
+}
+"""
+
+
+async def _wait_app_candidate_visible(
     page: Page,
     *,
-    editor: Locator,
     tool: BenchmarkTool,
     timeout_seconds: float,
-) -> Locator:
-    """Resolve a humanize-compatible visible App autocomplete target."""
+) -> None:
     try:
         await page.wait_for_function(
             _APP_CANDIDATE_VISIBLE_JS,
@@ -136,93 +210,43 @@ async def _find_app_candidate(
             "candidate"
         ) from exc
 
-    editor_box = await editor.bounding_box()
 
-    async def score(candidate: Locator) -> float | None:
-        try:
-            if not await candidate.is_visible():
-                return None
-            inside_composer = await candidate.evaluate(
-                """el => Boolean(el.closest(
-                    '#prompt-textarea, '
-                    + '[contenteditable="true"][data-lexical-editor="true"], '
-                    + '[contenteditable="true"][role="textbox"]'
-                ))"""
-            )
-            if inside_composer:
-                return None
+async def _select_app_candidate_with_keyboard(
+    page: Page,
+    *,
+    tool: BenchmarkTool,
+    timeout_seconds: float,
+) -> None:
+    """Select the exact App autocomplete candidate without any pointer action."""
+    await _wait_app_candidate_visible(
+        page,
+        tool=tool,
+        timeout_seconds=timeout_seconds,
+    )
 
-            box = await candidate.bounding_box()
-            if box is None:
-                return None
-            if editor_box is None:
-                return 0.0
+    seen: set[str] = set()
+    for _ in range(64):
+        state = await page.evaluate(_APP_KEYBOARD_ACTIVE_JS, [tool.name])
+        if isinstance(state, dict) and state.get("exact") is True:
+            await page.keyboard.press("Enter")
+            return
 
-            candidate_x = box["x"] + box["width"] / 2
-            candidate_y = box["y"] + box["height"] / 2
-            editor_x = editor_box["x"] + editor_box["width"] / 2
-            editor_y = editor_box["y"] + editor_box["height"] / 2
-            return abs(candidate_x - editor_x) + abs(candidate_y - editor_y)
-        except Exception:
-            return None
+        key = state.get("key") if isinstance(state, dict) else None
+        if isinstance(key, str) and key:
+            if key in seen:
+                break
+            seen.add(key)
 
-    # CloakBrowser's humanized click resolver accepts a plain CSS locator with a
-    # trailing .nth(), but not Playwright locator chains such as
-    # get_by_text(...).nth(...).locator("xpath=..."). Search the interactive rows
-    # directly so the returned locator stays within that supported subset.
-    rows = page.locator(_APP_INTERACTIVE_ROW_SELECTOR)
-    best: Locator | None = None
-    best_distance = float("inf")
-    for index in range(await rows.count()):
-        candidate = rows.nth(index)
-        try:
-            has_exact_label = await candidate.evaluate(
-                """(el, appName) => {
-                    const normalize = (value) => (value || '')
-                        .replace(/\\s+/g, ' ')
-                        .trim();
-                    if (normalize(el.innerText || el.textContent) === appName) {
-                        return true;
-                    }
-                    for (const child of el.querySelectorAll('*')) {
-                        if (normalize(child.innerText || child.textContent) === appName) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                tool.name,
-            )
-        except Exception:
-            continue
-        if not has_exact_label:
-            continue
+        # The composer already owns keyboard focus after typing the @ mention.
+        # ArrowDown moves only the autocomplete's keyboard highlight. Enter is
+        # never sent until the DOM proves the highlighted item is exactly the
+        # requested App, so this cannot submit the composer accidentally.
+        await page.keyboard.press("ArrowDown")
 
-        distance = await score(candidate)
-        if distance is not None and distance < best_distance:
-            best = candidate
-            best_distance = distance
-
-    if best is not None:
-        return best
-
-    # Picker revisions can expose a plain text leaf without an ARIA/button row.
-    # get_by_text(...).nth(...) is also supported by CloakBrowser humanization, so
-    # use that leaf directly rather than creating a chained parent/xpath locator.
-    matches = page.get_by_text(tool.name, exact=True)
-    for index in range(await matches.count()):
-        candidate = matches.nth(index)
-        distance = await score(candidate)
-        if distance is not None and distance < best_distance:
-            best = candidate
-            best_distance = distance
-
-    if best is None:
-        raise AppUnavailable(
-            f"ChatGPT app {tool.name!r} autocomplete text became visible but "
-            "no selectable candidate row could be resolved"
-        )
-    return best
+    raise AppUnavailable(
+        f"ChatGPT app {tool.name!r} autocomplete was visible but the exact App "
+        "never became the keyboard-highlighted candidate"
+    )
 
 
 async def _wait_app_accepted(
@@ -308,16 +332,14 @@ async def _select_app_via_mention(
         clear_existing=False,
     )
 
-    # Resolve and click the actual visible autocomplete candidate. Enter is
-    # deliberately not used here because it is also ChatGPT's submit key when
-    # the picker has no active keyboard selection.
-    candidate = await _find_app_candidate(
+    # Select the autocomplete result strictly through keyboard events. The
+    # exact App must be visibly present and must become the DOM-highlighted
+    # candidate before Enter is allowed, so Enter cannot submit the composer.
+    await _select_app_candidate_with_keyboard(
         page,
-        editor=editor,
         tool=tool,
         timeout_seconds=timeout_seconds,
     )
-    await interaction.click(candidate)
 
     await _wait_app_accepted(
         page,

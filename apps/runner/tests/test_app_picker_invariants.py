@@ -10,51 +10,46 @@ def _source(name: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_app_selection_types_query_and_clicks_visible_candidate_row() -> None:
+def test_app_selection_is_keyboard_only_and_fail_closed_before_enter() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
+    )[0]
+    keyboard = source.split("async def _select_app_candidate_with_keyboard", 1)[1].split(
+        "async def _wait_app_accepted", 1
     )[0]
 
     assert "interaction.type_text(" in select
     assert "raw_mention," in select
     assert "clear_existing=False" in select
-    assert "candidate = await _find_app_candidate(" in select
-    assert "await interaction.click(candidate)" in select
-    assert 'page.keyboard.press("Enter")' not in select
-    assert 'page.keyboard.type("@")' not in select
-    assert "page.keyboard.type(tool.name)" not in select
-    assert "delay=20" not in source
+    assert "await _select_app_candidate_with_keyboard(" in select
+    assert "interaction.click(candidate)" not in select
+    assert "_find_app_candidate" not in source
+    assert 'await page.keyboard.press("ArrowDown")' in keyboard
+    assert 'await page.keyboard.press("Enter")' in keyboard
+    assert 'state.get("exact") is True' in keyboard
+    assert keyboard.index('state.get("exact") is True') < keyboard.index(
+        'await page.keyboard.press("Enter")'
+    )
+    assert "never became the keyboard-highlighted candidate" in keyboard
 
-    find_candidate = source.split("async def _find_app_candidate", 1)[1].split(
-        "async def _wait_app_accepted", 1
-    )[0]
-    assert "rows = page.locator(_APP_INTERACTIVE_ROW_SELECTOR)" in find_candidate
-    assert "candidate = rows.nth(index)" in find_candidate
-    assert "matches = page.get_by_text(tool.name, exact=True)" in find_candidate
-    assert "candidate = matches.nth(index)" in find_candidate
-    assert ".locator(\"xpath=ancestor-or-self" not in find_candidate
-    assert "ancestor-or-self::*" not in find_candidate
 
-def test_app_selection_waits_for_candidate_click_then_acceptance() -> None:
+def test_app_selection_waits_for_visible_candidate_then_acceptance() -> None:
     source = _source("tools.py")
     select = source.split("async def _select_app_via_mention", 1)[1].split(
         "async def _composer_has_keyboard_focus", 1
     )[0]
 
-    assert "candidate = await _find_app_candidate(" in select
-    assert "await interaction.click(candidate)" in select
+    assert "await _select_app_candidate_with_keyboard(" in select
     assert "await _wait_app_accepted(" in select
-    assert select.index("interaction.click(candidate)") < select.index(
+    assert select.index("_select_app_candidate_with_keyboard") < select.index(
         "await _wait_app_accepted("
     )
     assert "_APP_CANDIDATE_VISIBLE_JS" in source
-    assert "page.get_by_text(tool.name, exact=True)" in source
-    assert "_APP_PICKER_READY_JS" not in source
-    assert "_wait_app_candidate_ready" not in source
-    assert "page.expect_response(" not in source
-    assert "client_prepare_source" not in source
-    assert "asyncio.sleep" not in source
+    assert "_APP_KEYBOARD_ACTIVE_JS" in source
+    assert "page.expect_response(" not in source.split(
+        "async def _select_app_candidate_with_keyboard", 1
+    )[1].split("async def _wait_app_accepted", 1)[0]
 
 def test_auth_cleanup_reacquires_composer_and_uses_backspace_only() -> None:
     source = _source("tools.py")
@@ -188,14 +183,15 @@ def test_runtime_app_selection_retries_once_only_pre_submission() -> None:
     assert "await _clear_auth_editor(page, get_editor=get_editor)" in runtime
 
 
-def test_app_picker_selection_never_uses_submit_enter() -> None:
+def test_app_picker_enter_is_guarded_by_exact_keyboard_highlight() -> None:
     source = _source("tools.py")
-    select = source.split("async def _select_app_via_mention", 1)[1].split(
-        "async def _composer_has_keyboard_focus", 1
+    keyboard = source.split("async def _select_app_candidate_with_keyboard", 1)[1].split(
+        "async def _wait_app_accepted", 1
     )[0]
 
-    assert "candidate = await _find_app_candidate(" in select
-    assert "await interaction.click(candidate)" in select
-    assert 'page.keyboard.press("Enter")' not in select
-    assert "before_enter_url" not in select
-
+    assert 'await page.keyboard.press("Enter")' in keyboard
+    assert 'state.get("exact") is True' in keyboard
+    assert keyboard.index('state.get("exact") is True') < keyboard.index(
+        'await page.keyboard.press("Enter")'
+    )
+    assert "interaction.click" not in keyboard
