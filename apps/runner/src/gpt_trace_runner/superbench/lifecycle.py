@@ -493,8 +493,13 @@ async def status_payload(settings):
     ):
         payload.update(
             {
-                "noVNC": settings.browser_novnc_url,
-                "action": "resolve in noVNC then sudo make resume",
+                "teacher_browser_public_url": (
+                    settings.validate_teacher_browser_public_url()
+                ),
+                "action": (
+                    "resolve in the teacher-browser KasmVNC session "
+                    "then sudo make resume"
+                ),
             }
         )
     return payload

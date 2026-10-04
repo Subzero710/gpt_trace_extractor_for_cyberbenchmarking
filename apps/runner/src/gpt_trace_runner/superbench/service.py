@@ -15,7 +15,6 @@ def campaign(settings) -> TeacherCampaign:
         settings.chatgpt_expected_model_slug,
         {
             "conversation_turns": settings.chatgpt_conversation_turns,
-            "turn_timeout_seconds": settings.chatgpt_turn_timeout_seconds,
         },
         os.environ.get("GPT_TRACE_RUNNER_BUILD_ID", "").strip(),
     )
