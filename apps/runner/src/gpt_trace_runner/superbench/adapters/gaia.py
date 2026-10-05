@@ -21,7 +21,7 @@ GAIA_REPO_ID = "gaia-benchmark/GAIA"
 GAIA_REVISION = "682dd723ee1e1697e00360edccf2366dc8418dd9"
 GAIA_YEAR = "2023"
 GAIA_SPLIT = "validation"
-GAIA_LEVEL = 1
+GAIA_LEVEL = 3
 GAIA_METADATA_FILE = f"{GAIA_YEAR}/{GAIA_SPLIT}/metadata.level{GAIA_LEVEL}.parquet"
 GAIA_SOURCE_URL = "https://huggingface.co/datasets/gaia-benchmark/GAIA"
 GAIA_PAPER = "https://arxiv.org/abs/2311.12983"
@@ -174,7 +174,7 @@ def _model_answer(captured: CapturedConversation) -> str:
 
 
 class GAIAAdapter(BenchmarkAdapter):
-    """Pinned GAIA 2023 Level-1 validation adapter."""
+    """Pinned GAIA 2023 Level-3 validation adapter."""
 
     adapter_id = "gaia"
     adapter_version = "7"
