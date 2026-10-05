@@ -167,7 +167,7 @@ def validate_tunnels(values: dict[str, str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("core", "doctor", "tools"))
+    parser.add_argument("mode", choices=("core", "doctor", "tunnels"))
     args = parser.parse_args()
 
     values = parse_env(ENV_PATH)
@@ -176,12 +176,12 @@ def main() -> int:
     ensure_control_tokens()
     materialize_teacher_browser_password(values)
 
-    if args.mode in ("doctor", "tools"):
+    if args.mode in ("doctor", "tunnels"):
         validate_tunnels(values)
 
-    if args.mode == "tools":
+    if args.mode == "tunnels":
         if not values.get("CONTROL_PLANE_API_KEY"):
-            raise SystemExit("CONTROL_PLANE_API_KEY is required in .env for make tools")
+            raise SystemExit("CONTROL_PLANE_API_KEY is required in .env for make tunnels")
 
     print(f"project state: {args.mode} ok")
     return 0

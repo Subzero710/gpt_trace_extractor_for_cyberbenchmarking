@@ -18,6 +18,11 @@ from .workstation_provider import LibvirtWorkstationProvider
 from .exceptions import RecoveryIncomplete
 from .journal import JournalStore
 from .lock import RunnerLock
+from .manual_kali import (
+    ManualKaliManager,
+    require_manual_kali_stopped,
+    require_no_active_benchmark_for_manual_kali,
+)
 from .models import BenchmarkTask, BenchmarkTool, task_fingerprint
 from .registry import AppRegistry
 from .runner import abandon_recovery
@@ -143,6 +148,7 @@ def doctor() -> None:
         )
         try:
             with RunnerLock(settings.runner_lock_path):
+                require_manual_kali_stopped(settings)
                 await preflight_tasks(
                     lifecycle,
                     tasks,
@@ -183,6 +189,7 @@ def register_apps() -> None:
         prepared = False
         try:
             with RunnerLock(settings.runner_lock_path):
+                require_manual_kali_stopped(settings)
                 await lifecycle.prepare(
                     task,
                     environments,
@@ -219,6 +226,55 @@ def register_apps() -> None:
 
     asyncio.run(main())
 
+
+
+@app.command("manual-kali-start")
+def manual_kali_start() -> None:
+    async def main() -> None:
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        manager = ManualKaliManager(settings, registry)
+        try:
+            with RunnerLock(settings.runner_lock_path):
+                require_no_active_benchmark_for_manual_kali(settings)
+                payload = await manager.start()
+        finally:
+            await manager.close()
+        console.print_json(json.dumps(payload, sort_keys=True))
+
+    asyncio.run(main())
+
+
+@app.command("manual-kali-status")
+def manual_kali_status() -> None:
+    async def main() -> None:
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        manager = ManualKaliManager(settings, registry)
+        try:
+            payload = await manager.status()
+        finally:
+            await manager.close()
+        console.print_json(json.dumps(payload, sort_keys=True))
+
+    asyncio.run(main())
+
+
+@app.command("manual-kali-stop")
+def manual_kali_stop() -> None:
+    async def main() -> None:
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        manager = ManualKaliManager(settings, registry)
+        try:
+            with RunnerLock(settings.runner_lock_path):
+                require_no_active_benchmark_for_manual_kali(settings)
+                payload = await manager.stop()
+        finally:
+            await manager.close()
+        console.print_json(json.dumps(payload, sort_keys=True))
+
+    asyncio.run(main())
 
 
 @app.command("superbench-fetch")

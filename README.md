@@ -9,7 +9,7 @@ make requirements  # optional explicit host preflight; make build runs it too
 sudo make build
 make up
 make doctor
-make tools
+make tunnels
 make auth
 make superbench-fetch ADAPTER=gaia
 make run ADAPTER=gaia
@@ -22,7 +22,7 @@ make export-sft
 make down
 ```
 
-`doctor` checks the Ubuntu host, then creates and destroys dedicated VM smoke attempts through the runner. `build` first validates the host-only system package manifest plus Python venv and Docker Engine/Compose/Buildx, builds the host broker and trusted Docker images, verifies the MCP manifest inside the built controller image, then pulls the checksum-verified Kali golden disk prebuilt on Docker Hub. `up` starts the host broker plus persistent Docker services. `tools` registers the one App tunnel. `down` destroys project-owned VM attempts and Docker execution containers without deleting database or teacher browser profile volumes. The host broker needs root privileges for loop mounts and nftables; run its lifecycle on a dedicated Ubuntu host with KVM.
+`doctor` checks the Ubuntu host, then creates and destroys dedicated VM smoke attempts through the runner. `build` first validates the host-only system package manifest plus Python venv and Docker Engine/Compose/Buildx, builds the host broker and trusted Docker images, verifies the MCP manifest inside the built controller image, then pulls the checksum-verified Kali golden disk prebuilt on Docker Hub. `up` starts the host broker plus persistent Docker services. `tunnels` starts/refreshes the OpenAI Secure MCP Tunnel without creating a Kali VM; `register_apps` is the separate interactive App-registration lifecycle. `down` destroys project-owned VM attempts and Docker execution containers without deleting database or teacher browser profile volumes. The host broker needs root privileges for loop mounts and nftables; run its lifecycle on a dedicated Ubuntu host with KVM.
 
 Put deployment-local values in `.env` using `.env.example`: PostgreSQL password, the independent teacher-browser KasmVNC password, `TEACHER_BROWSER_TUNNEL_TOKEN`, the non-secret `TEACHER_BROWSER_PUBLIC_URL` for the Cloudflare Kasm hostname, control plane API key, optional benchmark source token, and `APP_KALI_WORKSTATION_TUNNEL_ID`. Other non-secret runner/workstation settings remain versioned in `config/runner.toml`. Docker Compose injects `TEACHER_BROWSER_PUBLIC_URL` into runner containers, so `make auth` uses the deployment hostname without hardcoding it in TOML. The App registry and manifest live in `apps/registry/` and `apps/kali-workstation/`.
 
@@ -45,3 +45,20 @@ The teacher browser is the `teacher-browser` Compose service, with identity in t
 See [workstation architecture and operations](docs/workstation.md), [tool surface](docs/tools.md), and [artifact transfer](docs/file-transfer.md). The host needs KVM/libvirt, nftables, and adequate disk space; on a VMware Ubuntu development VM, enable nested virtualization. The guest has NAT egress to public IPv4 addresses and cannot route to private control networks by default.
 
 `make run` freezes selected task IDs and task/App/config fingerprints. Pause, resume, recovery, status, evaluation, and SFT export remain managed by the runner and storage service.
+
+## Manual Kali lifecycle
+
+The OpenAI Secure MCP Tunnel and the Kali VM have separate lifecycles. `make tunnels` starts/refreshes the persistent tunnel and does **not** create a VM. Benchmark entry points (`make run`, `make resume`, and `make auth`) ensure the tunnel is ready automatically.
+
+For an operator-driven disposable Kali outside a benchmark:
+
+```bash
+make start_kali
+make status_kali
+# use @Kali Workstation from ChatGPT
+make stop_kali
+```
+
+`start_kali` returns after the VM is ready; it does not keep a terminal process alive. Its identity is persisted atomically in the runner state volume, so `status_kali` and `stop_kali` work from a later Cockpit/SSH session. `stop_kali` resets the controller, detaches the gateway, destroys the libvirt attempt, verifies cleanup, and removes the persisted manual state. Manual Kali and Superbench ownership are mutually exclusive.
+
+`make register_apps` is the separate interactive App-registration helper. It may create a temporary registration VM, but `make tunnels` never does.

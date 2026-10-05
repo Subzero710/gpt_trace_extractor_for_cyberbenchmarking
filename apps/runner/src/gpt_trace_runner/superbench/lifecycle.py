@@ -15,6 +15,7 @@ from ..exceptions import (
     SiteChallengeFailed,
 )
 from ..lock import RunnerLock
+from ..manual_kali import require_manual_kali_stopped
 from .catalog import SuperbenchCatalog
 from .execution import run_pending
 from .models import task_spec_fingerprint
@@ -241,6 +242,7 @@ async def execute_active(
         )
 
         with RunnerLock(settings.runner_lock_path):
+            require_manual_kali_stopped(settings)
             state = store.load()
             if state is None or state.status == "completed":
                 raise RecoveryIncomplete(
@@ -268,6 +270,7 @@ async def execute_active(
             )
 
     with RunnerLock(settings.runner_lock_path):
+        require_manual_kali_stopped(settings)
         existing = store.load()
         if existing is not None and existing.status != "completed":
             raise RecoveryIncomplete(

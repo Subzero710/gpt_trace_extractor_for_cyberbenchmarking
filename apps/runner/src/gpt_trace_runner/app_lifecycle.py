@@ -202,6 +202,38 @@ class AppLifecycle:
                 )
             await asyncio.sleep(0.5)
 
+    async def gateway_status(self, tool) -> dict[str, Any]:
+        if not tool.control_endpoint:
+            raise AppInfrastructureError(
+                f"local App {tool.app_id!r} has no control endpoint"
+            )
+        self._validate_control_endpoint(tool.app_id, tool.control_endpoint)
+        try:
+            response = await self._client.get(
+                f"{tool.control_endpoint.rstrip('/')}/control/status",
+                headers=self._headers(),
+            )
+        except httpx.HTTPError as exc:
+            raise AppInfrastructureError(
+                f"{tool.app_id} gateway status transport failed"
+            ) from exc
+        if response.status_code != 200:
+            raise AppInfrastructureError(
+                f"{tool.app_id} gateway status failed: HTTP {response.status_code}: "
+                f"{response.text[:1000]}"
+            )
+        try:
+            value = response.json()
+        except ValueError as exc:
+            raise AppInfrastructureError(
+                f"{tool.app_id} gateway status returned invalid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise AppInfrastructureError(
+                f"{tool.app_id} gateway status returned a non-object"
+            )
+        return value
+
     async def _seed_workspace(self, task: BenchmarkTask, tool) -> None:
         if tool.app_id != "kali-workstation":
             return

@@ -7,3 +7,7 @@ General tools: `exec_command`, `create_terminal`, `send_terminal_input`, `read_t
 Browser tools: `navigate`, `new_page`, `list_pages`, `close_page`, `switch_page`, `go_back`, `go_forward`, `reload`, `click`, `type_text`, `press`, `hover`, `drag`, `select_option`, `query_selector`, `inspect_dom`, `get_html`, `get_attribute`, `evaluate_javascript`, `get_cookies`, `set_cookie`, `clear_cookies`, `get_console_logs`, `get_network_logs`, `get_request_details`, `get_response_body`, `upload_file`, `download_file`.
 
 Context creation/destruction, storage-state import/export, user-agent, viewport, timezone and geolocation settings are control-plane provisioning, so they are absent from the model manifest. The historical `search`, `read_page`, `tabs`, `wait`, `screenshot` and `download` shortcuts are absent; `observe_screen` serves desktop screenshots. Linux operations are performed with `exec_command` and ordinary guest programs.
+
+## Operational lifecycle commands
+
+`make tunnels` manages only the OpenAI Secure MCP Tunnel. `make register_apps` runs the temporary App-registration lifecycle. `make start_kali` creates and binds one disposable manual Kali VM, `make status_kali` reports persisted/gateway/broker state, and `make stop_kali` destroys it. These commands do not add model-facing MCP tools; the model tool contract remains `apps/kali-workstation/tool-manifest.json`.

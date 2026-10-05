@@ -236,5 +236,9 @@ class Settings(BaseSettings):
         return self.runner_state_root / "submission.json"
 
     @property
+    def manual_kali_state_path(self) -> Path:
+        return self.runner_state_root / "manual-kali.json"
+
+    @property
     def superbench_active_run_path(self) -> Path:
         return self.runner_state_root / "superbench" / "active-run.json"

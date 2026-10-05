@@ -1,4 +1,4 @@
-.PHONY: requirements build publish-kali-golden up doctor tools auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
 
 requirements:
 	python3 scripts/host_requirements.py
@@ -18,14 +18,26 @@ doctor: up
 	python3 scripts/host_doctor.py
 	docker compose run --rm --no-deps runner doctor
 
-tools:
-	python3 scripts/tools_flow.py
+tunnels: up
+	python3 scripts/tunnels.py
 
-auth:
+register_apps: tunnels
+	docker compose run --rm --no-deps runner register-apps
+
+start_kali: tunnels
+	docker compose run --rm --no-deps runner manual-kali-start
+
+status_kali: up
+	docker compose run --rm --no-deps runner manual-kali-status
+
+stop_kali: up
+	docker compose run --rm --no-deps runner manual-kali-stop
+
+auth: tunnels
 	python3 scripts/project_state.py core
 	docker compose run --rm --no-deps runner superbench-auth
 
-run:
+run: tunnels
 	python3 scripts/project_state.py core
 	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-run $(if $(ADAPTER),--adapter $(ADAPTER),) $(if $(LIMIT),--limit $(LIMIT),)
 
@@ -33,7 +45,7 @@ pause:
 	python3 scripts/project_state.py core
 	docker compose run --rm --no-deps runner superbench-pause
 
-resume:
+resume: tunnels
 	python3 scripts/project_state.py core
 	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-resume-active
 
