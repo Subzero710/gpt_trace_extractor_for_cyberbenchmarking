@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from typing import Any
+from urllib.parse import unquote
 
 from .models import BenchmarkTask, CapturedConversation, task_app_provenance
 from .workspace_seed import snapshot as workspace_snapshot
@@ -82,6 +84,54 @@ def _resolve_requested_identity(
     )
 
 
+def _path_identity(
+    path: Any,
+    *,
+    task: BenchmarkTask | None,
+) -> tuple[str | None, str | None]:
+    """Resolve a structured App resource path against the benchmark contract."""
+    if task is None or not isinstance(path, str) or not path.startswith("/"):
+        return None, None
+
+    clean = path.split("?", 1)[0].split("#", 1)[0]
+    parts = [unquote(part) for part in clean.split("/") if part]
+    if len(parts) < 2:
+        return None, None
+
+    app_name = parts[0].strip()
+    tool_name = parts[-1].strip()
+    if not app_name or not tool_name:
+        return None, None
+
+    app_id, canonical_name, _ = _resolve_requested_identity(
+        task,
+        app_name=app_name,
+        tool_name=tool_name,
+    )
+    if app_id is None or canonical_name is None:
+        return None, None
+    return app_name, canonical_name
+
+
+def _api_tool_call_path(message: dict[str, Any]) -> str | None:
+    if message.get("recipient") != "api_tool.call_tool":
+        return None
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return None
+    raw = content.get("text")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    path = payload.get("path")
+    return path if isinstance(path, str) and path else None
+
+
 def _resource_observation(
     message: dict[str, Any],
     *,
@@ -107,6 +157,16 @@ def _resource_observation(
 
     recipient = message.get("recipient")
     recipient = recipient.strip() if isinstance(recipient, str) and recipient.strip() else None
+
+    structured_path = resource.get("resource_uri")
+    if not isinstance(structured_path, str) or not structured_path:
+        structured_path = _api_tool_call_path(message)
+    path_app_name, path_tool_name = _path_identity(structured_path, task=task)
+    if app_name is None:
+        app_name = path_app_name
+    if tool_name is None:
+        tool_name = path_tool_name
+
     app_id, canonical_name, resolved_ui_name = _resolve_requested_identity(
         task, app_name=app_name, tool_name=tool_name, recipient=recipient
     )
@@ -265,6 +325,39 @@ def invoked_tool_calls(
     return calls
 
 
+def infrastructure_incidents(
+    calls: list[dict[str, str | None]],
+) -> list[dict[str, str]]:
+    """Return deterministic infrastructure incidents from attempted App calls.
+
+    An App being available to a task is not enough to create an incident. Only an
+    actual assistant call that resolves to a benchmark App/tool and has no
+    correlated tool-result message is classified as an infrastructure incident.
+    """
+    incidents: list[dict[str, str]] = []
+    for call in calls:
+        call_message_id = call.get("call_message_id")
+        app_id = call.get("app_id")
+        tool_name = call.get("canonical_tool_name")
+        if (
+            not call_message_id
+            or not app_id
+            or not tool_name
+            or call.get("result_message_id")
+        ):
+            continue
+        incidents.append(
+            {
+                "type": "app_call_without_result",
+                "app_id": app_id,
+                "tool_name": tool_name,
+                "call_id": str(call.get("call_id") or call_message_id),
+                "call_message_id": call_message_id,
+            }
+        )
+    return incidents
+
+
 def enrich_capture(
     captured: CapturedConversation,
     *,
@@ -292,5 +385,7 @@ def enrich_capture(
         "bytes": workspace.bytes,
     }
     metadata["app_runtime"] = deepcopy(app_runtime or {})
-    metadata["used_tool_calls"] = invoked_tool_calls(captured.messages, task=task)
+    used_tool_calls = invoked_tool_calls(captured.messages, task=task)
+    metadata["used_tool_calls"] = used_tool_calls
+    metadata["infrastructure_incidents"] = infrastructure_incidents(used_tool_calls)
     return CapturedConversation(captured.conversation_id, captured.messages, metadata)

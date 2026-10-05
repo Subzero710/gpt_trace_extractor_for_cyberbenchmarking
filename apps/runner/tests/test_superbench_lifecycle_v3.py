@@ -237,14 +237,25 @@ async def test_status_separates_evaluator_fail_from_infrastructure_failure(
         "pass": SimpleNamespace(
             status="completed",
             evaluation={"verdict": "pass"},
+            runtime_metadata={
+                "infrastructure_incidents": [{
+                    "type": "app_call_without_result",
+                    "app_id": "kali-workstation",
+                    "tool_name": "exec_command",
+                    "call_id": "call-1",
+                    "call_message_id": "call-1",
+                }],
+            },
         ),
         "fail": SimpleNamespace(
             status="completed",
             evaluation={"verdict": "fail"},
+            runtime_metadata={},
         ),
         "infra": SimpleNamespace(
             status="failed",
             evaluation=None,
+            runtime_metadata={},
         ),
     }
 
@@ -273,7 +284,9 @@ async def test_status_separates_evaluator_fail_from_infrastructure_failure(
     assert payload["evaluated"] == 2
     assert payload["pass"] == 1
     assert payload["fail"] == 1
-    assert payload["infra_failed"] == 1
+    # One terminal runner/storage failure plus one completed pass that suffered
+    # a structured App infrastructure incident.
+    assert payload["infra_failed"] == 2
 
 
 def test_auth_refuses_while_an_unfinished_active_run_exists(

@@ -458,6 +458,15 @@ async def status_payload(settings):
                 continue
 
             completed += 1
+            runtime_metadata = (
+                row.runtime_metadata
+                if isinstance(getattr(row, "runtime_metadata", None), dict)
+                else {}
+            )
+            incidents = runtime_metadata.get("infrastructure_incidents")
+            if isinstance(incidents, list) and incidents:
+                infra_failed += 1
+
             if row.evaluation is None:
                 continue
             verdict = row.evaluation.get("verdict")
