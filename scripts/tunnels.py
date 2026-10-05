@@ -228,6 +228,10 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
     if not tunnel_id:
         raise RuntimeError("APP_KALI_WORKSTATION_TUNNEL_ID is empty")
 
+    # The MCP tunnel is persistent infrastructure. Plain `compose up -d`
+    # starts it when absent/stopped and otherwise reuses the existing container.
+    # Compose may still recreate it when its effective configuration changes,
+    # which is desirable; do not force a recreation on every command.
     run(
         COMPOSE
         + [
@@ -235,7 +239,6 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
             "app-tunnels",
             "up",
             "-d",
-            "--force-recreate",
             "mcp-tunnel-workstation",
         ],
         env=env,
