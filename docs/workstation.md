@@ -26,7 +26,7 @@ The default attempt quota is 16 GiB, output buffer 1 MiB, screenshot 8 MiB, stag
 
 ## Manual ephemeral workstation
 
-The Secure MCP Tunnel is persistent infrastructure; a Kali domain is not. Use `make tunnels` to establish the OpenAI tunnel without creating a workstation. Use `make start_kali`, `make status_kali`, and `make stop_kali` for operator-driven work outside Superbench.
+The Secure MCP Tunnel is persistent infrastructure; a Kali domain is not. Use `make tunnels` to establish the OpenAI tunnel without creating a workstation. The tunnel bootstrap validates tunnel-client liveness and a successful OpenAI control-plane poll rather than MCP `/readyz`, because the MCP backend is intentionally absent while no Kali runtime is attached. Use `make start_kali`, `make status_kali`, and `make stop_kali` for operator-driven work outside Superbench.
 
 Manual mode uses the same `AppLifecycle` and `LibvirtWorkstationProvider` as benchmark attempts. The fixed logical task `__manual_kali__` gets a deterministic attempt identity, while `/data/state/manual-kali.json` records the exact task fingerprint and environment ID atomically. The runner state file is recovery metadata, not the sole source of truth: status also compares the gateway owner with broker-backed runtime discovery. If the gateway restarts while the VM survives, `stop_kali` can rediscover/rebind the recorded attempt and then run the normal reset/deactivate/destroy cleanup.
 

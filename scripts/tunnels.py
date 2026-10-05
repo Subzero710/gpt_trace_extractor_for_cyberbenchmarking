@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -9,7 +10,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose"]
-TUNNELS = (("mcp-tunnel-workstation", "kali-workstation"),)
+TUNNELS = ("mcp-tunnel-workstation",)
+HEALTH_URL = "http://127.0.0.1:8080"
+TUNNEL_READY_TIMEOUT_SECONDS = 60.0
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -75,45 +78,103 @@ def active_runner_containers(env: dict[str, str]) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def tunnel_has_recent_session(
+def tunnel_health_report(
     service: str,
-    server_name: str,
     *,
     env: dict[str, str],
-) -> bool:
+) -> tuple[dict | None, str | None]:
+    # The tunnel-client health command intentionally exits non-zero when
+    # /readyz is red. That is expected while no Kali backend is attached:
+    # /readyz includes the one-time MCP startup probe. For tunnel bootstrap we
+    # care about process liveness plus a successful OpenAI control-plane poll.
     proc = run(
         COMPOSE
         + [
             "--profile",
             "app-tunnels",
-            "logs",
-            "--since=90s",
+            "exec",
+            "-T",
             service,
+            "/usr/bin/tunnel-client",
+            "health",
+            "--url",
+            HEALTH_URL,
+            "--require-control-plane-poll",
+            "--json",
         ],
         env=env,
         check=False,
         capture=True,
     )
-    logs = proc.stdout + proc.stderr
+
+    raw = proc.stdout.strip()
+    if not raw:
+        detail = proc.stderr.strip() or f"health command exited {proc.returncode}"
+        return None, detail
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        detail = proc.stderr.strip()
+        suffix = f"; stderr={detail}" if detail else ""
+        return None, f"invalid tunnel health JSON: {exc}{suffix}"
+
+    if not isinstance(payload, dict):
+        return None, "tunnel health JSON is not an object"
+    return payload, None
+
+
+def tunnel_control_plane_ready(report: dict | None) -> bool:
+    if not isinstance(report, dict):
+        return False
+
+    healthz = report.get("healthz")
+    poll = report.get("control_plane_poll")
     return (
-        "mcp session initialized" in logs
-        and f"server_name={server_name}" in logs
+        isinstance(healthz, dict)
+        and healthz.get("ok") is True
+        and isinstance(poll, dict)
+        and poll.get("ok") is True
     )
 
 
 def wait_for_tunnel(
     service: str,
-    server_name: str,
     *,
     env: dict[str, str],
-    timeout: float = 30.0,
-) -> bool:
+    timeout: float = TUNNEL_READY_TIMEOUT_SECONDS,
+) -> tuple[bool, dict | None, str | None]:
     deadline = time.monotonic() + timeout
+    last_report: dict | None = None
+    last_error: str | None = None
+
     while time.monotonic() < deadline:
-        if tunnel_has_recent_session(service, server_name, env=env):
-            return True
+        report, error = tunnel_health_report(service, env=env)
+        if report is not None:
+            last_report = report
+        if error is not None:
+            last_error = error
+
+        if tunnel_control_plane_ready(report):
+            return True, report, None
+
         time.sleep(1.0)
-    return False
+
+    return False, last_report, last_error
+
+
+def print_health_diagnostic(
+    service: str,
+    report: dict | None,
+    error: str | None,
+) -> None:
+    print(f"{service}: tunnel health diagnostic:", file=sys.stderr)
+    if report is not None:
+        print(json.dumps(report, indent=2, sort_keys=True), file=sys.stderr)
+    elif error:
+        print(error, file=sys.stderr)
+    else:
+        print("no tunnel health report was available", file=sys.stderr)
 
 
 def ensure_tunnels_ready(env: dict[str, str]) -> None:
@@ -130,30 +191,51 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
         env=env,
     )
 
-    for service, server_name in TUNNELS:
-        if wait_for_tunnel(service, server_name, env=env):
-            print(f"{service}: MCP session ready", flush=True)
+    for service in TUNNELS:
+        ready, report, error = wait_for_tunnel(service, env=env)
+        if ready:
+            print(
+                f"{service}: OpenAI control-plane poll ready "
+                "(MCP backend may be idle)",
+                flush=True,
+            )
             continue
 
-        print(f"{service}: no MCP session yet; restarting once", flush=True)
+        print(
+            f"{service}: no successful OpenAI control-plane poll yet; "
+            "restarting once",
+            flush=True,
+        )
         run(
             COMPOSE + ["--profile", "app-tunnels", "restart", service],
             env=env,
         )
-        if not wait_for_tunnel(service, server_name, env=env):
-            run(
-                COMPOSE
-                + [
-                    "--profile",
-                    "app-tunnels",
-                    "logs",
-                    "--tail=100",
-                    service,
-                ],
-                env=env,
-                check=False,
+
+        ready, report, error = wait_for_tunnel(service, env=env)
+        if ready:
+            print(
+                f"{service}: OpenAI control-plane poll ready "
+                "(MCP backend may be idle)",
+                flush=True,
             )
-            raise RuntimeError(f"{service} failed to initialize MCP")
+            continue
+
+        print_health_diagnostic(service, report, error)
+        run(
+            COMPOSE
+            + [
+                "--profile",
+                "app-tunnels",
+                "logs",
+                "--tail=100",
+                service,
+            ],
+            env=env,
+            check=False,
+        )
+        raise RuntimeError(
+            f"{service} failed to establish a successful OpenAI control-plane poll"
+        )
 
 
 def main() -> int:
@@ -166,7 +248,7 @@ def main() -> int:
             + details
         )
     ensure_tunnels_ready(env)
-    print("Secure MCP tunnels: ready", flush=True)
+    print("Secure MCP tunnels: control plane ready", flush=True)
     print("No Kali VM was created.", flush=True)
     return 0
 
