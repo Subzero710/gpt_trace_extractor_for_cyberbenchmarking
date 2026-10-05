@@ -1,4 +1,4 @@
-.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes
+.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes kali_control
 
 requirements:
 	python3 scripts/host_requirements.py
@@ -14,6 +14,11 @@ up:
 	python3 scripts/workstation_broker.py start
 	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser teacher-browser-tunnel kali-workstation-controller workstation-gateway
 
+kali_control:
+	python3 scripts/project_state.py core
+	python3 scripts/workstation_broker.py start
+	docker compose up -d --wait --wait-timeout 120 kali-workstation-controller workstation-gateway
+
 doctor: up
 	python3 scripts/host_doctor.py
 	docker compose run --rm --no-deps runner doctor
@@ -27,10 +32,10 @@ register_apps: tunnels
 start_kali: tunnels
 	docker compose run --rm --no-deps runner manual-kali-start
 
-status_kali: up
+status_kali: kali_control
 	docker compose run --rm --no-deps runner manual-kali-status
 
-stop_kali: up
+stop_kali: kali_control
 	docker compose run --rm --no-deps runner manual-kali-stop
 
 auth: tunnels
