@@ -166,3 +166,34 @@ def test_api_tool_app_call_without_result_is_infrastructure_incident() -> None:
         "call_message_id": "call-1",
     }]
 
+def test_api_tool_path_does_not_resolve_by_tool_name_when_app_name_differs() -> None:
+    captured = CapturedConversation(
+        "c",
+        [{
+            "id": "call-external",
+            "author": {"role": "assistant"},
+            "recipient": "api_tool.call_tool",
+            "content": {
+                "content_type": "code",
+                "language": "python3",
+                "text": (
+                    '{"path":"/Some Other App/link_abc/navigate",'
+                    '"args":{"url":"https://example.test"}}'
+                ),
+            },
+        }],
+        {},
+    )
+
+    result = enrich_capture(
+        captured,
+        task=_app_task(),
+        app_environments={"browser": "env"},
+    )
+
+    assert result.runtime_metadata["infrastructure_incidents"] == []
+    assert not any(
+        call.get("app_id") == "browser"
+        for call in result.runtime_metadata["used_tool_calls"]
+    )
+

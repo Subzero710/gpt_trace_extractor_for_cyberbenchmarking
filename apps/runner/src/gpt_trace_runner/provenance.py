@@ -103,14 +103,16 @@ def _path_identity(
     if not app_name or not tool_name:
         return None, None
 
-    app_id, canonical_name, _ = _resolve_requested_identity(
-        task,
-        app_name=app_name,
-        tool_name=tool_name,
-    )
-    if app_id is None or canonical_name is None:
-        return None, None
-    return app_name, canonical_name
+    folded = app_name.casefold()
+    for candidate in task.tools:
+        if (
+            candidate.ui_name.casefold() == folded
+            or candidate.app_id.casefold() == folded
+        ):
+            if tool_name in _manifest_names(candidate):
+                return candidate.ui_name, tool_name
+            return None, None
+    return None, None
 
 
 def _api_tool_call_path(message: dict[str, Any]) -> str | None:
@@ -195,7 +197,13 @@ def _compatible(call: dict[str, str | None], observation: dict[str, str | None])
             return False
     runtime = observation.get("runtime_tool_name")
     recipient = call.get("recipient")
-    if runtime and recipient and "." in recipient and recipient.rsplit(".", 1)[-1] != runtime:
+    if (
+        runtime
+        and recipient
+        and recipient != "api_tool.call_tool"
+        and "." in recipient
+        and recipient.rsplit(".", 1)[-1] != runtime
+    ):
         canonical = call.get("canonical_tool_name")
         if canonical != runtime:
             return False
