@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ["docker", "compose"]
 TUNNELS = ("mcp-tunnel-workstation",)
 HEALTH_URL = "http://127.0.0.1:8080"
-TUNNEL_READY_TIMEOUT_SECONDS = 60.0
+PROCESS_HEALTH_RETRY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -83,10 +83,9 @@ def tunnel_health_report(
     *,
     env: dict[str, str],
 ) -> tuple[dict | None, str | None]:
-    # The tunnel-client health command intentionally exits non-zero when
-    # /readyz is red. That is expected while no Kali backend is attached:
-    # /readyz includes the one-time MCP startup probe. For tunnel bootstrap we
-    # care about process liveness plus a successful OpenAI control-plane poll.
+    # /readyz is allowed to be red while no Kali backend is attached. For
+    # bootstrap we only require the already-running tunnel-client process to
+    # answer its local liveness endpoint.
     proc = run(
         COMPOSE
         + [
@@ -99,7 +98,6 @@ def tunnel_health_report(
             "health",
             "--url",
             HEALTH_URL,
-            "--require-control-plane-poll",
             "--json",
         ],
         env=env,
@@ -124,43 +122,70 @@ def tunnel_health_report(
     return payload, None
 
 
-def tunnel_control_plane_ready(report: dict | None) -> bool:
+def tunnel_process_ready(report: dict | None) -> bool:
     if not isinstance(report, dict):
         return False
-
     healthz = report.get("healthz")
-    poll = report.get("control_plane_poll")
-    return (
-        isinstance(healthz, dict)
-        and healthz.get("ok") is True
-        and isinstance(poll, dict)
-        and poll.get("ok") is True
-    )
+    return isinstance(healthz, dict) and healthz.get("ok") is True
 
 
-def wait_for_tunnel(
+def wait_for_process_health(
     service: str,
     *,
     env: dict[str, str],
-    timeout: float = TUNNEL_READY_TIMEOUT_SECONDS,
 ) -> tuple[bool, dict | None, str | None]:
-    deadline = time.monotonic() + timeout
     last_report: dict | None = None
     last_error: str | None = None
 
-    while time.monotonic() < deadline:
+    for delay in PROCESS_HEALTH_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+
         report, error = tunnel_health_report(service, env=env)
         if report is not None:
             last_report = report
         if error is not None:
             last_error = error
 
-        if tunnel_control_plane_ready(report):
+        if tunnel_process_ready(report):
             return True, report, None
 
-        time.sleep(1.0)
-
     return False, last_report, last_error
+
+
+def control_plane_lookup(
+    service: str,
+    *,
+    tunnel_id: str,
+    env: dict[str, str],
+) -> tuple[bool, str | None]:
+    # This is an immediate, read-only control-plane request. Unlike the runtime
+    # command poll, it does not wait for the normal 30-second long-poll cycle.
+    proc = run(
+        COMPOSE
+        + [
+            "--profile",
+            "app-tunnels",
+            "exec",
+            "-T",
+            service,
+            "/usr/bin/tunnel-client",
+            "admin",
+            "tunnels",
+            "get",
+            tunnel_id,
+        ],
+        env=env,
+        check=False,
+        capture=True,
+    )
+    if proc.returncode == 0:
+        return True, None
+
+    detail = proc.stderr.strip() or proc.stdout.strip()
+    if not detail:
+        detail = f"control-plane lookup exited {proc.returncode}"
+    return False, detail
 
 
 def print_health_diagnostic(
@@ -177,7 +202,32 @@ def print_health_diagnostic(
         print("no tunnel health report was available", file=sys.stderr)
 
 
+def check_tunnel(
+    service: str,
+    *,
+    tunnel_id: str,
+    env: dict[str, str],
+) -> tuple[bool, dict | None, str | None]:
+    healthy, report, health_error = wait_for_process_health(service, env=env)
+    if not healthy:
+        return False, report, health_error
+
+    control_plane_ok, control_plane_error = control_plane_lookup(
+        service,
+        tunnel_id=tunnel_id,
+        env=env,
+    )
+    if not control_plane_ok:
+        return False, report, control_plane_error
+
+    return True, report, None
+
+
 def ensure_tunnels_ready(env: dict[str, str]) -> None:
+    tunnel_id = env.get("APP_KALI_WORKSTATION_TUNNEL_ID", "").strip()
+    if not tunnel_id:
+        raise RuntimeError("APP_KALI_WORKSTATION_TUNNEL_ID is empty")
+
     run(
         COMPOSE
         + [
@@ -192,18 +242,21 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
     )
 
     for service in TUNNELS:
-        ready, report, error = wait_for_tunnel(service, env=env)
+        ready, report, error = check_tunnel(
+            service,
+            tunnel_id=tunnel_id,
+            env=env,
+        )
         if ready:
             print(
-                f"{service}: OpenAI control-plane poll ready "
+                f"{service}: process healthy and control plane reachable "
                 "(MCP backend may be idle)",
                 flush=True,
             )
             continue
 
         print(
-            f"{service}: no successful OpenAI control-plane poll yet; "
-            "restarting once",
+            f"{service}: readiness check failed; restarting once",
             flush=True,
         )
         run(
@@ -211,16 +264,25 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
             env=env,
         )
 
-        ready, report, error = wait_for_tunnel(service, env=env)
+        ready, report, error = check_tunnel(
+            service,
+            tunnel_id=tunnel_id,
+            env=env,
+        )
         if ready:
             print(
-                f"{service}: OpenAI control-plane poll ready "
+                f"{service}: process healthy and control plane reachable "
                 "(MCP backend may be idle)",
                 flush=True,
             )
             continue
 
         print_health_diagnostic(service, report, error)
+        if error:
+            print(
+                f"{service}: control-plane/readiness error: {error}",
+                file=sys.stderr,
+            )
         run(
             COMPOSE
             + [
@@ -234,7 +296,7 @@ def ensure_tunnels_ready(env: dict[str, str]) -> None:
             check=False,
         )
         raise RuntimeError(
-            f"{service} failed to establish a successful OpenAI control-plane poll"
+            f"{service} failed tunnel process/control-plane readiness"
         )
 
 
