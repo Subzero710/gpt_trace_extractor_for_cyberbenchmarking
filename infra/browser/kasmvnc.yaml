@@ -4,6 +4,10 @@ desktop:
     height: 1080
   allow_resize: true
   pixel_depth: 24
+  # GPT_TRACE_TEACHER_BROWSER_GPU_FIX: use DRI3 hardware rendering instead of llvmpipe.
+  gpu:
+    hw3d: true
+    drinode: /dev/dri/renderD128
 
 network:
   protocol: http

@@ -109,6 +109,11 @@ services:
       BROWSER_CLIPBOARD_PORT: '8765'
       BROWSER_KASM_USERNAME: kasm_user
       BROWSER_KASM_PASSWORD_FILE: /run/secrets/teacher_browser_password
+      BROWSER_DRI_NODE: /dev/dri/renderD128
+      BROWSER_GPU_REQUIRED: '1'
+    # GPT_TRACE_TEACHER_BROWSER_GPU_FIX: expose host DRM render node to KasmVNC/Chromium.
+    devices:
+    - /dev/dri/renderD128:/dev/dri/renderD128
     volumes:
     - browser_profile:/profile
     secrets:

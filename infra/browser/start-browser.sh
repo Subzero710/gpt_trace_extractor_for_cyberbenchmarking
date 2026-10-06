@@ -5,6 +5,8 @@ display="${DISPLAY:-:99}"
 profile_dir="${BROWSER_PROFILE_DIR:-/profile}"
 kasm_user="${BROWSER_KASM_USERNAME:-kasm_user}"
 kasm_password_file="${BROWSER_KASM_PASSWORD_FILE:-/run/secrets/teacher_browser_password}"
+dri_node="${BROWSER_DRI_NODE:-/dev/dri/renderD128}"
+gpu_required="${BROWSER_GPU_REQUIRED:-0}"
 
 mkdir -p "$profile_dir"
 
@@ -16,6 +18,28 @@ if [[ "$(id -u)" -eq 0 ]]; then
   # Xvnc itself runs as the unprivileged browser uid. Clean only our display.
   install -d -m 1777 -o root -g root /tmp/.X11-unix
   rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+
+  # GPT_TRACE_TEACHER_BROWSER_GPU_FIX: preserve render-node access after dropping root.
+  if [[ "$gpu_required" == "1" ]]; then
+    [[ -c "$dri_node" ]] || {
+      echo "GPU render node missing in container: $dri_node" >&2
+      exit 72
+    }
+
+    dri_gid="$(stat -c '%g' "$dri_node")"
+
+    render_group="$(
+      awk -F: -v gid="$dri_gid"         '$3 == gid { print $1; exit }' /etc/group
+    )"
+
+    if [[ -z "$render_group" ]]; then
+      render_group="gpurender${dri_gid}"
+      groupadd --gid "$dri_gid" "$render_group"
+    fi
+
+    usermod -aG "$render_group" browser
+  fi
+
   chown -R browser:browser /home/browser
   exec gosu browser "$0" "$@"
 fi
@@ -24,6 +48,20 @@ fi
   echo "start-browser must run as root for setup or uid 10001 after privilege drop" >&2
   exit 68
 }
+
+if [[ "$gpu_required" == "1" ]]; then
+  [[ -c "$dri_node" ]] || {
+    echo "GPU render node missing after privilege drop: $dri_node" >&2
+    exit 72
+  }
+
+  [[ -r "$dri_node" && -w "$dri_node" ]] || {
+    echo "browser cannot access GPU render node: $dri_node" >&2
+    id >&2
+    ls -ln "$dri_node" >&2 || true
+    exit 72
+  }
+fi
 
 [[ -r "$kasm_password_file" ]] || {
   echo "teacher browser Kasm password secret is unreadable: $kasm_password_file" >&2
