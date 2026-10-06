@@ -331,13 +331,35 @@ def create_app(state: GatewayState) -> Starlette:
     async def control_proxy(request: Request) -> JSONResponse:
         if not state.authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        active = state.active
-        if active is None:
-            return JSONResponse({"detail": "no active backend"}, status_code=503)
+        operation = request.path_params["operation"]
+        if operation not in {"prepare", "resume", "reset"}:
+            return JSONResponse({"detail": "not found"}, status_code=404)
         try:
             payload = await _body(request)
         except ValueError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
+
+        active = state.active
+        if active is None:
+            if operation != "reset":
+                return JSONResponse({"detail": "no active backend"}, status_code=503)
+            try:
+                task_id, attempt, environment_id, fingerprint = _identity(payload)
+            except ValueError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=400)
+            # Reset is cleanup and therefore idempotent. An idle gateway already
+            # satisfies the requested postcondition, including recovery from a
+            # crash/pause while the journal is still in phase="starting".
+            return JSONResponse(
+                {
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "environment_id": environment_id,
+                    "task_fingerprint": fingerprint,
+                    "status": "idle",
+                }
+            )
+
         if not _matches(active, {**payload, "attempt": active.attempt}):
             # Backend control payload intentionally omits attempt. Match the stable fields.
             if not (
@@ -346,9 +368,6 @@ def create_app(state: GatewayState) -> Starlette:
                 and payload.get("task_fingerprint") == active.task_fingerprint
             ):
                 return JSONResponse({"detail": "gateway/backend identity mismatch"}, status_code=409)
-        operation = request.path_params["operation"]
-        if operation not in {"prepare", "resume", "reset"}:
-            return JSONResponse({"detail": "not found"}, status_code=404)
         try:
             response = await state.client.post(
                 f"{active.backend_url}/control/{operation}",

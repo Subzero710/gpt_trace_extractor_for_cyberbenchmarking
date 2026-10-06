@@ -23,3 +23,29 @@ async def test_gateway_accepts_only_fixed_trusted_controller():
         ok=await client.post('/control/deactivate',headers=headers,json=IDENT)
         assert ok.status_code==200
     await state.close()
+
+@pytest.mark.asyncio
+async def test_reset_is_idempotent_when_gateway_is_idle():
+    state = GatewayState(
+        app_id="kali-workstation",
+        backend_prefix="kali-workstation-controller",
+        control_token=TOKEN,
+    )
+    app = create_app(state)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://workstation-gateway:8000",
+    ) as client:
+        headers = {"authorization": "Bearer " + TOKEN}
+        response = await client.post(
+            "/control/reset",
+            headers=headers,
+            json=IDENT,
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            **IDENT,
+            "status": "idle",
+        }
+    await state.close()
+
