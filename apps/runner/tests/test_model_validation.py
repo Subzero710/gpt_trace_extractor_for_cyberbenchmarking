@@ -12,10 +12,11 @@ class FakePage:
 def make_client():
     return ChatGPTClient(
         FakePage(), base_url="https://chatgpt.com", conversation_turns=1000,
-        turn_timeout_seconds=1, stream_start_timeout_seconds=1,
+        stream_start_timeout_seconds=1,
         tool_select_timeout_seconds=1, upload_timeout_seconds=1,
         site_ready_timeout_seconds=1, challenge_timeout_seconds=1,
         natural_snapshot_wait_seconds=0,
+        backend_quiet_seconds=0,
         clipboard_url="http://browser:8765/clipboard",
         expected_model_slug="gpt-5-6-thinking",
     )
@@ -57,10 +58,11 @@ def make_event_client():
     page = EventPage()
     client = ChatGPTClient(
         page, base_url="https://chatgpt.com", conversation_turns=100,
-        turn_timeout_seconds=1, stream_start_timeout_seconds=1,
+        stream_start_timeout_seconds=1,
         tool_select_timeout_seconds=1, upload_timeout_seconds=1,
         site_ready_timeout_seconds=1, challenge_timeout_seconds=1,
         natural_snapshot_wait_seconds=0,
+        backend_quiet_seconds=0,
         clipboard_url="http://browser:8765/clipboard",
         expected_model_slug="gpt-5-6-thinking",
     )

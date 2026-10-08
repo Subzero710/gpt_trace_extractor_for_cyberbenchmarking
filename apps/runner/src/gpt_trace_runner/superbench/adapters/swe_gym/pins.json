@@ -1,0 +1,16 @@
+{
+  "contract_sha256": "fbb8b762277d09b6732a9697735889f761cf5d1920df0cafb5320809f834f38f",
+  "dataset_revision": "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0",
+  "harness_commit": "16dd480cce9b27bf111a362d280881c6def5d2a7",
+  "parquet_sha256": "f3a7cd934e8cc523b6053298d0abb2c82fd7db2b83f9f2ccba5944545aaa4eb1",
+  "recipe_version": 1,
+  "schema_version": 1,
+  "upstream_files": {
+    "constants.py": "5bd655172c9a9dfcb494d9c52bcbcc0d79a59cd20c39b8bbdc41ab8b0a9baf14",
+    "dockerfiles.py": "94c0b9937d2d3f6ca752676835225ed249b8397481645d03e0c73981ec5ab919",
+    "grading.py": "51eb584b85ffbc245042332a080ff20ba2529c712e76db14da16f246b0e0675d",
+    "log_parsers.py": "6d1bce4088dc4d7cb614783dcd63eeb5c20478906158a82cc97ce0b886367b7c",
+    "test_spec.py": "b2dd4c7b579b5c50979d00abad3a77d7ecce56e71b990565cf3439006f0ac676",
+    "utils.py": "a379e3cb4fa02b738cc4e4fcbf6f5b8a0c38d328644d98477b0d5b2304b540af"
+  }
+}

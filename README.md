@@ -2,6 +2,9 @@
 
 This project runs benchmarks through the ChatGPT web UI, captures tool trajectories, and stores traces for SFT export. The teacher browser and storage/control services run in Docker. A trusted host broker creates one disposable KVM/QEMU Kali workstation per model attempt. The single local MCP App is `kali-workstation` 3.0.0.
 
+SWE-Gym Lite uses the same teacher and App with pinned native grading and immutable
+common/repo VM templates. See [the build, smoke-run and recovery guide](docs/swe-gym-lite.md).
+
 ## Workflow
 
 ```bash

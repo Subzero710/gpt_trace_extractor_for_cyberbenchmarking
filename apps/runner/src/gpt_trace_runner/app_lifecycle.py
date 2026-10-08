@@ -36,6 +36,32 @@ class AppLifecycle:
             await self._client.aclose()
         await self.runtime.close()
 
+    async def preflight_templates(self, tasks) -> dict:
+        values = sorted({task.workstation_template for task in tasks if task.workstation_template is not None})
+        if not values:
+            return {"templates": {}}
+        return await self.runtime.preflight(values)
+
+    async def abandon(self, task, environments, fingerprint, *, attempt):
+        # Explicit operator action may clean a partially booted/unreadable VM.
+        errors = []
+        for tool in task.tools:
+            if tool.kind == "local_mcp":
+                try:
+                    await self._operation(task, tool, environments[tool.app_id], fingerprint, "reset", attempt)
+                except AppInfrastructureError as exc:
+                    errors.append(str(exc))
+                try:
+                    await self._deactivate(task, tool, environments[tool.app_id], fingerprint, attempt=attempt)
+                except AppInfrastructureError as exc:
+                    errors.append(str(exc))
+        try:
+            await self.runtime.abandon(task, environments, fingerprint, attempt=attempt)
+        except AppInfrastructureError as exc:
+            errors.append(str(exc))
+        if errors:
+            raise AppInfrastructureError("; ".join(errors))
+
     def _read_token(self) -> str:
         if self._token is not None:
             return self._token
@@ -334,6 +360,9 @@ class AppLifecycle:
                 await self._seed_workspace(task, tool)
             return runtime
         except Exception as prepare_error:
+            if task.workstation_template is not None:
+                # Preserve the selected VM for diagnosis and same-attempt resume.
+                raise
             cleanup_errors: list[str] = []
             for tool in reversed(activated):
                 try:

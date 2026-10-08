@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Protocol
+from dataclasses import dataclass, replace
+import hashlib
+from .workstation_provider import InternalRuntime
 
 from rich.console import Console
 
@@ -98,13 +101,22 @@ async def abandon_recovery(
         attempt=entry.attempt,
         runner_id=entry.runner_id,
     )
-    await lifecycle.reset(
+    reset = lifecycle.abandon if task.workstation_template is not None else lifecycle.reset
+    await reset(
         task,
         expected_environments,
         fingerprint,
         attempt=entry.attempt,
     )
     journal.clear()
+    journal.clear_capture()
+
+
+@dataclass(frozen=True)
+class RuntimeHooks:
+    prepare: Callable
+    capture: Callable
+    evaluate: Callable
 
 
 class InterruptedBeforeSubmission(RuntimeError):
@@ -127,6 +139,7 @@ class BenchmarkRunner:
             str,
             Callable[[CapturedConversation], Awaitable[dict[str, Any] | None]],
         ] | None = None,
+        runtime_hooks: dict[str, RuntimeHooks] | None = None,
     ) -> None:
         self.chatgpt = chatgpt
         self.storage = storage
@@ -138,6 +151,32 @@ class BenchmarkRunner:
         self._session_prepared = False
         self.storage_context = storage_context or {}
         self.evaluation_hooks = evaluation_hooks or {}
+        self.runtime_hooks = runtime_hooks or {}
+
+    def _internal(self, task, environments, fingerprint, attempt):
+        key = hashlib.sha256(f"{task.task_id}\0{attempt}\0{fingerprint}".encode()).hexdigest()
+        return InternalRuntime(self.lifecycle.runtime, task, environments, fingerprint, attempt,
+                               self.journal.path.parent / "evaluation-artifacts" / key)
+
+    async def _evaluate_capture(self, task, captured, attempt, environments, fingerprint):
+        hooks = self.runtime_hooks.get(task.task_id)
+        if hooks is None:
+            evaluation = self.evaluation_hooks.get(task.task_id)
+            return await evaluation(captured) if evaluation is not None else None
+        entry = self.journal.load()
+        if entry is None or entry.task_id != task.task_id or entry.attempt != attempt:
+            raise RecoveryIncomplete("missing candidate evaluation journal")
+        if entry.phase not in {"conversation_checkpointed", "candidate_checkpointed"}:
+            digest = self.journal.write_capture(captured, entry)
+            entry = replace(entry, phase="conversation_checkpointed", conversation_id=captured.conversation_id,
+                            capture_sha256=digest)
+            self.journal.write(entry)
+        runtime = self._internal(task, environments, fingerprint, attempt)
+        if entry.phase != "candidate_checkpointed":
+            candidate = await hooks.capture(captured, runtime)
+            entry = replace(entry, phase="candidate_checkpointed", candidate=candidate)
+            self.journal.write(entry)
+        return await hooks.evaluate(captured, entry.candidate, runtime)
 
     async def _ensure_session(self) -> None:
         if self._session_prepared:
@@ -218,8 +257,7 @@ class BenchmarkRunner:
             app_runtime=app_runtime,
         )
         await self.storage.set_conversation(task.task_id, conversation_id, attempt=existing.attempt, runner_id=identity)
-        evaluation_hook = self.evaluation_hooks.get(task.task_id)
-        evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
+        evaluation = await self._evaluate_capture(task, captured, existing.attempt, environments, fingerprint)
         await self.storage.complete(task.task_id, captured, attempt=existing.attempt, runner_id=identity, **({"evaluation": evaluation} if evaluation is not None else {}))
         self.journal.write(
             self._entry(
@@ -236,6 +274,7 @@ class BenchmarkRunner:
         await self.chatgpt.delete_completed_conversation(conversation_id)
         await self.lifecycle.reset(recovery_task, environments, fingerprint, attempt=existing.attempt)
         self.journal.clear()
+        self.journal.clear_capture()
         self.console.print(f"[green]{task.task_id}: recovered ({len(captured.messages)} messages)[/]")
 
     async def reconcile_journal(self, tasks: list[BenchmarkTask]) -> None:
@@ -264,6 +303,7 @@ class BenchmarkRunner:
                 await self.chatgpt.delete_completed_conversation(conversation_id)
             await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             self.journal.clear()
+            self.journal.clear_capture()
             return
         if (
             existing is not None
@@ -271,8 +311,36 @@ class BenchmarkRunner:
             and existing.attempt == entry.attempt
             and existing.runner_id == entry.runner_id
         ):
+            reset = self.lifecycle.abandon if task.workstation_template is not None else self.lifecycle.reset
+            await reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
+            self.journal.clear()
+            self.journal.clear_capture()
+            return
+
+        if task.task_id in self.runtime_hooks and entry.phase in {
+            "starting", "apps_prepared", "benchmark_preparing", "benchmark_ready", "composer_dirty"
+        }:
+            if existing is None or existing.status != "running" or existing.attempt != entry.attempt or existing.runner_id != entry.runner_id:
+                raise RecoveryIncomplete("runtime preparation checkpoint has no matching running attempt")
+            await self._run_attempt(recovery_task, fingerprint, expected_environments, entry.attempt,
+                                    started=existing, resume_entry=entry)
+            return
+
+        if entry.phase in {"conversation_checkpointed", "candidate_checkpointed"}:
+            if task.task_id not in self.runtime_hooks:
+                raise RecoveryIncomplete("durable evaluation checkpoint has no runtime hooks")
+            if existing is None or existing.status != "running" or existing.attempt != entry.attempt or existing.runner_id != entry.runner_id:
+                raise RecoveryIncomplete("evaluation checkpoint has no matching running attempt")
+            captured = self.journal.load_capture(entry)
+            await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
+            evaluation = await self._evaluate_capture(recovery_task, captured, entry.attempt, expected_environments, fingerprint)
+            await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id,
+                                        **({"evaluation": evaluation} if evaluation is not None else {}))
+            self.journal.write(replace(self.journal.load(), phase="cleanup_pending"))
+            await self.chatgpt.delete_completed_conversation(captured.conversation_id)
             await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
             self.journal.clear()
+            self.journal.clear_capture()
             return
 
         if entry.phase in {"starting", "apps_prepared", "composer_dirty"}:
@@ -353,8 +421,7 @@ class BenchmarkRunner:
             app_environments=expected_environments,
             app_runtime=app_runtime,
         )
-        evaluation_hook = self.evaluation_hooks.get(entry.task_id)
-        evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
+        evaluation = await self._evaluate_capture(task, captured, entry.attempt, expected_environments, fingerprint)
         await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id, **({"evaluation": evaluation} if evaluation is not None else {}))
         self.journal.write(
             self._entry(
@@ -371,6 +438,7 @@ class BenchmarkRunner:
         await self.chatgpt.delete_completed_conversation(conversation_id)
         await self.lifecycle.reset(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
         self.journal.clear()
+        self.journal.clear_capture()
         self.console.print(f"[green]{entry.task_id}: crash recovery completed[/]")
 
     async def _recover_existing(self, task: BenchmarkTask, existing: StoredRun) -> bool:
@@ -423,33 +491,46 @@ class BenchmarkRunner:
                 environments=environments,
             )
         )
-        started: StoredRun | None = None
-        phase = "starting"
+        await self._run_attempt(task, fingerprint, environments, expected_attempt)
+
+    async def _run_attempt(self, task, fingerprint, environments, expected_attempt,
+                           *, started=None, resume_entry=None):
+        identity = resume_entry.runner_id if resume_entry is not None else self.runner_id
+        phase = resume_entry.phase if resume_entry is not None else "starting"
         try:
-            context = self.storage_context.get(task.task_id, {})
-            started = await self.storage.start(
-                task.task_id,
-                self.runner_id,
-                expected_attempt,
-                fingerprint,
-                provenance,
-                logical_task_id=context.get("logical_task_id"),
-                dataset_metadata=context.get("dataset_metadata"),
-            )
-            if started.attempt != expected_attempt or started.runner_id != self.runner_id:
-                raise StorageError("storage /start returned unexpected attempt identity")
-            await self.lifecycle.prepare(task, environments, fingerprint, attempt=expected_attempt)
+            if resume_entry is None:
+                context = self.storage_context.get(task.task_id, {})
+                started = await self.storage.start(
+                    task.task_id, identity, expected_attempt, fingerprint, task_app_provenance(task),
+                    logical_task_id=context.get("logical_task_id"),
+                    dataset_metadata=context.get("dataset_metadata"),
+                )
+                if started.attempt != expected_attempt or started.runner_id != identity:
+                    raise StorageError("storage /start returned unexpected attempt identity")
+                await self.lifecycle.prepare(task, environments, fingerprint, attempt=expected_attempt)
+            elif resume_entry.phase == "starting":
+                await self.lifecycle.prepare(task, environments, fingerprint, attempt=expected_attempt)
+            else:
+                await self.lifecycle.assert_resume(task, environments, fingerprint, attempt=expected_attempt)
             phase = "apps_prepared"
             self.journal.write(
                 self._entry(
                     task,
-                    runner_id=self.runner_id,
+                    runner_id=identity,
                     attempt=expected_attempt,
                     phase=phase,
                     fingerprint=fingerprint,
                     environments=environments,
                 )
             )
+            if task.task_id in self.runtime_hooks:
+                phase = "benchmark_preparing"
+                self.journal.write(self._entry(task, runner_id=identity, attempt=expected_attempt,
+                    phase=phase, fingerprint=fingerprint, environments=environments))
+                await self.runtime_hooks[task.task_id].prepare(self._internal(task, environments, fingerprint, expected_attempt))
+                phase = "benchmark_ready"
+                self.journal.write(self._entry(task, runner_id=identity, attempt=expected_attempt,
+                    phase=phase, fingerprint=fingerprint, environments=environments))
             await self._ensure_session()
             prepared = await self.chatgpt.prepare_task(task)
             if task_fingerprint(task) != fingerprint:
@@ -458,7 +539,7 @@ class BenchmarkRunner:
             self.journal.write(
                 self._entry(
                     task,
-                    runner_id=self.runner_id,
+                    runner_id=identity,
                     attempt=expected_attempt,
                     phase=phase,
                     fingerprint=fingerprint,
@@ -472,7 +553,7 @@ class BenchmarkRunner:
                 self.journal.write(
                     self._entry(
                         task,
-                        runner_id=self.runner_id,
+                        runner_id=identity,
                         attempt=expected_attempt,
                         phase=phase,
                         fingerprint=fingerprint,
@@ -484,7 +565,7 @@ class BenchmarkRunner:
                 self.journal.write(
                     self._entry(
                         task,
-                        runner_id=self.runner_id,
+                        runner_id=identity,
                         attempt=expected_attempt,
                         phase="submission_started",
                         fingerprint=fingerprint,
@@ -502,7 +583,7 @@ class BenchmarkRunner:
             self.journal.write(
                 self._entry(
                     task,
-                    runner_id=self.runner_id,
+                    runner_id=identity,
                     attempt=expected_attempt,
                     phase=phase,
                     fingerprint=fingerprint,
@@ -515,7 +596,7 @@ class BenchmarkRunner:
                 task.task_id,
                 submitted.conversation_id,
                 attempt=expected_attempt,
-                runner_id=self.runner_id,
+                runner_id=identity,
             )
             self.console.print(f"{task.task_id}: conversation {submitted.conversation_id}")
             captured = await self.chatgpt.wait_for_completion(submitted)
@@ -531,14 +612,13 @@ class BenchmarkRunner:
                 app_environments=environments,
                 app_runtime=app_runtime,
             )
-            evaluation_hook = self.evaluation_hooks.get(task.task_id)
-            evaluation = await evaluation_hook(captured) if evaluation_hook is not None else None
-            await self.storage.complete(task.task_id, captured, attempt=expected_attempt, runner_id=self.runner_id, **({"evaluation": evaluation} if evaluation is not None else {}))
+            evaluation = await self._evaluate_capture(task, captured, expected_attempt, environments, fingerprint)
+            await self.storage.complete(task.task_id, captured, attempt=expected_attempt, runner_id=identity, **({"evaluation": evaluation} if evaluation is not None else {}))
             phase = "cleanup_pending"
             self.journal.write(
                 self._entry(
                     task,
-                    runner_id=self.runner_id,
+                    runner_id=identity,
                     attempt=expected_attempt,
                     phase=phase,
                     fingerprint=fingerprint,
@@ -550,12 +630,13 @@ class BenchmarkRunner:
             await self.chatgpt.delete_completed_conversation(submitted.conversation_id)
             await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
             self.journal.clear()
+            self.journal.clear_capture()
             self.console.print(f"[green]{task.task_id}: completed ({len(captured.messages)} messages)[/]")
         except Exception as exc:
             if phase == "starting" and started is None and isinstance(exc, StorageConflict):
                 self.journal.clear()
-            elif phase in {"starting", "apps_prepared", "composer_dirty"} and started is not None and not isinstance(exc, StorageError):
+            elif task.task_id not in self.runtime_hooks and phase in {"starting", "apps_prepared", "composer_dirty"} and started is not None and not isinstance(exc, StorageError):
                 await self.lifecycle.reset(task, environments, fingerprint, attempt=expected_attempt)
-                await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=self.runner_id)
+                await self.storage.fail(task.task_id, exc, attempt=expected_attempt, runner_id=identity)
                 self.journal.clear()
             raise

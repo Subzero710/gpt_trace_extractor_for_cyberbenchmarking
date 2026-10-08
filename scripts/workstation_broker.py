@@ -41,6 +41,7 @@ def start():
     env={**os.environ,'WORKSTATION_BROKER_ADMIN_TOKEN_FILE':str(ADMIN_TOKEN),
          'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE':str(CONTROLLER_TOKEN),
          'WORKSTATION_BROKER_STATE':str(BASE.parent/'attempts'),
+         'WORKSTATION_TEMPLATE_ROOT':str(BASE.parent/'templates'),
          'WORKSTATION_BASE_IMAGE':str(BASE),'WORKSTATION_BROKER_SOCKET':str(SOCKET),
          'WORKSTATION_CONFIG':str(ROOT/'config/runner.toml')}
     with (STATE/'broker.log').open('ab') as log:

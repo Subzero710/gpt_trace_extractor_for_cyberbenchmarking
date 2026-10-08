@@ -181,8 +181,8 @@ def classify_incident(exc):
     if isinstance(exc, RateLimited):
         return "rate_limited", False
     if isinstance(exc, RecoveryIncomplete):
-        return "recovery", False
-    return "infrastructure", False
+        return "recovery", True
+    return "infrastructure", True
 
 
 async def _storage_completed_run_task_ids(settings, state: ActiveRun):
@@ -209,6 +209,30 @@ async def _storage_completed_run_task_ids(settings, state: ActiveRun):
             + ", ".join(not_completed)
         )
     return frozenset(completed)
+
+
+async def _preflight_selected(settings, registry, adapters, selected_ids, make_lifecycle, adapter_ids):
+    selected = set(selected_ids)
+    camp = campaign(settings)
+    tasks = []
+    expected = {}
+    for entry in SuperbenchCatalog(adapters).discover(adapter_ids):
+        adapter = adapters.get(entry.adapter_id)
+        bt = to_benchmark_task(entry.task, registry, camp, adapter)
+        if bt.task_id in selected and bt.workstation_template is not None:
+            tasks.append(bt)
+            expected[bt.workstation_template] = entry.task.metadata.get("source_fingerprint")
+    if tasks:
+        from ..runtime_preflight import preflight_templates
+        lifecycle = make_lifecycle(settings, tasks)
+        try:
+            result = await preflight_templates(lifecycle, tasks)
+            for template_id, row in result["templates"].items():
+                source_fp = expected[template_id]
+                if source_fp is not None and row["template_source_fingerprint"] != source_fp:
+                    raise RecoveryIncomplete("published template source differs from frozen benchmark source")
+        finally:
+            await lifecycle.close()
 
 
 async def execute_active(
@@ -257,6 +281,8 @@ async def execute_active(
                 registry,
                 adapters,
             )
+            await _preflight_selected(settings, registry, adapters, selected_ids, make_lifecycle,
+                                      tuple(sorted({task.adapter_id for task in state.selected_tasks})))
             store.begin_resume()
             return await _execute_locked(
                 settings,
@@ -293,6 +319,9 @@ async def execute_active(
             expected_model=settings.chatgpt_expected_model_slug,
             configuration_fingerprint=config_fp(settings),
         )
+        await _preflight_selected(settings, registry, adapters,
+                                   tuple(task.run_task_id for task in tasks), make_lifecycle,
+                                   tuple(sorted({task.adapter_id for task in tasks})))
         store.create(state)
         selected_ids = validate_frozen(
             store.load(),

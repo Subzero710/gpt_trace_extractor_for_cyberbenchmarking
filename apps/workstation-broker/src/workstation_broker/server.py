@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from .computer import capture, input_events
+from .templates import TemplateRegistry, backing
 
 PORT = 17171
 MAX_BODY = 32 * 1024 * 1024
@@ -79,7 +80,8 @@ def qemu_image_info(path: Path, *, force_share: bool = False) -> dict:
 
 
 def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: int,
-               memory_mb: int, vcpus: int, ident: dict, digest: str) -> bytes:
+               memory_mb: int, vcpus: int, ident: dict, digest: str,
+               template: dict | None = None) -> bytes:
     domain = ET.Element("domain", type="kvm")
     ET.SubElement(domain, "name").text = name
     ET.SubElement(domain, "memory", unit="MiB").text = str(memory_mb)
@@ -95,7 +97,7 @@ def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: in
     metadata = ET.SubElement(domain, "metadata")
     node = ET.SubElement(metadata, f"{{{META_NS}}}attempt")
     node.text = json.dumps({**ident, "project": PROJECT, "base_sha256": digest,
-                            "overlay": str(overlay), "network": network, "cid": cid}, sort_keys=True)
+                            "overlay": str(overlay), "network": network, "cid": cid, **(template or {})}, sort_keys=True)
     devices = ET.SubElement(domain, "devices")
     disk = ET.SubElement(devices, "disk", type="file", device="disk")
     ET.SubElement(disk, "driver", name="qemu", type="qcow2")
@@ -135,6 +137,7 @@ class Broker:
     max_transfer_bytes: int = 67108864
     max_seed_bytes: int = 268435456
     egress_allow_cidrs: tuple[str, ...] = ()
+    template_root: Path | None = None
 
     def __post_init__(self):
         if not self.base.is_file() or self.base.is_symlink():
@@ -155,6 +158,8 @@ class Broker:
         if self.qemu_uid is None:
             raise RuntimeError("libvirt QEMU service user is missing")
         self.base_digest = file_sha256(self.base)
+        self.templates = TemplateRegistry(self.template_root or self.base.parent / "templates",
+                                          self.base, qemu_image_info)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
 
@@ -225,15 +230,23 @@ add rule inet {table} input iifname "{bridge}" drop
         node = xml.find(f"./metadata/{{{META_NS}}}attempt")
         if node is None or json.loads(node.text or "null") != data["metadata"]:
             raise ValueError("libvirt domain identity mismatch")
-        if data["metadata"]["base_sha256"] != self.base_digest:
-            raise ValueError("base image identity changed")
+        recorded = data["metadata"]
+        if recorded.get("template_id") is not None:
+            selection = self.templates.verify_record(recorded)
+            selected = Path(selection["backing_path"])
+            if recorded["base_sha256"] != selection["backing_sha256"] or data["base"] != str(selected):
+                raise ValueError("selected backing identity changed")
+        else:
+            selected = self.base
+            if recorded["base_sha256"] != self.base_digest or self.templates.immutable_sha256(selected) != self.base_digest:
+                raise ValueError("base image identity changed")
         disk = xml.find("./devices/disk[@device='disk']/source")
         if disk is None or disk.get("file") != str(directory / "disk/overlay.qcow2"):
             raise ValueError("domain overlay mismatch")
         if not (directory / "disk").is_mount() or not (directory / "disk/overlay.qcow2").is_file():
             raise ValueError("overlay missing")
         disk_info = qemu_image_info(directory / "disk/overlay.qcow2", force_share=True)
-        if disk_info.get("format") != "qcow2" or Path(disk_info.get("backing-filename", "")).resolve() != self.base.resolve():
+        if disk_info.get("format") != "qcow2" or backing(disk_info, directory / "disk/overlay.qcow2") != selected.resolve():
             raise ValueError("overlay backing image mismatch")
         if not run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines().__contains__(network):
             raise ValueError("attempt network missing")
@@ -242,22 +255,36 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError("attempt egress firewall missing")
         return data
 
-    async def create(self, ident: dict) -> dict:
+    def preflight_templates(self, template_ids) -> dict:
+        if not isinstance(template_ids, list) or len(template_ids) > 256:
+            raise ValueError("invalid template preflight selection")
+        return {"templates": {value: self.templates.select(value) for value in sorted(set(template_ids))}}
+
+    async def create(self, ident: dict, template_id: str | None = None) -> dict:
         name, network, directory = self._paths(ident)
+        if template_id is not None and (directory / "state.json").is_file():
+            data = self._read(ident)
+            if data["metadata"].get("template_id") != template_id:
+                raise ValueError("attempt already uses another template")
+            return await self.inspect_verified(ident)
+        selection = self.templates.select(template_id) if template_id is not None else {}
+        selected = Path(selection["backing_path"]) if selection else self.base
         if directory.exists() or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines():
             raise ValueError("attempt already exists; discover or destroy it explicitly")
+        digest = selection["backing_sha256"] if selection else self.base_digest
+        if not selection and self.templates.immutable_sha256(selected) != digest:
+            raise ValueError("Kali base image mutated")
         directory.mkdir(mode=0o711)
         secret = secrets.token_hex(32)
         cid = 4096 + int(suffix(ident), 16) % 2147480000
-        digest = self.base_digest
         overlay, iso = directory / "disk/overlay.qcow2", directory / "disk/identity.iso"
         meta = {**ident, "project": PROJECT, "base_sha256": digest,
-                "overlay": str(overlay), "network": network, "cid": cid}
+                "overlay": str(overlay), "network": network, "cid": cid, **selection}
         state = {"identity": ident, "name": name, "network": network, "metadata": meta,
-                 "secret": secret, "backend": "vsock", "base": str(self.base)}
+                 "secret": secret, "backend": "vsock", "base": str(selected)}
         try:
             self._mount(directory)
-            run("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(self.base), str(overlay))
+            run("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(selected), str(overlay))
             os.chown(overlay, self.qemu_uid, -1)
             os.chmod(overlay, 0o600)
             key = int(suffix(ident), 16)
@@ -291,10 +318,18 @@ add rule inet {table} input iifname "{bridge}" drop
             os.chown(iso, self.qemu_uid, -1)
             os.chmod(iso, 0o600)
             domain_definition = directory / "domain.xml"
-            domain_definition.write_bytes(domain_xml(name, network, overlay, iso, cid, self.memory_mb, self.vcpus, ident, digest))
+            domain_definition.write_bytes(domain_xml(name, network, overlay, iso, cid, self.memory_mb, self.vcpus, ident, digest, selection))
             run("virsh", "-c", "qemu:///system", "define", str(domain_definition))
-            (directory / "state.json").write_text(json.dumps(state, sort_keys=True))
-            os.chmod(directory / "state.json", 0o600)
+            state_path = directory / "state.json"
+            with state_path.with_suffix(".tmp").open("w") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump(state, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(state_path.with_suffix(".tmp"), state_path)
+            fd = os.open(directory, os.O_DIRECTORY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
             run("virsh", "-c", "qemu:///system", "start", name)
             for _ in range(self.boot_timeout_seconds):
                 try:
@@ -306,7 +341,9 @@ add rule inet {table} input iifname "{bridge}" drop
                 await asyncio.sleep(1)
             raise TimeoutError("guest agent did not become ready")
         except BaseException:
-            self.destroy(ident, strict=False)
+            if template_id is None:
+                self.destroy(ident, strict=False)
+            # A templated failure is diagnostic state, abandoned only explicitly.
             raise
 
     def inspect(self, ident: dict) -> dict:
@@ -316,7 +353,10 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError(f"attempt domain is {state}")
         return {"identity": ident, "domain": data["name"], "network": data["network"],
                 "base_sha256": data["metadata"]["base_sha256"], "overlay": data["metadata"]["overlay"],
-                "cid": data["metadata"]["cid"], "provider": "libvirt"}
+                "cid": data["metadata"]["cid"], "provider": "libvirt",
+                **{key: data["metadata"].get(key) for key in
+                   ("template_id", "backing_path", "backing_sha256", "template_generation",
+                    "template_source_fingerprint")}}
 
     async def inspect_verified(self, ident: dict) -> dict:
         result = self.inspect(ident)
@@ -347,7 +387,8 @@ add rule inet {table} input iifname "{bridge}" drop
             run("virsh", "-c", "qemu:///system", "net-undefine", network)
         self._remove_firewall(ident)
         self._unmount(directory)
-        shutil.rmtree(directory, ignore_errors=False)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=False)
         self.assert_absent(ident)
 
     def assert_absent(self, ident: dict) -> None:
@@ -627,11 +668,16 @@ def create_app(broker: Broker) -> Starlette:
                 raise ValueError("broker request must be an object")
             if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
             if action == "destroy_all": return JSONResponse(broker.destroy_all())
+            if action == "preflight_templates":
+                return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
             ident = identity(payload)
-            if action == "create_attempt": result = await broker.create(ident)
+            if action == "create_attempt":
+                result = await broker.create(ident, payload.get("template_id"))
             elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
             elif action == "destroy_attempt":
                 broker.destroy(ident); result = {"destroyed": True}
+            elif action == "abandon_attempt":
+                broker.destroy(ident, strict=False); result = {"destroyed": True}
             elif action == "assert_absent":
                 broker.assert_absent(ident); result = {"absent": True}
             elif action == "rpc":
@@ -671,7 +717,8 @@ def main():
                     screenshot_max_bytes=config["screenshot_max_bytes"],
                     max_terminals=config["max_terminals"], max_output_bytes=config["max_output_bytes"],
                     max_transfer_bytes=config["max_transfer_bytes"], max_seed_bytes=config["max_seed_bytes"],
-                    egress_allow_cidrs=tuple(config["egress_allow_cidrs"]))
+                    egress_allow_cidrs=tuple(config["egress_allow_cidrs"]),
+                    template_root=Path(os.environ["WORKSTATION_TEMPLATE_ROOT"]) if "WORKSTATION_TEMPLATE_ROOT" in os.environ else None)
     uds = Path(os.environ["WORKSTATION_BROKER_SOCKET"])
     uds.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if uds.exists():

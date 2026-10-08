@@ -47,6 +47,11 @@ class BenchmarkTask:
     attachments: tuple[Path, ...]
     tools: tuple[BenchmarkTool, ...] = ()
     initial_workspace: Path | None = None
+    workstation_template: str | None = None
+
+    def __post_init__(self) -> None:
+        from .workstation_template import validate_template_id
+        validate_template_id(self.workstation_template)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +105,7 @@ def task_fingerprint(task: BenchmarkTask) -> str:
             "files": workspace.files,
             "bytes": workspace.bytes,
         },
-        "workspace_template": None,
+        "workspace_template": task.workstation_template,
         "apps": [
             {
                 "type": tool.type,

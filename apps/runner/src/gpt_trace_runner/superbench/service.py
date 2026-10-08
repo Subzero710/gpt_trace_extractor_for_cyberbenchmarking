@@ -48,6 +48,7 @@ def to_benchmark_task(task: TaskSpec, registry, camp: TeacherCampaign, adapter) 
         attachments=task.attachments,
         tools=tuple(benchmark_tool(registry, app_id) for app_id in task.tools),
         initial_workspace=task.initial_workspace,
+        workstation_template=task.workstation_template,
     )
 
 

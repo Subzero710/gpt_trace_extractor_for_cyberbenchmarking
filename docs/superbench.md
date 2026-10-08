@@ -34,6 +34,12 @@ The pinned split is validated to expose both Browser and Code Workspace across t
 
 ## Adapter contract
 
+The [SWE-Gym Lite guide](swe-gym-lite.md) documents its pinned 230-task source,
+separate host template builder, native grading and durable evaluation recovery.
+`TaskSpec.workstation_template` selects a validated host template before VM
+creation. Adapters can opt into internal runtime hooks; `task_order_key()` gives
+a stable campaign order while the default retains task-ID ordering.
+
 To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, preserve useful source provenance in task metadata, implement native `evaluate()` when an upstream oracle exists, add tests and expose the adapter through the `gpt_trace_runner.benchmark_adapters` entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
 
 `TaskSpec.tools` lists Apps available to the task. Availability never implies mandatory invocation: the agent alone decides whether to use a tool. Captured provenance records observed tool use. Attachments intended for Code Workspace can be materialized through `initial_workspace` instead of being uploaded to the teacher conversation.
