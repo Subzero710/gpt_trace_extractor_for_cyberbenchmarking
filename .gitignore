@@ -2,6 +2,8 @@
 .secrets/
 .venv/
 .venv-workstation-broker/
+*.qcow2
+*.qcow2.tmp
 __pycache__/
 *.py[cod]
 .pytest_cache/

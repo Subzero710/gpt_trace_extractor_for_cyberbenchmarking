@@ -188,3 +188,10 @@ async def preflight_tasks(lifecycle: AppLifecycle, tasks: Sequence[BenchmarkTask
             if prepared:
                 await lifecycle.reset(probe, environments, fingerprint, attempt=1)
             await lifecycle.assert_clean(probe, environments, fingerprint, attempt=1)
+
+
+async def preflight_templates(lifecycle, tasks) -> dict:
+    """Validate immutable images without starting a VM or connecting the teacher."""
+    if not any(task.workstation_template is not None for task in tasks):
+        return {"templates": {}}
+    return await lifecycle.preflight_templates(tasks)

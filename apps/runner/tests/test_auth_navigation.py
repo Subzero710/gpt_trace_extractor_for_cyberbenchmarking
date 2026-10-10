@@ -414,6 +414,7 @@ def test_auth_command_directs_operator_to_kasm_authwall() -> None:
     )[0]
 
     assert "https://<server>:6901/" in auth_block
-    assert "kasm_user" in auth_block
+    assert "settings.validate_teacher_browser_public_url()" in auth_block
+    assert "authenticate with TEACHER_BROWSER_PASSWORD" in auth_block
     assert "noVNC" not in auth_block
     assert "browser_novnc_url" not in auth_block

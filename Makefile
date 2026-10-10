@@ -1,4 +1,4 @@
-.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes kali_control
+.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes kali_control swe-gym-lite-templates template-doctor
 
 requirements:
 	python3 scripts/host_requirements.py
@@ -72,6 +72,13 @@ down:
 superbench-fetch:
 	@test -n "$(ADAPTER)" || (echo "usage: make superbench-fetch ADAPTER=<adapter_id>" >&2; exit 2)
 	docker compose run --rm --no-deps benchmark-fetch --adapter "$(ADAPTER)"
+
+swe-gym-lite-templates:
+	python3 scripts/build_swe_gym_lite_templates.py $(TEMPLATE_BUILD_ARGS)
+
+template-doctor: kali_control
+	@test -n "$(ADAPTER)" || (echo "usage: make template-doctor ADAPTER=<adapter_id>" >&2; exit 2)
+	docker compose run --rm --no-deps runner superbench-template-doctor --adapter "$(ADAPTER)"
 
 export-parquet:
 	python3 scripts/project_state.py core

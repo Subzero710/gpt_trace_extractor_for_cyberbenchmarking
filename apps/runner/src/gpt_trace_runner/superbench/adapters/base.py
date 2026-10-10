@@ -37,6 +37,10 @@ class BenchmarkAdapter(ABC):
     @abstractmethod
     def discover_tasks(self) -> list[TaskSpec]: ...
 
+    def task_order_key(self, task: TaskSpec) -> str:
+        """Stable campaign selection order; default adapters retain task-ID order."""
+        return task.task_id
+
     def materialize_task(self, task: TaskSpec, staging_root: Path) -> TaskSpec:
         return task
 
@@ -51,6 +55,21 @@ class BenchmarkAdapter(ABC):
         app_environments: dict[str, str],
     ) -> PreparedBenchmarkContext:
         return await self.prepare(task)
+
+    @property
+    def uses_runtime_hooks(self) -> bool:
+        return False
+
+    async def prepare_runtime(self, task, *, prepared, runtime) -> None:
+        """Trusted setup after VM boot, before teacher interaction."""
+        return None
+
+    async def capture_candidate(self, task, *, prepared, captured, runtime) -> dict:
+        """Export a candidate before the durable grading checkpoint."""
+        return {}
+
+    async def evaluate_runtime(self, task, *, prepared, captured, candidate, runtime):
+        return await self.evaluate(task, prepared=prepared, captured=captured)
 
     async def evaluate(
         self,

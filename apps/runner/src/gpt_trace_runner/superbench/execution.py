@@ -17,13 +17,37 @@ from ..exceptions import (
 from ..journal import JournalStore
 from ..lock import RunnerLock
 from ..models import task_app_provenance, task_fingerprint
-from ..runner import BenchmarkRunner
+from ..runner import BenchmarkRunner, RuntimeHooks
 from ..storage_client import StorageClient
 from .catalog import SuperbenchCatalog
 from .models import run_task_id
 from .registry import AdapterRegistry
 from .service import campaign, storage_context, to_benchmark_task
 
+
+
+class DeferredCleanupChatGPT:
+    """No teacher connection occurs during checkpoint-only evaluation recovery."""
+    def __init__(self, get_chatgpt):
+        self.get_chatgpt = get_chatgpt
+
+    async def delete_completed_conversation(self, conversation_id):
+        client = await self.get_chatgpt()
+        await client.delete_completed_conversation(conversation_id)
+
+
+def runtime_hooks(adapter, task, prepared):
+    if not getattr(adapter, "uses_runtime_hooks", False):
+        return None
+    async def prepare(runtime):
+        await adapter.prepare_runtime(task, prepared=prepared, runtime=runtime)
+    async def capture(captured, runtime):
+        return await adapter.capture_candidate(task, prepared=prepared, captured=captured, runtime=runtime)
+    async def evaluate(captured, candidate, runtime):
+        result = await adapter.evaluate_runtime(task, prepared=prepared, captured=captured,
+                                               candidate=candidate, runtime=runtime)
+        return result.as_dict() if result is not None else None
+    return RuntimeHooks(prepare, capture, evaluate)
 
 
 async def _record_pre_runner_failure(
@@ -123,7 +147,7 @@ def _persist_rate_limit_defer(journal: JournalStore, pending, exc: RateLimited) 
 
 
 def _raise_if_recovery_deferred(pending) -> None:
-    not_before = pending.retry_not_before
+    not_before = getattr(pending, "retry_not_before", None)
     if not_before is None:
         return
     remaining = float(not_before) - time.time()
@@ -188,7 +212,10 @@ async def _recover_pending_journal(
     lifecycle = make_lifecycle(settings, [bt])
     recovery_error: BaseException | None = None
     try:
-        chatgpt = await get_chatgpt()
+        if getattr(pending, "phase", None) in {"conversation_checkpointed", "candidate_checkpointed"}:
+            chatgpt = DeferredCleanupChatGPT(get_chatgpt)
+        else:
+            chatgpt = await get_chatgpt()
 
         async def evaluate(captured):
             result = await adapter.evaluate(task, prepared=prepared, captured=captured)
@@ -204,6 +231,7 @@ async def _recover_pending_journal(
             journal=journal,
             storage_context={bt.task_id: storage_context(catalog_entry.task, camp, adapter, registry)},
             evaluation_hooks={bt.task_id: evaluate},
+            runtime_hooks={bt.task_id: runtime_hooks(adapter, task, prepared)} if getattr(adapter, "uses_runtime_hooks", False) else {},
         )
         try:
             await runner.reconcile_journal([bt])
@@ -453,6 +481,7 @@ async def run_pending(
                         journal=journal,
                         storage_context={bt.task_id: storage_context(entry.task, camp, adapter, registry)},
                         evaluation_hooks={bt.task_id: evaluate},
+                        runtime_hooks={bt.task_id: runtime_hooks(adapter, task, prepared)} if getattr(adapter, "uses_runtime_hooks", False) else {},
                     )
                     runner_started = True
                     await runner.run_task(bt, True)

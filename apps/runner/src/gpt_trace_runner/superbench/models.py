@@ -46,8 +46,11 @@ class TaskSpec:
     attachments: tuple[Path, ...] = ()
     initial_workspace: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    workstation_template: str | None = None
 
     def __post_init__(self) -> None:
+        from ..workstation_template import validate_template_id
+        validate_template_id(self.workstation_template)
         if not self.task_id.strip() or len(self.task_id) > 255:
             raise ValueError("task_id must contain 1..255 non-whitespace characters")
         if not self.prompt.strip():
@@ -85,6 +88,8 @@ def task_spec_fingerprint(task: "TaskSpec") -> str:
         },
         "metadata": task.metadata,
     }
+    if task.workstation_template is not None:
+        payload["workstation_template"] = task.workstation_template
     return hashlib.sha256(_stable(payload)).hexdigest()
 
 

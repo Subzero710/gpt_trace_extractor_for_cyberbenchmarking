@@ -164,6 +164,29 @@ def doctor() -> None:
     asyncio.run(main())
 
 
+@app.command("superbench-template-doctor")
+def superbench_template_doctor(adapter: str = typer.Option(..., "--adapter")) -> None:
+    """Validate selected immutable templates without booting a VM or teacher."""
+    async def main():
+        from .superbench.registry import AdapterRegistry
+        from .superbench.service import campaign, to_benchmark_task
+        settings = Settings()
+        registry = AppRegistry.load(settings.app_registry_path)
+        selected = AdapterRegistry.discover().get(adapter)
+        tasks = [to_benchmark_task(task, registry, campaign(settings), selected) for task in selected.discover_tasks()]
+        lifecycle = make_lifecycle(settings, tasks)
+        try:
+            result = await lifecycle.preflight_templates(tasks)
+            expected = {task.metadata.get("source_fingerprint") for task in selected.discover_tasks()
+                        if task.workstation_template is not None}
+            if expected and any(row["template_source_fingerprint"] not in expected for row in result["templates"].values()):
+                raise RecoveryIncomplete("template sources differ from the pinned adapter")
+            console.print(json.dumps(result, indent=2))
+        finally:
+            await lifecycle.close()
+    asyncio.run(main())
+
+
 @app.command("register-apps")
 def register_apps() -> None:
     # Operational lifecycle helper only; it deliberately does not load benchmark data.
@@ -352,6 +375,7 @@ def superbench_active_status():
  asyncio.run(main())
 @app.command("superbench-auth")
 def superbench_auth(timeout_minutes: int = typer.Option(30, min=1)) -> None:
+    """Authenticate through KasmVNC, e.g. https://<server>:6901/."""
     async def main() -> None:
         settings = Settings()
         from .superbench.run_control import RunControlStore

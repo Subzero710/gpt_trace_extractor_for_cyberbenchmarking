@@ -47,6 +47,16 @@ class BenchmarkTask:
     attachments: tuple[Path, ...]
     tools: tuple[BenchmarkTool, ...] = ()
     initial_workspace: Path | None = None
+    workstation_template: str | None = None
+    template_task_id: str | None = None
+
+    def __post_init__(self) -> None:
+        from .workstation_template import validate_template_id
+        validate_template_id(self.workstation_template)
+        if self.template_task_id is not None:
+            import re
+            if self.workstation_template is None or not isinstance(self.template_task_id, str) or re.fullmatch(r"[A-Za-z0-9._:-]{1,255}", self.template_task_id) is None:
+                raise ValueError("invalid template logical task scope")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +110,7 @@ def task_fingerprint(task: BenchmarkTask) -> str:
             "files": workspace.files,
             "bytes": workspace.bytes,
         },
-        "workspace_template": None,
+        "workspace_template": task.workstation_template,
         "apps": [
             {
                 "type": tool.type,
@@ -111,6 +121,8 @@ def task_fingerprint(task: BenchmarkTask) -> str:
             for tool in task.tools
         ],
     }
+    if task.template_task_id is not None:
+        payload["template_task_id"] = task.template_task_id
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 

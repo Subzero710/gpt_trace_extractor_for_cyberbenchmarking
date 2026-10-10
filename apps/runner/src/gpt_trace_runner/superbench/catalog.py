@@ -37,4 +37,4 @@ class SuperbenchCatalog:
                     )
                 seen[task.task_id] = adapter_id
                 tasks.append(CatalogEntry(task=task, adapter_id=adapter_id))
-        return sorted(tasks, key=lambda item: item.task.task_id)
+        return sorted(tasks, key=lambda item: self.registry.get(item.adapter_id).task_order_key(item.task))

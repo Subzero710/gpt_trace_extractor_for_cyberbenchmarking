@@ -8,6 +8,7 @@ from gpt_trace_runner.models import CapturedConversation
 from gpt_trace_runner.superbench.adapters.base import PreparedBenchmarkContext
 from gpt_trace_runner.superbench.adapters.gaia import (
     GAIAAdapter,
+    GAIA_LEVEL,
     GAIA_METADATA_FILE,
     GAIA_REVISION,
     gaia_question_scorer,
@@ -21,7 +22,7 @@ def _write_metadata(path: Path) -> Path:
         {
             "task_id": "task-web",
             "Question": "What is the answer?",
-            "Level": 1,
+            "Level": GAIA_LEVEL,
             "Final answer": "Paris",
             "file_name": None,
             "file_path": None,
@@ -32,7 +33,7 @@ def _write_metadata(path: Path) -> Path:
         {
             "task_id": "task-direct",
             "Question": "What is two plus two?",
-            "Level": 1,
+            "Level": GAIA_LEVEL,
             "Final answer": "4",
             "file_name": None,
             "file_path": None,
@@ -41,7 +42,7 @@ def _write_metadata(path: Path) -> Path:
         {
             "task_id": "task-file",
             "Question": "Read the attachment and answer.",
-            "Level": 1,
+            "Level": GAIA_LEVEL,
             "Final answer": "42",
             "file_name": "sample.txt",
             "file_path": "2023/validation/sample.txt",

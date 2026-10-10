@@ -25,6 +25,7 @@ test = ["pytest>=8.3,<9", "pytest-asyncio>=0.25,<1"]
 gpt-trace = "gpt_trace_runner.cli:app"
 
 [project.entry-points."gpt_trace_runner.benchmark_adapters"]
+swe-gym-lite = "gpt_trace_runner.superbench.adapters.swe_gym_lite:SWEGymLiteAdapter"
 gaia = "gpt_trace_runner.superbench.adapters.gaia:GAIAAdapter"
 
 [tool.setuptools.packages.find]
@@ -33,3 +34,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"gpt_trace_runner.superbench.adapters.swe_gym" = ["*.json", "upstream/*.py", "upstream/LICENSE"]

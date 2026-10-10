@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from .computer import capture, input_events
+from .templates import TemplateRegistry, backing
 
 PORT = 17171
 MAX_BODY = 32 * 1024 * 1024
@@ -53,6 +54,11 @@ def identity(payload: dict) -> dict:
         raise ValueError("invalid attempt")
     if not isinstance(result["fingerprint"], str) or not SHA256.fullmatch(result["fingerprint"]):
         raise ValueError("invalid fingerprint")
+    if payload.get("purpose") is not None:
+        retry = payload.get("evaluator_retry")
+        if payload["purpose"] != "evaluator" or not isinstance(retry, str) or re.fullmatch(r"[0-9a-f]{32}", retry) is None:
+            raise ValueError("invalid isolated evaluator identity")
+        result.update(purpose="evaluator", evaluator_retry=retry)
     return result
 
 
@@ -78,8 +84,9 @@ def qemu_image_info(path: Path, *, force_share: bool = False) -> dict:
     return json.loads(run(*args))
 
 
-def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: int,
-               memory_mb: int, vcpus: int, ident: dict, digest: str) -> bytes:
+def domain_xml(name: str, network: str | None, overlay: Path, config_iso: Path, cid: int,
+               memory_mb: int, vcpus: int, ident: dict, digest: str,
+               template: dict | None = None) -> bytes:
     domain = ET.Element("domain", type="kvm")
     ET.SubElement(domain, "name").text = name
     ET.SubElement(domain, "memory", unit="MiB").text = str(memory_mb)
@@ -95,7 +102,7 @@ def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: in
     metadata = ET.SubElement(domain, "metadata")
     node = ET.SubElement(metadata, f"{{{META_NS}}}attempt")
     node.text = json.dumps({**ident, "project": PROJECT, "base_sha256": digest,
-                            "overlay": str(overlay), "network": network, "cid": cid}, sort_keys=True)
+                            "overlay": str(overlay), "network": network, "cid": cid, **(template or {})}, sort_keys=True)
     devices = ET.SubElement(domain, "devices")
     disk = ET.SubElement(devices, "disk", type="file", device="disk")
     ET.SubElement(disk, "driver", name="qemu", type="qcow2")
@@ -106,13 +113,14 @@ def domain_xml(name: str, network: str, overlay: Path, config_iso: Path, cid: in
     ET.SubElement(cd, "source", file=str(config_iso))
     ET.SubElement(cd, "target", dev="sda", bus="sata")
     ET.SubElement(cd, "readonly")
-    nic = ET.SubElement(devices, "interface", type="network")
-    ET.SubElement(nic, "source", network=network)
-    ET.SubElement(nic, "model", type="virtio")
-    ET.SubElement(devices, "controller", type="usb", model="qemu-xhci")
-    ET.SubElement(devices, "input", type="tablet", bus="usb")
-    ET.SubElement(devices, "video").append(ET.Element("model", type="virtio", heads="1", primary="yes"))
-    ET.SubElement(devices, "graphics", type="spice", autoport="yes", listen="127.0.0.1")
+    if network is not None:
+        nic = ET.SubElement(devices, "interface", type="network")
+        ET.SubElement(nic, "source", network=network)
+        ET.SubElement(nic, "model", type="virtio")
+        ET.SubElement(devices, "controller", type="usb", model="qemu-xhci")
+        ET.SubElement(devices, "input", type="tablet", bus="usb")
+        ET.SubElement(devices, "video").append(ET.Element("model", type="virtio", heads="1", primary="yes"))
+        ET.SubElement(devices, "graphics", type="spice", autoport="yes", listen="127.0.0.1")
     vsock = ET.SubElement(devices, "vsock", model="virtio")
     ET.SubElement(vsock, "cid", auto="no", address=str(cid))
     return ET.tostring(domain, encoding="utf-8")
@@ -135,6 +143,7 @@ class Broker:
     max_transfer_bytes: int = 67108864
     max_seed_bytes: int = 268435456
     egress_allow_cidrs: tuple[str, ...] = ()
+    template_root: Path | None = None
 
     def __post_init__(self):
         if not self.base.is_file() or self.base.is_symlink():
@@ -155,6 +164,8 @@ class Broker:
         if self.qemu_uid is None:
             raise RuntimeError("libvirt QEMU service user is missing")
         self.base_digest = file_sha256(self.base)
+        self.templates = TemplateRegistry(self.template_root or self.base.parent / "templates",
+                                          self.base, qemu_image_info)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
 
@@ -211,7 +222,8 @@ add rule inet {table} input iifname "{bridge}" drop
 
     def _paths(self, ident: dict) -> tuple[str, str, Path]:
         key = suffix(ident)
-        return f"gpt-trace-ws-{key}", f"gpt-trace-net-{key}", self.root / key
+        network = None if ident.get("purpose") == "evaluator" else f"gpt-trace-net-{key}"
+        return f"gpt-trace-ws-{key}", network, self.root / key
 
     def _read(self, ident: dict, *, require_firewall: bool = True) -> dict:
         name, network, directory = self._paths(ident)
@@ -225,64 +237,79 @@ add rule inet {table} input iifname "{bridge}" drop
         node = xml.find(f"./metadata/{{{META_NS}}}attempt")
         if node is None or json.loads(node.text or "null") != data["metadata"]:
             raise ValueError("libvirt domain identity mismatch")
-        if data["metadata"]["base_sha256"] != self.base_digest:
-            raise ValueError("base image identity changed")
+        recorded = data["metadata"]
+        if recorded.get("template_id") is not None:
+            selection = self.templates.verify_record(recorded)
+            selected = Path(selection["backing_path"])
+            if recorded["base_sha256"] != selection["backing_sha256"] or data["base"] != str(selected):
+                raise ValueError("selected backing identity changed")
+        else:
+            selected = self.base
+            if recorded["base_sha256"] != self.base_digest or self.templates.immutable_sha256(selected) != self.base_digest:
+                raise ValueError("base image identity changed")
         disk = xml.find("./devices/disk[@device='disk']/source")
         if disk is None or disk.get("file") != str(directory / "disk/overlay.qcow2"):
             raise ValueError("domain overlay mismatch")
         if not (directory / "disk").is_mount() or not (directory / "disk/overlay.qcow2").is_file():
             raise ValueError("overlay missing")
         disk_info = qemu_image_info(directory / "disk/overlay.qcow2", force_share=True)
-        if disk_info.get("format") != "qcow2" or Path(disk_info.get("backing-filename", "")).resolve() != self.base.resolve():
+        if disk_info.get("format") != "qcow2" or backing(disk_info, directory / "disk/overlay.qcow2") != selected.resolve():
             raise ValueError("overlay backing image mismatch")
-        if not run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines().__contains__(network):
+        if ident.get("purpose") == "evaluator":
+            if network is not None or xml.findall("./devices/interface") or xml.findall("./devices/filesystem") or xml.findall("./devices/graphics"):
+                raise ValueError("evaluator has a network, shared filesystem or desktop route")
+        elif not run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines().__contains__(network):
             raise ValueError("attempt network missing")
-        if require_firewall and subprocess.run(("nft", "list", "table", "inet", "gt_" + suffix(ident)),
+        if network is not None and require_firewall and subprocess.run(("nft", "list", "table", "inet", "gt_" + suffix(ident)),
                                                capture_output=True).returncode != 0:
             raise ValueError("attempt egress firewall missing")
         return data
 
-    async def create(self, ident: dict) -> dict:
+    def preflight_templates(self, template_ids) -> dict:
+        if not isinstance(template_ids, list) or len(template_ids) > 256:
+            raise ValueError("invalid template preflight selection")
+        selected = {value: self.templates.select(value) for value in sorted(set(template_ids))}
+        for record in selected.values():
+            _, manifest = self.templates.manifest(record)
+            for logical, row in manifest["task_artifacts"].items():
+                if row.get("template_id") == record["template_id"]:
+                    self.templates.task_scope(record, logical)
+        return {"templates": selected}
+
+    async def create(self, ident: dict, template_id: str | None = None, logical_task_id=None, *, _selection=None) -> dict:
         name, network, directory = self._paths(ident)
+        if template_id is not None and (directory / "state.json").is_file():
+            data = self._read(ident)
+            if data["metadata"].get("template_id") != template_id or data["metadata"].get("logical_task_id") != logical_task_id:
+                raise ValueError("attempt already uses another template")
+            return await self.inspect_verified(ident)
+        if ident.get("purpose") == "evaluator" and _selection is None:
+            raise ValueError("evaluator must be created from its recorded teacher backing")
+        selection = _selection if _selection is not None else self.templates.select(template_id) if template_id is not None else {}
+        if selection:
+            self.templates.task_scope(selection, logical_task_id)
+            selection = {**selection, "logical_task_id": logical_task_id}
+        selected = Path(selection["backing_path"]) if selection else self.base
         if directory.exists() or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines():
             raise ValueError("attempt already exists; discover or destroy it explicitly")
+        digest = selection["backing_sha256"] if selection else self.base_digest
+        if not selection and self.templates.immutable_sha256(selected) != digest:
+            raise ValueError("Kali base image mutated")
         directory.mkdir(mode=0o711)
         secret = secrets.token_hex(32)
         cid = 4096 + int(suffix(ident), 16) % 2147480000
-        digest = self.base_digest
         overlay, iso = directory / "disk/overlay.qcow2", directory / "disk/identity.iso"
         meta = {**ident, "project": PROJECT, "base_sha256": digest,
-                "overlay": str(overlay), "network": network, "cid": cid}
+                "overlay": str(overlay), "network": network, "cid": cid, **selection}
         state = {"identity": ident, "name": name, "network": network, "metadata": meta,
-                 "secret": secret, "backend": "vsock", "base": str(self.base)}
+                 "secret": secret, "backend": "vsock", "base": str(selected)}
         try:
             self._mount(directory)
-            run("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(self.base), str(overlay))
+            run("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(selected), str(overlay))
             os.chown(overlay, self.qemu_uid, -1)
             os.chmod(overlay, 0o600)
-            key = int(suffix(ident), 16)
-            subnet = f"10.{200 + key % 24}.{(key >> 8) % 256}"
-            proposed = ipaddress.ip_network(subnet + ".0/24")
-            for route in json.loads(run("ip", "-j", "route", "show", "table", "all")):
-                destination = route.get("dst", "default")
-                if destination == "default":
-                    continue
-                try:
-                    existing = ipaddress.ip_network(destination, strict=False)
-                except ValueError:
-                    continue
-                if proposed.overlaps(existing):
-                    raise ValueError(f"workstation network conflicts with host route {existing}")
-            bridge = "gt" + suffix(ident)[:10]
-            net = (f"<network><name>{network}</name><forward mode='nat'/>"
-                   f"<bridge name='{bridge}' stp='off' delay='0'/>"
-                   f"<ip address='{subnet}.1' netmask='255.255.255.0'>"
-                   f"<dhcp><range start='{subnet}.10' end='{subnet}.200'/></dhcp></ip></network>").encode()
-            network_definition = directory / "network.xml"
-            network_definition.write_bytes(net)
-            run("virsh", "-c", "qemu:///system", "net-define", str(network_definition))
-            run("virsh", "-c", "qemu:///system", "net-start", network)
-            self._firewall(ident, bridge, f"{subnet}.1")
+            if network is not None:
+                self._create_network(ident, network, directory)
             (directory / "identity.json").write_text(json.dumps({**ident, "secret": secret,
                 "limits": {"max_terminals": self.max_terminals, "max_output_bytes": self.max_output_bytes,
                            "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes}}))
@@ -291,10 +318,9 @@ add rule inet {table} input iifname "{bridge}" drop
             os.chown(iso, self.qemu_uid, -1)
             os.chmod(iso, 0o600)
             domain_definition = directory / "domain.xml"
-            domain_definition.write_bytes(domain_xml(name, network, overlay, iso, cid, self.memory_mb, self.vcpus, ident, digest))
+            domain_definition.write_bytes(domain_xml(name, network, overlay, iso, cid, self.memory_mb, self.vcpus, ident, digest, selection))
             run("virsh", "-c", "qemu:///system", "define", str(domain_definition))
-            (directory / "state.json").write_text(json.dumps(state, sort_keys=True))
-            os.chmod(directory / "state.json", 0o600)
+            self._write_state(directory / "state.json", state)
             run("virsh", "-c", "qemu:///system", "start", name)
             for _ in range(self.boot_timeout_seconds):
                 try:
@@ -306,8 +332,48 @@ add rule inet {table} input iifname "{bridge}" drop
                 await asyncio.sleep(1)
             raise TimeoutError("guest agent did not become ready")
         except BaseException:
-            self.destroy(ident, strict=False)
+            if template_id is None:
+                self.destroy(ident, strict=False)
+            # Templated/evaluator failures remain until an explicit operator action.
             raise
+
+    @staticmethod
+    def _write_state(path, data):
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(data, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        fd = os.open(path.parent, os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+
+    def _create_network(self, ident, network, directory):
+        key = int(suffix(ident), 16)
+        subnet = f"10.{200 + key % 24}.{(key >> 8) % 256}"
+        proposed = ipaddress.ip_network(subnet + ".0/24")
+        for route in json.loads(run("ip", "-j", "route", "show", "table", "all")):
+            destination = route.get("dst", "default")
+            if destination == "default":
+                continue
+            try:
+                existing = ipaddress.ip_network(destination, strict=False)
+            except ValueError:
+                continue
+            if proposed.overlaps(existing):
+                raise ValueError(f"workstation network conflicts with host route {existing}")
+        bridge = "gt" + suffix(ident)[:10]
+        net = (f"<network><name>{network}</name><forward mode='nat'/>"
+               f"<bridge name='{bridge}' stp='off' delay='0'/>"
+               f"<ip address='{subnet}.1' netmask='255.255.255.0'>"
+               f"<dhcp><range start='{subnet}.10' end='{subnet}.200'/></dhcp></ip></network>").encode()
+        network_definition = directory / "network.xml"
+        network_definition.write_bytes(net)
+        run("virsh", "-c", "qemu:///system", "net-define", str(network_definition))
+        run("virsh", "-c", "qemu:///system", "net-start", network)
+        self._firewall(ident, bridge, f"{subnet}.1")
 
     def inspect(self, ident: dict) -> dict:
         data = self._read(ident)
@@ -316,7 +382,10 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError(f"attempt domain is {state}")
         return {"identity": ident, "domain": data["name"], "network": data["network"],
                 "base_sha256": data["metadata"]["base_sha256"], "overlay": data["metadata"]["overlay"],
-                "cid": data["metadata"]["cid"], "provider": "libvirt"}
+                "cid": data["metadata"]["cid"], "provider": "libvirt",
+                **{key: data["metadata"].get(key) for key in
+                   ("template_id", "backing_path", "backing_sha256", "template_generation",
+                    "template_source_fingerprint", "logical_task_id")}}
 
     async def inspect_verified(self, ident: dict) -> dict:
         result = self.inspect(ident)
@@ -324,6 +393,114 @@ add rule inet {table} input iifname "{bridge}" drop
         if health.get("identity") != ident or health.get("guest_agent_version") != "3.0.0":
             raise ValueError("guest agent identity/version mismatch")
         return {**result, "guest_agent_version": health["guest_agent_version"]}
+
+    def _evaluator_index(self, teacher):
+        if teacher.get("purpose") is not None:
+            raise ValueError("an evaluator cannot own another evaluator")
+        path = self._paths(teacher)[2] / "evaluators.json"
+        if not path.exists():
+            return path, []
+        if path.is_symlink() or path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
+            raise ValueError("untrusted evaluator recovery index")
+        rows = json.loads(path.read_text())
+        if not isinstance(rows, list):
+            raise ValueError("invalid evaluator recovery index")
+        for row in rows:
+            ident = identity(row)
+            if ident.get("purpose") != "evaluator" or any(ident[key] != teacher[key] for key in teacher):
+                raise ValueError("evaluator does not belong to this teacher attempt")
+        return path, rows
+
+    async def create_evaluator(self, teacher, *, abandon_stale=False):
+        data = self._read(teacher)
+        selection = self.templates.verify_record(data["metadata"])
+        path, previous = self._evaluator_index(teacher)
+        if previous:
+            if not abandon_stale:
+                raise ValueError("stale evaluator preserved; explicit candidate-checkpoint resume is required")
+            self.abandon_evaluators(teacher)
+        evaluator = {**teacher, "purpose": "evaluator", "evaluator_retry": uuid.uuid4().hex}
+        # Write before allocating even the quota filesystem: crashes at any
+        # creation point remain associated with the exact teacher attempt.
+        self._write_state(path, [evaluator])
+        return await self.create(evaluator, selection["template_id"], data["metadata"]["logical_task_id"], _selection=selection)
+
+    def evaluator_identity(self, teacher, retry):
+        _, rows = self._evaluator_index(teacher)
+        matches = [row for row in rows if row["evaluator_retry"] == retry]
+        if len(matches) != 1:
+            raise ValueError("unknown evaluator retry for this teacher attempt")
+        ident = identity(matches[0])
+        evaluated = self._read(ident)
+        teacher_data = self._read(teacher)
+        for field in ("template_id", "template_generation", "backing_path", "backing_sha256", "logical_task_id"):
+            if evaluated["metadata"].get(field) != teacher_data["metadata"].get(field):
+                raise ValueError("evaluator backing/source differs from recorded teacher generation")
+        return ident
+
+    def inspect_evaluators(self, teacher):
+        _, rows = self._evaluator_index(teacher)
+        result = []
+        for ident in rows:
+            directory = self._paths(ident)[2]
+            state = directory / "state.json"
+            record = {"identity": ident, "state_directory": str(directory), "overlay": str(directory / "disk/overlay.qcow2")}
+            if state.is_file() and not state.is_symlink():
+                data = json.loads(state.read_text())
+                record.update({key: data["metadata"].get(key) for key in
+                               ("template_id", "template_generation", "backing_sha256", "logical_task_id")})
+            result.append(record)
+        return {"evaluators": result}
+
+    def destroy_evaluator(self, teacher, retry):
+        ident = self.evaluator_identity(teacher, retry)
+        self.destroy(ident)
+        path, rows = self._evaluator_index(teacher)
+        self._write_state(path, [row for row in rows if row != ident])
+        return {"destroyed": True}
+
+    def abandon_evaluators(self, teacher):
+        path, rows = self._evaluator_index(teacher)
+        for ident in rows:
+            # Explicit recovery also handles partial construction/stopped guests.
+            self.destroy(identity(ident), strict=False)
+        if path.parent.exists():
+            self._write_state(path, [])
+        return {"abandoned": len(rows)}
+
+    async def materialize_template_artifact(self, ident, artifact_id):
+        data = self._read(ident)
+        row = self.templates.artifact(data["metadata"], artifact_id)
+        path = "/var/lib/gpt-trace-template-artifacts/" + artifact_id + "/payload"
+        health = await self.rpc(ident, "health", {})
+        if health.get("trusted_artifacts_version") != 1:
+            raise ValueError("golden guest lacks trusted template streaming; rebuild/install the golden")
+        await self.rpc(ident, "template_import_begin", {"path": path, "sha256": row["sha256"],
+                                                        "size": row["size"], "overwrite": True})
+        digest, size = hashlib.sha256(), 0
+        try:
+            # The runner never reads these bytes. Every frame is <= 1 MiB.
+            fd = os.open(row["host_path"], os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if before.st_size != row["size"] or before.st_uid != 0 or before.st_mode & 0o222:
+                    raise ValueError("template artifact changed before streaming")
+                while chunk := stream.read(1048576):
+                    size += len(chunk)
+                    digest.update(chunk)
+                    await self.rpc(ident, "template_import_chunk", {"content_base64": base64.b64encode(chunk).decode()})
+                after = os.fstat(stream.fileno())
+            stat_key = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+            if size != row["size"] or digest.hexdigest() != row["sha256"] or stat_key(before) != stat_key(after):
+                raise ValueError("template artifact changed while streaming")
+            proof = await self.rpc(ident, "template_import_end", {"size": size})
+            if proof != {"path": path, "sha256": row["sha256"], "size": size}:
+                raise ValueError("guest template artifact integrity mismatch")
+            return {**proof, "artifact_id": artifact_id, "kind": row["kind"],
+                    "logical_task_id": row["logical_task_id"], "source_identity": row["source_identity"]}
+        except BaseException:
+            await self.rpc(ident, "template_import_abort", {})
+            raise
 
     def destroy(self, ident: dict, *, strict: bool = True) -> None:
         name, network, directory = self._paths(ident)
@@ -347,7 +524,8 @@ add rule inet {table} input iifname "{bridge}" drop
             run("virsh", "-c", "qemu:///system", "net-undefine", network)
         self._remove_firewall(ident)
         self._unmount(directory)
-        shutil.rmtree(directory, ignore_errors=False)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=False)
         self.assert_absent(ident)
 
     def assert_absent(self, ident: dict) -> None:
@@ -627,11 +805,44 @@ def create_app(broker: Broker) -> Starlette:
                 raise ValueError("broker request must be an object")
             if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
             if action == "destroy_all": return JSONResponse(broker.destroy_all())
+            if action == "preflight_templates":
+                return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
             ident = identity(payload)
-            if action == "create_attempt": result = await broker.create(ident)
+            if controller and not admin and (ident.get("purpose") == "evaluator" or
+                    (action == "rpc" and str(payload.get("method", "")).startswith("template_import_"))):
+                return JSONResponse({"detail": "trusted runtime operation forbidden for controller token"}, status_code=403)
+            if action == "create_attempt":
+                if ident.get("purpose") is not None:
+                    raise ValueError("isolated runtimes require create_evaluator")
+                result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
+            elif action == "create_evaluator":
+                if type(payload.get("abandon_stale", False)) is not bool:
+                    raise ValueError("invalid evaluator recovery flag")
+                result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
+            elif action == "inspect_evaluators": result = broker.inspect_evaluators(ident)
+            elif action == "destroy_evaluator": result = broker.destroy_evaluator(ident, payload.get("evaluator_retry"))
+            elif action == "abandon_evaluators": result = broker.abandon_evaluators(ident)
+            elif action == "materialize_template_artifact":
+                result = await broker.materialize_template_artifact(ident, payload.get("artifact_id"))
+            elif action.startswith("evaluator_"):
+                evaluator = broker.evaluator_identity(ident, payload.get("evaluator_retry"))
+                operation = action.removeprefix("evaluator_")
+                args = payload.get("args", {})
+                if operation == "rpc": result = await broker.rpc(evaluator, payload.get("method"), args)
+                elif operation == "materialize_template_artifact": result = await broker.materialize_template_artifact(evaluator, payload.get("artifact_id"))
+                elif operation == "artifact_export": result = await broker.export_artifact(evaluator, args)
+                elif operation == "artifact_read": result = broker.artifact_chunk(evaluator, args)
+                elif operation == "artifact_stage_begin": result = broker.stage_begin(evaluator)
+                elif operation == "artifact_stage_chunk": result = broker.stage_chunk(evaluator, args)
+                elif operation == "artifact_stage_end": result = broker.stage_end(evaluator, args)
+                elif operation == "artifact_stage_abort": result = broker.stage_abort(evaluator, args)
+                elif operation == "artifact_import": result = await broker.import_artifact(evaluator, args)
+                else: raise ValueError("unknown evaluator operation")
             elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
             elif action == "destroy_attempt":
                 broker.destroy(ident); result = {"destroyed": True}
+            elif action == "abandon_attempt":
+                broker.destroy(ident, strict=False); result = {"destroyed": True}
             elif action == "assert_absent":
                 broker.assert_absent(ident); result = {"absent": True}
             elif action == "rpc":
@@ -671,7 +882,8 @@ def main():
                     screenshot_max_bytes=config["screenshot_max_bytes"],
                     max_terminals=config["max_terminals"], max_output_bytes=config["max_output_bytes"],
                     max_transfer_bytes=config["max_transfer_bytes"], max_seed_bytes=config["max_seed_bytes"],
-                    egress_allow_cidrs=tuple(config["egress_allow_cidrs"]))
+                    egress_allow_cidrs=tuple(config["egress_allow_cidrs"]),
+                    template_root=Path(os.environ["WORKSTATION_TEMPLATE_ROOT"]) if "WORKSTATION_TEMPLATE_ROOT" in os.environ else None)
     uds = Path(os.environ["WORKSTATION_BROKER_SOCKET"])
     uds.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if uds.exists():

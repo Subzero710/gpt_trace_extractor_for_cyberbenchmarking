@@ -176,7 +176,7 @@ async def test_delete_retries_429_and_honors_retry_after() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_me_429_is_not_reported_as_authentication_loss() -> None:
+async def test_cookie_session_429_is_not_reported_as_authentication_loss() -> None:
     page = type("PageDouble", (), {})()
     page.url = "https://chatgpt.com/"
     page.evaluate = AsyncMock(return_value={"status": 429, "object": None, "id": None})
@@ -184,8 +184,10 @@ async def test_backend_me_429_is_not_reported_as_authentication_loss() -> None:
     client._page = page
     client._base_url = "https://chatgpt.com"
 
-    with pytest.raises(RateLimited, match="/backend-api/me"):
+    with pytest.raises(RateLimited, match="/api/auth/session") as incident:
         await client.assert_authenticated_current_page()
+    assert incident.value.endpoint == "/api/auth/session"
+    assert incident.value.method == "GET"
 
 
 @pytest.mark.asyncio
