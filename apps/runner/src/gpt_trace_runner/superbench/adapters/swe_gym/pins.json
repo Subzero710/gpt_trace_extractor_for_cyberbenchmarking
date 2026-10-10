@@ -3,8 +3,8 @@
   "dataset_revision": "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0",
   "harness_commit": "16dd480cce9b27bf111a362d280881c6def5d2a7",
   "parquet_sha256": "f3a7cd934e8cc523b6053298d0abb2c82fd7db2b83f9f2ccba5944545aaa4eb1",
-  "recipe_version": 1,
-  "schema_version": 1,
+  "recipe_version": 2,
+  "schema_version": 2,
   "upstream_files": {
     "constants.py": "5bd655172c9a9dfcb494d9c52bcbcc0d79a59cd20c39b8bbdc41ab8b0a9baf14",
     "dockerfiles.py": "94c0b9937d2d3f6ca752676835225ed249b8397481645d03e0c73981ec5ab919",

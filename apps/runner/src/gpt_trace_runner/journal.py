@@ -38,6 +38,7 @@ class SubmissionJournal:
     retry_not_before: float | None = None
     capture_sha256: str | None = None
     candidate: dict | None = None
+    evaluator: dict | None = None
 
 
 class JournalStore:
@@ -70,6 +71,14 @@ class JournalStore:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def record_evaluator(self, record):
+        from dataclasses import replace
+        entry = self.load()
+        if entry is None or entry.phase != "candidate_checkpointed" or record["identity"]["task_id"] != entry.task_id or record["identity"]["attempt"] != entry.attempt:
+            raise RecoveryIncomplete("evaluator created outside durable candidate checkpoint")
+        self.write(replace(entry, evaluator={key: record[key] for key in
+                   ("identity", "domain", "overlay", "template_id", "template_generation", "backing_sha256")}))
 
     def clear(self) -> None:
         if not self.path.exists():

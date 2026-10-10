@@ -527,6 +527,14 @@ async def status_payload(settings):
         payload["exception_type"] = state.exception_type
     if state.intervention_message is not None:
         payload["message"] = state.intervention_message
+    from ..journal import JournalStore
+    entry = JournalStore(settings.journal_path).load()
+    if entry is not None:
+        payload["checkpoint_phase"] = entry.phase
+        if entry.candidate is not None:
+            payload["candidate_sha256"] = entry.candidate.get("sha256")
+        if entry.evaluator is not None:
+            payload["evaluator"] = entry.evaluator
     if (
         state.status == "needs_intervention"
         and state.intervention_reason

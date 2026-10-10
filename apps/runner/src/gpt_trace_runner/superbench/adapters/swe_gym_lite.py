@@ -9,7 +9,7 @@ from pathlib import Path
 from ...exceptions import AppInfrastructureError, RecoveryIncomplete
 from ..models import EvaluationResult, TaskSpec
 from .base import BenchmarkAdapter, PreparedBenchmarkContext
-from .swe_gym import guest_runtime, source
+from .swe_gym import guest_runtime, source, task_sources
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,13 +18,21 @@ class LiteContext(PreparedBenchmarkContext):
 
 
 def guest_program(body):
-    # Deliver runner-owned code each time, rather than executing a file the
-    # teacher may have edited. Dataset gold patches are never passed to it.
-    # A cancelled host request can leave its guest operation running. Serialize
-    # retries inside the guest before touching the shared evaluator/checkouts.
-    barrier = "\nimport fcntl\noperation_lock = (ROOT / 'attempt.lock').open('a+b')\n"
-    barrier += "fcntl.flock(operation_lock, fcntl.LOCK_EX)\n"
-    return Path(guest_runtime.__file__).read_text() + barrier + body + "\n"
+    # Both helpers are runner-owned bytes, including during teacher capture.
+    program = "import types\n_sources = types.ModuleType('trusted_task_sources')\n"
+    program += "exec(compile(" + repr(Path(task_sources.__file__).read_text()) + ", 'trusted-task-sources', 'exec'), _sources.__dict__)\n"
+    program += "exec(compile(" + repr(Path(guest_runtime.__file__).read_text()) + ", 'trusted-swe-gym-runtime', 'exec'), globals())\n"
+    program += "import fcntl\noperation_lock = (ROOT / 'attempt.lock').open('a+b')\nfcntl.flock(operation_lock, fcntl.LOCK_EX)\n"
+    return program + body + "\n"
+
+
+async def materialize(runtime, item, kind):
+    artifact_id = task_sources.artifact_id(kind, item['instance_id'])
+    record = await runtime.materialize_template_artifact(artifact_id)
+    expected = {key: item[key] for key in ('instance_id', 'repo', 'base_commit')}
+    if record.get('artifact_id') != artifact_id or record.get('kind') != kind or record.get('logical_task_id') != item['instance_id'] or record.get('source_identity') != expected or record.get('path') != '/var/lib/gpt-trace-template-artifacts/' + artifact_id + '/payload':
+        raise AppInfrastructureError('task template artifact identity mismatch')
+    return record
 
 
 async def execute(runtime, program, *, timeout=1800):
@@ -53,7 +61,7 @@ def native_grade(row, output):
 
 class SWEGymLiteAdapter(BenchmarkAdapter):
     adapter_id = "swe-gym-lite"
-    adapter_version = "1"
+    adapter_version = "2"
 
     def __init__(self):
         self._rows = None
@@ -104,10 +112,15 @@ class SWEGymLiteAdapter(BenchmarkAdapter):
         item = source.contract()["tasks"][task.task_id]
         if task.workstation_template != item["template_id"]:
             raise AppInfrastructureError("Lite task/template mapping mismatch")
+        artifact = await materialize(runtime, item, "task_source")
+        cache = await materialize(runtime, item, "setup_cache")
         body = f"""
 item = json.loads({json.dumps(json.dumps(item))})
 ROOT.joinpath('attempt').mkdir(exist_ok=True)
-prepare(item, log=ROOT / 'attempt/setup.log')
+artifact = json.loads({json.dumps(json.dumps(artifact))})
+cache = json.loads({json.dumps(json.dumps(cache))})
+install_setup_cache(item, cache)
+prepare(item, artifact=artifact, log=ROOT / 'attempt/setup.log')
 workspace = Path('/home/kali/workspace')
 if workspace.is_symlink():
     if workspace.resolve() != Path('/testbed'):
@@ -130,14 +143,15 @@ print(json.dumps({{'base_commit': run('git', '-C', '/testbed', 'rev-parse', 'HEA
 
     async def capture_candidate(self, task, *, prepared, captured, runtime):
         item = source.contract()["tasks"][task.task_id]
+        artifact = await materialize(runtime, item, "task_source")
         body = f"""
 item = json.loads({json.dumps(json.dumps(item))})
+artifact = json.loads({json.dumps(json.dumps(artifact))})
 folder = Path('/tmp/swe-gym-candidate')
 folder.mkdir(exist_ok=True)
 patch = folder / 'candidate.patch'
 proof = candidate_patch('/testbed', item['base_commit'], patch)
-mirror = ROOT / 'repos' / (repo_name(item['repo']) + '.git')
-verify_candidate(item, patch, mirror, folder / 'verify')
+verify_candidate(item, patch, artifact, folder / 'verify')
 print(json.dumps(proof))
 """
         result = await execute(runtime, guest_program(body))
@@ -150,7 +164,8 @@ print(json.dumps(proof))
             raise AppInfrastructureError("candidate runtime template provenance mismatch")
         return {**exported, "env_hash": item["env_hash"], "template_id": task.workstation_template,
                 "template_generation": template["template_generation"],
-                "backing_sha256": template["backing_sha256"]}
+                "backing_sha256": template["backing_sha256"], "source_sha256": artifact["sha256"],
+                "source_artifact_id": artifact["artifact_id"]}
 
     async def evaluate_runtime(self, task, *, prepared, captured, candidate, runtime):
         if not isinstance(candidate, dict) or candidate.get("template_id") != task.workstation_template:
@@ -158,9 +173,11 @@ print(json.dumps(proof))
         expected = runtime.artifact_root / "candidate.patch"
         if candidate.get("local_path") != str(expected) or not expected.is_file() or expected.is_symlink():
             raise RecoveryIncomplete("persisted candidate artifact missing")
-        patch = expected.read_bytes()
-        if hashlib.sha256(patch).hexdigest() != candidate.get("sha256") or len(patch) != candidate.get("size"):
+        if expected.stat().st_size != candidate.get("size") or expected.stat().st_size > 268435456 or task_sources.digest(expected) != candidate.get("sha256"):
             raise RecoveryIncomplete("persisted candidate patch changed")
+        patch = expected.read_bytes()  # Candidate is bounded; source archives never enter runner RAM.
+        if hashlib.sha256(patch).hexdigest() != candidate["sha256"]:
+            raise RecoveryIncomplete("candidate changed while reading")
         row = self.rows()[task.task_id]
         item = source.contract()["tasks"][task.task_id]
         if candidate.get("env_hash") != item["env_hash"]:
@@ -170,50 +187,74 @@ print(json.dumps(proof))
         template = current["apps"]["kali-workstation"]
         if template["template_generation"] != candidate["template_generation"] or template["backing_sha256"] != candidate["backing_sha256"]:
             raise RecoveryIncomplete("candidate backing generation changed")
-        await runtime.import_bytes(patch, "/tmp/swe-gym-candidate/exact-candidate.patch")
-        official = source.harness()
-        specs = official.constants.MAP_REPO_VERSION_TO_SPECS[row["repo"].lower()][row["version"]]
-        directory = "/tmp/swe-gym-evaluator/repo"
-        commands = official.test_spec.make_eval_script_list(row, specs, "testbed", directory,
-                                                            row["base_commit"], row["test_patch"])
-        test_command = official.test_spec.make_test_command(row)
-        if commands[-2] != test_command:
-            raise AppInfrastructureError("pinned native evaluation command contract changed")
-        # Only the official hidden test patch enters the guest, after the runner's
-        # durable candidate barrier. The dataset's gold code patch is never used.
-        body = f"""
+        evaluator = await runtime.create_evaluator()
+        record = evaluator.record
+        if record["template_generation"] != candidate["template_generation"] or record["backing_sha256"] != candidate["backing_sha256"] or record["backing_path"] != template["backing_path"]:
+            raise RecoveryIncomplete("fresh evaluator backing differs from teacher immutable generation")
+        try:
+            artifact = await materialize(evaluator, item, "task_source")
+            if artifact["sha256"] != candidate.get("source_sha256") or artifact["artifact_id"] != candidate.get("source_artifact_id"):
+                raise RecoveryIncomplete("checkpointed source artifact changed")
+            cache = await materialize(evaluator, item, "setup_cache")
+            official = source.harness()
+            specs = official.constants.MAP_REPO_VERSION_TO_SPECS[row["repo"].lower()][row["version"]]
+            commands = official.test_spec.make_eval_script_list(row, specs, "testbed", "/testbed",
+                                                                row["base_commit"], row["test_patch"])
+            test_command = official.test_spec.make_test_command(row)
+            if commands[-2] != test_command or commands[-3].find(row["test_patch"]) < 0:
+                raise AppInfrastructureError("pinned native evaluation command contract changed")
+            setup = commands[:-4]  # Includes upstream eval-time install, on CLEAN BASE.
+            hidden = commands[:3] + specs.get("eval_commands", []) + commands[-4:-2]
+            # No gold patch or oracle lists enter either VM. Only hidden tests
+            # enter this runner-only evaluator, after clean setup and candidate.
+            prepare_body = f"""
 item = json.loads({json.dumps(json.dumps(item))})
-folder = Path('/tmp/swe-gym-evaluator')
-folder.mkdir(exist_ok=True)
-mirror = ROOT / 'repos' / (repo_name(item['repo']) + '.git')
-destination = folder / 'repo'
-prefix = clone_env(item, offline=True)
-configure_vcs_cache(item)
-verify_candidate(item, '/tmp/swe-gym-candidate/exact-candidate.patch', mirror, destination)
-env = runtime_environment(item, offline=True)
-setup = setup_commands(item, mirror, prefix)
-setup = relocate_checkout(setup, destination)
-shell(setup, cwd=destination, env=env, offline=True, log=folder / 'setup.log')
-commands = json.loads({json.dumps(json.dumps(commands))})
-eval_script = 'set -eo pipefail\\n' + '\\n'.join(commands[:-2])
-eval_script += '\\nset +e\\n' + commands[-2] + ' >' + shlex.quote(str(folder / 'tests.log')) + ' 2>&1\\n'
-eval_script += 'status=$?\\nprintf \"%s\\n\" \"$status\" >' + shlex.quote(str(folder / 'tests.exit')) + '\\nexit 0\\n'
-shell([eval_script], cwd=destination, env=env, offline=True, log=folder / 'eval-setup.log')
-status = int((folder / 'tests.exit').read_text())
-if status < 0 or status in (126, 127) or status >= 128:
-    raise RuntimeError('native test process failed to execute')
-print(json.dumps({{'test_exit_status': status}}))
+artifact = json.loads({json.dumps(json.dumps(artifact))})
+cache = json.loads({json.dumps(json.dumps(cache))})
+install_setup_cache(item, cache)
+proof = prepare_evaluator(item, artifact, json.loads({json.dumps(json.dumps(setup))}), '/tmp/swe-gym-evaluator')
+print(json.dumps(proof))
 """
-        result = await execute(runtime, guest_program(body))
-        proof = json.loads(result["stdout"])
-        log = await runtime.export("/tmp/swe-gym-evaluator/tests.log", "tests.log")
-        # Keep setup diagnostics as artifacts even after a successful verdict.
-        await runtime.export("/tmp/swe-gym-evaluator/eval-setup.log", "eval-setup.log")
-        passed, counts = native_grade(row, Path(log["local_path"]).read_text(errors="replace"))
+            ready = await execute(evaluator, guest_program(prepare_body))
+            if json.loads(ready["stdout"]) != {"base_commit":item["base_commit"], "env_hash":item["env_hash"], "source_sha256":artifact["sha256"]}:
+                raise AppInfrastructureError("clean evaluator setup proof mismatch")
+            # Even the candidate FILE enters only after all clean setup succeeds.
+            await evaluator.import_bytes(patch, "/tmp/swe-gym-candidate/exact-candidate.patch")
+            body = f"""
+item = json.loads({json.dumps(json.dumps(item))})
+proof = grade_prepared(item, '/tmp/swe-gym-candidate/exact-candidate.patch',
+    candidate_sha256={candidate['sha256']!r}, candidate_size={candidate['size']!r},
+    hidden=json.loads({json.dumps(json.dumps(hidden))}), test_command={test_command!r},
+    test_prelude=json.loads({json.dumps(json.dumps(commands[:3] + specs.get('eval_commands', [])))}),
+    folder='/tmp/swe-gym-evaluator')
+print(json.dumps(proof))
+"""
+            result = await execute(evaluator, guest_program(body))
+            proof = json.loads(result["stdout"])
+            log = await evaluator.export("/tmp/swe-gym-evaluator/tests.log", "tests.log")
+            await evaluator.export("/tmp/swe-gym-evaluator/setup.log", "setup.log")
+            await evaluator.export("/tmp/swe-gym-evaluator/eval-setup.log", "eval-setup.log")
+            await evaluator.export("/tmp/swe-gym-evaluator/hidden.log", "hidden.log")
+            passed, counts = native_grade(row, Path(log["local_path"]).read_text(errors="replace"))
+        except BaseException:
+            # Preserve both guests, exact checkpoint and broker artifacts. These
+            # best-effort diagnostic exports never substitute for a verdict.
+            errors = []
+            for name in ("setup.log", "eval-setup.log", "hidden.log", "tests.log", "test-launch.log"):
+                try:
+                    await evaluator.export("/tmp/swe-gym-evaluator/" + name, name)
+                except Exception as exc:
+                    errors.append({"artifact": name, "error": str(exc)[:1000]})
+            evaluator.artifact_root.mkdir(parents=True, exist_ok=True)
+            (evaluator.artifact_root / "diagnostic-export-errors.json").write_text(json.dumps(errors))
+            raise
+        await evaluator.destroy()  # Native pass AND native fail use normal cleanup.
         return EvaluationResult("pass" if passed else "fail", score=1.0 if passed else 0.0, details=counts,
             metadata={"candidate_patch_sha256": candidate["sha256"], "candidate_artifact": candidate["local_path"],
                       "env_hash": item["env_hash"], "template_id": task.workstation_template,
                       "template_generation": candidate["template_generation"], "harness_commit": source.PINS["harness_commit"],
+                      "evaluator_identity": record["identity"], "evaluator_backing_sha256": record["backing_sha256"],
+                      "source_artifact_sha256": artifact["sha256"],
                       "test_command_sha256": hashlib.sha256(test_command.encode()).hexdigest(),
                       "test_exit_status": proof["test_exit_status"], "log_artifact_id": log["artifact_id"],
                       "log_sha256": log["sha256"], "log_artifact": log["local_path"]})

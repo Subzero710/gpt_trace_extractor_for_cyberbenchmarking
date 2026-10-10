@@ -13,6 +13,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import runpy
+import types
 from pathlib import Path
 
 ROOT = Path("/opt/swe-gym-lite")
@@ -68,27 +70,36 @@ def repo_name(repo):
     return repo.replace("/", "_")
 
 
-def clean_checkout(item, mirror, destination):
+def source_tools():
+    if "_sources" in globals():
+        return globals()["_sources"]
+    if __package__:
+        from . import task_sources
+        return task_sources
+    return types.SimpleNamespace(**runpy.run_path(str(ROOT / "task_sources.py")))
+
+
+def clean_checkout(item, artifact, destination):
     destination = Path(destination)
     if destination.is_symlink():
         raise RuntimeError("unsafe checkout destination")
     if destination.exists():
         shutil.rmtree(destination)
-    run("git", "clone", "--shared", "--no-checkout", str(mirror), str(destination))
-    run("git", "-C", str(destination), "reset", "--hard", item["base_commit"])
-    run("git", "-C", str(destination), "remote", "remove", "origin")
-    if run("git", "-C", str(destination), "rev-parse", "HEAD").decode().strip() != item["base_commit"]:
-        raise RuntimeError("checkout HEAD differs from exact base_commit")
+    tools = source_tools()
+    tools.extract(artifact["path"], destination, sha256=artifact["sha256"], size=artifact["size"])
+    tools.validate_checkout(destination, item["base_commit"])
 
 
-def setup_commands(item, mirror, prefix):
+def setup_commands(item, destination, prefix):
     commands = list(item["repo_script_list"])
-    # The original clone/reset/removal is performed above against cached Git.
+    # Clone/reset/removal has been replaced by a validated single-commit source.
     if len(commands) < 9 or not commands[0].startswith("git clone -o origin "):
         raise RuntimeError("pinned upstream repo setup contract changed")
     commands = commands[5:]
-    # Pandas' tag fetch uses the frozen local mirror, then removes the remote.
-    commands = [line.replace("https://github.com/" + item["repo"] + ".git", str(mirror)) for line in commands]
+    # Pandas may fetch only this checkout's single-commit object store, which
+    # has no tags or descendants. Never fetch a full benchmark mirror/network.
+    commands = [line.replace("https://github.com/" + item["repo"] + ".git", str(destination)) for line in commands]
+    commands = [line.replace("apt-get -y update && apt-get -y upgrade &&", "apt-get -y update &&") for line in commands]
     # pipx/PDM are permanent build-time tools. Upstream installs them before
     # every instance; make that prerequisite idempotent once it is frozen.
     adapted = []
@@ -108,11 +119,12 @@ def runtime_environment(item, *, offline):
     env = os.environ.copy()
     env.update(HOME="/root", PIP_CACHE_DIR=str(ROOT / "caches/pip"),
                npm_config_cache=str(ROOT / "caches/npm"), PDM_CACHE_DIR=str(ROOT / "caches/pdm"),
-               PIPX_HOME=str(ROOT / "caches/pipx"), PIPX_BIN_DIR="/root/.local/bin")
+               PIPX_HOME=str(ROOT / "caches/pipx"), PIPX_BIN_DIR="/root/.local/bin",
+               npm_config_prefix=str(ROOT / "caches/npm-global"))
+    env["PATH"] = str(ROOT / "offline-bin") + ":" + str(ROOT / "caches/npm-global/bin") + ":" + env["PATH"]
     if offline:
         env.update(PIP_NO_INDEX="1", PIP_FIND_LINKS=str(ROOT / "wheelhouse" / item["instance_id"]),
                    npm_config_offline="true", PDM_NO_UPDATE_CHECK="1")
-        env["PATH"] = str(ROOT / "offline-bin") + ":" + env["PATH"]
     return env
 
 
@@ -122,26 +134,27 @@ def relocate_checkout(commands, destination):
     return [re.sub(pattern, lambda _: str(destination), line) for line in commands]
 
 
-def prepare(item, *, mirror=None, offline=True, destination="/testbed", log=None):
-    mirror = Path(mirror) if mirror else ROOT / "repos" / (repo_name(item["repo"]) + ".git")
-    if not mirror.is_dir():
-        raise RuntimeError("cached repository missing")
+def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
+    clean_checkout(item, artifact, destination)
     if offline:
         if any(line.startswith("pipx install pdm") for line in item["repo_script_list"]) and not Path("/root/.local/bin/pdm").is_file():
             raise RuntimeError("frozen PDM tool is missing; runtime cannot install it")
         configure_vcs_cache(item)
-    run("git", "--git-dir", str(mirror), "cat-file", "-e", item["base_commit"] + "^{commit}")
     prefix = clone_env(item, offline=offline)
-    clean_checkout(item, mirror, destination)
-    commands = setup_commands(item, mirror, prefix)
+    commands = setup_commands(item, destination, prefix)
     # Upstream expects /testbed; builder and evaluator use that path too.
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
     shell(commands, cwd=destination, env=runtime_environment(item, offline=offline), offline=offline, log=log)
     if offline:
-        expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".json")).read_text())
+        expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).read_text())
         if env_inventory(prefix) != expected:
             raise RuntimeError("offline official setup differs from the frozen build-time package inventory")
+    verify_os_packages()
+    # Official pre-install recipes can edit tracked requirements/setup files.
+    # Preserve installed packages and ignored build products, but restore the
+    # exact tracked base that candidate diffs are defined against.
+    run("git", "-C", str(destination), "reset", "--hard", item["base_commit"])
     return prefix
 
 
@@ -167,15 +180,71 @@ def candidate_patch(repo, base, output):
         Path(name + ".lock").unlink(missing_ok=True)
 
 
-def verify_candidate(item, candidate, mirror, destination):
-    clean_checkout(item, mirror, destination)
+def apply_candidate(candidate, destination, *, sha256=None, size=None):
+    candidate = Path(candidate)
+    if candidate.is_symlink() or not candidate.is_file() or (size is not None and candidate.stat().st_size != size) or (sha256 is not None and source_tools().digest(candidate) != sha256):
+        raise RuntimeError("persisted candidate patch integrity mismatch")
     if Path(candidate).stat().st_size:
         run("git", "apply", "--check", "--binary", str(candidate), cwd=destination)
         run("git", "apply", "--binary", str(candidate), cwd=destination)
 
 
-def warm_task(item, mirror):
-    prefix = prepare(item, mirror=mirror, offline=False, log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
+def verify_candidate(item, candidate, artifact, destination):
+    clean_checkout(item, artifact, destination)
+    apply_candidate(candidate, destination)
+
+
+def evaluation_setup(item, prefix, commands, folder, *, destination="/testbed"):
+    shell(commands, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "eval-setup.log")
+    expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".json")).read_text())
+    if env_inventory(prefix) != expected:
+        raise RuntimeError("clean evaluator setup differs from frozen package inventory")
+    if run("git", "-C", str(destination), "rev-parse", "HEAD").decode().strip() != item["base_commit"]:
+        raise RuntimeError("setup changed the base HEAD")
+    run("git", "-C", str(destination), "reset", "--hard", item["base_commit"])
+    verify_os_packages()
+
+
+def prepare_evaluator(item, artifact, setup, folder, *, destination="/testbed"):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    prefix = prepare(item, artifact=artifact, log=folder / "setup.log", destination=destination)
+    evaluation_setup(item, prefix, setup, folder, destination=destination)
+    return {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "source_sha256": artifact["sha256"]}
+
+
+def evaluate_clean(item, artifact, candidate, *, candidate_sha256, candidate_size,
+                   setup, hidden, test_command, folder, test_prelude=(), destination="/testbed"):
+    """Convenience sequence for the instrumented Git regression test."""
+    prepare_evaluator(item, artifact, setup, folder, destination=destination)
+    return grade_prepared(item, candidate, candidate_sha256=candidate_sha256, candidate_size=candidate_size,
+                          hidden=hidden, test_command=test_command, folder=folder,
+                          test_prelude=test_prelude, destination=destination)
+
+
+def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
+                   test_command, folder, test_prelude=(), destination="/testbed"):
+    folder = Path(folder)
+    apply_candidate(candidate, destination, sha256=candidate_sha256, size=candidate_size)
+    shell(hidden, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "hidden.log")
+    script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate testbed\nset +e\n' + test_command
+    script += ' >' + shlex.quote(str(folder / 'tests.log')) + ' 2>&1\nstatus=$?\n'
+    script += 'printf "%s\\n" "$status" >' + shlex.quote(str(folder / 'tests.exit')) + '\nexit 0\n'
+    shell([script], cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "test-launch.log")
+    status = int((folder / "tests.exit").read_text())
+    if status < 0 or status in (126, 127) or status >= 128:
+        raise RuntimeError("native test process failed to execute")
+    return {"test_exit_status": status}
+
+
+def warm_task(item, artifact):
+    prefix = prepare(item, artifact=artifact, offline=False, log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
+    # Upstream evaluation may install additional distributions. Keep distinct
+    # inventories so teacher repo setup and clean evaluator setup each verify
+    # against their own build-time phase, without requiring identical outputs.
+    (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(json.dumps(env_inventory(prefix), sort_keys=True))
+    shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
+          log=ROOT / "logs/eval-warm.log")
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
@@ -294,7 +363,7 @@ def install_offline_apt_guard():
     (folder / "apt-get").write_text('''#!/usr/bin/python3
 import subprocess, sys
 args = [arg for arg in sys.argv[1:] if arg not in {"-y", "--yes"}]
-if args in (["update"], ["upgrade"]):
+if args == ["update"]:
     raise SystemExit(0)
 if args and args[0] == "install" and len(args) > 1:
     for package in args[1:]:
@@ -317,42 +386,92 @@ def freeze_downloads():
 
 
 def build_common(inputs):
-    for folder in ("environments", "logs", "task-provenance", "repos", "wheelhouse", "caches/pip", "caches/npm", "caches/pdm", "caches/pipx"):
+    for folder in ("environments", "logs", "task-provenance", "wheelhouse", "caches/pip", "caches/npm", "caches/pdm", "caches/pipx"):
         (ROOT / folder).mkdir(parents=True, exist_ok=True)
-    shell(["apt-get update", "apt-get -y upgrade", "apt-get install -y build-essential cmake libpq-dev locales locales-all "
-           "openjdk-17-jdk openjdk-17-jre pipx nodejs npm libffi-dev libtiff-dev jq"], cwd=ROOT, log=ROOT / "logs/os.log")
+    install_offline_apt_guard()
     if not CONDA.is_file():
         raise RuntimeError("pinned Miniconda installer did not complete")
     for env_hash, record in sorted(inputs["environments"].items()):
-        shell(record["stored_script"], cwd=ROOT, log=ROOT / "logs" / (env_hash + ".build.log"))
+        shell(record["stored_script"], cwd=ROOT, env={**os.environ, "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]},
+              log=ROOT / "logs" / (env_hash + ".build.log"))
         prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
         (ROOT / "environments" / (env_hash + ".json")).write_text(json.dumps(env_inventory(prefix), sort_keys=True))
-    temporary_mirrors = ROOT / "builder-mirrors"
-    for item in inputs["tasks"].values():
-        mirror = temporary_mirrors / (repo_name(item["repo"]) + ".git")
-        warm_task(item, mirror)
-    install_offline_apt_guard()
-    # Mandatory fresh, network-disabled replay for all 230 task setups. No
-    # generation is published if pip/npm/PDM/VCS material is still unavailable.
-    for item in inputs["tasks"].values():
-        mirror = temporary_mirrors / (repo_name(item["repo"]) + ".git")
-        prepare(item, mirror=mirror, offline=True, log=ROOT / "logs" / (item["instance_id"] + ".offline.log"))
-    run(str(CONDA), "env", "remove", "--name", "testbed", "-y")
-    shutil.rmtree("/testbed")
-    shutil.rmtree(temporary_mirrors)
-    freeze_downloads()
-    run("dpkg-query", "-W", "-f=${Package} ${Version}\\n")
-    (ROOT / "os-packages.txt").write_bytes(run("dpkg-query", "-W", "-f=${Package} ${Version}\\n"))
-    (ROOT / "inputs.json").write_text(json.dumps(inputs, sort_keys=True))
-    # Original template stores only reusable environments/caches, no testbed.
+    # Task setup is performed only in disposable builder overlays. The common
+    # image has never contained benchmark checkouts or source archives.
+    caches = {"conda": file_inventory(Path("/opt/miniconda3/pkgs")),
+              "pip": file_inventory(Path("/root/.cache/pip")), "recipe_caches": file_inventory(ROOT / "caches")}
+    (ROOT / "environment-cache-provenance.json").write_text(json.dumps(caches, sort_keys=True))
+    validate_publication()
     shell(["chmod -R a+rX " + shlex.quote(str(ROOT)), "chmod -R a+rX /opt/miniconda3"], cwd=ROOT)
 
 
 def build_repo(inputs, repo):
-    mirror = ROOT / "repos" / (repo_name(repo) + ".git")
-    run("git", "clone", "--mirror", str(ROOT / "incoming.git"), str(mirror))
-    shutil.rmtree(ROOT / "incoming.git")
-    run("git", "--git-dir", str(mirror), "remote", "remove", "origin")
-    for item in inputs["tasks"].values():
-        if item["repo"] == repo:
-            run("git", "--git-dir", str(mirror), "cat-file", "-e", item["base_commit"] + "^{commit}")
+    (ROOT / "repo.json").write_text(json.dumps({"repo": repo, "template_id": "swe-gym-lite/" + repo_name(repo)}))
+    validate_publication()
+
+
+def validate_publication():
+    for path in (ROOT / "builder-mirrors", ROOT / "repos", ROOT / "incoming.git", ROOT / "task-sources",
+                 Path("/opt/swe-gym-build"), Path("/testbed"), Path("/var/lib/gpt-trace-template-artifacts")):
+        if path.exists() or path.is_symlink():
+            raise RuntimeError("forbidden source/mirror payload in permanent image: " + str(path))
+    if any(ROOT.rglob("*.git")):
+        raise RuntimeError("Git object store in permanent common/repo payload")
+    if (ROOT / "os-manifest.json").exists():
+        verify_os_packages()
+    return {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
+
+
+def verify_os_packages():
+    tools = runpy.run_path(str(ROOT / "os_packages.py"))
+    manifest = json.loads((ROOT / "os-manifest.json").read_text())
+    if tools["installed"]() != manifest["installed_after"]:
+        raise RuntimeError("build/task setup changed the exact frozen OS package inventory")
+
+
+def file_inventory(folder):
+    records = {}
+    for path in sorted(folder.rglob("*")):
+        if path.is_symlink():
+            records[path.relative_to(folder).as_posix()] = {"link": os.readlink(path)}
+        elif path.is_file():
+            records[path.relative_to(folder).as_posix()] = {"sha256": source_tools().digest(path), "size": path.stat().st_size}
+    return records
+
+
+CACHE_LINK_ROOTS = ("/opt/miniconda3", "/opt/swe-gym-lite/caches", "/usr/bin")
+
+
+def export_setup_cache(item, output):
+    """Only this task's disposable builder has contributed to this cache."""
+    verify_os_packages()
+    with tempfile.TemporaryDirectory(prefix="swegym-cache-") as temporary:
+        folder = Path(temporary)
+        for name in ("caches", "wheelhouse", "task-provenance"):
+            shutil.copytree(ROOT / name, folder / name, symlinks=True, copy_function=os.link)
+        local = Path("/root/.local")
+        if local.exists():
+            shutil.copytree(local, folder / "root-local", symlinks=True, copy_function=os.link)
+        (folder / "identity.json").write_text(json.dumps({key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}))
+        inventory = file_inventory(folder)
+        integrity = source_tools().pack(folder, output, allowed_absolute_links=CACHE_LINK_ROOTS)
+    return {**integrity, "files": inventory}
+
+
+def install_setup_cache(item, artifact):
+    with tempfile.TemporaryDirectory(prefix="swegym-cache-") as temporary:
+        folder = Path(temporary) / "payload"
+        source_tools().extract(artifact["path"], folder, sha256=artifact["sha256"], size=artifact["size"],
+                               allowed_absolute_links=CACHE_LINK_ROOTS)
+        expected = {key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}
+        if json.loads((folder / "identity.json").read_text()) != expected:
+            raise RuntimeError("setup cache belongs to another task/base/environment")
+        if set(path.name for path in folder.iterdir()) - {"caches", "wheelhouse", "task-provenance", "root-local", "identity.json"}:
+            raise RuntimeError("unexpected task setup cache payload")
+        for name in ("caches", "wheelhouse", "task-provenance"):
+            destination = ROOT / name
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.move(folder / name, destination)
+        if (folder / "root-local").exists():
+            shutil.copytree(folder / "root-local", "/root/.local", dirs_exist_ok=True, symlinks=True)

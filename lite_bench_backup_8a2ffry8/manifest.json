@@ -1,0 +1,187 @@
+{
+  "base_revision": "0bc2b27c3e658ca1a79c57a5615d5f852fa8af26",
+  "result_revision": "e0033534d4d2243b38157b96f2ca5d5989c5570a",
+  "head_before": "0bc2b27c3e658ca1a79c57a5615d5f852fa8af26",
+  "files": [
+    {
+      "path": "README.md",
+      "before_sha256": "3231d96ccd6174048ee712a953547e0cb0826915f4d6dc816ce93da4f1528282",
+      "before_mode": 420,
+      "after_sha256": "3706f9ab9eed37769e6e3730f4a27b95885e021ff9478b8e39a838a00444220a"
+    },
+    {
+      "path": "apps/kali-workstation/src/kali_workstation/guest/agent.py",
+      "before_sha256": "ffbcbef2635d78f29705b35908d126a1d08c1f9fad6fd462cac8c12beafcb339",
+      "before_mode": 436,
+      "after_sha256": "ae60037bef78dd034026bf7b0d2603191046ffdb1df15d68c0ed3b53a696745a"
+    },
+    {
+      "path": "apps/kali-workstation/src/kali_workstation/guest/files.py",
+      "before_sha256": "f67f929137e3513bc0a6383781ba39bdf297a1c94a3c148b9b4d5d1c19286059",
+      "before_mode": 436,
+      "after_sha256": "7244fd29d8820e287313e6dc14cc362c193bab5523b884d7dc103ef3144a0622"
+    },
+    {
+      "path": "apps/kali-workstation/tests/test_trusted_runtime.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "9cd057b41edbda47b24a8056a63ad0834dcbd44f9c28f8c344f6bad6a081006c"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/journal.py",
+      "before_sha256": "ef180a4632e692751816f2e97db8454d9959a58e33d340ccf1768d9b32213950",
+      "before_mode": 420,
+      "after_sha256": "1acf59805455a6a615a1e0a04ed76943794b04226de60a2fce324545237ed27c"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/models.py",
+      "before_sha256": "ff0d0b6e2423429049cc8051fc37aec80ae1e1dcd3b094ef5f0b2497501272f3",
+      "before_mode": 420,
+      "after_sha256": "a5a58b244ea31135432f724174d43f7d6a99ee5a877be668492c29979801fcfa"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/runner.py",
+      "before_sha256": "7dbf2a4c1f6b2ae49af40701e8a8d0645f9484faee32645b8facdfd5a1384dde",
+      "before_mode": 420,
+      "after_sha256": "03f73806f7cd6b975faddc3b634b79e25104846f99c464ce28a07bb48b80afda"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py",
+      "before_sha256": "5a28a17ade63e97f36497d6df634043663537ef4058be856d56becad3ab8e844",
+      "before_mode": 420,
+      "after_sha256": "f3dea2b5c1d5dafa802038d33319b0b4968025c083cec4a3ec6bf26e07efd786"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "21c10a47f04b9b803f220049c0b9681e7b9309757acdb684a16e823d2b7ae0a9"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
+      "before_sha256": "ce75f805f42063b14492092ff29d4f267362cc7c9f55fc8943e27f6760e8f2d2",
+      "before_mode": 420,
+      "after_sha256": "7b7b8327a4fe2b0b00417753c1524709434d30655c6bb0d4ad3652d6d498c82b"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/source.py",
+      "before_sha256": "e9ab20aef2f146bb5a44fdfc89ccf4e0bb4a777961ff2669f2b327584f0f6593",
+      "before_mode": 420,
+      "after_sha256": "b1a490a531235de4aca0f0a034e8991a981a72a0f3ea715a67bbb56a4169d05b"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/task_sources.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "ef94f4ed10dd8c2553a97f8192b87819b620e39c64f327faa1c38cfc6e97e1b2"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym_lite.py",
+      "before_sha256": "69a7979999da41e7c14c0feafe54cc185257ddc7f3c04f31d20d0027deb04d6c",
+      "before_mode": 420,
+      "after_sha256": "182362760ebd2682e0a3039c9e1e93115cc30a4fb2b5ed9e875c2ccaa057afae"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/lifecycle.py",
+      "before_sha256": "b1c97c899a2cecb17e8f9abf72bff231adca8a1378623b3a0a7a67aade90549d",
+      "before_mode": 420,
+      "after_sha256": "76c1fb637c89d5588f16013c7011b3d26c36b4ae245d95c7012155394ca1ab7a"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/superbench/service.py",
+      "before_sha256": "7b43d0361969be5935d6166aead5c7909b421304e5e856a4faa11a79ac25a32d",
+      "before_mode": 420,
+      "after_sha256": "449148203e1e2ceadc4a110e107249b805cc73c443628339bfb402c6a5b40cab"
+    },
+    {
+      "path": "apps/runner/src/gpt_trace_runner/workstation_provider.py",
+      "before_sha256": "5f145fe3695d7514668a256210f1b61dee2a596760703ef47905d616bdeb330a",
+      "before_mode": 420,
+      "after_sha256": "9423d546e80ab950e6b3eb6d6792380ead182a8033af0fd16872731db4e5f840"
+    },
+    {
+      "path": "apps/runner/tests/test_superbench_lifecycle_v3.py",
+      "before_sha256": "46726f053819044a8ce568372a58147de030bc856be03e4caad6906ff7a0ceeb",
+      "before_mode": 436,
+      "after_sha256": "33520fb9509add116d9d0a4884efff6842170b83a063f5525a73754bfd0b65ff"
+    },
+    {
+      "path": "apps/runner/tests/test_swe_gym_build_v2.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "385f698e293ec18aafae4fb976ddfb0a772b480ab4ad2736bda7d0f4cc71c6a6"
+    },
+    {
+      "path": "apps/runner/tests/test_swe_gym_evaluator_recovery_v2.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "18f725c4dddfd33bdd77a265ca305781a0cb4e0f0268f8017d07ba13f7812690"
+    },
+    {
+      "path": "apps/runner/tests/test_swe_gym_grading_v2.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "caeb66f7b8758e4670a47afe4c823eecab5fe5c58d279f5af6e01ab8551d9bae"
+    },
+    {
+      "path": "apps/runner/tests/test_swe_gym_lite.py",
+      "before_sha256": "28989f377bbb294e6572403e362738bc265acde9e19d7ea9f485f3d63416b8d3",
+      "before_mode": 420,
+      "after_sha256": "412f12df26b84fe7462e74cebf76f6065dfd0f15195ea73fd5e9772205afebc2"
+    },
+    {
+      "path": "apps/runner/tests/test_swe_gym_sources_v2.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "41b3bd59f2c6ecb13eda20acf5140f2fbfcce56830b546f39ef627665b3fce93"
+    },
+    {
+      "path": "apps/workstation-broker/src/workstation_broker/server.py",
+      "before_sha256": "ce5a1349b221fc6d51f2003cdcdc9d03bffafeff8fc12d4da799d9f3894ea543",
+      "before_mode": 420,
+      "after_sha256": "7c4cb7ce72006da5ca0dce1a7f9e97066c72a0c1528d55b545f194c68c678279"
+    },
+    {
+      "path": "apps/workstation-broker/src/workstation_broker/templates.py",
+      "before_sha256": "06efd102de4ee184b308d48c6d4c6271ac01ecf4553b886230242163ad110edc",
+      "before_mode": 420,
+      "after_sha256": "7492178b0bac4127b60110bbd8c853eab71cd6e1a9797050b237f320120d6468"
+    },
+    {
+      "path": "apps/workstation-broker/tests/test_isolated_evaluator.py",
+      "before_sha256": null,
+      "before_mode": null,
+      "after_sha256": "5e3888ab3a8dd7caf68a5e8530efdadee264490dfe86cad59c3318586ee48499"
+    },
+    {
+      "path": "apps/workstation-broker/tests/test_templates.py",
+      "before_sha256": "ecadbdd6fc9f56d04b3fec6779ae454912e6ebd2afb56c8df189bf8116ab09bf",
+      "before_mode": 420,
+      "after_sha256": "05e598c6fe85c8b643382d015454775ec4532527c6a40a6b12f7611f1b8729ae"
+    },
+    {
+      "path": "docs/superbench.md",
+      "before_sha256": "e5cc0b95831bf9a79e07bfd4fb5d044b83ab39e73950b450dd22949ee52ae291",
+      "before_mode": 420,
+      "after_sha256": "3b4953c45de3e9fc590f1fd23e7996f06b29e0734025f190eb311be9503b117f"
+    },
+    {
+      "path": "docs/swe-gym-lite.md",
+      "before_sha256": "b79cb45ff5b9343ef5300edb928e75d948b8f5327cd1ae338059f6a83607ec10",
+      "before_mode": 420,
+      "after_sha256": "f85ccae25da64f8c2ef826f7970dce60919fd61f86d03723ea2c4f7d861956fd"
+    },
+    {
+      "path": "docs/workstation.md",
+      "before_sha256": "2f26fa812881912795529c957ae46cbf7e978bdf1e3b822fd1ffc00093997313",
+      "before_mode": 436,
+      "after_sha256": "de8751dc733ae863e967b55c4e8a597b6723de73e335c5a652a48da371f091da"
+    },
+    {
+      "path": "scripts/build_swe_gym_lite_templates.py",
+      "before_sha256": "0c73bb199e689006f0326509abe982792e0588f65cf85855c5dd323fb958b06d",
+      "before_mode": 420,
+      "after_sha256": "71312e58819fd94eb5410308879f6644f149bc0783afb7f557afca13964bb69f"
+    }
+  ]
+}

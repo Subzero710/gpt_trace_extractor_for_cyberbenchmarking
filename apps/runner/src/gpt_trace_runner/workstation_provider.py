@@ -50,6 +50,8 @@ class WorkstationProvider(Protocol):
     async def export(self, task, environments, fingerprint, *, attempt, path, destination) -> dict: ...
     async def import_bytes(self, task, environments, fingerprint, *, attempt, data, path) -> dict: ...
     async def abandon(self, task, environments, fingerprint, *, attempt) -> None: ...
+    async def materialize_template_artifact(self, task, environments, fingerprint, *, attempt, artifact_id) -> dict: ...
+    async def create_evaluator(self, task, environments, fingerprint, *, attempt, abandon_stale=False) -> dict: ...
 
 
 class LibvirtWorkstationProvider:
@@ -87,6 +89,7 @@ class LibvirtWorkstationProvider:
         payload = dict(identity)
         if name == "create_attempt" and task.workstation_template is not None:
             payload["template_id"] = validate_template_id(task.workstation_template)
+            payload["logical_task_id"] = task.template_task_id
         details = await self._request(name, payload)
         if details.get("identity") != identity or details.get("provider") != "libvirt":
             raise AppInfrastructureError("broker attempt identity mismatch")
@@ -98,6 +101,8 @@ class LibvirtWorkstationProvider:
                 raise AppInfrastructureError("broker workstation template identity mismatch")
         elif details.get("template_id") is not None:
             raise AppInfrastructureError("unexpected template for default Kali attempt")
+        if task.template_task_id is not None and details.get("logical_task_id") != task.template_task_id:
+            raise AppInfrastructureError("broker template source scope mismatch")
         token = hmac.new(control_token.encode(),
                          f"backend\0{APP_ID}\0{identity['environment_id']}".encode(), hashlib.sha256).hexdigest()
         return AttemptRuntime({APP_ID: RuntimeResource(APP_ID, identity["environment_id"],
@@ -141,7 +146,10 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None:
             raise AppInfrastructureError("internal export requires a workstation")
-        info = await self._request("artifact_export", {**ident, "args": {"path": path}})
+        return await self._export(ident, path, destination)
+
+    async def _export(self, ident, path, destination, prefix=""):
+        info = await self._request(prefix + "artifact_export", {**ident, "args": {"path": path}})
         size, sha = info.get("size"), info.get("sha256")
         if type(size) is not int or not 0 <= size <= 268435456 or info.get("artifact_id") != sha:
             raise AppInfrastructureError("invalid exported artifact record")
@@ -154,7 +162,7 @@ class LibvirtWorkstationProvider:
             with os.fdopen(fd, "wb") as output:
                 offset = 0
                 while offset < size:
-                    chunk = await self._request("artifact_read", {**ident, "args": {"artifact_id": sha, "offset": offset}})
+                    chunk = await self._request(prefix + "artifact_read", {**ident, "args": {"artifact_id": sha, "offset": offset}})
                     raw = base64.b64decode(chunk["content_base64"], validate=True)
                     if chunk.get("sha256") != sha or chunk.get("size") != size or not raw or len(raw) > min(1048576, size-offset):
                         raise AppInfrastructureError("artifact changed while downloading")
@@ -177,22 +185,48 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None or len(data) > 268435456:
             raise AppInfrastructureError("invalid internal artifact import")
-        upload = await self._request("artifact_stage_begin", ident)
+        return await self._import(ident, data, path)
+
+    async def _import(self, ident, data, path, prefix=""):
+        if len(data) > 268435456:
+            raise AppInfrastructureError("invalid internal artifact import")
+        upload = await self._request(prefix + "artifact_stage_begin", ident)
         try:
             for offset in range(0, len(data), 1048576):
-                await self._request("artifact_stage_chunk", {**ident, "args": {"upload_id": upload["upload_id"],
+                await self._request(prefix + "artifact_stage_chunk", {**ident, "args": {"upload_id": upload["upload_id"],
                     "content_base64": base64.b64encode(data[offset:offset+1048576]).decode()}})
-            info = await self._request("artifact_stage_end", {**ident, "args": {"upload_id": upload["upload_id"],
+            info = await self._request(prefix + "artifact_stage_end", {**ident, "args": {"upload_id": upload["upload_id"],
                 "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}})
-            return await self._request("artifact_import", {**ident, "args": {"artifact_id": info["artifact_id"],
+            result = await self._request(prefix + "artifact_import", {**ident, "args": {"artifact_id": info["artifact_id"],
                                                                               "path": path, "overwrite": True}})
+            if result.get("sha256") != hashlib.sha256(data).hexdigest() or result.get("size") != len(data) or result.get("path") != path:
+                raise AppInfrastructureError("guest import did not preserve exact candidate bytes")
+            return result
         except BaseException:
-            await self._request("artifact_stage_abort", {**ident, "args": {"upload_id": upload["upload_id"]}})
+            await self._request(prefix + "artifact_stage_abort", {**ident, "args": {"upload_id": upload["upload_id"]}})
             raise
+
+    async def materialize_template_artifact(self, task, environments, fingerprint, *, attempt, artifact_id):
+        ident = self._identity(task, environments, fingerprint, attempt)
+        if ident is None:
+            raise AppInfrastructureError("template artifact requires an attempt")
+        return await self._request("materialize_template_artifact", {**ident, "artifact_id": artifact_id})
+
+    async def create_evaluator(self, task, environments, fingerprint, *, attempt, abandon_stale=False):
+        ident = self._identity(task, environments, fingerprint, attempt)
+        if ident is None or task.workstation_template is None:
+            raise AppInfrastructureError("isolated evaluation requires an immutable workstation template")
+        result = await self._request("create_evaluator", {**ident, "abandon_stale": abandon_stale})
+        evaluator = result.get("identity", {})
+        if any(evaluator.get(key) != value for key, value in ident.items()) or evaluator.get("purpose") != "evaluator" or result.get("template_id") != task.workstation_template or result.get("network") is not None:
+            raise AppInfrastructureError("isolated evaluator identity/template/network mismatch")
+        return result
 
     async def abandon(self, task, environments, fingerprint, *, attempt):
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is not None:
+            if task.workstation_template is not None:
+                await self._request("abandon_evaluators", ident)
             await self._request("abandon_attempt", ident)
 
 
@@ -205,6 +239,8 @@ class InternalRuntime:
     fingerprint: str
     attempt: int
     artifact_root: Path
+    explicit_recovery: bool = False
+    journal: Any = None
 
     async def call(self, method, args):
         return await self.provider.call(self.task, self.environments, self.fingerprint,
@@ -219,3 +255,48 @@ class InternalRuntime:
     async def import_bytes(self, data, path):
         return await self.provider.import_bytes(self.task, self.environments, self.fingerprint,
                                                 attempt=self.attempt, data=data, path=path)
+
+    async def materialize_template_artifact(self, artifact_id):
+        return await self.provider.materialize_template_artifact(self.task, self.environments, self.fingerprint,
+                                                                attempt=self.attempt, artifact_id=artifact_id)
+
+    async def create_evaluator(self):
+        record = await self.provider.create_evaluator(self.task, self.environments, self.fingerprint,
+                                                     attempt=self.attempt, abandon_stale=self.explicit_recovery)
+        if self.journal is not None:
+            self.journal.record_evaluator(record)
+        return EvaluatorRuntime(self, record)
+
+
+@dataclass(frozen=True)
+class EvaluatorRuntime:
+    """Runner-only control; no App resource, gateway, browser, or MCP endpoint."""
+    teacher: InternalRuntime
+    record: dict
+
+    @property
+    def artifact_root(self):
+        return self.teacher.artifact_root / "evaluators" / self.record["identity"]["evaluator_retry"]
+
+    @property
+    def request_identity(self):
+        teacher = self.teacher
+        ident = teacher.provider._identity(teacher.task, teacher.environments, teacher.fingerprint, teacher.attempt)
+        return {**ident, "evaluator_retry": self.record["identity"]["evaluator_retry"]}
+
+    async def call(self, method, args):
+        return await self.teacher.provider._request("evaluator_rpc", {**self.request_identity, "method": method, "args": args})
+
+    async def materialize_template_artifact(self, artifact_id):
+        return await self.teacher.provider._request("evaluator_materialize_template_artifact", {**self.request_identity, "artifact_id": artifact_id})
+
+    async def import_bytes(self, data, path):
+        return await self.teacher.provider._import(self.request_identity, data, path, prefix="evaluator_")
+
+    async def export(self, path, name):
+        if Path(name).name != name or name in {"", ".", ".."}:
+            raise AppInfrastructureError("invalid evaluator artifact filename")
+        return await self.teacher.provider._export(self.request_identity, path, self.artifact_root / name, prefix="evaluator_")
+
+    async def destroy(self):
+        return await self.teacher.provider._request("destroy_evaluator", self.request_identity)

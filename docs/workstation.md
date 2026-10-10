@@ -31,3 +31,29 @@ The Secure MCP Tunnel is persistent infrastructure; a Kali domain is not. Use `m
 Manual mode uses the same `AppLifecycle` and `LibvirtWorkstationProvider` as benchmark attempts. The fixed logical task `__manual_kali__` gets a deterministic attempt identity, while `/data/state/manual-kali.json` records the exact task fingerprint and environment ID atomically. The runner state file is recovery metadata, not the sole source of truth: status also compares the gateway owner with broker-backed runtime discovery. If the gateway restarts while the VM survives, `stop_kali` can rediscover/rebind the recorded attempt and then run the normal reset/deactivate/destroy cleanup.
 
 A manual state blocks benchmark/registration VM lifecycles, and `start_kali` refuses while an unfinished Superbench run or recovery journal exists. The gateway's existing single-owner `409` check remains a final defense against accidental overlap.
+
+## Trusted template artifacts and isolated evaluators
+
+Template schema 2 verifies immutable root-owned generation manifests and their
+resolved content identity, QCOW2 backing chains, source scopes, and opaque
+artifact ID/hash/size mappings. The runner-only broker operation streams a
+selected generation artifact to a fixed guest staging path with 1 MiB frames.
+It accepts only the attempt's logical task and recorded generation, without
+host-path input. Its size-bound guest session is independent of ordinary App
+imports. Controller credentials cannot access template delivery or evaluator
+operations; the model-facing tool manifest is unchanged.
+
+An evaluator is a separate reserved overlay over the SAME immutable repo image
+as its teacher attempt. It has a distinct vsock identity/secret/retry, no NIC,
+shared writable mount, graphical console, App/gateway attachment or model route.
+Guest evaluator identities reject browser, terminal and preparation RPCs. Hidden
+test data goes only to this runtime; gold code patches go to neither runtime.
+
+The broker records evaluator ownership before allocation, exposes diagnostic
+inspect metadata, and preserves partial/stopped evaluators after technical
+failure. Native pass/fail destroys the evaluator normally. Explicit resume may
+abandon an old evaluator and must create a new one; reset-recovery abandons both
+runtimes. A new registry publication never changes an existing attempt's
+backing generation or selected artifact scope. The guest streaming addition
+changes the golden semantic build-input hash; old golden artifacts must be
+rebuilt/installed before using schema-2 Lite templates.

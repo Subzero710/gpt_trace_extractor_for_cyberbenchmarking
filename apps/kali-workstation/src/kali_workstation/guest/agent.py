@@ -21,6 +21,8 @@ MAX_FRAME = 32 * 1024 * 1024
 class Agent:
     def __init__(self, identity: dict):
         self.identity = {key: identity[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
+        if identity.get("purpose") == "evaluator":
+            self.identity.update(purpose="evaluator", evaluator_retry=identity["evaluator_retry"])
         self.secret = identity["secret"]
         limits = identity["limits"]
         shell.MAX_OUTPUT = limits["max_output_bytes"]
@@ -30,6 +32,7 @@ class Agent:
         self.browser = Browser(self.identity["fingerprint"])
         self.seed = SeedSession()
         self.import_session = ImportSession()
+        self.template_import = ImportSession(trusted_template=True)
 
     async def call(self, payload: dict) -> dict:
         if not isinstance(payload, dict) or payload.get("identity") != self.identity or not hmac.compare_digest(str(payload.get("secret", "")), self.secret):
@@ -37,7 +40,13 @@ class Agent:
         method = payload.get("method")
         args = payload.get("args", {})
         if not isinstance(args, dict): raise ValueError("RPC arguments must be an object")
-        if method == "health": return {"identity": self.identity, "guest_agent_version": "3.0.0"}
+        if method == "health": return {"identity": self.identity, "guest_agent_version": "3.0.0", "trusted_artifacts_version": 1}
+        if self.identity.get("purpose") == "evaluator" and method not in {
+            "exec_command", "artifact_stat", "artifact_read_chunk", "artifact_import_begin",
+            "artifact_import_chunk", "artifact_import_end", "artifact_import_abort",
+            "template_import_begin", "template_import_chunk", "template_import_end", "template_import_abort",
+        }:
+            raise ValueError("evaluator has no browser, terminal or model control route")
         if method == "prepare":
             await self.browser.start()
             return {"status": "ready", **self.identity}
@@ -60,6 +69,10 @@ class Agent:
         if method == "artifact_import_chunk": return self.import_session.chunk(args)
         if method == "artifact_import_end": return self.import_session.finish(args)
         if method == "artifact_import_abort": self.import_session.abort(); return {"aborted": True}
+        if method == "template_import_begin": return self.template_import.begin(args)
+        if method == "template_import_chunk": return self.template_import.chunk(args)
+        if method == "template_import_end": return self.template_import.finish(args)
+        if method == "template_import_abort": self.template_import.abort(); return {"aborted": True}
         if isinstance(method, str) and method.startswith("browser_"):
             return await self.browser.call(method[8:], args)
         raise ValueError("unknown guest RPC method")

@@ -128,9 +128,18 @@ def source_fingerprint():
 def export_inputs(destination, root):
     """Only safe recipes/source snapshots leave the evaluator-side source cache."""
     fetch(root)
-    data = validate_rows(read_rows(root))
+    rows = read_rows(root)
+    data = validate_rows(rows)
+    official = harness(data)
+    tasks = {key: dict(value) for key, value in data["tasks"].items()}
+    for row in rows:
+        specs = official.constants.MAP_REPO_VERSION_TO_SPECS[row["repo"].lower()][row["version"]]
+        commands = official.test_spec.make_eval_script_list(row, specs, "testbed", "/testbed", row["base_commit"], row["test_patch"])
+        # All install/setup commands are clean-base inputs. The four remaining
+        # entries contain evaluator-only hidden data and never leave this cache.
+        tasks[row["instance_id"]]["eval_setup_commands"] = commands[:-4]
     safe = {"pins": PINS, "source_fingerprint": source_fingerprint(),
-            "tasks": data["tasks"], "environments": data["environments"],
+            "tasks": tasks, "environments": data["environments"],
             "snapshots": data["snapshots"]}
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)

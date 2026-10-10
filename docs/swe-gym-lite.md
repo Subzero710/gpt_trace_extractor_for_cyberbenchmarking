@@ -12,7 +12,7 @@ prerequisite. Campaigns never build missing permanent environments.
 | `data/train-00000-of-00001.parquet` SHA256 | `f3a7cd934e8cc523b6053298d0abb2c82fd7db2b83f9f2ccba5944545aaa4eb1` |
 | [SWE-Gym/SWE-Bench-Package](https://github.com/SWE-Gym/SWE-Bench-Package) commit | `16dd480cce9b27bf111a362d280881c6def5d2a7` |
 | Safe setup contract SHA256 | `fbb8b762277d09b6732a9697735889f761cf5d1920df0cafb5320809f834f38f` |
-| Recipe / registry schema | `1` / `1` |
+| Recipe / registry schema / adapter | `2` / `2` / `2` |
 | Miniconda installer | `Miniconda3-py311_24.7.1-0-Linux-x86_64.sh` |
 | Installer SHA256 | `a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c` |
 
@@ -41,50 +41,110 @@ missing base commits before publication.
 Some hashes are shared across repos. Template IDs prepend `swe-gym-lite/` to
 these suffixes. The first 11 tasks cycle through all 11 repositories.
 
-## Images, setup and trust
+## Images, sources and trust
 
-Every attempt uses `overlay -> repo.qcow2 -> common.qcow2 -> kali-base.qcow2`.
-The common image contains all 25 environments under `swegym_<official_env_hash>`,
-shared Conda/pip/npm/PDM/pipx caches, frozen public VCS dependencies, inventories
-and safe recipes. Each of the 11 repo images adds its local Git mirror. Task
-overlays receive a proper Conda clone named `testbed`, exact `/testbed` checkout,
-and official repo installation. The teacher workspace links to that checkout;
-login shells activate the environment. No benchmark MCP helpers are added.
+Teacher and evaluator each use an independent fresh overlay over the same
+`repo.qcow2 -> common.qcow2 -> kali-base.qcow2` chain. There are still exactly
+11 repo template IDs/images and 25 shared immutable `swegym_<env_hash>` Conda
+environments. No permanent instance images are built during campaigns.
 
-The host builder runs one VM at a time, uses sparse QCOW2 files, grows the ext4
-guest root partition/filesystem, monitors host free space, and reports virtual
-and physical allocated sizes. The existing 64 GiB attempt reservation remains
-separate from permanent template capacity.
+Full Git mirrors live only in the root-only host `build-cache`. They never enter
+common/repo images, task overlays, mounted shares or the teacher tools. The host
+builds 230 deterministic gzip/tar source artifacts. Each preserves the ORIGINAL
+exact base SHA as detached HEAD, marks that SHA as the shallow boundary, and
+contains exactly one reachable commit, its trees/blobs, no remote, tags, other
+refs, alternates, hooks, reflogs or unreachable object corpus. Exact Gitlink
+submodules receive independent single-commit checkouts at their pinned SHAs.
+The validator checks clean tracked and ignored-file contents, Git configuration,
+all objects versus reachable objects, SHA/size, instance/repo/base/template
+association, and an independent extraction. No ancestor exception is enabled.
+Pandas' upstream tag fetch can access only its own sanitized checkout, never a
+full mirror or public repository. If single-commit setup is incompatible, the
+build fails for operator review; history is never expanded automatically.
 
-Published paths are under
-`/var/lib/libvirt/images/gpt-trace/templates/swe-gym-lite/generations/<generation>/`:
-`common.qcow2`, `repos/<suffix>.qcow2`, `manifest.json`, and build logs.
-The generation hashes source pins, installed Kali base, host/guest recipe bytes,
-virtual capacity and installer digest. All images and generation directories
-become read-only before atomic publication of `swe-gym-lite/registry.json`.
+Host mirror -> sanitized task source -> CURRENT task overlay only. The common
+image has never held any task checkout or task-source archive. Its inputs are
+only the 25 environment recipes, trusted helpers and frozen OS artifacts.
+Repo images hold safe repo identity/configuration, without source history.
+Publication inspects common and every repo image for forbidden mirror/source
+paths and Git directories. Disposable task builder disks are deleted only after
+successful fresh offline replay; failed disks remain diagnostic state.
 
-Publication requires complete mappings, inventories, commits, digests, QCOW2
-checks and backing chains. All 230 official task setups are replayed in fresh
-environments with networking disabled and compared with their build-time package
-inventories. A historical recipe or missing-cache failure stops publication and
-preserves its build disks/logs; it never replaces a good generation.
+Task-dependent downloads, VCS dependencies, wheelhouses, npm state and PDM/pipx
+prerequisites are likewise frozen into separate HOST-ONLY setup-cache artifacts.
+Every task is warmed in its own disposable VM and then validated in another new,
+network-disabled VM. No earlier task filesystem or source-containing cache can
+enter a later task's permanent image or overlay.
 
-The broker accepts validated IDs only and rejects unknown IDs, traversal,
-symlinks, mutable or modified images, and broken backing chains. Relative backing
-filenames are resolved from the image directory. Attempt and domain metadata
-record backing path/SHA256, template ID, generation and source fingerprint.
-Recovery and cleanup verify the original recorded generation after publication
-of a newer one. `workstation_template=None` retains normal Kali/GAIA behavior.
+The schema-2 manifest maps opaque artifact IDs to immutable root-owned files,
+SHA/size, logical task, source identity and allowed template. The broker resolves
+only the attempt's recorded generation, rejects sibling/unknown IDs, traversal,
+symlinks, changed bytes/size or permissions, and streams host -> guest in 1 MiB
+frames. Source/cache archives never pass through runner RAM or model-visible MCP.
+The separate trusted import session is sized from the selected artifact and can
+exceed the ordinary 256 MiB runner import cap. It returns only a broker-controlled
+guest path and verified integrity. Controller credentials cannot invoke it.
+
+Runtime setup extracts only the selected source, validates the graph and SHA,
+clones the exact environment with Conda prefix relocation, runs official setup,
+checks frozen package/OS inventories, and exposes `/testbed` as the workspace.
+Repo setup and upstream evaluation-time installation have separate frozen
+inventories, so evaluation-only dependencies are verified at the correct phase.
+Tracked setup-file mutations are reset to the exact base after installation;
+installed packages and ignored build products remain. This keeps candidate diffs
+base-relative without letting candidate setup.py/pyproject affect installation.
+Candidate clean verification extracts the SAME source artifact again.
+
+## Reproducible construction and publication
+
+The golden records `kali-last-snapshot`, a mutable alias, not an immutable
+snapshot identifier. The Lite builder therefore uses two-phase APT resolution.
+A disposable trusted resolver downloads the exact `.deb` closure, records each
+package/version/architecture/SHA/size and the golden/resolved installed package
+inventories, and checks installation with no network. Common installation uses
+ONLY these verified local artifacts with `unshare --net`, empty APT lists,
+`--no-download` and `--no-remove`. There is no blanket APT upgrade. Official
+pre-install OS upgrade clauses are removed; a guard checks already-frozen
+prerequisites without resolving packages. Missing/corrupted artifacts or an OS
+inventory change stop the build. Exact `.deb` files and manifests are retained.
+
+Only after all 230 offline setups, source validations and QCOW2 chain/check
+operations succeed does the builder calculate the final canonical input hash.
+It covers source/harness/contract pins, golden SHA/provenance, host/guest recipes,
+Miniconda, capacity, exact OS artifacts/inventories, all 25 environment inventories,
+Conda/pip caches, VCS and task-download provenance, all 230 source/cache artifact
+hashes, recipe/schema/security contract, and final common/repo QCOW2 hashes.
+Relative backing paths avoid a generation-directory hash cycle. Different
+resolved bytes cannot reuse a previous generation identity.
+
+Publication moves `.build-<random>` to `generations/<content-id>`, seals all files
+and directories, validates through the broker, and atomically replaces
+`registry.json`. Failed validation restores/preserves the build stage and leaves
+the old registry untouched. Recipe/schema-1 generations are rejected. Adapter
+version 2 gives new run-row identities while source instance IDs stay unchanged.
+
+The builder remains sequential and sparse, monitors the host free-space margin,
+and reports common physical bytes, 11 repo-image physical bytes, 230 source
+physical/logical bytes, setup-cache physical/logical bytes, and total unique-inode
+immutable generation allocation. Published images, artifacts, manifests and audit
+records are root-owned and read-only. Default virtual capacity is 512 GiB; the
+host attempt reservation remains separately configured.
 
 ## Real-host commands
 
 Use the dedicated Ubuntu/KVM host with the existing runtime requirements and
 packages in `requirements-golden-build.txt`. The builder requires Docker, Git,
-QEMU, `virt-customize` and `virt-cat`. Stop active/manual attempts before replacing
-the installed Kali base.
+QEMU, `virt-customize`, `virt-cat`, `virt-copy-out` and `dpkg-deb`. Stop active/manual
+attempts before replacing the installed Kali base. The internal guest streaming
+capability changes the golden build-input hash: build/install the golden from this
+checkout (or publish that matching image on the publishing host) before Lite builds.
 
 ```bash
+# On the KVM image-building host, build the matching golden locally:
+sudo python3 infra/workstation/image/build.py --local
+# Deploy the matching golden and rebuild/start the runtime containers.
 make build
+make up
 make superbench-fetch ADAPTER=swe-gym-lite
 sudo make swe-gym-lite-templates
 make template-doctor ADAPTER=swe-gym-lite
@@ -119,60 +179,67 @@ or connecting the teacher; unselected dataset sources are not discovered.
 
 ## Grading and recovery
 
-The teacher receives public issue text and ordinary Kali tools. Gold code patches
-never enter the guest. Hidden test/oracle data remain evaluator-side until the
-teacher has finished and durable conversation/candidate checkpoints exist.
+Teacher overlay -> durable conversation and candidate.patch -> NEW isolated
+evaluator overlay -> native hidden grading. The evaluator shares only immutable
+repo/common/golden backings with the teacher. It has no NIC, shared filesystem,
+desktop, browser, gateway attachment, App resource or model-facing route. Only
+runner/broker credentials and authenticated host vsock can reach it. Loopback
+continues to work in offline execution namespaces.
 
-Capture uses a temporary Git index with `git add -A` and a binary diff against the
-exact base, preserving the real index and including new files and deletions. A
-clean checkout must accept the candidate. The exported bytes and SHA256 are
-durable before grading starts. Evaluation recreates a separate checkout, applies
-the exact persisted candidate, performs official setup, injects the hidden test
-patch, runs the official command, and uses the pinned upstream log parser and
-FAIL_TO_PASS/PASS_TO_PASS grading. Full logs remain artifacts; stored evaluation
-metadata contains compact counts, identities, hashes and exit status.
+The order is exact base -> clone exact env -> official pre-install/install/setup
+ON CLEAN BASE -> verify/reset tracked setup mutations -> import/apply the exact
+persisted candidate -> official hidden test patch -> official test command ->
+pinned log parser -> FAIL_TO_PASS/PASS_TO_PASS grading. Upstream eval-time install
+also runs before the candidate. Candidate bytes are imported only after clean
+setup has returned its proof. No post-candidate installation runs.
+
+Capture keeps a temporary Git index, binary diffs, new/deleted files, the real
+index, atomic host export and SHA verification. The durable journal phases are
+`conversation_checkpointed` and `candidate_checkpointed`. Gold code patches never
+enter either VM. Hidden test patches enter ONLY the evaluator, and oracle lists
+remain in the trusted host parser/grader; neither ever enters the teacher VM.
+Logs are evaluator artifacts, with compact hashes/counts/identities in storage.
 
 | Event | Outcome |
 | --- | --- |
-| Native pass | Storage completed, evaluation `pass`, continue |
-| Normally executed native benchmark reports incorrect candidate | Storage completed, evaluation `fail`, continue |
-| Template/setup/capture/parser/broker/QEMU/storage error | Preserve running attempt and journal; `needs_intervention`; stop |
-| First SIGINT/cooperative pause | Existing durable paused state |
-| Rate limit | Existing durable Retry-After/defer behavior |
+| Native pass or native fail | Destroy evaluator, complete storage with verdict, normal teacher cleanup, continue |
+| Template/setup/capture/parser/broker/QEMU/storage error | Preserve existing checkpoints/logs and remaining runtime state; `needs_intervention`; stop |
+| Explicit resume after durable candidate | Abandon stale evaluator, allocate NEW retry over recorded backing, grade SAME patch; no recapture or model generation |
+| Explicit reset-recovery | Abandon both runtimes, terminalize old attempt, retry same frozen task on next attempt |
+| SIGINT / RateLimited | Existing cooperative pause / Retry-After behavior |
 
-Preparation recovery reruns deterministic setup in the same attempt. Once
-`submission_started` is durable, recovery never sends a duplicate task.
-`conversation_checkpointed` loads the saved capture; `candidate_checkpointed`
-also loads the exact persisted patch and recreates only the evaluator. Neither
-phase resumes ChatGPT generation. Checkpoints are cleaned only after storage
-completion and runtime cleanup. Conversation deletion connects the teacher
-browser only after evaluation succeeds.
+Evaluator identities include teacher run-task ID, attempt, environment,
+fingerprint, purpose=evaluator and a new grading retry ID. Template ID,
+generation, backing SHA and logical source scope are verified against the teacher
+record. A durable host index is written BEFORE evaluator allocation, so partial
+construction/stopped VMs remain recoverable. A stale evaluator is never silently
+reused; only explicit checkpoint resume authorizes its abandonment. Status
+includes checkpoint, candidate SHA and evaluator metadata. Broker inspect retains
+partial evaluator paths even before guest boot succeeds.
 
 ```bash
 make status
 make resume
-```
-
-Explicit abandonment of an irreparable attempt retries the same frozen task:
-
-```bash
 make reset-recovery TASK=<run_task_id_from_status>
 make resume
 ```
 
-Technical errors never automatically skip tasks or destroy diagnostic VMs.
-`make auth` retains its refusal during an unfinished run; resolve authentication
-in the operator browser and resume. Typed Parquet/SFT export remains compatible;
-default SFT filtering retains native passes.
+Neither durable phase resumes ChatGPT generation. Conversation deletion connects
+the teacher browser only after evaluation completes. Unexpected infrastructure
+errors never skip tasks or automatically delete diagnostic guests. GAIA/manual
+Kali, normal App tools, pause/rate-limit behavior and typed SFT export stay intact.
 
 ## Validation and operational limit
 
-**314 tests passed** across runner, broker, Kali guest/controller and MCP gateway.
-This includes the actual pinned parquet, official recipe/hash derivation, native
-parsers, real Git candidate capture, backing selection/security, and recovery
-barriers. Baseline fixtures were aligned with the already-current constructor,
-GAIA Level-3 split, cookie-session endpoint and password-based KasmVNC auth;
-behavioral model, rate-limit and tool assertions remain active.
+The original 314-test baseline is retained. With the actual pinned parquet
+available, the implementation validation passed all 401 tests with zero skips
+(42 unchanged upstream escape-sequence warnings). Regression coverage additionally
+checks real multi-commit Git sanitization and exact submodules, ignored/unreachable
+history attacks, task-scoped delivery, >256 MiB streaming, evaluator identity and
+network isolation, hidden-data routing, clean setup before candidate application,
+exact checkpoint recovery/abandonment, actual Debian artifact metadata/integrity,
+resolved generation identity and atomic publication. These tests model libvirt;
+real KVM construction and smoke execution are separate acceptance gates.
 
 With runner test dependencies and broker installed:
 

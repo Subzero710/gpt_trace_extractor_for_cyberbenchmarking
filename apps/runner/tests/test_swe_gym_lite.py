@@ -104,7 +104,7 @@ def test_template_contract_propagation_and_default_fingerprints():
     bt = to_benchmark_task(task, registry, camp, adapter)
     assert bt.workstation_template == task.workstation_template
     assert task_spec_fingerprint(task) != task_spec_fingerprint(replace(task, workstation_template=None))
-    assert task_fingerprint(bt) != task_fingerprint(replace(bt, workstation_template=None))
+    assert task_fingerprint(bt) != task_fingerprint(replace(bt, workstation_template=None, template_task_id=None))
     assert BenchmarkTask("gaia", "p", ()).workstation_template is None
     for invalid in ("/tmp/evil", "../evil", "swe-gym-lite/../x", "swe-gym-lite/x.qcow2", "swe-gym-lite/x/y"):
         with pytest.raises(ValueError):
@@ -250,11 +250,15 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
     task = TaskSpec(item["instance_id"], "public issue", tools=("kali-workstation",),
                     workstation_template=item["template_id"])
     programs = []
+    targets = []
     async def execute(runtime, program, **kwargs):
         compile(program, "trusted-guest-validation", "exec")
         programs.append(program)
-        if "prepare(item, log=ROOT" in program:
+        targets.append(runtime.purpose)
+        if "prepare(item, artifact=artifact, log=ROOT" in program:
             return {"stdout": json.dumps({"base_commit": item["base_commit"], "env_hash": item["env_hash"]})}
+        if "proof = prepare_evaluator" in program:
+            return {"stdout":json.dumps({"base_commit":item["base_commit"],"env_hash":item["env_hash"],"source_sha256":"a"*64})}
         return {"stdout": json.dumps({"test_exit_status": 0})}
     monkeypatch.setattr(module, "execute", execute)
     patch = b"candidate bytes"
@@ -262,20 +266,39 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
     artifact.write_bytes(patch)
     candidate = {"local_path": str(artifact), "sha256": hashlib.sha256(patch).hexdigest(), "size": len(patch),
                  "template_id": task.workstation_template, "env_hash": item["env_hash"],
-                 "template_generation": "b"*64, "backing_sha256": "c"*64}
+                 "template_generation": "b"*64, "backing_sha256": "c"*64,
+                 "source_sha256":"a"*64, "source_artifact_id":module.task_sources.artifact_id("task_source",task.task_id)}
     class Provider:
         async def snapshot(self, *args, **kwargs):
-            return {"apps": {"kali-workstation": {"template_generation": "b"*64, "backing_sha256": "c"*64}}}
+            return {"apps": {"kali-workstation": {"template_generation": "b"*64, "backing_sha256": "c"*64,
+                "backing_path":"/trusted/repo.qcow2"}}}
     class Runtime:
+        purpose = 'teacher'
         artifact_root = tmp_path
         provider = Provider()
         task, environments, fingerprint, attempt = None, {}, "d"*64, 1
+        destroyed = False
+        async def materialize_template_artifact(self, artifact_id):
+            kind = next(kind for kind in ('task_source','setup_cache') if module.task_sources.artifact_id(kind,item['instance_id']) == artifact_id)
+            return {'artifact_id':artifact_id,'kind':kind,'logical_task_id':item['instance_id'],
+                    'source_identity':{key:item[key] for key in ('instance_id','repo','base_commit')},
+                    'path':'/var/lib/gpt-trace-template-artifacts/'+artifact_id+'/payload','sha256':'a'*64,'size':2}
+        async def create_evaluator(self):
+            evaluator = Runtime()
+            evaluator.purpose = 'evaluator'
+            evaluator.record = {'template_generation':'b'*64,'backing_sha256':'c'*64,
+                'backing_path':'/trusted/repo.qcow2','identity':{'purpose':'evaluator'}}
+            self.evaluator = evaluator
+            return evaluator
         async def import_bytes(self, data, path):
-            assert data == patch
+            assert self.purpose == 'evaluator' and data == patch
         async def export(self, path, name):
+            assert self.purpose == 'evaluator'
             target = tmp_path / name
             target.write_text("PASSED tests/test_x.py::test_fixed\nPASSED tests/test_x.py::test_old\n")
             return {"local_path": str(target), "artifact_id": "e"*64, "sha256": "e"*64}
+        async def destroy(self):
+            self.destroyed = True
     runtime = Runtime()
     prepared = await adapter.prepare(task)
     await adapter.prepare_runtime(task, prepared=prepared, runtime=runtime)
@@ -284,5 +307,9 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
     result = await adapter.evaluate_runtime(task, prepared=prepared, captured=CapturedConversation("conv", []),
                                              candidate=candidate, runtime=runtime)
     assert result.verdict == "pass"
-    assert "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" in programs[1]
+    assert "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" not in programs[1]
+    assert "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" in programs[2]
     assert all("GOLD_CODE_NEVER_DELIVERED" not in program for program in programs)
+
+    assert targets == ['teacher','evaluator','evaluator']
+    assert runtime.evaluator.destroyed

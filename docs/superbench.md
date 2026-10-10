@@ -34,11 +34,16 @@ The pinned split is validated to expose both Browser and Code Workspace across t
 
 ## Adapter contract
 
-The [SWE-Gym Lite guide](swe-gym-lite.md) documents its pinned 230-task source,
-separate host template builder, native grading and durable evaluation recovery.
-`TaskSpec.workstation_template` selects a validated host template before VM
-creation. Adapters can opt into internal runtime hooks; `task_order_key()` gives
-a stable campaign order while the default retains task-ID ordering.
+The [SWE-Gym Lite guide](swe-gym-lite.md) documents the unchanged pinned
+230-task/11-repo/25-env contract, recipe/schema/adapter version 2, host-only shallow
+task sources and setup caches, and a fresh evaluator VM over the exact recorded
+immutable backing. Native grading runs base -> clean official setup -> persisted
+candidate -> hidden tests -> test command. Candidate checkpoints resume only
+trusted grading in a new evaluator, with no ChatGPT generation. Technical errors
+preserve both runtimes for explicit recovery; native benchmark fail completes
+normally. `TaskSpec.workstation_template` selects the template;
+`BenchmarkTask.template_task_id` binds its logical artifact scope without changing
+ordinary Kali MCP tools or the GAIA/manual `None` behavior.
 
 To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, preserve useful source provenance in task metadata, implement native `evaluate()` when an upstream oracle exists, add tests and expose the adapter through the `gpt_trace_runner.benchmark_adapters` entry-point group. Core scheduler/storage/export code should not need benchmark-specific branches.
 

@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 MAX_FILE = 64 * 1024 * 1024
 MAX_SEED = 268435456
 WORKSPACE = Path("/home/kali/workspace")
+TEMPLATE_ROOT = Path("/var/lib/gpt-trace-template-artifacts")
 
 
 def path(value: str) -> Path:
@@ -46,7 +47,9 @@ def read_chunk(args: dict) -> dict:
 
 
 class ImportSession:
-    def __init__(self):
+    def __init__(self, *, trusted_template=False):
+        self.trusted_template = trusted_template
+        self.limit = None
         self.target = None
         self.temp = None
         self.digest = hashlib.sha256()
@@ -58,6 +61,14 @@ class ImportSession:
         if self.temp is not None:
             raise ValueError("artifact import already active")
         target = path(args["path"])
+        if self.trusted_template:
+            size = args.get("size")
+            prefix = TEMPLATE_ROOT
+            if type(size) is not int or size < 0 or not target.is_absolute() or not target.is_relative_to(prefix) or ".." in target.parts:
+                raise ValueError("invalid trusted template import scope")
+            self.limit = size
+        else:
+            self.limit = MAX_FILE
         if target.exists() and not args.get("overwrite", False):
             raise ValueError("artifact destination exists")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +86,7 @@ class ImportSession:
         if self.temp is None:
             raise ValueError("artifact import not active")
         data = base64.b64decode(args["content_base64"], validate=True)
-        if len(data) > 1048576 or self.size + len(data) > MAX_FILE:
+        if len(data) > 1048576 or self.size + len(data) > self.limit:
             raise ValueError("artifact chunk exceeds configured limit")
         with self.temp.open("ab") as output:
             output.write(data)
@@ -89,6 +100,8 @@ class ImportSession:
         try:
             if self.digest.hexdigest() != self.expected or self.size != args["size"]:
                 raise ValueError("artifact import integrity mismatch")
+            if self.trusted_template and self.size != self.limit:
+                raise ValueError("trusted template import size mismatch")
             if self.target.exists() and not self.overwrite:
                 raise ValueError("artifact destination exists")
             os.replace(self.temp, self.target)

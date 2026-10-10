@@ -153,12 +153,13 @@ class BenchmarkRunner:
         self.evaluation_hooks = evaluation_hooks or {}
         self.runtime_hooks = runtime_hooks or {}
 
-    def _internal(self, task, environments, fingerprint, attempt):
+    def _internal(self, task, environments, fingerprint, attempt, *, explicit_recovery=False):
         key = hashlib.sha256(f"{task.task_id}\0{attempt}\0{fingerprint}".encode()).hexdigest()
         return InternalRuntime(self.lifecycle.runtime, task, environments, fingerprint, attempt,
-                               self.journal.path.parent / "evaluation-artifacts" / key)
+                               self.journal.path.parent / "evaluation-artifacts" / key,
+                               explicit_recovery=explicit_recovery, journal=self.journal)
 
-    async def _evaluate_capture(self, task, captured, attempt, environments, fingerprint):
+    async def _evaluate_capture(self, task, captured, attempt, environments, fingerprint, *, explicit_recovery=False):
         hooks = self.runtime_hooks.get(task.task_id)
         if hooks is None:
             evaluation = self.evaluation_hooks.get(task.task_id)
@@ -171,7 +172,7 @@ class BenchmarkRunner:
             entry = replace(entry, phase="conversation_checkpointed", conversation_id=captured.conversation_id,
                             capture_sha256=digest)
             self.journal.write(entry)
-        runtime = self._internal(task, environments, fingerprint, attempt)
+        runtime = self._internal(task, environments, fingerprint, attempt, explicit_recovery=explicit_recovery)
         if entry.phase != "candidate_checkpointed":
             candidate = await hooks.capture(captured, runtime)
             entry = replace(entry, phase="candidate_checkpointed", candidate=candidate)
@@ -333,7 +334,7 @@ class BenchmarkRunner:
                 raise RecoveryIncomplete("evaluation checkpoint has no matching running attempt")
             captured = self.journal.load_capture(entry)
             await self.lifecycle.assert_resume(recovery_task, expected_environments, fingerprint, attempt=entry.attempt)
-            evaluation = await self._evaluate_capture(recovery_task, captured, entry.attempt, expected_environments, fingerprint)
+            evaluation = await self._evaluate_capture(recovery_task, captured, entry.attempt, expected_environments, fingerprint, explicit_recovery=True)
             await self.storage.complete(entry.task_id, captured, attempt=entry.attempt, runner_id=entry.runner_id,
                                         **({"evaluation": evaluation} if evaluation is not None else {}))
             self.journal.write(replace(self.journal.load(), phase="cleanup_pending"))

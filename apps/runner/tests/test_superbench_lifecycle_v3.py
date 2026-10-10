@@ -50,6 +50,10 @@ class V3Settings:
     workstation_memory_mb: int = 8192
     workstation_vcpus: int = 4
 
+    @property
+    def journal_path(self):
+        return self.superbench_active_run_path.parent / "submission.json"
+
 
 class EmptyRegistry:
     def resolve_id(self, _app_id):
