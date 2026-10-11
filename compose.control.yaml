@@ -414,13 +414,13 @@
   },
   "secrets": {
     "app_control_token": {
-      "environment": "APP_CONTROL_TOKEN"
+      "file": "./.secrets/app_control_token"
     },
     "workstation_broker_admin_token": {
-      "environment": "DIST_BROKER_ADMIN_TOKEN"
+      "file": "./.secrets/workstation_broker_admin_token"
     },
     "workstation_broker_controller_token": {
-      "environment": "DIST_BROKER_CONTROLLER_TOKEN"
+      "file": "./.secrets/workstation_broker_controller_token"
     },
     "teacher_browser_password": {
       "file": "./.secrets/teacher_browser_password"
