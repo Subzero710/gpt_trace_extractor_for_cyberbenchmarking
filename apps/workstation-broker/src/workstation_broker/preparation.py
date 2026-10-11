@@ -138,7 +138,7 @@ class PreparationManager:
         self.root = self.base.parent / "preparations"
         self.deployment = deployment if deployment is not None else {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
             "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}
-        if os.geteuid() != 0: raise RuntimeError("preparations require Acer root")
+        if os.geteuid() != 0: raise RuntimeError("preparations require execution host root")
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         safe(self.root, directory=True)
         if self.root.stat().st_mode & 0o077: raise ValueError("preparation root must be private")
@@ -173,7 +173,7 @@ class PreparationManager:
 
     def probe(self, payload):
         if set(payload) != {"source_contract"} or payload["source_contract"] != source_contract(self.source_root):
-            raise ValueError("Fossil/Acer pinned preparation sources differ")
+            raise ValueError("control/execution pinned preparation sources differ")
         expected = self.expected()
         return {"operation_id": hashlib.sha256(canonical(expected)).hexdigest(),
                 "compatibility": expected, "deployment": self.deployment}
@@ -491,7 +491,7 @@ def worker(operation_id, slot_fd):
     templates = TemplateRegistry(BASE.parent / "templates", BASE, lambda p: {})
     manager = PreparationManager(BASE, templates.root, templates)
     stamp = process_identity(os.getpid())
-    if stamp is None: raise RuntimeError("Acer process identity is unavailable; no construction permitted")
+    if stamp is None: raise RuntimeError("execution host process identity is unavailable; no construction permitted")
     if stamp["pgid"] != os.getpid() or stamp["session"] != os.getpid():
         raise RuntimeError("worker has no private process session")
     with manager.lock():

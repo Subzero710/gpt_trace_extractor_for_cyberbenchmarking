@@ -1,0 +1,25 @@
+# Shared deployment policy. The two machine roles are independent of hostnames.
+# DIST_ROLE, DIST_CONTROL_ADDRESS, DIST_EXECUTION_ADDRESS and DIST_SERVER_NAME
+# are read from the local gitignored .env. Credential proofs stay in .secrets/.
+[deployment]
+role = ""
+control_id = "control"
+execution_id = "execution"
+
+[network]
+control_address = ""
+execution_address = ""
+server_name = ""
+broker_port = 9443
+
+[paths]
+tls_directory = ".secrets/distributed"
+base_image = "/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"
+broker_runtime_directory = "state/broker"
+storage_root = "/srv/stockage/cyber-dataset"
+
+[storage]
+postgres_data = "gpt-trace-extractor_postgres_data"
+browser_profile = "gpt-trace-extractor_browser_profile"
+runner_state = "gpt-trace-extractor_runner_state"
+benchmark_sources = "gpt-trace-extractor_benchmark_sources"

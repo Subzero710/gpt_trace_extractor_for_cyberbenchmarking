@@ -1,4 +1,4 @@
-"""Acer-only offline cleanup after a proved inactive managed broker.
+"""execution host-only offline cleanup after a proved inactive managed broker.
 
 No service starts, guest allocation or image mutation. The dispatcher supplies
 the same fixed deployment configuration used by serve, in the native venv.
@@ -15,7 +15,7 @@ from workstation_broker.preparation import same_process, PreparationManager
 
 
 def main():
-    if os.geteuid() != 0: raise RuntimeError("local cleanup requires Acer root")
+    if os.geteuid() != 0: raise RuntimeError("local cleanup requires execution host root")
     runtime = safe(Path(os.environ["WORKSTATION_BROKER_SOCKET"]).parent, directory=True)
     record_path = runtime / "broker-process.json"
     if record_path.exists():
@@ -40,7 +40,7 @@ def main():
             environment = (path / "environ").read_bytes().split(b"\0")
         except FileNotFoundError: continue
         if ("WORKSTATION_BROKER_EXECUTION_ID=" + os.environ["WORKSTATION_BROKER_EXECUTION_ID"]).encode() in environment:
-            raise RuntimeError("a native broker for this Acer deployment is still alive")
+            raise RuntimeError("a native broker for this execution host deployment is still alive")
     from workstation_broker.server import Broker, inventory
     base = Path(os.environ["WORKSTATION_BASE_IMAGE"])
     limits = __import__("tomllib").loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
@@ -62,7 +62,7 @@ def main():
     broker.destroy_all()
     proof = inventory(broker)
     if not proof["absent"]: raise RuntimeError("local resource absence unconfirmed")
-    print(json.dumps({"scope": "acer-local", "global": False, "broker_stopped": True,
+    print(json.dumps({"scope": "execution-local", "global": False, "broker_stopped": True,
         "inventory": proof, "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}))
 

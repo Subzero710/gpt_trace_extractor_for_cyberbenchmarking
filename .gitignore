@@ -21,6 +21,5 @@ exports/*.parquet
 # Distributed source migration and deployment-local configuration.
 .distributed-patch-backups/
 .unified-source-patch-backups/
-config/distributed.toml
 state/distributed/
 .local-preparation-patch-backups/

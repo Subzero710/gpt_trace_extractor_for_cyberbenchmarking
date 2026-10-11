@@ -193,28 +193,28 @@ class OfflineCertificateTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.directory = Path(cls.temp.name)
-        cls.result = provision(cls.directory / "pki", server_name="acer-broker.test",
-            acer_address="192.168.90.10", fossil_address="192.168.90.20")
-        cls.fossil = cls.directory / "pki/fossil"
-        cls.expected = {"control_id": "fossil", "execution_id": "acer", "acer_address": "192.168.90.10",
-            "fossil_address": "192.168.90.20", "server_name": "acer-broker.test", "port": 9443}
+        cls.result = provision(cls.directory / "pki", server_name="execution-broker.test",
+            execution_address="192.168.90.10", control_address="192.168.90.20")
+        cls.control = cls.directory / "pki/control"
+        cls.expected = {"control_id": "control", "execution_id": "execution", "execution_address": "192.168.90.10",
+            "control_address": "192.168.90.20", "server_name": "execution-broker.test", "port": 9443}
 
     @classmethod
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def verify(self, role="fossil", expected=None):
-        return verify_bundle(self.fossil, self.result["fossil"]["manifest_sha256"], role, expected or self.expected)
+    def verify(self, role="control", expected=None):
+        return verify_bundle(self.control, self.result["control"]["manifest_sha256"], role, expected or self.expected)
 
     def handshake(self, hostname):
         # OpenSSL's actual TLS engine over in-memory records; no socket or mocked TLS result.
         manifest = self.verify()
-        endpoint = Endpoint("mtls", Path("/unused.sock"), "https://acer-broker.test:9443", "192.168.90.10",
-            self.fossil / "ca.crt", self.fossil / "admin.crt", self.fossil / "admin.key", manifest["server_sha256"])
+        endpoint = Endpoint("mtls", Path("/unused.sock"), "https://execution-broker.test:9443", "192.168.90.10",
+            self.control / "ca.crt", self.control / "admin.crt", self.control / "admin.key", manifest["server_sha256"])
         server_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        acer = self.directory / "pki/acer"
-        server_context.load_verify_locations(cafile=str(acer / "ca.crt"))
-        server_context.load_cert_chain(str(acer / "server.crt"), str(acer / "server.key"))
+        execution = self.directory / "pki/execution"
+        server_context.load_verify_locations(cafile=str(execution / "ca.crt"))
+        server_context.load_cert_chain(str(execution / "server.crt"), str(execution / "server.key"))
         server_context.verify_mode = ssl.CERT_REQUIRED
         server_context.minimum_version = ssl.TLSVersion.TLSv1_2
         client_in, client_out, server_in, server_out = (ssl.MemoryBIO() for _ in range(4))
@@ -238,21 +238,21 @@ class OfflineCertificateTests(unittest.TestCase):
     def test_real_certificate_bundles_and_scopes_validate_offline(self):
         manifest = self.verify()
         self.assertEqual(manifest["server_sha256"], self.result["server_certificate_sha256"])
-        self.assertFalse((self.fossil / "server.key").exists())
-        self.assertFalse((self.directory / "pki/acer/admin.key").exists())
-        self.assertNotEqual(certificate_sha(self.fossil / "admin.crt"), certificate_sha(self.fossil / "controller.crt"))
-        endpoint = Endpoint("mtls", Path("/unused.sock"), "https://acer-broker.test:9443", "192.168.90.10",
-            self.fossil / "ca.crt", self.fossil / "admin.crt", self.fossil / "admin.key", manifest["server_sha256"])
+        self.assertFalse((self.control / "server.key").exists())
+        self.assertFalse((self.directory / "pki/execution/admin.key").exists())
+        self.assertNotEqual(certificate_sha(self.control / "admin.crt"), certificate_sha(self.control / "controller.crt"))
+        endpoint = Endpoint("mtls", Path("/unused.sock"), "https://execution-broker.test:9443", "192.168.90.10",
+            self.control / "ca.crt", self.control / "admin.crt", self.control / "admin.key", manifest["server_sha256"])
         self.assertTrue(endpoint.client_context().check_hostname)
 
     def test_wrong_role_or_host_identity_is_rejected(self):
-        with self.assertRaises(ValueError): self.verify("acer")
+        with self.assertRaises(ValueError): self.verify("execution")
         with self.assertRaises(ValueError): self.verify(expected={**self.expected, "control_id": "wrong-host"})
 
     def test_actual_mtls_handshake_and_encrypted_bytes_without_network(self):
-        client, server, output, target = self.handshake("acer-broker.test")
+        client, server, output, target = self.handshake("execution-broker.test")
         self.assertEqual(hashlib.sha256(client.getpeercert(binary_form=True)).hexdigest(), self.result["server_certificate_sha256"])
-        self.assertEqual(hashlib.sha256(server.getpeercert(binary_form=True)).hexdigest(), certificate_sha(self.fossil / "admin.crt"))
+        self.assertEqual(hashlib.sha256(server.getpeercert(binary_form=True)).hexdigest(), certificate_sha(self.control / "admin.crt"))
         content = os.urandom(4096)
         self.assertEqual(client.write(content), len(content))
         while output.pending: target.write(output.read())
@@ -262,14 +262,14 @@ class OfflineCertificateTests(unittest.TestCase):
         with self.assertRaises(ssl.SSLCertVerificationError): self.handshake("wrong-host.test")
 
     def test_altered_token_and_key_permissions_are_rejected(self):
-        token = self.fossil / "workstation_broker_admin_token"
+        token = self.control / "workstation_broker_admin_token"
         raw = token.read_bytes()
         try:
             token.write_bytes(b"x" * 64)
             with self.assertRaises(ValueError): self.verify()
         finally:
             token.write_bytes(raw)
-        key = self.fossil / "admin.key"
+        key = self.control / "admin.key"
         try:
             key.chmod(0o644)
             with self.assertRaises(IdentityFailure): self.verify()
@@ -278,9 +278,9 @@ class OfflineCertificateTests(unittest.TestCase):
 
     def test_public_or_equal_host_addresses_are_rejected_before_creation(self):
         output = self.directory / "invalid"
-        for acer, fossil in (("8.8.8.8", "192.168.1.2"), ("192.168.1.2", "192.168.1.2")):
+        for execution, control in (("8.8.8.8", "192.168.1.2"), ("192.168.1.2", "192.168.1.2")):
             with self.assertRaises(ValueError):
-                provision(output, server_name="acer.test", acer_address=acer, fossil_address=fossil)
+                provision(output, server_name="execution.test", execution_address=execution, control_address=control)
         self.assertFalse(output.exists())
 
 

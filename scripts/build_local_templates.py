@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential local Acer builder; invoked only by the authenticated preparation job."""
+"""Sequential local execution host builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
 import argparse
@@ -242,7 +242,7 @@ def install_generation(staged, target_root, manifest, validate):
 
 def build(args):
     if os.geteuid() != 0:
-        raise RuntimeError("local preparation requires the Acer root execution broker")
+        raise RuntimeError("local preparation requires the execution host root execution broker")
     from workstation_broker.preparation import verify_worker_claim
     job = verify_worker_claim(args.operation_id)
     from workstation_broker.preparation_resources import source_container_arguments
@@ -338,7 +338,7 @@ def build(args):
         try:
             inputs_root = staged / "build-inputs"
             inputs_root.mkdir()
-            # Acer has no control-plane deployment,
+            # execution host has no control-plane deployment,
             # credentials, Compose services or persistent campaign volumes.
             # Build only a source-fetch image and bind its private build cache.
             image = "gpt-trace-lite-local-source:" + digest(PINS)[:32]
@@ -601,7 +601,7 @@ PY_GUEST
 
 
 def main():
-    raise SystemExit("Use make superbench-fetch ADAPTER=swe-gym-lite on Fossil; this local builder is an internal worker recipe")
+    raise SystemExit("Use make superbench-fetch ADAPTER=swe-gym-lite on the control host; this local builder is an internal worker recipe")
 
 
 if __name__ == "__main__":

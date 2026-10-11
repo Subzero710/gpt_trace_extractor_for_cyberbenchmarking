@@ -173,7 +173,7 @@ class DurableJobProcessTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.parent = Path(self.temp.name)
         self.files = fixture(self.parent)
-        self.deployment = {"control_id": "fixture-fossil", "execution_id": "fixture-acer"}
+        self.deployment = {"control_id": "fixture-control", "execution_id": "fixture-execution"}
         self.manager = jobs.PreparationManager(self.files.base, self.files.root, self.files.registry,
             source_root=ROOT, deployment=self.deployment)
         self.identified = self.manager.probe({"source_contract": local.source_contract(ROOT)})
@@ -275,7 +275,7 @@ finally:
 
     def refresh_process_fixture(self):
         # The synthetic process table follows the observed real child exit;
-        # fixture records never stand in for physical Acer process inspection.
+        # fixture records never stand in for physical execution host process inspection.
         for process in self.children:
             if process.poll() is not None:
                 folder = self.proc / str(process.pid)
@@ -424,7 +424,7 @@ finally:
 class SourceContainerOwnershipTests(unittest.TestCase):
     """Actual discovery/cleanup functions with explicit Docker CLI responses."""
     def setUp(self):
-        self.deployment = {'control_id': 'fixture-fossil', 'execution_id': 'fixture-acer'}
+        self.deployment = {'control_id': 'fixture-control', 'execution_id': 'fixture-execution'}
         self.operation_id = hashlib.sha256(b'fixture operation').hexdigest()
         self.container_id = hashlib.sha256(b'fixture container identity').hexdigest()
         self.state = {'operation_id': self.operation_id, 'attempt': 2, 'deployment': self.deployment}
@@ -457,7 +457,7 @@ class SourceContainerOwnershipTests(unittest.TestCase):
     def test_foreign_execution_wrong_name_and_unrecorded_job_preserved(self):
         for attack in ('execution', 'name', 'job'):
             row = copy.deepcopy(self.row)
-            if attack == 'execution': row['Config']['Labels'][resources.LABEL + 'execution_id'] = 'foreign-acer'
+            if attack == 'execution': row['Config']['Labels'][resources.LABEL + 'execution_id'] = 'foreign-execution'
             elif attack == 'name': row['Name'] = '/foreign-container'
             self.row = row
             with patch.object(resources.subprocess, 'check_output', side_effect=self.output), patch.object(resources.subprocess, 'run', side_effect=AssertionError('foreign mutation')):
@@ -508,7 +508,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
 
     def test_single_explicit_fetch_polls_and_never_repeats_a_lost_start(self):
         with tempfile.TemporaryDirectory() as temp:
-            cfg = {"deployment": {"control_id": "fixture-fossil", "execution_id": "fixture-acer"}}
+            cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
             expected = {**local.source_contract(ROOT), "golden_sha256": hashlib.sha256(b"actual fixture golden bytes").hexdigest()}
             operation_id = hashlib.sha256(local.canonical(expected)).hexdigest()
             identified = {"operation_id": operation_id, "compatibility": expected, "deployment": cfg["deployment"]}
@@ -558,7 +558,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 stamp = jobs.process_identity(process.pid)
                 shutdown_id = secrets.token_hex(32)
                 value = {"project": "gpt-trace-extractor", "scope": "global", "shutdown_id": shutdown_id,
-                    "deployment": {"control_id": "fixture-fossil", "execution_id": "fixture-acer"},
+                    "deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"},
                     "broker_stopped": True, "broker_identity": stamp,
                     "inventory": {"project": "gpt-trace-extractor", "absent": True}}
                 with patch.dict(os.environ, {"WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(path)}):
@@ -581,7 +581,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 if "proc_patch" in locals(): proc_patch.stop()
 
     def test_network_loss_is_not_broker_exit_confirmation(self):
-        cfg = {"deployment": {"control_id": "fixture-fossil", "execution_id": "fixture-acer"}}
+        cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
         clock = iter([0, 0, 101])
         with patch.object(self.dispatch, "broker", side_effect=TransportFailure("link unavailable")), patch.object(self.dispatch.time, "monotonic", side_effect=lambda: next(clock)), patch.object(self.dispatch.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
@@ -590,7 +590,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
             with self.assertRaises(IdentityFailure): self.dispatch.confirm_remote_shutdown(cfg, secrets.token_hex(32))
 
     def test_global_shutdown_requires_post_exit_proof_before_recording_success(self):
-        cfg = {"deployment": {"role": "fossil", "control_id": "fixture-fossil", "execution_id": "fixture-acer"}}
+        cfg = {"deployment": {"role": "control", "control_id": "fixture-control", "execution_id": "fixture-execution"}}
         calls = []
         def command(args, **kw):
             if args[:3] == ["docker", "volume", "ls"]: return "persistent_database\npersistent_checkpoints"
@@ -608,12 +608,12 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
             self.assertFalse((Path(temp) / "state/distributed/last-cleanup.json").exists())
         self.assertEqual(calls, ["begin_shutdown", "inventory", "destroy_all", "inventory", "shutdown"])
 
-    def test_acer_local_scope_is_explicit_before_cleanup(self):
-        cfg = {"deployment": {"role": "acer"}, "paths": {}, "network": {}}
-        with patch.object(self.dispatch, "acer_environment", side_effect=RuntimeError("fixture stop before deployment access")), contextlib.redirect_stdout(io.StringIO()) as output:
+    def test_execution_local_scope_is_explicit_before_cleanup(self):
+        cfg = {"deployment": {"role": "execution"}, "paths": {}, "network": {}}
+        with patch.object(self.dispatch, "execution_environment", side_effect=RuntimeError("fixture stop before deployment access")), contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(RuntimeError): self.dispatch.local_down(cfg)
-        self.assertIn("scope=acer-local; global=false", output.getvalue())
-        self.assertIn("Fossil campaign/services are not stopped", output.getvalue())
+        self.assertIn("scope=execution-local; global=false", output.getvalue())
+        self.assertIn("control host campaign/services are not stopped", output.getvalue())
 
     def test_scientific_contract_and_hidden_evaluator_routing_are_unchanged(self):
         pins = json.loads((ROOT / local.PINS).read_bytes())

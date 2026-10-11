@@ -131,39 +131,39 @@ class InterfaceAndShutdownTests(unittest.TestCase):
         for target in targets:
             self.assertIn("python3 scripts/distributed.py " + target, make)
 
-    def test_acer_refuses_control_operations_before_any_side_effect(self):
+    def test_execution_refuses_control_operations_before_any_side_effect(self):
         for action in ("run", "resume", "register_apps", "export-parquet"):
             with patch.object(self.dispatch, "host") as host:
-                with self.assertRaises(RuntimeError): self.dispatch.acer({"deployment": {"role": "acer"}}, action, None)
+                with self.assertRaises(RuntimeError): self.dispatch.execution({"deployment": {"role": "execution"}}, action, None)
                 host.assert_not_called()
 
-    def test_fossil_host_plan_checks_docker_without_kvm_or_libvirt(self):
+    def test_control_host_plan_checks_docker_without_kvm_or_libvirt(self):
         """Command-planning boundary test, not a physical host prerequisite test."""
-        cfg = {"network": {"fossil_address": "192.168.90.20"}}
+        cfg = {"network": {"control_address": "192.168.90.20"}}
         addresses = [{"addr_info": [{"family": "inet", "local": "192.168.90.20"}]}]
         with patch.object(self.dispatch.platform, "system", return_value="Linux"), patch.object(Path, "read_text", return_value='ID=ubuntu\nVERSION_ID="26.04"\n'), patch.object(self.dispatch, "json_command", return_value=addresses), patch.object(self.dispatch, "run", return_value="ok") as command:
-            self.dispatch.host("fossil", cfg, build_tools=True)
+            self.dispatch.host("control", cfg, build_tools=True)
         self.assertEqual([call.args[0] for call in command.call_args_list], [
             ["docker", "info", "--format", "{{.ServerVersion}}"],
             ["docker", "compose", "version"], ["docker", "buildx", "version"]])
 
     def test_only_explicit_lite_fetch_triggers_administrative_preparation(self):
         from types import SimpleNamespace
-        cfg = {"deployment": {"role": "fossil"}}
+        cfg = {"deployment": {"role": "control"}}
         for adapter in ("gaia", "swe-gym-lite"):
             calls = []
             with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "compose", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=lambda *a, **k: calls.append(("prepare", a))):
-                self.dispatch.fossil(cfg, "superbench-fetch", SimpleNamespace(adapter=adapter))
+                self.dispatch.control(cfg, "superbench-fetch", SimpleNamespace(adapter=adapter))
             self.assertEqual(calls[1], ("fetch", ("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", adapter)))
             self.assertEqual([x[0] for x in calls], ["project", "fetch"] + (["prepare"] if adapter == "swe-gym-lite" else []))
 
     def test_no_image_build_in_up_run_or_resume(self):
         parsed = ast.parse((ROOT / "scripts/distributed.py").read_bytes())
-        acer = next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == "acer")
-        source = ast.get_source_segment((ROOT / "scripts/distributed.py").read_text(), acer)
+        execution = next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == "execution")
+        source = ast.get_source_segment((ROOT / "scripts/distributed.py").read_text(), execution)
         self.assertNotIn("install_templates", source)
-        build = next(n for n in acer.body if isinstance(n, ast.If) and ast.unparse(n.test) == "action == 'build'")
-        remaining = copy.deepcopy(acer)
+        build = next(n for n in execution.body if isinstance(n, ast.If) and ast.unparse(n.test) == "action == 'build'")
+        remaining = copy.deepcopy(execution)
         remaining.body.remove(next(n for n in remaining.body if isinstance(n, ast.If) and ast.unparse(n.test) == "action == 'build'"))
         self.assertNotIn("build_workstation_base_image", ast.unparse(remaining))
         self.assertNotIn("build_local_templates", source)
@@ -237,7 +237,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
             if args[:2] == ["docker", "rm"]: state["containers"] = False
             if args[:3] == ["docker", "network", "rm"]: state["networks"] = False
             return ""
-        cfg = {"deployment": {"role": "fossil"}}
+        cfg = {"deployment": {"role": "control"}}
         with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "config", side_effect=ValueError("expired certificate")), patch.object(self.dispatch, "run", side_effect=command):
             with self.assertRaisesRegex(ValueError, "expired"):
                 self.dispatch.global_down(cfg)

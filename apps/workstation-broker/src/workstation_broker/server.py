@@ -291,7 +291,7 @@ add rule inet {table} input iifname "{bridge}" drop
                         self.templates.task_scope(record, logical)
         except (OSError, ValueError) as exc:
             raise RuntimeError("SWE-Gym Lite local artifacts are unavailable/incompatible: " + str(exc) +
-                "; run make superbench-fetch ADAPTER=swe-gym-lite on Fossil") from exc
+                "; run make superbench-fetch ADAPTER=swe-gym-lite on the control host") from exc
         return {"templates": selected}
 
     async def create(self, ident: dict, template_id: str | None = None, logical_task_id=None, *, _selection=None) -> dict:
@@ -1050,7 +1050,7 @@ def main():
     if uds.is_symlink(): raise RuntimeError("untrusted native broker socket")
     if uds.exists(): uds.unlink()
     stamp = process_identity(os.getpid())
-    if stamp is None: raise RuntimeError("Acer native process identity is unavailable")
+    if stamp is None: raise RuntimeError("execution host native process identity is unavailable")
     atomic_json(record_path, {"schema": 1, "broker_identity": stamp,
         "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}, 0o600)

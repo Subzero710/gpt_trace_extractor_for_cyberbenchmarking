@@ -76,7 +76,7 @@ async def exercise(adapter_name=None):
             program += " try:\n  s.connect((address,port))\n except OSError:\n  pass\n else:\n  raise SystemExit('Control Plane reachable from Kali')\n finally:\n  s.close()\n"
             isolation = await runtime.call("exec_command", {"command": "python3 -c 'import sys; exec(sys.stdin.read())'",
                 "stdin": program, "cwd": "/tmp", "timeout_seconds": 20})
-            if isolation["exit_code"] != 0: raise RuntimeError("Kali reached Fossil: " + isolation["stderr"])
+            if isolation["exit_code"] != 0: raise RuntimeError("Kali reached control host: " + isolation["stderr"])
             # Force a new HTTPS connection and rebind the exact surviving runtime through the normal recovery contract.
             await lifecycle.assert_resume(task, environments, fingerprint, attempt=1)
             if await lifecycle.runtime_metadata(task, environments, fingerprint, attempt=1) != first:

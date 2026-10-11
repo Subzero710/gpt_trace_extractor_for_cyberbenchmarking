@@ -37,7 +37,7 @@ def issue(root, name, san, usage):
             str(certificate))
 
 
-def provision(output, *, server_name, acer_address, fossil_address, control_id="fossil", execution_id="acer",
+def provision(output, *, server_name, execution_address, control_address, control_id="control", execution_id="execution",
               port=9443, tokens_from=None):
     output = Path(output).absolute()
     for parent in (output, *output.parents):
@@ -48,8 +48,8 @@ def provision(output, *, server_name, acer_address, fossil_address, control_id="
     for name in (control_id, execution_id):
         if not re.fullmatch(r"[a-zA-Z0-9-]{1,63}", name):
             raise ValueError("invalid host identity")
-    acer_address, fossil_address = private_address(acer_address), private_address(fossil_address)
-    if acer_address == fossil_address or control_id == execution_id or not 1024 <= port <= 65535:
+    execution_address, control_address = private_address(execution_address), private_address(control_address)
+    if execution_address == control_address or control_id == execution_id or not 1024 <= port <= 65535:
         raise ValueError("hosts must have distinct identities and private addresses")
     output.mkdir(mode=0o700, parents=True)
     authority = output / "authority"
@@ -68,48 +68,32 @@ def provision(output, *, server_name, acer_address, fossil_address, control_id="
         (authority / name).chmod(0o600)
     if token(authority / "workstation_broker_admin_token") == token(authority / "workstation_broker_controller_token"):
         raise ValueError("admin and controller tokens must be distinct")
-    metadata = {"schema": 1, "server_name": server_name, "acer_address": acer_address,
-                "fossil_address": fossil_address, "control_id": control_id, "execution_id": execution_id,
+    metadata = {"schema": 1, "server_name": server_name, "execution_address": execution_address,
+                "control_address": control_address, "control_id": control_id, "execution_id": execution_id,
                 "port": port, "server_sha256": certificate_sha(authority / "server.crt")}
     result = {}
-    for role in ("acer", "fossil"):
+    for role in ("execution", "control"):
         directory = output / role
         directory.mkdir(mode=0o700)
         names = ["ca.crt", "server.crt", "admin.crt", "controller.crt",
                  "workstation_broker_admin_token", "workstation_broker_controller_token"]
-        names += ["server.key"] if role == "acer" else ["admin.key", "controller.key"]
+        names += ["server.key"] if role == "execution" else ["admin.key", "controller.key"]
         for name in names:
             shutil.copyfile(authority / name, directory / name)
             (directory / name).chmod(0o600 if name.endswith(".key") or name.endswith("_token") else 0o644)
         manifest = {**metadata, "role": role, "files": {name: digest(directory / name) for name in names}}
         (directory / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         bundle_sha = digest(directory / "manifest.json")
-        cfg = f'''# Generated deployment configuration; contains no secret.
-[deployment]
-role = {json.dumps(role)}
-control_id = {json.dumps(control_id)}
-execution_id = {json.dumps(execution_id)}
-bundle_manifest_sha256 = {json.dumps(bundle_sha)}
-
-[network]
-acer_address = {json.dumps(acer_address)}
-fossil_address = {json.dumps(fossil_address)}
-server_name = {json.dumps(server_name)}
-broker_port = {port}
-
-[paths]
-tls_directory = ".secrets/distributed"
-base_image = "/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"
-broker_runtime_directory = "state/broker"
-storage_root = "/srv/stockage/cyber-dataset"
-
-[storage]
-postgres_data = "gpt-trace-extractor_postgres_data"
-browser_profile = "gpt-trace-extractor_browser_profile"
-runner_state = "gpt-trace-extractor_runner_state"
-benchmark_sources = "gpt-trace-extractor_benchmark_sources"
-'''
-        (directory / "distributed.toml").write_text(cfg)
+        # The installer transfers the expected digest with the credential bundle.
+        # It is not entered in .env or generated from the manifest at runtime.
+        (directory / "manifest.sha256").write_text(bundle_sha + "\n")
+        (directory / "manifest.sha256").chmod(0o600)
+        (directory / "distributed.env").write_text(
+            f"DIST_ROLE={role}\n"
+            f"DIST_CONTROL_ADDRESS={control_address}\n"
+            f"DIST_EXECUTION_ADDRESS={execution_address}\n"
+            f"DIST_SERVER_NAME={server_name}\n")
+        (directory / "distributed.env").chmod(0o600)
         result[role] = {"manifest_sha256": bundle_sha, "directory": str(directory)}
     result["server_certificate_sha256"] = metadata["server_sha256"]
     return result
@@ -119,12 +103,17 @@ def verify_bundle(directory, expected, role, cfg):
     directory = Path(directory)
     if directory.is_symlink() or directory.stat().st_mode & 0o077:
         raise ValueError("credential bundle directory must be private mode 0700")
+    if expected is None:
+        # The expected digest was generated by provisioning, never configured
+        # by the operator. Missing/changed pin fails closed. The initial transfer
+        # must still be authenticated; a colocated checksum is not a trust root.
+        expected = safe_file(directory / "manifest.sha256", secret=True).decode("ascii").strip()
     raw = safe_file(directory / "manifest.json")
     if not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError("bundle manifest fingerprint mismatch; verify transfer out of band")
     manifest = json.loads(raw)
     names = {"ca.crt", "server.crt", "admin.crt", "controller.crt", "workstation_broker_admin_token", "workstation_broker_controller_token"}
-    names |= {"server.key"} if role == "acer" else {"admin.key", "controller.key"}
+    names |= {"server.key"} if role == "execution" else {"admin.key", "controller.key"}
     if manifest.get("schema") != 1 or manifest.get("role") != role or set(manifest.get("files", {})) != names:
         raise ValueError("wrong bundle role/schema/files")
     for key, value in cfg.items():
@@ -148,15 +137,15 @@ def main():
     parser = argparse.ArgumentParser(description="Offline, dedicated broker CA and separate host credential bundles")
     parser.add_argument("--output", required=True)
     parser.add_argument("--server-name", required=True)
-    parser.add_argument("--acer-address", required=True)
-    parser.add_argument("--fossil-address", required=True)
-    parser.add_argument("--control-id", default="fossil")
-    parser.add_argument("--execution-id", default="acer")
+    parser.add_argument("--execution-address", required=True)
+    parser.add_argument("--control-address", required=True)
+    parser.add_argument("--control-id", default="control")
+    parser.add_argument("--execution-id", default="execution")
     parser.add_argument("--port", type=int, default=9443)
     parser.add_argument("--tokens-from")
     args = parser.parse_args()
-    print(json.dumps(provision(args.output, server_name=args.server_name, acer_address=args.acer_address,
-        fossil_address=args.fossil_address, control_id=args.control_id, execution_id=args.execution_id,
+    print(json.dumps(provision(args.output, server_name=args.server_name, execution_address=args.execution_address,
+        control_address=args.control_address, control_id=args.control_id, execution_id=args.execution_id,
         port=args.port, tokens_from=args.tokens_from), indent=2))
 
 

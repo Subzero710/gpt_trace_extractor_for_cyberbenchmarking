@@ -1,4 +1,4 @@
-"""Persistent shutdown barrier; explicit Acer up reopens only audited absence."""
+"""Persistent shutdown barrier; explicit execution host up reopens only audited absence."""
 from __future__ import annotations
 import json
 import os
@@ -36,7 +36,7 @@ def mark_draining(path):
 
 
 def reopen():
-    if os.geteuid() != 0: raise RuntimeError("Acer admission requires root")
+    if os.geteuid() != 0: raise RuntimeError("execution host admission requires root")
     marker = barrier_path()
     read_barrier(marker, deployment())
     state = subprocess.check_output(["systemctl", "show", "--property=ActiveState", "--value",
@@ -63,7 +63,7 @@ def reopen():
     manager = PreparationManager(base, templates.root, templates)
     view = SimpleNamespace(root=Path(os.environ["WORKSTATION_BROKER_STATE"]), preparations=manager)
     if not inventory(view)["absent"]:
-        raise RuntimeError("temporary project resources remain; complete make down on Acer before reopening admission")
+        raise RuntimeError("temporary project resources remain; complete make down on execution host before reopening admission")
     safe(marker)
     marker.unlink()
     sync_directory(marker.parent)

@@ -22,7 +22,7 @@ from workstation_broker.preparation import (identifier, process_identity,
     same_process, PreparationManager)
 
 PROJECT = "gpt-trace-extractor"
-SCOPES = frozenset({"global", "acer-local"})
+SCOPES = frozenset({"global", "execution-local"})
 
 
 def proof_path(shutdown_id):
@@ -122,7 +122,7 @@ class Confirmation:
 
 
 def observe(shutdown_id):
-    if os.geteuid() != 0: raise RuntimeError("shutdown observer requires Acer root")
+    if os.geteuid() != 0: raise RuntimeError("shutdown observer requires execution host root")
     path = proof_path(shutdown_id)
     value = read_proof(shutdown_id)
     if value["status"] != "waiting" or value["observer"] is not None or not same_process(value["broker_identity"]):
@@ -146,7 +146,7 @@ def observe(shutdown_id):
         if not proof["absent"]: raise RuntimeError("project resources appeared after native broker exit")
         value = {**value, "status": "stopped", "broker_stopped": True,
                  "inventory": proof, "observed_at": time.time()}
-        if value["scope"] == "acer-local":
+        if value["scope"] == "execution-local":
             atomic_json(path, value, 0o600)
             return
         confirmation = Confirmation(value)

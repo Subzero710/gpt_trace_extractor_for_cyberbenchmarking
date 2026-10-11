@@ -1,7 +1,7 @@
 # SWE-Gym Lite
 
 `swe-gym-lite` uses the ordinary Kali Workstation App with runner-owned setup,
-candidate capture and native grading. Template construction is triggered only by explicit Fossil
+candidate capture and native grading. Template construction is triggered only by explicit control host
 `make superbench-fetch ADAPTER=swe-gym-lite`. Campaigns never build missing permanent environments.
 
 ## Pinned sources and validated contract
@@ -117,7 +117,7 @@ hashes, recipe/schema/security contract, and final common/repo QCOW2 hashes.
 Relative backing paths avoid a generation-directory hash cycle. Different
 resolved bytes cannot reuse a previous generation identity.
 
-The local builder `scripts/build_local_templates.py` runs only inside the root-owned administrative job on Acer. It reuses the pinned recipes and constructs sequential sparse images. It monitors the existing 64 GiB free-space safety margin and reports the measured common/repository/archive/setup-cache allocation. The existing per-guest build timeout remains 96 hours. Default template virtual capacity remains 512 GiB; the attempt reservation stays separately configured.
+The local builder `scripts/build_local_templates.py` runs only inside the root-owned administrative job on the execution host. It reuses the pinned recipes and constructs sequential sparse images. It monitors the existing 64 GiB free-space safety margin and reports the measured common/repository/archive/setup-cache allocation. The existing per-guest build timeout remains 96 hours. Default template virtual capacity remains 512 GiB; the attempt reservation stays separately configured.
 
 The complete byte inventory in `local-validation.json` binds all files to the actual source recipe, native helpers, verified golden and generation. It contains only SHA-256 values calculated from actual built bytes. Installation seals files and directories, atomically renames the complete generation, rechecks native QCOW2 chains and all task scopes, then atomically activates `registry.json`. Validation failure retains diagnostics and leaves the previous registry/generations unchanged. Completed generations are never automatically removed, including generations referenced by recovery checkpoints.
 
@@ -125,7 +125,7 @@ The broker checks owner, permissions, manifest/recipe/provenance, 230 source map
 
 ## Preparation and deployment
 
-After installing the role configuration, on Acer:
+After installing the role configuration, on the execution host:
 
 ```bash
 sudo make requirements
@@ -134,7 +134,7 @@ sudo make up
 sudo make doctor
 ```
 
-Build prepares the broker and local pinned Kali golden. Up starts only the broker; neither prepares Lite. On Fossil:
+Build prepares the broker and local pinned Kali golden. Up starts only the broker; neither prepares Lite. On the control host:
 
 ```bash
 sudo make build
@@ -147,13 +147,13 @@ make status
 make export-parquet
 ```
 
-Fetch first runs the unchanged benchmark source fetcher, which verifies the official pinned dataset and exact task contract. Fossil and Acer then compare their source/recipe fingerprints. A preparation ID is derived from these exact inputs and the actual verified golden. Only Fossil's administrative certificate/token, exact source address and existing pinned mTLS transport can start/query the job. Controller/MCP/model/guest credentials cannot access preparation, lifecycle or evaluator routes. There is no shell RPC, arbitrary command or task-controlled installation path.
+Fetch first runs the unchanged benchmark source fetcher, which verifies the official pinned dataset and exact task contract. control host and execution host then compare their source/recipe fingerprints. A preparation ID is derived from these exact inputs and the actual verified golden. Only the control host's administrative certificate/token, exact source address and existing pinned mTLS transport can start/query the job. Controller/MCP/model/guest credentials cannot access preparation, lifecycle or evaluator routes. There is no shell RPC, arbitrary command or task-controlled installation path.
 
 The native broker starts one detached, finite worker and responds immediately. Short status requests report `starting`, `running`, `validating`, `ready`, or an explicit terminal error. A root-only state directory and an inherited flock identify the job across disconnects and broker restarts. PID, boot ID, start time and private process session prevent ambiguous duplicate mutations. A lost response never causes an automatic start retry. Rerunning the explicit fetch rediscovers the ID; only a proved-dead failed/interrupted job can be retried. Sealed results interrupted before activation can be validated and activated without rebuilding. Failed build stages, logs and original valid generations remain available for investigation.
 
 Fetch returns success only after complete validation and activation, and records the actual generation. Permanent reuse checks the full immutable inventory, provenance and recorded integrity signatures. GAIA fetch remains unchanged and does not invoke the Lite builder. Source/dependency downloads needed for this local construction are verified by the existing pins, Git commits, package hashes and resolved provenance. No external image publication or image registry is used.
 
-`make down` on Fossil drains both runtime mutations and finite preparation workers, destroys only project-owned temporary resources, proves their absence and requests native broker exit. A finite, admin-only mTLS confirmation child reuses the existing listener after the actual broker PID/start-time has disappeared, audits absence again, confirms the fresh shutdown ID, and exits. A failed connection is never absence or broker-exit evidence. Acer `make down` performs local cleanup/exit and explicitly reports that Fossil campaign/services are outside this local scope. Golden, templates, permanent sources/environments, PostgreSQL, Docker volumes, traces and checkpoints are retained.
+`make down` on the control host drains both runtime mutations and finite preparation workers, destroys only project-owned temporary resources, proves their absence and requests native broker exit. A finite, admin-only mTLS confirmation child reuses the existing listener after the actual broker PID/start-time has disappeared, audits absence again, confirms the fresh shutdown ID, and exits. A failed connection is never absence or broker-exit evidence. execution host `make down` performs local cleanup/exit and explicitly reports that control host campaign/services are outside this local scope. Golden, templates, permanent sources/environments, PostgreSQL, Docker volumes, traces and checkpoints are retained.
 
 ## Grading and recovery
 
@@ -220,9 +220,9 @@ python -m pytest apps/runner/tests apps/workstation-broker/tests \
   apps/kali-workstation/tests apps/mcp-gateway/tests -q
 ```
 
-The source root must contain `swe-gym-lite/train-00000-of-00001.parquet` with the pinned checksum. The live dataset test reports its prerequisite when absent. Native source sanitization, exact submodules, scoped delivery, isolated evaluator, hidden-data routing, clean setup before candidate application, grading and checkpoint recovery retain their existing regression tests. `python3 scripts/distributed.py acceptance --adapter swe-gym-lite` on Fossil is the separate physical acceptance operation. It requires actual hosts and a successfully prepared generation; offline source checks never substitute for it.
+The source root must contain `swe-gym-lite/train-00000-of-00001.parquet` with the pinned checksum. The live dataset test reports its prerequisite when absent. Native source sanitization, exact submodules, scoped delivery, isolated evaluator, hidden-data routing, clean setup before candidate application, grading and checkpoint recovery retain their existing regression tests. `python3 scripts/distributed.py acceptance --adapter swe-gym-lite` on the control host is the separate physical acceptance operation. It requires actual hosts and a successfully prepared generation; offline source checks never substitute for it.
 
-The shutdown admission barrier is durable across broker restarts. Explicit Acer `make up` reopens it only after the managed broker and confirmation child are stopped and a fresh ownership audit proves temporary project resources absent. It never repairs templates or destroys resources while starting.
+The shutdown admission barrier is durable across broker restarts. Explicit execution host `make up` reopens it only after the managed broker and confirmation child are stopped and a fresh ownership audit proves temporary project resources absent. It never repairs templates or destroys resources while starting.
 
 
 Finite preparations inherit a root-only cgroup v2 subtree of the existing `gpt-trace-distributed-broker.service` (`Delegate=yes`). Libguestfs uses its direct backend so detached helper processes remain inside this job's subtree. The durable job records this scope alongside PID/boot identity. Cleanup uses pidfds and, when required, the kernel subtree kill, then verifies the populated event and removes only the empty temporary scope. Source-fetch containers carry project, execution, preparation and attempt labels plus a fixed derived name; cleanup rechecks their identity, stops/removes only these temporary containers, and never prunes volumes or images. Unknown scopes, foreign container identities or unavailable inventory block a success claim. Fetch waits for the finite worker and its auxiliary resources to finish before reporting readiness.

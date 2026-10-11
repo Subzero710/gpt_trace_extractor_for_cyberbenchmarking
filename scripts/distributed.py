@@ -49,28 +49,80 @@ def path_from_config(value):
     return path
 
 
+
+# Only local routing values belong in .env. No secrets or manifest SHA must be
+# copied by the operator; PKI provisioning creates a protected pin sidecar.
+DISTRIBUTED_ENV_FIELDS = {
+    ("deployment", "role"): "DIST_ROLE",
+    ("network", "control_address"): "DIST_CONTROL_ADDRESS",
+    ("network", "execution_address"): "DIST_EXECUTION_ADDRESS",
+    ("network", "server_name"): "DIST_SERVER_NAME",
+}
+
+def local_deployment_env():
+    source = ROOT / ".env"
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("missing/unsafe local .env; copy .env.example and set DIST_* fields")
+    if source.stat().st_mode & 0o022:
+        raise ValueError("local .env must not be group/world writable")
+    keys = set(DISTRIBUTED_ENV_FIELDS.values())
+    result = {}
+    # This does not execute a shell or expand arbitrary application credentials.
+    for line in source.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        name, sep, value = line.partition("=")
+        name = name.strip()
+        if not sep or name not in keys:
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError("invalid quoted .env field: " + name)
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].rstrip()
+        if name in result:
+            raise ValueError("duplicate .env field: " + name)
+        if not value or len(value) > 253 or any(ch.isspace() or ord(ch) < 32 for ch in value):
+            raise ValueError("invalid or empty .env field: " + name)
+        result[name] = value
+    return result
+
 def config(role=None, *, credentials=True):
     source = ROOT / "config/distributed.toml"
     if source.is_symlink(): raise ValueError("unsafe distributed configuration")
     cfg = tomllib.loads(source.read_text())
     required = {
-        "deployment": {"role", "control_id", "execution_id", "bundle_manifest_sha256"},
-        "network": {"acer_address", "fossil_address", "server_name", "broker_port"},
+        "deployment": {"role", "control_id", "execution_id"},
+        "network": {"execution_address", "control_address", "server_name", "broker_port"},
         "paths": {"tls_directory", "base_image", "broker_runtime_directory", "storage_root"},
         "storage": set(VOLUMES),
     }
     if set(cfg) != set(required) or any(set(cfg[section]) != keys for section, keys in required.items()):
         raise ValueError("distributed.toml has missing or unknown fields")
+    # The committed configuration is common to both roles; fail closed without
+    # an explicit local role/IP/TLS identity, and never infer from hostnames.
+    local = local_deployment_env()
+    for (section, field), env_key in DISTRIBUTED_ENV_FIELDS.items():
+        if cfg[section][field] != "":
+            raise ValueError("tracked distributed.toml cannot hardcode host identity: " + field)
+        if env_key not in local:
+            raise ValueError("missing " + env_key + " in local .env")
+        cfg[section][field] = local[env_key]
     configured_role = cfg["deployment"]["role"]
-    if configured_role not in {"acer", "fossil"}:
+    if configured_role not in {"execution", "control"}:
         raise ValueError("distributed.toml must explicitly identify the physical host role")
     if role is not None and configured_role != role:
         raise ValueError("this command belongs to another physical host role")
     role = configured_role
     network, deployment = cfg["network"], cfg["deployment"]
-    for name in ("acer_address", "fossil_address"):
+    for name in ("execution_address", "control_address"):
         network[name] = private_address(network[name])
-    if network["acer_address"] == network["fossil_address"]:
+    if network["execution_address"] == network["control_address"]:
         raise ValueError("hosts must have distinct LAN addresses")
     if not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", network["server_name"]):
         raise ValueError("invalid broker DNS identity")
@@ -87,10 +139,10 @@ def config(role=None, *, credentials=True):
         raise ValueError("invalid explicit Docker volume name")
     if len(set(cfg["storage"].values())) != len(VOLUMES): raise ValueError("persistent volume names must be distinct")
     if credentials:
-        expected = {"acer_address": network["acer_address"], "fossil_address": network["fossil_address"],
+        expected = {"execution_address": network["execution_address"], "control_address": network["control_address"],
             "server_name": network["server_name"], "port": network["broker_port"],
             "control_id": deployment["control_id"], "execution_id": deployment["execution_id"]}
-        cfg["bundle"] = verify_bundle(cfg["paths"]["tls_directory"], deployment["bundle_manifest_sha256"], role, expected)
+        cfg["bundle"] = verify_bundle(cfg["paths"]["tls_directory"], None, role, expected)
     return cfg
 
 
@@ -108,27 +160,27 @@ def host(role, cfg, *, docker=True, build_tools=False):
         if build_tools: commands += [["docker", "compose", "version"], ["docker", "buildx", "version"]]
         for command in commands:
             run(command, capture=True, timeout=30)
-    if role == "acer":
-        if os.geteuid() != 0: raise RuntimeError("Acer broker operations require root")
-        if not os.access("/dev/kvm", os.R_OK | os.W_OK): raise RuntimeError("Acer KVM is unavailable")
+    if role == "execution":
+        if os.geteuid() != 0: raise RuntimeError("execution host broker operations require root")
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK): raise RuntimeError("execution host KVM is unavailable")
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
         parent = cfg["paths"]["base_image"].parent
         while not parent.exists() and parent != parent.parent: parent = parent.parent
         device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
         if not device.startswith("/dev/") or run(["lsblk", "-dn", "-o", "ROTA", device], capture=True, timeout=10) != "0":
-            raise RuntimeError("Kali base/templates/overlays must reside on Acer's local SSD")
+            raise RuntimeError("Kali base/templates/overlays must reside on execution host's local SSD")
 
 
 def environment(cfg):
     paths, network, bundle = cfg["paths"], cfg["network"], cfg["bundle"]
     values = {"COMPOSE_FILE": str(ROOT / "compose.control.yaml"), "DIST_TLS_DIRECTORY": str(paths["tls_directory"]),
         "DIST_BROKER_URL": f'https://{network["server_name"]}:{network["broker_port"]}',
-        "DIST_BROKER_ADDRESS": network["acer_address"], "DIST_SERVER_SHA256": bundle["server_sha256"],
-        "DIST_CONTROL_ADDRESS": network["fossil_address"],
+        "DIST_BROKER_ADDRESS": network["execution_address"], "DIST_SERVER_SHA256": bundle["server_sha256"],
+        "DIST_CONTROL_ADDRESS": network["control_address"],
         "WORKSTATION_BROKER_TRANSPORT": "mtls",
         "WORKSTATION_BROKER_URL": f'https://{network["server_name"]}:{network["broker_port"]}',
-        "WORKSTATION_BROKER_ADDRESS": network["acer_address"],
+        "WORKSTATION_BROKER_ADDRESS": network["execution_address"],
         "WORKSTATION_BROKER_CA_FILE": str(paths["tls_directory"] / "ca.crt"),
         "WORKSTATION_BROKER_CERT_FILE": str(paths["tls_directory"] / "admin.crt"),
         "WORKSTATION_BROKER_KEY_FILE": str(paths["tls_directory"] / "admin.key"),
@@ -150,7 +202,7 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         expected = hashlib.sha256(json.dumps(limits, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if result.get("project") != PROJECT or result.get("status") != "ok" or result.get("execution_id") != cfg["deployment"]["execution_id"] or result.get("workstation_sha256") != expected:
-            raise RuntimeError("Acer identity/workstation configuration differs from Fossil; preserve attempts and reconcile explicitly")
+            raise RuntimeError("execution host identity/workstation configuration differs from control host; preserve attempts and reconcile explicitly")
     return result
 
 
@@ -169,7 +221,7 @@ def verify_storage(cfg):
         device = volume.get("Options", {}).get("device") if isinstance(volume.get("Options"), dict) else None
         actual = Path(device if device else volume["Mountpoint"]).resolve(strict=True)
         if not actual.is_relative_to(root.resolve(strict=True)):
-            raise RuntimeError(f"{logical} storage is outside configured Fossil storage root; migrate from a verified cold backup")
+            raise RuntimeError(f"{logical} storage is outside configured control host storage root; migrate from a verified cold backup")
         if actual == root.resolve(strict=True) or not actual.is_dir():
             raise RuntimeError("volume needs a dedicated directory under the storage root")
         resolved[logical] = actual
@@ -282,19 +334,19 @@ def preparation_fetch(cfg):
     deployment = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
     if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
             or identified.get("deployment") != deployment or not isinstance(identified.get("compatibility"), dict)):
-        raise RuntimeError("Acer preparation identity differs")
+        raise RuntimeError("execution host preparation identity differs")
     recipe = source_contract(ROOT)
     if any(identified["compatibility"].get(key) != value for key, value in recipe.items()):
-        raise RuntimeError("Acer preparation recipe differs from Fossil")
+        raise RuntimeError("execution host preparation recipe differs from control host")
     if hashlib.sha256(json.dumps(identified["compatibility"], sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, allow_nan=False).encode()).hexdigest() != operation_id:
-        raise RuntimeError("Acer preparation content identity differs")
+        raise RuntimeError("execution host preparation content identity differs")
     directory = ROOT / "state/distributed"
     for parent in (directory, *directory.parents):
         if parent.is_symlink(): raise ValueError("unsafe local preparation journal")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_json(directory / ("preparation-" + operation_id + ".json"), identified, 0o600)
-    print("Acer local preparation: " + operation_id, flush=True)
+    print("execution host local preparation: " + operation_id, flush=True)
     started = False
     last_phase = None
     try:
@@ -313,7 +365,7 @@ def preparation_fetch(cfg):
                         or not result.get("verified_signature")):
                     raise RuntimeError("preparation returned no verified complete generation")
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
-                print("SWE-Gym Lite ready on Acer: " + result["generation"], flush=True)
+                print("SWE-Gym Lite ready on execution host: " + result["generation"], flush=True)
                 return result
             if phase in {"not_started", "failed", "interrupted", "canceled"}:
                 if started:
@@ -357,27 +409,27 @@ def confirm_remote_shutdown(cfg, shutdown_id):
     raise RuntimeError("remote broker exit/cleanup confirmation unavailable; global shutdown incomplete")
 
 
-def acer_environment(cfg):
+def execution_environment(cfg):
     paths, network = cfg["paths"], cfg["network"]
     os.environ.update({"WORKSTATION_CONFIG": str(ROOT / "config/runner.toml"),
         "WORKSTATION_BROKER_SOCKET": str(paths["broker_runtime_directory"] / "broker.sock"),
         "WORKSTATION_BROKER_STATE": str(paths["base_image"].parent / "attempts"),
         "WORKSTATION_TEMPLATE_ROOT": str(paths["base_image"].parent / "templates"),
         "WORKSTATION_BASE_IMAGE": str(paths["base_image"]), "WORKSTATION_BROKER_LISTENER": "mtls",
-        "WORKSTATION_BROKER_LISTEN_ADDRESS": network["acer_address"],
-        "WORKSTATION_BROKER_ALLOWED_PEER": network["fossil_address"],
+        "WORKSTATION_BROKER_LISTEN_ADDRESS": network["execution_address"],
+        "WORKSTATION_BROKER_ALLOWED_PEER": network["control_address"],
         "WORKSTATION_BROKER_LISTEN_PORT": str(network["broker_port"]),
         "WORKSTATION_BROKER_CONTROL_ID": cfg["deployment"]["control_id"],
         "WORKSTATION_BROKER_EXECUTION_ID": cfg["deployment"]["execution_id"],
         "WORKSTATION_BROKER_TLS_DIR": str(paths["tls_directory"]),
-        "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["fossil_address"] + "/32"]),
+        "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["control_address"] + "/32"]),
         "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
         "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")})
 
 
 def local_down(cfg):
-    print("scope=acer-local; global=false; Fossil campaign/services are not stopped by this command. Run make down on Fossil for global shutdown.", flush=True)
-    acer_environment(cfg)
+    print("scope=execution-local; global=false; control host campaign/services are not stopped by this command. Run make down on control host for global shutdown.", flush=True)
+    execution_environment(cfg)
     sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
     from gpt_trace_transport.local_templates import safe
     from workstation_broker.preparation import same_process
@@ -395,11 +447,11 @@ def local_down(cfg):
         # An explicitly verified inactive lifecycle, not a network-error path.
         python = ROOT / ".venv-workstation-broker/bin/python"
         result = json.loads(run([python, "-B", "-m", "workstation_broker.local_shutdown"], capture=True, timeout=150))
-        if (result.get("scope") != "acer-local" or result.get("global") is not False
+        if (result.get("scope") != "execution-local" or result.get("global") is not False
                 or result.get("deployment") != expected or result.get("broker_stopped") is not True
                 or result.get("inventory", {}).get("absent") is not True):
             raise RuntimeError("local offline cleanup lacks verified absence")
-        print("Acer local shutdown complete; Fossil global shutdown remains separate; permanent data/images retained.")
+        print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
         return result
     barrier = broker(cfg, "begin_shutdown", local=True, timeout=90)
     if barrier.get("draining") is not True or barrier.get("project") != PROJECT:
@@ -409,7 +461,7 @@ def local_down(cfg):
     if proof.get("absent") is not True or proof.get("project") != PROJECT:
         raise RuntimeError("local temporary resources remain")
     shutdown_id = secrets.token_hex(32)
-    acknowledgement = broker(cfg, "shutdown", {"shutdown_id": shutdown_id, "scope": "acer-local"}, local=True, timeout=30)
+    acknowledgement = broker(cfg, "shutdown", {"shutdown_id": shutdown_id, "scope": "execution-local"}, local=True, timeout=30)
     if acknowledgement.get("shutdown_id") != shutdown_id or acknowledgement.get("shutdown") is not True:
         raise RuntimeError("local broker shutdown handoff unconfirmed")
     path = runtime / ("shutdown-" + shutdown_id + ".json")
@@ -418,9 +470,9 @@ def local_down(cfg):
         value = json.loads(safe(path).read_bytes())
         if value.get("status") == "failed": raise RuntimeError("local shutdown confirmation failed: " + str(value.get("error")))
         if value.get("status") == "stopped":
-            verify_stopped(value, shutdown_id, "acer-local", expected)
+            verify_stopped(value, shutdown_id, "execution-local", expected)
             if same_process(value["broker_identity"]): raise RuntimeError("native broker still exists")
-            print("Acer local shutdown confirmed; Fossil campaign/services remain outside this local scope; permanent data/images retained.")
+            print("execution host local shutdown confirmed; control host campaign/services remain outside this local scope; permanent data/images retained.")
             return value
         time.sleep(0.2)
     raise RuntimeError("local broker exit confirmation timed out")
@@ -453,32 +505,32 @@ def install_unit(cfg):
 
 
 def global_down(cfg):
-    """Fossil coordinates cleanup; local producers stop even on credential failure."""
-    if cfg["deployment"]["role"] != "fossil":
-        raise RuntimeError("global shutdown must run on Fossil: make down; no local-only cleanup was performed")
-    host("fossil", cfg)
+    """control host coordinates cleanup; local producers stop even on credential failure."""
+    if cfg["deployment"]["role"] != "control":
+        raise RuntimeError("global shutdown must run on control host: make down; no local-only cleanup was performed")
+    host("control", cfg)
     project_filter = "label=com.docker.compose.project=" + PROJECT
     before_volumes = set(run(["docker", "volume", "ls", "--format", "{{.Name}}"], capture=True).splitlines())
     running = run(["docker", "ps", "-q", "--filter", project_filter,
                    "--filter", "label=com.docker.compose.service=runner"], capture=True).splitlines()
     if running: run(["docker", "stop", "--time", "30", *running])
     try:
-        full = config("fossil")
+        full = config("control")
         environment(full)
         draining = broker(full, "begin_shutdown")
         if draining.get("draining") is not True or draining.get("project") != PROJECT:
-            raise RuntimeError("Acer did not acknowledge the shutdown mutation barrier")
+            raise RuntimeError("execution host did not acknowledge the shutdown mutation barrier")
         before = broker(full, "inventory")
         if before.get("project") != PROJECT: raise RuntimeError("remote project identity differs")
         broker(full, "destroy_all")
         proof = broker(full, "inventory")
         if proof.get("absent") is not True or proof.get("project") != PROJECT:
-            raise RuntimeError("Acer cleanup has no authenticated absence proof")
+            raise RuntimeError("execution host cleanup has no authenticated absence proof")
         shutdown_id = secrets.token_hex(32)
         reply = broker(full, "shutdown", {"shutdown_id": shutdown_id, "scope": "global"}, timeout=30)
         if (reply.get("shutdown_id") != shutdown_id or reply.get("absent") is not True
                 or reply.get("shutdown") is not True):
-            raise RuntimeError("Acer broker did not acknowledge the clean shutdown handoff")
+            raise RuntimeError("execution host broker did not acknowledge the clean shutdown handoff")
         stopped = confirm_remote_shutdown(full, shutdown_id)
         directory = ROOT / "state/distributed"
         for parent in (directory, *directory.parents):
@@ -498,11 +550,11 @@ def global_down(cfg):
         networks = run(["docker", "network", "ls", "-q", "--filter", project_filter], capture=True).splitlines()
         if networks: run(["docker", "network", "rm", *networks])
         if run(["docker", "ps", "-aq", "--filter", project_filter], capture=True):
-            raise RuntimeError("Fossil project containers remain after shutdown")
+            raise RuntimeError("control host project containers remain after shutdown")
         after_volumes = set(run(["docker", "volume", "ls", "--format", "{{.Name}}"], capture=True).splitlines())
         if before_volumes - after_volumes:
             raise RuntimeError("pre-existing Docker volumes disappeared during shutdown")
-    print("Global shutdown confirmed; Acer native broker stopped; temporary Acer resources absent; Fossil services stopped; data and permanent images retained.")
+    print("Global shutdown confirmed; execution host native broker stopped; temporary execution host resources absent; control host services stopped; data and permanent images retained.")
 
 
 def control_up(cfg, *, minimal=False):
@@ -513,14 +565,14 @@ def control_up(cfg, *, minimal=False):
     compose("up", "-d", "--wait", "--wait-timeout", "300", *services)
 
 
-def fossil(cfg, action, args):
+def control(cfg, action, args):
     if action == "down": return global_down(cfg)
-    host("fossil", cfg, build_tools=action in {"build", "requirements"})
+    host("control", cfg, build_tools=action in {"build", "requirements"})
     if action == "init-storage": return init_storage(cfg)
     if action == "restore": return restore(cfg, args.directory)
     if action == "requirements":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(role="fossil"): raise RuntimeError("Fossil prerequisites failed")
+        if not verify_host_requirements(role="control"): raise RuntimeError("control host prerequisites failed")
         return
     environment(cfg)
     if action == "build":
@@ -552,7 +604,7 @@ def fossil(cfg, action, args):
                            "/app/tools/distributed_acceptance.py", *values)
         driver = Path("/sys/class/drm/renderD128/device/driver")
         if not driver.exists() or driver.resolve().name != "nouveau":
-            raise RuntimeError("Fossil render node is not driven by Nouveau")
+            raise RuntimeError("control host render node is not driven by Nouveau")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
         compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/teacher_gpu_doctor.py")
         return compose("run", "--rm", "--no-deps", "runner", "doctor")
@@ -575,7 +627,7 @@ def fossil(cfg, action, args):
         "start_kali": "manual-kali-start", "stop_kali": "manual-kali-stop",
         "status_kali": "manual-kali-status", "register_apps": "register-apps",
         "reset-recovery": "superbench-reset-recovery", "export-parquet": "export-parquet"}
-    if action not in mapping: raise ValueError("operation does not belong to Fossil")
+    if action not in mapping: raise ValueError("operation does not belong to control host")
     arguments = []
     if action == "run":
         if args.adapter: arguments += ["--adapter", args.adapter]
@@ -594,20 +646,20 @@ def fossil(cfg, action, args):
     compose("run", "--rm", "--no-deps", "-e", "GPT_TRACE_RUNNER_BUILD_ID", "runner", mapping[action], *arguments)
 
 
-def acer(cfg, action, args):
+def execution(cfg, action, args):
     allowed = {"requirements", "build", "up", "doctor", "status", "kali_control", "serve", "down"}
     if action not in allowed:
-        raise RuntimeError("this operation belongs to Fossil; Acer never runs control-plane services")
-    host("acer", cfg, docker=action in {"requirements", "build"}, build_tools=action in {"requirements", "build"})
+        raise RuntimeError("this operation belongs to control host; execution host never runs control-plane services")
+    host("execution", cfg, docker=action in {"requirements", "build"}, build_tools=action in {"requirements", "build"})
     paths, network = cfg["paths"], cfg["network"]
     if action == "down": return local_down(cfg)
     if action == "requirements":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="acer", golden_build=True): raise RuntimeError("Acer prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="execution", golden_build=True): raise RuntimeError("execution host prerequisites failed")
         return
     if action == "build":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="acer", golden_build=True): raise RuntimeError("Acer prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="execution", golden_build=True): raise RuntimeError("execution host prerequisites failed")
         domains = run(["virsh", "-c", "qemu:///system", "list", "--all", "--name"], capture=True).splitlines()
         if any(x.startswith("gpt-trace-ws-") for x in domains):
             raise RuntimeError("preserve existing attempts before installing broker/images")
@@ -627,12 +679,12 @@ def acer(cfg, action, args):
         runtime.chmod(0o700)
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         if limits["provider"] != "libvirt": raise ValueError("libvirt provider required")
-        acer_environment(cfg)
+        execution_environment(cfg)
         python = ROOT / ".venv-workstation-broker/bin/python"
         os.execv(str(python), [str(python), "-m", "workstation_broker.server"])
     if action in {"up", "kali_control", "doctor"}:
         install_unit(cfg)
-        acer_environment(cfg)
+        execution_environment(cfg)
         if (paths["base_image"].parent / "broker-drain.json").exists():
             run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=150)
         run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
@@ -643,7 +695,7 @@ def acer(cfg, action, args):
                 break
             except (OSError, RuntimeError):
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("Acer broker startup deadline exceeded")
+                    raise RuntimeError("execution host broker startup deadline exceeded")
                 time.sleep(0.5)
         if action != "doctor": return
     if action in {"status", "doctor"}:
@@ -675,10 +727,10 @@ def main(argv=None):
     cfg = config(credentials=args.action not in {"requirements", "backup", "restore", "init-storage", "down"})
     role = cfg["deployment"]["role"]
     if args.action == "backup":
-        if role != "fossil": raise RuntimeError("cold backup belongs to Fossil")
-        host("fossil", cfg)
+        if role != "control": raise RuntimeError("cold backup belongs to control host")
+        host("control", cfg)
         return backup(args.directory)
-    return (fossil if role == "fossil" else acer)(cfg, args.action, args)
+    return (control if role == "control" else execution)(cfg, args.action, args)
 
 
 if __name__ == "__main__":

@@ -121,24 +121,24 @@ def _probe_venv() -> tuple[bool, str]:
 
 def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True, role: str | None = None) -> bool:
     if role is None and (ROOT / "config/distributed.toml").exists():
-        import tomllib
-        role = tomllib.loads((ROOT / "config/distributed.toml").read_text())["deployment"]["role"]
-    if role not in {None, "acer", "fossil"}:
+        from distributed import config as deployment_config
+        role = deployment_config(credentials=False)["deployment"]["role"]
+    if role not in {None, "execution", "control"}:
         raise ValueError("unknown distributed host role")
-    if role == "fossil" and golden_build:
-        raise RuntimeError("local golden construction requires the Acer execution host")
+    if role == "control" and golden_build:
+        raise RuntimeError("local golden construction requires the execution host execution host")
     failures: list[str] = []
     missing_packages: list[str] = []
 
     if platform.system() != "Linux":
         failures.append(f"Linux host required; found {platform.system()}")
-    if role == 'acer':
+    if role == 'execution':
         if not Path('/sys/fs/cgroup/cgroup.controllers').is_file():
-            failures.append('Acer finite preparation jobs require native cgroup v2')
+            failures.append('execution host finite preparation jobs require native cgroup v2')
         if not hasattr(os, 'pidfd_open'):
-            failures.append('Acer finite preparation cleanup requires Linux pidfds')
+            failures.append('execution host finite preparation cleanup requires Linux pidfds')
         if shutil.which('systemctl') is None:
-            failures.append('Acer requires the existing managed systemd broker unit')
+            failures.append('execution host requires the existing managed systemd broker unit')
     if not _debian_like():
         failures.append("requirements.txt currently targets Ubuntu/Debian hosts")
     if shutil.which("dpkg-query") is None:
@@ -146,7 +146,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
 
     packages: tuple[str, ...] = ()
     try:
-        base_packages = load_packages(ROOT / "requirements-control.txt" if role == "fossil" else REQUIREMENTS)
+        base_packages = load_packages(ROOT / "requirements-control.txt" if role == "control" else REQUIREMENTS)
         extra_packages = load_packages(GOLDEN_BUILD_REQUIREMENTS) if golden_build else ()
         packages = tuple(dict.fromkeys((*base_packages, *extra_packages)))
     except RuntimeError as exc:
@@ -155,7 +155,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
     if packages and shutil.which("dpkg-query") is not None:
         missing_packages = [package for package in packages if not _package_installed(package)]
 
-    command_packages = {key: value for key, value in COMMAND_PACKAGES.items() if role != "fossil" or key in {"ip", "curl", "git"}}
+    command_packages = {key: value for key, value in COMMAND_PACKAGES.items() if role != "control" or key in {"ip", "curl", "git"}}
     if golden_build:
         command_packages.update(GOLDEN_BUILD_COMMAND_PACKAGES)
     for command, package in command_packages.items():
@@ -187,7 +187,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
             if not ok:
                 failures.append(f"{label} unavailable" + (f": {detail}" if detail else ""))
 
-    if require_root and role != "fossil" and os.geteuid() != 0:
+    if require_root and role != "control" and os.geteuid() != 0:
         failures.append("hybrid build must run as root; use `sudo make build`")
 
     if missing_packages:

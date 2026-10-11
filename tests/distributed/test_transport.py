@@ -69,10 +69,10 @@ class TransportTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.directory = Path(cls.temp.name)
-        cls.result = provision(cls.directory / "pki", server_name="acer-broker.test",
-            acer_address="192.168.90.10", fossil_address="192.168.90.20")
+        cls.result = provision(cls.directory / "pki", server_name="execution-broker.test",
+            execution_address="192.168.90.10", control_address="192.168.90.20")
         cls.authority = cls.directory / "pki/authority"
-        cls.credentials = cls.directory / "pki/fossil"
+        cls.credentials = cls.directory / "pki/control"
         cls.socket = cls.directory / "broker.sock"
         cls.backend = UnixServer(str(cls.socket), FileBackend)
         cls.backend.requests, cls.backend.delay, cls.backend.disconnect = [], 0, False
@@ -86,12 +86,12 @@ class TransportTests(unittest.TestCase):
         context.verify_mode = ssl.CERT_REQUIRED
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         cls.roles = {certificate_sha(cls.credentials / (name + ".crt")):
-                     (name, "urn:gpt-trace:fossil:" + name, (cls.credentials / ("workstation_broker_" + name + "_token")).read_text().strip())
+                     (name, "urn:gpt-trace:control:" + name, (cls.credentials / ("workstation_broker_" + name + "_token")).read_text().strip())
                      for name in ("admin", "controller")}
         cls.gateway = Gateway(("127.0.0.1", 0), context, WireClient(Endpoint("unix", cls.socket)), cls.roles, "127.0.0.1", timeout=0.15)
         cls.gateway_thread = threading.Thread(target=cls.gateway.serve_forever, daemon=True)
         cls.gateway_thread.start()
-        cls.endpoint = Endpoint("mtls", cls.socket, "https://acer-broker.test:" + str(cls.gateway.server_port),
+        cls.endpoint = Endpoint("mtls", cls.socket, "https://execution-broker.test:" + str(cls.gateway.server_port),
             "127.0.0.1", cls.credentials / "ca.crt", cls.credentials / "admin.crt", cls.credentials / "admin.key",
             certificate_sha(cls.authority / "server.crt"), operation_timeout=2)
 
@@ -153,7 +153,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.backend.requests, [])
 
     def test_unpinned_client_identity_is_forbidden(self):
-        issue(self.authority, "intruder", "URI:urn:gpt-trace:fossil:intruder", "clientAuth")
+        issue(self.authority, "intruder", "URI:urn:gpt-trace:control:intruder", "clientAuth")
         endpoint = replace(self.endpoint, cert=self.authority / "intruder.crt", key=self.authority / "intruder.key")
         status, _ = WireClient(endpoint).exchange("POST", "/v1/probe", b"{}", "Bearer " + self.credential())
         self.assertEqual(status, 403)
@@ -179,12 +179,12 @@ class TransportTests(unittest.TestCase):
         with self.assertRaises(IdentityFailure): WireClient(replace(self.endpoint, key=key))
 
     def test_bundle_identity_hash_and_role_are_verified(self):
-        expected = {"control_id": "fossil", "execution_id": "acer", "acer_address": "192.168.90.10",
-                    "fossil_address": "192.168.90.20", "server_name": "acer-broker.test", "port": 9443}
-        verified = verify_bundle(self.credentials, self.result["fossil"]["manifest_sha256"], "fossil", expected)
+        expected = {"control_id": "control", "execution_id": "execution", "execution_address": "192.168.90.10",
+                    "control_address": "192.168.90.20", "server_name": "execution-broker.test", "port": 9443}
+        verified = verify_bundle(self.credentials, self.result["control"]["manifest_sha256"], "control", expected)
         self.assertEqual(verified["server_sha256"], self.endpoint.server_sha256)
-        with self.assertRaises(ValueError): verify_bundle(self.credentials, "0" * 64, "fossil", expected)
-        with self.assertRaises(ValueError): verify_bundle(self.credentials, self.result["fossil"]["manifest_sha256"], "acer", expected)
+        with self.assertRaises(ValueError): verify_bundle(self.credentials, "0" * 64, "control", expected)
+        with self.assertRaises(ValueError): verify_bundle(self.credentials, self.result["control"]["manifest_sha256"], "execution", expected)
 
     def test_disconnect_after_mutation_is_not_replayed_or_reported_absent(self):
         self.backend.disconnect = True
