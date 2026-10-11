@@ -104,6 +104,8 @@ class Endpoint:
     cert: Path | None = None
     key: Path | None = None
     server_sha256: str = ""
+    access_client_id_file: Path | None = None
+    access_client_secret_file: Path | None = None
     connect_timeout: float = 10.0
     operation_timeout: float = 1900.0
 
@@ -116,8 +118,15 @@ class Endpoint:
                 "WORKSTATION_BROKER_CERT_FILE", "WORKSTATION_BROKER_KEY_FILE", "WORKSTATION_BROKER_SERVER_SHA256")):
                 raise IdentityFailure("network credentials supplied with unix transport")
             return cls(mode, socket_path)
+        if mode == "access":
+            required = {name: os.environ[name] for name in (
+                "WORKSTATION_BROKER_URL", "WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE",
+                "WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE")}
+            return cls(mode, socket_path, required['WORKSTATION_BROKER_URL'],
+                access_client_id_file=Path(required['WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE']),
+                access_client_secret_file=Path(required['WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE']))
         if mode != "mtls":
-            raise IdentityFailure("WORKSTATION_BROKER_TRANSPORT must be unix or mtls")
+            raise IdentityFailure("WORKSTATION_BROKER_TRANSPORT must be unix, mtls or access")
         required = {key: os.environ[key] for key in (
             "WORKSTATION_BROKER_URL", "WORKSTATION_BROKER_ADDRESS", "WORKSTATION_BROKER_CA_FILE",
             "WORKSTATION_BROKER_CERT_FILE", "WORKSTATION_BROKER_KEY_FILE", "WORKSTATION_BROKER_SERVER_SHA256")}
@@ -126,13 +135,32 @@ class Endpoint:
                    Path(required["WORKSTATION_BROKER_CA_FILE"]), Path(required["WORKSTATION_BROKER_CERT_FILE"]),
                    Path(required["WORKSTATION_BROKER_KEY_FILE"]), required["WORKSTATION_BROKER_SERVER_SHA256"])
 
+    def access_headers(self) -> dict[str, str]:
+        if self.mode != 'access' or self.access_client_id_file is None or self.access_client_secret_file is None:
+            raise IdentityFailure('missing Cloudflare Access credentials')
+        result = {}
+        for header, path in (('CF-Access-Client-Id', self.access_client_id_file),
+                             ('CF-Access-Client-Secret', self.access_client_secret_file)):
+            value = safe_file(path, secret=True, mounted=True).decode('ascii').strip()
+            if not 10 <= len(value) <= 512 or not re.fullmatch(r'[A-Za-z0-9._-]+', value):
+                raise IdentityFailure('invalid Cloudflare Access service token field: ' + header)
+            result[header] = value
+        return result
+
     def client_context(self) -> ssl.SSLContext:
         parsed = urlsplit(self.url)
-        if (self.mode != "mtls" or parsed.scheme != "https" or not parsed.hostname or
+        if (self.mode not in {"mtls", "access"} or parsed.scheme != "https" or not parsed.hostname or
             parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"} or
-            not parsed.port or not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", parsed.hostname) or
-            not re.fullmatch(r"[0-9a-f]{64}", self.server_sha256)):
+            not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", parsed.hostname) or
+            (self.mode == 'mtls' and (not parsed.port or not re.fullmatch(r"[0-9a-f]{64}", self.server_sha256))) or
+            (self.mode == 'access' and (parsed.port not in (None, 443) or '.' not in parsed.hostname))):
             raise IdentityFailure("invalid explicit mTLS origin or server fingerprint")
+        if self.mode == 'access':
+            self.access_headers()
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.set_alpn_protocols(['http/1.1'])
+            return context
         if self.ca is None or self.cert is None or self.key is None:
             raise IdentityFailure("missing mTLS credentials")
         safe_file(self.ca)
@@ -174,8 +202,8 @@ def bounded_read(response: http.client.HTTPResponse, connection, maximum: int, d
 class WireClient:
     def __init__(self, endpoint: Endpoint):
         self.endpoint = endpoint
-        self.context = endpoint.client_context() if endpoint.mode == "mtls" else None
-        if endpoint.mode not in {"unix", "mtls"}:
+        self.context = endpoint.client_context() if endpoint.mode in {'mtls', 'access'} else None
+        if endpoint.mode not in {"unix", "mtls", "access"}:
             raise IdentityFailure("unknown broker transport")
 
     def exchange(self, method: str, path: str, body: bytes, authorization: str,
@@ -198,28 +226,53 @@ class WireClient:
                 sock.connect(str(endpoint.socket_path))
             else:
                 parsed = urlsplit(endpoint.url)
-                sock = socket.create_connection((endpoint.address, parsed.port), endpoint.connect_timeout)
+                sock = socket.create_connection(((parsed.hostname if endpoint.mode == 'access' else endpoint.address),
+                                                 (443 if endpoint.mode == 'access' else parsed.port)), endpoint.connect_timeout)
                 sock = self.context.wrap_socket(sock, server_hostname=parsed.hostname)
-                digest = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
-                if not hmac.compare_digest(digest, endpoint.server_sha256):
-                    raise IdentityFailure("broker certificate fingerprint mismatch")
+                if endpoint.mode == 'mtls':
+                    digest = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+                    if not hmac.compare_digest(digest, endpoint.server_sha256):
+                        raise IdentityFailure("broker certificate fingerprint mismatch")
                 connection.host = parsed.hostname
-                connection.port = parsed.port
+                connection.port = 443 if endpoint.mode == 'access' else parsed.port
             connection.sock = sock
             sock.settimeout(max(0.001, deadline - time.monotonic()))
-            connection.request(method, path, body=body, headers={
-                "Authorization": authorization, "Content-Type": "application/json",
-                "Content-Length": str(len(body)), "Connection": "close", "Accept-Encoding": "identity"})
+            headers = {"Authorization": authorization, "Content-Type": "application/json",
+                "Content-Length": str(len(body)), "Connection": "close", "Accept-Encoding": "identity"}
+            if endpoint.mode == 'access':
+                headers.update(endpoint.access_headers())
+                headers['Host'] = parsed.hostname
+            connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             return response.status, bounded_read(response, connection, MAX_BODY, deadline)
         except ssl.SSLError as exc:
-            raise IdentityFailure("mTLS certificate/handshake validation failed") from exc
+            raise IdentityFailure("TLS certificate/handshake validation failed") from exc
         except (OSError, http.client.HTTPException) as exc:
             raise TransportFailure("broker connection failed; VM outcome unconfirmed") from exc
         finally:
             connection.close()
             if sock is not None:
                 sock.close()
+
+    def check_access_policy(self):
+        """Probe anonymous edge access: unauthenticated /healthz must be blocked.
+
+        Never send broker tokens or service credentials in this request.
+        This detects a missing/bypassed Access application on the tunnel hostname.
+        """
+        if self.endpoint.mode != 'access': return
+        parsed = urlsplit(self.endpoint.url)
+        connection = http.client.HTTPSConnection(parsed.hostname, 443, timeout=10,
+            context=ssl.create_default_context(ssl.Purpose.SERVER_AUTH))
+        try:
+            connection.request('GET', '/healthz', headers={'Accept-Encoding': 'identity'})
+            response = connection.getresponse()
+            if response.status not in {302, 401, 403}:
+                raise IdentityFailure('Cloudflare Access gate not enforced or origin unreachable: anonymous /healthz HTTP ' + str(response.status))
+        except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+            raise IdentityFailure('cannot validate Cloudflare Access security policy') from exc
+        finally:
+            connection.close()
 
     def request(self, action: str, payload: dict, credential: str, *, timeout: float | None = None) -> dict:
         status, raw = self.exchange("POST", "/v1/" + action,

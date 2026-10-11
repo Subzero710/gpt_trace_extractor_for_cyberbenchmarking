@@ -1,19 +1,12 @@
-# Shared deployment policy. The two machine roles are independent of hostnames.
-# DIST_ROLE, DIST_CONTROL_ADDRESS, DIST_EXECUTION_ADDRESS and DIST_SERVER_NAME
-# are read from the local gitignored .env. Credential proofs stay in .secrets/.
+# Versioned deployment roles and paths. No hostname, hardware identifier, IP, or secret.
+# Local fields (DIST_ROLE, Access credentials, Tunnel token) belong to .env.
 [deployment]
 role = ""
 control_id = "control"
 execution_id = "execution"
 
-[network]
-control_address = ""
-execution_address = ""
-server_name = ""
-broker_port = 9443
-
 [paths]
-tls_directory = ".secrets/distributed"
+credentials_directory = ".secrets/distributed"
 base_image = "/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"
 broker_runtime_directory = "state/broker"
 storage_root = "/srv/stockage/cyber-dataset"

@@ -99,14 +99,11 @@
       },
       "environment": {
         "TEACHER_BROWSER_PUBLIC_URL": "${TEACHER_BROWSER_PUBLIC_URL:-}",
-        "WORKSTATION_BROKER_TRANSPORT": "mtls",
+        "WORKSTATION_BROKER_TRANSPORT": "access",
         "WORKSTATION_BROKER_URL": "${DIST_BROKER_URL:?}",
-        "WORKSTATION_BROKER_ADDRESS": "${DIST_BROKER_ADDRESS:?}",
-        "WORKSTATION_BROKER_CA_FILE": "/run/secrets/broker_ca",
-        "WORKSTATION_BROKER_CERT_FILE": "/run/secrets/broker_admin_crt",
-        "WORKSTATION_BROKER_KEY_FILE": "/run/secrets/broker_admin_key",
-        "WORKSTATION_BROKER_SERVER_SHA256": "${DIST_SERVER_SHA256:?}",
-        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:?}"
+        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:-}",
+        "WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE": "/run/secrets/access_client_id",
+        "WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE": "/run/secrets/access_client_secret"
       },
       "secrets": [
         {
@@ -118,16 +115,12 @@
           "target": "workstation_broker_admin_token"
         },
         {
-          "source": "broker_ca",
-          "target": "broker_ca"
+          "source": "access_client_id",
+          "target": "access_client_id"
         },
         {
-          "source": "broker_admin_crt",
-          "target": "broker_admin_crt"
-        },
-        {
-          "source": "broker_admin_key",
-          "target": "broker_admin_key"
+          "source": "access_client_secret",
+          "target": "access_client_secret"
         }
       ],
       "volumes": [
@@ -365,14 +358,11 @@
         "WORKSTATION_CONFIG": "/app/config/runner.toml",
         "APP_CONTROL_TOKEN_FILE": "/run/secrets/app_control_token",
         "WORKSTATION_BROKER_TOKEN_FILE": "/run/secrets/workstation_broker_controller_token",
-        "WORKSTATION_BROKER_TRANSPORT": "mtls",
+        "WORKSTATION_BROKER_TRANSPORT": "access",
         "WORKSTATION_BROKER_URL": "${DIST_BROKER_URL:?}",
-        "WORKSTATION_BROKER_ADDRESS": "${DIST_BROKER_ADDRESS:?}",
-        "WORKSTATION_BROKER_CA_FILE": "/run/secrets/broker_ca",
-        "WORKSTATION_BROKER_CERT_FILE": "/run/secrets/broker_controller_crt",
-        "WORKSTATION_BROKER_KEY_FILE": "/run/secrets/broker_controller_key",
-        "WORKSTATION_BROKER_SERVER_SHA256": "${DIST_SERVER_SHA256:?}",
-        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:?}"
+        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:-}",
+        "WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE": "/run/secrets/access_client_id",
+        "WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE": "/run/secrets/access_client_secret"
       },
       "volumes": [
         "./config/runner.toml:/app/config/runner.toml:ro"
@@ -387,16 +377,12 @@
           "target": "workstation_broker_controller_token"
         },
         {
-          "source": "broker_ca",
-          "target": "broker_ca"
+          "source": "access_client_id",
+          "target": "access_client_id"
         },
         {
-          "source": "broker_controller_crt",
-          "target": "broker_controller_crt"
-        },
-        {
-          "source": "broker_controller_key",
-          "target": "broker_controller_key"
+          "source": "access_client_secret",
+          "target": "access_client_secret"
         }
       ],
       "networks": [
@@ -453,28 +439,19 @@
       "file": "./.secrets/app_control_token"
     },
     "workstation_broker_admin_token": {
-      "file": "${DIST_TLS_DIRECTORY:?}/workstation_broker_admin_token"
+      "file": "${DIST_CREDENTIALS_DIRECTORY:?}/workstation_broker_admin_token"
     },
     "workstation_broker_controller_token": {
-      "file": "${DIST_TLS_DIRECTORY:?}/workstation_broker_controller_token"
+      "file": "${DIST_CREDENTIALS_DIRECTORY:?}/workstation_broker_controller_token"
     },
     "teacher_browser_password": {
       "file": "./.secrets/teacher_browser_password"
     },
-    "broker_admin_crt": {
-      "file": "${DIST_TLS_DIRECTORY:?}/admin.crt"
+    "access_client_id": {
+      "file": "${DIST_CREDENTIALS_DIRECTORY:?}/access_client_id"
     },
-    "broker_admin_key": {
-      "file": "${DIST_TLS_DIRECTORY:?}/admin.key"
-    },
-    "broker_controller_crt": {
-      "file": "${DIST_TLS_DIRECTORY:?}/controller.crt"
-    },
-    "broker_controller_key": {
-      "file": "${DIST_TLS_DIRECTORY:?}/controller.key"
-    },
-    "broker_ca": {
-      "file": "${DIST_TLS_DIRECTORY:?}/ca.crt"
+    "access_client_secret": {
+      "file": "${DIST_CREDENTIALS_DIRECTORY:?}/access_client_secret"
     }
   }
 }

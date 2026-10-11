@@ -69,7 +69,9 @@ async def exercise(adapter_name=None):
             from pathlib import Path
             if Path(exported["local_path"]).read_bytes() != data or imported["sha256"] != hashlib.sha256(data).hexdigest():
                 raise RuntimeError("remote bounded import/export did not preserve exact bytes")
-            control_address = os.environ["WORKSTATION_CONTROL_PLANE_ADDRESS"]
+            control_address = os.environ.get("WORKSTATION_CONTROL_PLANE_ADDRESS", "")
+            if not control_address:
+                raise RuntimeError("set DIST_CONTROL_ADDRESS on control host for physical isolation acceptance")
             program = "import socket\naddress=" + repr(control_address) + "\n"
             program += "for port in (22,8080,9222,9443):\n"
             program += " s=socket.socket(); s.settimeout(2)\n"

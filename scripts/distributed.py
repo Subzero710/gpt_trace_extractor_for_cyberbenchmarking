@@ -20,12 +20,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "shared"))
-from gpt_trace_transport.pki import verify_bundle
-from gpt_trace_transport.wire import Endpoint, WireClient, private_address, token, TransportFailure, IdentityFailure, RemoteFailure
+from gpt_trace_transport.wire import Endpoint, WireClient, token, TransportFailure, IdentityFailure, RemoteFailure
 
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
 CORE = ("postgres", "storage", "teacher-browser", "teacher-browser-tunnel", "kali-workstation-controller", "workstation-gateway")
+_VERIFIED_ACCESS_ORIGINS = set()
 
 
 def run(arguments, *, capture=False, timeout=None):
@@ -50,100 +50,122 @@ def path_from_config(value):
 
 
 
-# Only local routing values belong in .env. No secrets or manifest SHA must be
-# copied by the operator; PKI provisioning creates a protected pin sidecar.
-DISTRIBUTED_ENV_FIELDS = {
-    ("deployment", "role"): "DIST_ROLE",
-    ("network", "control_address"): "DIST_CONTROL_ADDRESS",
-    ("network", "execution_address"): "DIST_EXECUTION_ADDRESS",
-    ("network", "server_name"): "DIST_SERVER_NAME",
-}
+# Host identities stay outside versioned TOML. Neither LAN IP nor certificates
+# are needed to reach the execution broker through Cloudflare Access.
+DISTRIBUTED_ENV_FIELDS = {('deployment', 'role'): 'DIST_ROLE'}
+OPTIONAL_ENV_FIELDS = {'DIST_BROKER_URL', 'DIST_ACCESS_CLIENT_ID',
+    'DIST_ACCESS_CLIENT_SECRET', 'DIST_BROKER_TUNNEL_TOKEN', 'DIST_CONTROL_ADDRESS'}
+
 
 def local_deployment_env():
-    source = ROOT / ".env"
+    source = ROOT / '.env'
     if source.is_symlink() or not source.is_file():
-        raise ValueError("missing/unsafe local .env; copy .env.example and set DIST_* fields")
-    if source.stat().st_mode & 0o022:
-        raise ValueError("local .env must not be group/world writable")
-    keys = set(DISTRIBUTED_ENV_FIELDS.values())
+        raise ValueError('missing/unsafe local .env; copy .env.example')
+    if source.stat().st_mode & 0o077:
+        raise ValueError('local .env carries service credentials and must be mode 0600')
+    keys = set(DISTRIBUTED_ENV_FIELDS.values()) | OPTIONAL_ENV_FIELDS
     result = {}
-    # This does not execute a shell or expand arbitrary application credentials.
-    for line in source.read_text(encoding="utf-8").splitlines():
+    for line in source.read_text(encoding='utf-8').splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        name, sep, value = line.partition("=")
+        if not line or line.startswith('#'): continue
+        if line.startswith('export '): line = line[7:].lstrip()
+        name, sep, value = line.partition('=')
         name = name.strip()
-        if not sep or name not in keys:
-            continue
+        if not sep or name not in keys: continue
         value = value.strip()
         if value[:1] in ("'", '"'):
             if len(value) < 2 or value[-1] != value[0]:
-                raise ValueError("invalid quoted .env field: " + name)
+                raise ValueError('invalid quoted .env field: ' + name)
             value = value[1:-1]
         else:
-            value = value.split(" #", 1)[0].rstrip()
-        if name in result:
-            raise ValueError("duplicate .env field: " + name)
-        if not value or len(value) > 253 or any(ch.isspace() or ord(ch) < 32 for ch in value):
-            raise ValueError("invalid or empty .env field: " + name)
-        result[name] = value
+            value = value.split(' #', 1)[0].rstrip()
+        if name in result: raise ValueError('duplicate .env field: ' + name)
+        if len(value) > 2048 or any(ch.isspace() or ord(ch) < 32 for ch in value):
+            raise ValueError('invalid .env field: ' + name)
+        if value: result[name] = value
     return result
 
+
+def broker_origin(value):
+    from urllib.parse import urlsplit
+    import ipaddress
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+        or parsed.query or parsed.fragment or parsed.path not in ('', '/')
+        or parsed.port not in (None, 443)
+        or not re.fullmatch(r'[a-zA-Z0-9.-]{1,253}', parsed.hostname)
+        or '.' not in parsed.hostname):
+        raise ValueError('DIST_BROKER_URL must be a dedicated public https://hostname origin')
+    try: ipaddress.ip_address(parsed.hostname)
+    except ValueError: pass
+    else: raise ValueError('broker Access URL must be a DNS hostname, not an IP')
+    return 'https://' + parsed.hostname.lower()
+
+
 def config(role=None, *, credentials=True):
-    source = ROOT / "config/distributed.toml"
-    if source.is_symlink(): raise ValueError("unsafe distributed configuration")
+    source = ROOT / 'config/distributed.toml'
+    if source.is_symlink(): raise ValueError('unsafe distributed configuration')
     cfg = tomllib.loads(source.read_text())
     required = {
-        "deployment": {"role", "control_id", "execution_id"},
-        "network": {"execution_address", "control_address", "server_name", "broker_port"},
-        "paths": {"tls_directory", "base_image", "broker_runtime_directory", "storage_root"},
-        "storage": set(VOLUMES),
+        'deployment': {'role', 'control_id', 'execution_id'},
+        'paths': {'credentials_directory', 'base_image', 'broker_runtime_directory', 'storage_root'},
+        'storage': set(VOLUMES),
     }
     if set(cfg) != set(required) or any(set(cfg[section]) != keys for section, keys in required.items()):
-        raise ValueError("distributed.toml has missing or unknown fields")
-    # The committed configuration is common to both roles; fail closed without
-    # an explicit local role/IP/TLS identity, and never infer from hostnames.
+        raise ValueError('distributed.toml has missing or unknown fields')
     local = local_deployment_env()
-    for (section, field), env_key in DISTRIBUTED_ENV_FIELDS.items():
-        if cfg[section][field] != "":
-            raise ValueError("tracked distributed.toml cannot hardcode host identity: " + field)
-        if env_key not in local:
-            raise ValueError("missing " + env_key + " in local .env")
-        cfg[section][field] = local[env_key]
-    configured_role = cfg["deployment"]["role"]
-    if configured_role not in {"execution", "control"}:
-        raise ValueError("distributed.toml must explicitly identify the physical host role")
-    if role is not None and configured_role != role:
-        raise ValueError("this command belongs to another physical host role")
-    role = configured_role
-    network, deployment = cfg["network"], cfg["deployment"]
-    for name in ("execution_address", "control_address"):
-        network[name] = private_address(network[name])
-    if network["execution_address"] == network["control_address"]:
-        raise ValueError("hosts must have distinct LAN addresses")
-    if not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", network["server_name"]):
-        raise ValueError("invalid broker DNS identity")
-    if type(network["broker_port"]) is not int or not 1024 <= network["broker_port"] <= 65535:
-        raise ValueError("invalid private broker port")
-    for name in ("control_id", "execution_id"):
-        if not re.fullmatch(r"[a-zA-Z0-9-]{1,63}", deployment[name]): raise ValueError("invalid host identity")
-    if deployment["control_id"] == deployment["execution_id"]:
-        raise ValueError("host identities must differ")
-    cfg["paths"] = {key: path_from_config(value) for key, value in cfg["paths"].items()}
-    if not cfg["paths"]["base_image"].is_absolute() or cfg["paths"]["base_image"].suffix != ".qcow2":
-        raise ValueError("explicit QCOW2 image path required")
-    if any(not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", value) for value in cfg["storage"].values()):
-        raise ValueError("invalid explicit Docker volume name")
-    if len(set(cfg["storage"].values())) != len(VOLUMES): raise ValueError("persistent volume names must be distinct")
+    if cfg['deployment']['role'] != '':
+        raise ValueError('tracked config cannot choose a physical host role')
+    host_role = local.get('DIST_ROLE')
+    if host_role not in {'execution','control'}: raise ValueError('DIST_ROLE must be control or execution')
+    cfg['deployment']['role'] = host_role
+    if role is not None and host_role != role: raise ValueError('operation belongs to another physical host role')
+    deployment = cfg['deployment']
+    for name in ('control_id','execution_id'):
+        if not re.fullmatch(r'[a-zA-Z0-9-]{1,63}', deployment[name]):
+            raise ValueError('invalid deployment identity')
+    if deployment['control_id'] == deployment['execution_id']:
+        raise ValueError('deployment identities must differ')
+    cfg['paths'] = {key: path_from_config(value) for key,value in cfg['paths'].items()}
+    if cfg['paths']['base_image'].suffix != '.qcow2': raise ValueError('explicit QCOW2 path required')
+    if any(not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}', value)
+            for value in cfg['storage'].values()): raise ValueError('invalid Docker volume name')
+    if len(set(cfg['storage'].values())) != len(VOLUMES): raise ValueError('duplicate Docker volumes')
+    cfg['local'] = local
     if credentials:
-        expected = {"execution_address": network["execution_address"], "control_address": network["control_address"],
-            "server_name": network["server_name"], "port": network["broker_port"],
-            "control_id": deployment["control_id"], "execution_id": deployment["execution_id"]}
-        cfg["bundle"] = verify_bundle(cfg["paths"]["tls_directory"], None, role, expected)
+        directory = cfg['paths']['credentials_directory']
+        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_mode & 0o077:
+            raise ValueError('private broker credentials directory must exist with mode 0700')
+        for name in ('admin','controller'):
+            token(directory / ('workstation_broker_' + name + '_token'))
+        if token(directory / 'workstation_broker_admin_token') == token(directory / 'workstation_broker_controller_token'):
+            raise ValueError('broker scopes must have different tokens')
+        if host_role == 'control':
+            broker_origin(local.get('DIST_BROKER_URL',''))
+            for field in ('DIST_ACCESS_CLIENT_ID','DIST_ACCESS_CLIENT_SECRET'):
+                value = local.get(field, '')
+                if not 10 <= len(value) <= 512 or not re.fullmatch(r'[A-Za-z0-9._-]+', value):
+                    raise ValueError('missing/invalid Cloudflare Access service credential: ' + field)
+        elif not local.get('DIST_BROKER_TUNNEL_TOKEN'):
+            raise ValueError('missing DIST_BROKER_TUNNEL_TOKEN on execution host')
     return cfg
+
+
+def write_private(path, value):
+    directory = path.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink() or directory.stat().st_mode & 0o077:
+        raise ValueError('unsafe private credential directory')
+    if path.is_symlink(): raise ValueError('unsafe credential file')
+    if path.exists() and path.stat().st_mode & 0o077:
+        raise ValueError('credential file must have mode 0600')
+    fd, temp = tempfile.mkstemp(prefix='.access-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(value + '\n'); output.flush(); os.fsync(output.fileno())
+        os.replace(temp, path)
+    finally: Path(temp).unlink(missing_ok=True)
 
 
 def host(role, cfg, *, docker=True, build_tools=False):
@@ -151,10 +173,6 @@ def host(role, cfg, *, docker=True, build_tools=False):
     release = Path("/etc/os-release").read_text()
     if not re.search(r'^ID=\"?ubuntu\"?$', release, re.M) or not re.search(r'^VERSION_ID=\"?26\.04\"?$', release, re.M):
         raise RuntimeError("deployment requires Ubuntu 26.04")
-    addresses = {entry["local"] for device in json_command(["ip", "-j", "address", "show"])
-                 for entry in device.get("addr_info", []) if entry.get("family") == "inet"}
-    if cfg["network"][role + "_address"] not in addresses:
-        raise RuntimeError("the configured role LAN address is not assigned to this host")
     if docker:
         commands = [["docker", "info", "--format", "{{.ServerVersion}}"]]
         if build_tools: commands += [["docker", "compose", "version"], ["docker", "buildx", "version"]]
@@ -173,21 +191,24 @@ def host(role, cfg, *, docker=True, build_tools=False):
 
 
 def environment(cfg):
-    paths, network, bundle = cfg["paths"], cfg["network"], cfg["bundle"]
-    values = {"COMPOSE_FILE": str(ROOT / "compose.control.yaml"), "DIST_TLS_DIRECTORY": str(paths["tls_directory"]),
-        "DIST_BROKER_URL": f'https://{network["server_name"]}:{network["broker_port"]}',
-        "DIST_BROKER_ADDRESS": network["execution_address"], "DIST_SERVER_SHA256": bundle["server_sha256"],
-        "DIST_CONTROL_ADDRESS": network["control_address"],
-        "WORKSTATION_BROKER_TRANSPORT": "mtls",
-        "WORKSTATION_BROKER_URL": f'https://{network["server_name"]}:{network["broker_port"]}',
-        "WORKSTATION_BROKER_ADDRESS": network["execution_address"],
-        "WORKSTATION_BROKER_CA_FILE": str(paths["tls_directory"] / "ca.crt"),
-        "WORKSTATION_BROKER_CERT_FILE": str(paths["tls_directory"] / "admin.crt"),
-        "WORKSTATION_BROKER_KEY_FILE": str(paths["tls_directory"] / "admin.key"),
-        "WORKSTATION_BROKER_SERVER_SHA256": bundle["server_sha256"],
-        "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
-        "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")}
-    values.update({"DIST_VOLUME_" + key.upper(): name for key, name in cfg["storage"].items()})
+    paths, local = cfg['paths'], cfg['local']
+    directory = paths['credentials_directory']
+    origin = broker_origin(local['DIST_BROKER_URL'])
+    write_private(directory / 'access_client_id', local['DIST_ACCESS_CLIENT_ID'])
+    write_private(directory / 'access_client_secret', local['DIST_ACCESS_CLIENT_SECRET'])
+    values = {
+        'COMPOSE_FILE': str(ROOT / 'compose.control.yaml'),
+        'DIST_CREDENTIALS_DIRECTORY': str(directory),
+        'DIST_BROKER_URL': origin,
+        'DIST_CONTROL_ADDRESS': local.get('DIST_CONTROL_ADDRESS',''),
+        'WORKSTATION_BROKER_TRANSPORT': 'access',
+        'WORKSTATION_BROKER_URL': origin,
+        'WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE': str(directory / 'access_client_id'),
+        'WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE': str(directory / 'access_client_secret'),
+        'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(directory / 'workstation_broker_admin_token'),
+        'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(directory / 'workstation_broker_controller_token'),
+    }
+    values.update({'DIST_VOLUME_' + key.upper(): name for key,name in cfg['storage'].items()})
     os.environ.update(values)
 
 
@@ -196,8 +217,12 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
         endpoint = Endpoint("unix", cfg["paths"]["broker_runtime_directory"] / "broker.sock")
     else:
         endpoint = Endpoint.from_env(Path("/unused-private-broker.sock"))
-    result = WireClient(endpoint).request("deployment_probe" if action == "probe" and not local else action,
-        payload if payload is not None else {}, token(cfg["paths"]["tls_directory"] / "workstation_broker_admin_token"), timeout=timeout)
+    client = WireClient(endpoint)
+    if not local and endpoint.url not in _VERIFIED_ACCESS_ORIGINS:
+        client.check_access_policy()
+        _VERIFIED_ACCESS_ORIGINS.add(endpoint.url)
+    result = client.request("deployment_probe" if action == "probe" and not local else action,
+        payload if payload is not None else {}, token(cfg["paths"]["credentials_directory"] / "workstation_broker_admin_token"), timeout=timeout)
     if action == "probe" and not local:
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         expected = hashlib.sha256(json.dumps(limits, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -393,7 +418,7 @@ def confirm_remote_shutdown(cfg, shutdown_id):
             value = broker(cfg, "shutdown_status", {"shutdown_id": shutdown_id}, timeout=5)
         except IdentityFailure: raise
         except RemoteFailure as exc:
-            if exc.status != 503: raise
+            if exc.status not in {502, 503, 504, 520, 521, 522, 523, 524}: raise
         except TransportFailure:
             pass  # A read may be repeated; connection failure is never stopped proof.
         else:
@@ -410,21 +435,40 @@ def confirm_remote_shutdown(cfg, shutdown_id):
 
 
 def execution_environment(cfg):
-    paths, network = cfg["paths"], cfg["network"]
-    os.environ.update({"WORKSTATION_CONFIG": str(ROOT / "config/runner.toml"),
-        "WORKSTATION_BROKER_SOCKET": str(paths["broker_runtime_directory"] / "broker.sock"),
-        "WORKSTATION_BROKER_STATE": str(paths["base_image"].parent / "attempts"),
-        "WORKSTATION_TEMPLATE_ROOT": str(paths["base_image"].parent / "templates"),
-        "WORKSTATION_BASE_IMAGE": str(paths["base_image"]), "WORKSTATION_BROKER_LISTENER": "mtls",
-        "WORKSTATION_BROKER_LISTEN_ADDRESS": network["execution_address"],
-        "WORKSTATION_BROKER_ALLOWED_PEER": network["control_address"],
-        "WORKSTATION_BROKER_LISTEN_PORT": str(network["broker_port"]),
-        "WORKSTATION_BROKER_CONTROL_ID": cfg["deployment"]["control_id"],
-        "WORKSTATION_BROKER_EXECUTION_ID": cfg["deployment"]["execution_id"],
-        "WORKSTATION_BROKER_TLS_DIR": str(paths["tls_directory"]),
-        "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["control_address"] + "/32"]),
-        "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
-        "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")})
+    paths, local = cfg['paths'], cfg['local']
+    control_address = local.get('DIST_CONTROL_ADDRESS')
+    if control_address:
+        import ipaddress
+        address = ipaddress.ip_address(control_address)
+        if address.version != 4 or not address.is_private:
+            raise ValueError('DIST_CONTROL_ADDRESS must be a private IPv4 for guest isolation')
+    os.environ.update({
+        'WORKSTATION_CONFIG': str(ROOT / 'config/runner.toml'),
+        'WORKSTATION_BROKER_SOCKET': str(paths['broker_runtime_directory'] / 'broker.sock'),
+        'WORKSTATION_BROKER_STATE': str(paths['base_image'].parent / 'attempts'),
+        'WORKSTATION_TEMPLATE_ROOT': str(paths['base_image'].parent / 'templates'),
+        'WORKSTATION_BASE_IMAGE': str(paths['base_image']),
+        'WORKSTATION_BROKER_LISTENER': 'unix',
+        'WORKSTATION_BROKER_CONTROL_ID': cfg['deployment']['control_id'],
+        'WORKSTATION_BROKER_EXECUTION_ID': cfg['deployment']['execution_id'],
+        'WORKSTATION_CONTROL_PLANE_CIDRS': json.dumps([control_address + '/32'] if control_address else []),
+        'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_admin_token'),
+        'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_controller_token'),
+    })
+
+
+def execution_tunnel(cfg, action):
+    if action not in {'up', 'down', 'ps'}: raise ValueError('invalid execution tunnel action')
+    local = cfg['local']
+    if action == 'up':
+        value = local.get('DIST_BROKER_TUNNEL_TOKEN','')
+        if not 30 <= len(value) <= 2048 or not re.fullmatch(r'[A-Za-z0-9._=-]+', value):
+            raise ValueError('invalid/missing DIST_BROKER_TUNNEL_TOKEN')
+        os.environ['DIST_BROKER_TUNNEL_TOKEN'] = value
+    os.environ['DIST_BROKER_RUNTIME_DIR'] = str(cfg['paths']['broker_runtime_directory'])
+    # Separate project: control-host Docker teardown never touches this tunnel.
+    options = ['up', '-d', '--wait', '--wait-timeout', '120'] if action == 'up' else [action]
+    return run(['docker', 'compose', '-f', str(ROOT / 'compose.execution-tunnel.yaml'), *options])
 
 
 def local_down(cfg):
@@ -651,8 +695,11 @@ def execution(cfg, action, args):
     if action not in allowed:
         raise RuntimeError("this operation belongs to control host; execution host never runs control-plane services")
     host("execution", cfg, docker=action in {"requirements", "build"}, build_tools=action in {"requirements", "build"})
-    paths, network = cfg["paths"], cfg["network"]
-    if action == "down": return local_down(cfg)
+    paths = cfg["paths"]
+    if action == "down":
+        result = local_down(cfg)
+        execution_tunnel(cfg, 'down')
+        return result
     if action == "requirements":
         from host_requirements import verify_host_requirements
         if not verify_host_requirements(require_root=True, role="execution", golden_build=True): raise RuntimeError("execution host prerequisites failed")
@@ -697,8 +744,10 @@ def execution(cfg, action, args):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("execution host broker startup deadline exceeded")
                 time.sleep(0.5)
+        execution_tunnel(cfg, 'up')
         if action != "doctor": return
     if action in {"status", "doctor"}:
+        execution_tunnel(cfg, 'ps')
         print(json.dumps(broker(cfg, "inventory", local=True), indent=2))
         if action == "doctor":
             run([sys.executable, "infra/workstation/image/build.py", "--verify"])

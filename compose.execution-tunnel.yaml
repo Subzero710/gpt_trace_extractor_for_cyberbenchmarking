@@ -1,0 +1,17 @@
+name: gpt-trace-execution-tunnel
+services:
+  execution-broker-tunnel:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: "${DIST_BROKER_TUNNEL_TOKEN:-}"
+    user: "0:0" # Native socket has a root-owned 0700 parent; no TCP listener is published.
+    volumes:
+      - "${DIST_BROKER_RUNTIME_DIR:?}:/run/workstation-broker:ro"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [tunnel_egress]
+networks:
+  tunnel_egress: {}

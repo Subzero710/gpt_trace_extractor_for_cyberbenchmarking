@@ -1,7 +1,7 @@
 """One-shot authenticated proof after the actual broker process has exited.
 
 This finite child has no mutation route and no new service/unit. It reuses the
-same pinned mTLS listener only after the native broker PID/start-time is gone,
+same protected Unix socket after the native broker PID/start-time is gone,
 audits resource absence again, confirms one fresh shutdown nonce, then exits.
 """
 from __future__ import annotations
@@ -150,20 +150,22 @@ def observe(shutdown_id):
             atomic_json(path, value, 0o600)
             return
         confirmation = Confirmation(value)
-        from gpt_trace_transport.gateway import start_from_env
-        listener = start_from_env(None, upstream=confirmation, operation_timeout=15)
-        if listener is None: raise RuntimeError("global shutdown requires the existing mTLS confirmation listener")
+        # cloudflared keeps forwarding to this exact Unix origin during handoff.
+        # Only the admin bearer credential can observe/acknowledge shutdown.
+        from gpt_trace_transport.unix_confirmation import start_confirmation
+        listener = start_confirmation(Path(os.environ['WORKSTATION_BROKER_SOCKET']), confirmation)
         atomic_json(path, value, 0o600)
-        # Finite confirmation lease, no watchdog, service or persistent listener.
         confirmation.completed.wait(120)
     except BaseException as exc:
-        atomic_json(path, {**value, "status": "failed", "error": type(exc).__name__ + ": " + str(exc),
-                          "broker_stopped": False}, 0o600)
+        atomic_json(path, {**value, 'status': 'failed', 'error': type(exc).__name__ + ': ' + str(exc),
+                           'broker_stopped': False}, 0o600)
         raise
     finally:
         if listener is not None:
             listener.shutdown()
             listener.server_close()
+            socket_path = Path(os.environ['WORKSTATION_BROKER_SOCKET'])
+            if socket_path.is_socket() and not socket_path.is_symlink(): socket_path.unlink()
 
 
 if __name__ == "__main__":
