@@ -87,11 +87,16 @@ def certificate_sha(path: Path) -> str:
     return hashlib.sha256(der).hexdigest()
 
 
+def token_value(value: str) -> str:
+    """Validate a secret provided by the private deployment .env."""
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{32,512}", value) is None:
+        raise IdentityFailure("invalid broker token in .env")
+    return value
+
+
 def token(path: Path, *, strict: bool = True) -> str:
     value = (safe_file(path, secret=True, mounted=True) if strict else path.read_bytes()).decode("ascii").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{32,512}", value):
-        raise IdentityFailure("invalid broker token")
-    return value
+    return token_value(value)
 
 
 @dataclass(frozen=True)

@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT/'shared'), str(ROOT/'scripts')]
 from gpt_trace_transport.wire import Endpoint, IdentityFailure, WireClient
 from gpt_trace_transport.unix_confirmation import start_confirmation
-from create_broker_tokens import provision
+from gpt_trace_transport.wire import token_value
 
 
 def dispatcher():
@@ -100,29 +100,25 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('ports:',compose)
         self.assertIn('broker.sock', (ROOT/'docs/distributed.md').read_text())
 
-    def test_broker_credentials_are_distinct_generated_once(self):
-        root=self.root/'generated'
-        provision(root)
-        self.assertEqual(stat.S_IMODE(root.stat().st_mode),0o700)
-        names=sorted(root.iterdir())
-        self.assertEqual(len(names),2)
-        self.assertNotEqual(names[0].read_text(),names[1].read_text())
-        self.assertTrue(all(stat.S_IMODE(name.stat().st_mode)==0o600 for name in names))
-        with self.assertRaises(ValueError):provision(root)
-        assert all('PRIVATE KEY' not in name.read_text() for name in names)
-
-    def test_control_and_execution_need_no_address_or_access_service_token(self):
-        directory=self.root/'.secrets/distributed'
-        provision(directory)
+    def test_env_only_credentials_are_rejected_if_missing_or_equal(self):
+        pair = ('DIST_BROKER_ADMIN_TOKEN='+'a'*64+'\n'
+                'DIST_BROKER_CONTROLLER_TOKEN='+'b'*64+'\n')
         self.env(extra='DIST_BROKER_URL=https://broker.example.net\n')
+        with self.assertRaises(Exception): self.module.config()
+        self.env(extra='DIST_BROKER_URL=https://broker.example.net\n'+pair)
         cfg=self.module.config()
         self.module.environment(cfg)
         self.assertEqual(os.environ['WORKSTATION_BROKER_TRANSPORT'],'https')
         self.assertEqual(os.environ['WORKSTATION_BROKER_URL'],'https://broker.example.net')
+        self.assertEqual(os.environ['DIST_BROKER_ADMIN_TOKEN'],'a'*64)
+        self.assertFalse((self.root/'.secrets').exists())
         self.assertNotIn('WORKSTATION_CONTROL_PLANE_ADDRESS',
                          {k: v for k,v in os.environ.items() if k.startswith('DIST_')})
-        self.assertFalse((directory/'access_client_id').exists())
-        self.env('execution','DIST_BROKER_TUNNEL_TOKEN=eyJ1234567890abcdefghijabcdefghijabcdefghij\n')
+        self.env(extra='DIST_BROKER_URL=https://broker.example.net\n'
+                       + 'DIST_BROKER_ADMIN_TOKEN='+'a'*64+'\n'
+                       + 'DIST_BROKER_CONTROLLER_TOKEN='+'a'*64+'\n')
+        with self.assertRaisesRegex(ValueError,'different tokens'): self.module.config()
+        self.env('execution','DIST_BROKER_TUNNEL_TOKEN=eyJ1234567890abcdefghijabcdefghijabcdefghij\n'+pair)
         self.assertEqual(self.module.config()['deployment']['role'],'execution')
 
 

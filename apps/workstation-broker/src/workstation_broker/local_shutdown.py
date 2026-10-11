@@ -44,10 +44,10 @@ def main():
     from workstation_broker.server import Broker, inventory
     base = Path(os.environ["WORKSTATION_BASE_IMAGE"])
     limits = __import__("tomllib").loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
-    from gpt_trace_transport.wire import token
+    from gpt_trace_transport.wire import token_value
     broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), base,
-        token(Path(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN_FILE"])),
-        token(Path(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE"])),
+        token_value(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN"]),
+        token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"]),
         memory_mb=limits["memory_mb"], vcpus=limits["vcpus"],
         boot_timeout_seconds=limits["boot_timeout_seconds"], guest_agent_timeout_seconds=limits["guest_agent_timeout_seconds"],
         overlay_quota_gb=limits["overlay_quota_gb"], screenshot_max_bytes=limits["screenshot_max_bytes"],

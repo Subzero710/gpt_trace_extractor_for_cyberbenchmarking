@@ -6,7 +6,6 @@ control_id = "control"
 execution_id = "execution"
 
 [paths]
-credentials_directory = ".secrets/distributed"
 base_image = "/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"
 broker_runtime_directory = "state/broker"
 storage_root = "/srv/stockage/cyber-dataset"

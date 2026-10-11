@@ -66,36 +66,41 @@ are forbidden, so control-host access cannot accidentally be re-enabled via
 a whitelist. The physical acceptance probes representative private IPv4
 addresses without requiring the actual control host's address.
 
-## One-time broker tokens
+## Operator-managed tokens (read-only `.env`)
 
-The publicly routed broker relies on its own two distinct, strong bearer-token
-scopes for authentication and authorization. Generate one shared pair ONCE on
-control using the checked-out generator (no OpenSSL):
+**The application never generates, chooses, changes, transfers or writes broker
+credentials or `.env`.** Only the operator supplies their values.
 
-```bash
-python3 scripts/create_broker_tokens.py --output "$HOME/new-broker-credentials"
-install -d -m 700 .secrets/distributed
-install -m 600 "$HOME/new-broker-credentials/"workstation_broker_{admin,controller}_token .secrets/distributed/
+Choose two **different**, high-entropy strings (32 to 512 characters, using
+letters, numbers, `_` and `-`; prefer 48 or more random bytes). Enter the **same**
+two values manually in `.env` on both hosts:
+
+```dotenv
+DIST_BROKER_ADMIN_TOKEN=YOUR_OWN_ADMIN_SECRET
+DIST_BROKER_CONTROLLER_TOKEN=YOUR_OWN_CONTROLLER_SECRET
 ```
 
-Copy **the same two files** to the execution host over authenticated SSH.
-For example (adjust SSH username):
+On **control**, also define the app-control secret, independently chosen:
 
-```bash
-scp "$HOME/new-broker-credentials/"workstation_broker_{admin,controller}_token user@EXECUTION_HOST:~/
+```dotenv
+APP_CONTROL_TOKEN=YOUR_OWN_APP_CONTROL_SECRET
 ```
 
-On execution, from the repository root:
+Store the values in a password manager and enter them yourself. The project
+never calls SSH to exchange credentials, nor generates a pair, nor changes
+`.env`. The two hosts authenticate only if the corresponding broker values
+match **exactly**; changing one requires manually changing the other before
+resuming the broker. Do not paste actual credentials into chats or commits.
 
-```bash
-install -d -m 700 .secrets/distributed
-install -m 600 ~/workstation_broker_admin_token ~/workstation_broker_controller_token .secrets/distributed/
-rm -f ~/workstation_broker_admin_token ~/workstation_broker_controller_token
-```
+Run `chmod 600 .env` **yourself** on each host. At runtime `.env` is only read,
+and missing/invalid credentials fail closed. Compose obtains the control host
+secrets from `.env` as environment-backed Docker Compose secrets, exposing the
+existing `/run/secrets/*` interfaces inside containers without any user-managed
+secret files. The native execution broker reads broker credentials from `.env`.
 
-Do not regenerate them independently on each host: the existing code still
-requires both ends to agree. The generator refuses to overwrite any existing
-bundle. Rotate deliberately when there are no active benchmark attempts.
+The existing teacher-browser password also originates in `.env`; a runtime
+file is still materialized for its legacy service interface, but `.env` is
+never edited by that operation.
 
 ## Build and launch
 

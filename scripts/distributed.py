@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "shared"))
-from gpt_trace_transport.wire import Endpoint, WireClient, token, TransportFailure, IdentityFailure, RemoteFailure
+from gpt_trace_transport.wire import Endpoint, WireClient, token_value, TransportFailure, IdentityFailure, RemoteFailure
 
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
@@ -52,7 +52,7 @@ def path_from_config(value):
 # Host identities stay outside versioned TOML. Broker traffic uses Cloudflare Tunnel HTTPS;
 # no LAN IP, Cloudflare Access policy, or private CA is required.
 DISTRIBUTED_ENV_FIELDS = {('deployment', 'role'): 'DIST_ROLE'}
-OPTIONAL_ENV_FIELDS = {'DIST_BROKER_URL', 'DIST_BROKER_TUNNEL_TOKEN'}
+OPTIONAL_ENV_FIELDS = {'DIST_BROKER_URL', 'DIST_BROKER_TUNNEL_TOKEN', 'DIST_BROKER_ADMIN_TOKEN', 'DIST_BROKER_CONTROLLER_TOKEN'}
 
 
 def local_deployment_env():
@@ -106,7 +106,7 @@ def config(role=None, *, credentials=True):
     cfg = tomllib.loads(source.read_text())
     required = {
         'deployment': {'role', 'control_id', 'execution_id'},
-        'paths': {'credentials_directory', 'base_image', 'broker_runtime_directory', 'storage_root'},
+        'paths': {'base_image', 'broker_runtime_directory', 'storage_root'},
         'storage': set(VOLUMES),
     }
     if set(cfg) != set(required) or any(set(cfg[section]) != keys for section, keys in required.items()):
@@ -131,12 +131,9 @@ def config(role=None, *, credentials=True):
     if len(set(cfg['storage'].values())) != len(VOLUMES): raise ValueError('duplicate Docker volumes')
     cfg['local'] = local
     if credentials:
-        directory = cfg['paths']['credentials_directory']
-        if directory.is_symlink() or not directory.is_dir() or directory.stat().st_mode & 0o077:
-            raise ValueError('private broker credentials directory must exist with mode 0700')
-        for name in ('admin','controller'):
-            token(directory / ('workstation_broker_' + name + '_token'))
-        if token(directory / 'workstation_broker_admin_token') == token(directory / 'workstation_broker_controller_token'):
+        admin = token_value(local.get('DIST_BROKER_ADMIN_TOKEN', ''))
+        controller = token_value(local.get('DIST_BROKER_CONTROLLER_TOKEN', ''))
+        if secrets.compare_digest(admin, controller):
             raise ValueError('broker scopes must have different tokens')
         if host_role == 'control':
             broker_origin(local.get('DIST_BROKER_URL',''))
@@ -170,16 +167,14 @@ def host(role, cfg, *, docker=True, build_tools=False):
 
 def environment(cfg):
     paths, local = cfg['paths'], cfg['local']
-    directory = paths['credentials_directory']
     origin = broker_origin(local['DIST_BROKER_URL'])
     values = {
         'COMPOSE_FILE': str(ROOT / 'compose.control.yaml'),
-        'DIST_CREDENTIALS_DIRECTORY': str(directory),
+        'DIST_BROKER_ADMIN_TOKEN': token_value(local['DIST_BROKER_ADMIN_TOKEN']),
+        'DIST_BROKER_CONTROLLER_TOKEN': token_value(local['DIST_BROKER_CONTROLLER_TOKEN']),
         'DIST_BROKER_URL': origin,
         'WORKSTATION_BROKER_TRANSPORT': 'https',
         'WORKSTATION_BROKER_URL': origin,
-        'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(directory / 'workstation_broker_admin_token'),
-        'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(directory / 'workstation_broker_controller_token'),
     }
     values.update({'DIST_VOLUME_' + key.upper(): name for key,name in cfg['storage'].items()})
     os.environ.update(values)
@@ -192,7 +187,7 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
         endpoint = Endpoint.from_env(Path("/unused-private-broker.sock"))
     client = WireClient(endpoint)
     result = client.request("deployment_probe" if action == "probe" and not local else action,
-        payload if payload is not None else {}, token(cfg["paths"]["credentials_directory"] / "workstation_broker_admin_token"), timeout=timeout)
+        payload if payload is not None else {}, token_value(cfg['local']['DIST_BROKER_ADMIN_TOKEN']), timeout=timeout)
     if action == "probe" and not local:
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         expected = hashlib.sha256(json.dumps(limits, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -415,8 +410,8 @@ def execution_environment(cfg):
         'WORKSTATION_BROKER_LISTENER': 'unix',
         'WORKSTATION_BROKER_CONTROL_ID': cfg['deployment']['control_id'],
         'WORKSTATION_BROKER_EXECUTION_ID': cfg['deployment']['execution_id'],
-        'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_admin_token'),
-        'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_controller_token'),
+        'WORKSTATION_BROKER_ADMIN_TOKEN': token_value(local['DIST_BROKER_ADMIN_TOKEN']),
+        'WORKSTATION_BROKER_CONTROLLER_TOKEN': token_value(local['DIST_BROKER_CONTROLLER_TOKEN']),
     })
 
 

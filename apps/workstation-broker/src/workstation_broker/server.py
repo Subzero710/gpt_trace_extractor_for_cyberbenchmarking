@@ -1021,10 +1021,9 @@ def create_app(broker: Broker) -> Starlette:
 
 def main():
     import uvicorn
-    admin_token = Path(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN_FILE"]).read_text().strip()
-    controller_token = Path(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE"]).read_text().strip()
-    if len(admin_token) < 32 or len(controller_token) < 32:
-        raise RuntimeError("broker tokens are missing or too short")
+    from gpt_trace_transport.wire import token_value
+    admin_token = token_value(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN"])
+    controller_token = token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"])
     if hmac.compare_digest(admin_token, controller_token):
         raise RuntimeError("broker admin and controller tokens must be distinct")
     from gpt_trace_transport.local_templates import golden_builder

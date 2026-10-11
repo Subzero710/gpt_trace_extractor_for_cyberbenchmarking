@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import ROOT, atomic_json, safe
-from gpt_trace_transport.wire import token
+from gpt_trace_transport.wire import token_value
 from workstation_broker.preparation import (identifier, process_identity,
     same_process, PreparationManager)
 
@@ -98,7 +98,7 @@ class Confirmation:
     def __init__(self, proof):
         self.proof = proof
         self.completed = threading.Event()
-        self.credential = token(Path(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN_FILE"]))
+        self.credential = token_value(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN"])
 
     def exchange(self, method, path, body, authorization, *, timeout=None):
         if not hmac.compare_digest(authorization, "Bearer " + self.credential):
