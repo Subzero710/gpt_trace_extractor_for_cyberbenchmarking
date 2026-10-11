@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import secrets
 import re
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "shared"))
 from gpt_trace_transport.pki import verify_bundle
-from gpt_trace_transport.wire import Endpoint, WireClient, private_address, token
+from gpt_trace_transport.wire import Endpoint, WireClient, private_address, token, TransportFailure, IdentityFailure, RemoteFailure
 
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
@@ -138,13 +139,13 @@ def environment(cfg):
     os.environ.update(values)
 
 
-def broker(cfg, action, payload=None, *, local=False):
+def broker(cfg, action, payload=None, *, local=False, timeout=None):
     if local:
         endpoint = Endpoint("unix", cfg["paths"]["broker_runtime_directory"] / "broker.sock")
     else:
         endpoint = Endpoint.from_env(Path("/unused-private-broker.sock"))
     result = WireClient(endpoint).request("deployment_probe" if action == "probe" and not local else action,
-        payload or {}, token(cfg["paths"]["tls_directory"] / "workstation_broker_admin_token"))
+        payload if payload is not None else {}, token(cfg["paths"]["tls_directory"] / "workstation_broker_admin_token"), timeout=timeout)
     if action == "probe" and not local:
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         expected = hashlib.sha256(json.dumps(limits, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -272,26 +273,157 @@ def restore(cfg, directory):
 
 
 
-def install_templates(cfg):
-    # Pure host file installation plus qemu-img inspection; never VM creation.
-    sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
-    from workstation_broker.templates import TemplateRegistry
-    from gpt_trace_transport.template_release import UnpublishedRelease, install
-    base = cfg["paths"]["base_image"]
-    def image_info(path):
-        value = json_command(["qemu-img", "info", "--output=json", path])
-        run(["qemu-img", "check", path], capture=True, timeout=3600)
-        return value
-    def registry(root, golden):
-        return TemplateRegistry(root, golden, image_info)
+def preparation_fetch(cfg):
+    """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
+    from gpt_trace_transport.local_templates import source_contract, atomic_json
+    broker(cfg, "probe", timeout=60)
+    identified = broker(cfg, "template_preparation_probe", {"source_contract": source_contract(ROOT)}, timeout=120)
+    operation_id = identified.get("operation_id")
+    deployment = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
+    if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
+            or identified.get("deployment") != deployment or not isinstance(identified.get("compatibility"), dict)):
+        raise RuntimeError("Acer preparation identity differs")
+    recipe = source_contract(ROOT)
+    if any(identified["compatibility"].get(key) != value for key, value in recipe.items()):
+        raise RuntimeError("Acer preparation recipe differs from Fossil")
+    if hashlib.sha256(json.dumps(identified["compatibility"], sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False).encode()).hexdigest() != operation_id:
+        raise RuntimeError("Acer preparation content identity differs")
+    directory = ROOT / "state/distributed"
+    for parent in (directory, *directory.parents):
+        if parent.is_symlink(): raise ValueError("unsafe local preparation journal")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    atomic_json(directory / ("preparation-" + operation_id + ".json"), identified, 0o600)
+    print("Acer local preparation: " + operation_id, flush=True)
+    started = False
+    last_phase = None
     try:
-        return install(base, base.parent / "templates", registry)
-    except UnpublishedRelease as exc:
-        # Only a genuinely absent release is optional for GAIA. Corruption,
-        # incompatibility, mutable drafts and authentication/network errors fail.
-        # Lite selection still fails before allocating its teacher or attempt.
-        print("SWE-Gym Lite unavailable: " + str(exc) + "; GAIA golden remains usable", file=sys.stderr)
-        return None
+        while True:
+            status = broker(cfg, "template_preparation_status", {"operation_id": operation_id}, timeout=60)
+            if status.get("operation_id") != operation_id or status.get("deployment") != deployment:
+                raise RuntimeError("preparation status identity differs")
+            phase = status.get("phase")
+            if phase != last_phase:
+                print("preparation " + operation_id + ": " + str(phase), flush=True)
+                last_phase = phase
+            if phase == "ready":
+                result = status.get("result")
+                if (not isinstance(result, dict) or re.fullmatch(r"[0-9a-f]{64}", str(result.get("generation"))) is None
+                        or result.get("invariants") != {"tasks": 230, "repos": 11, "env_hashes": 25}
+                        or not result.get("verified_signature")):
+                    raise RuntimeError("preparation returned no verified complete generation")
+                atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
+                print("SWE-Gym Lite ready on Acer: " + result["generation"], flush=True)
+                return result
+            if phase in {"not_started", "failed", "interrupted", "canceled"}:
+                if started:
+                    raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
+                # A new explicit fetch may retry a previously proved-dead job.
+                # This command NEVER repeats a start after a lost response.
+                started = True
+                broker(cfg, "prepare_templates", {"operation_id": operation_id,
+                    "compatibility": identified["compatibility"], "retry": phase != "not_started"}, timeout=60)
+            elif phase not in {"starting", "running", "validating"}:
+                raise RuntimeError("unknown preparation phase: " + str(phase))
+            time.sleep(2)
+    except TransportFailure as exc:
+        raise RuntimeError("preparation " + operation_id + " has an unconfirmed remote outcome: " + str(exc) +
+            "; rerun make superbench-fetch ADAPTER=swe-gym-lite to rediscover it; no mutation was blindly retried") from exc
+
+
+def confirm_remote_shutdown(cfg, shutdown_id):
+    sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
+    from workstation_broker.shutdown_observer import verify_stopped
+    expected = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
+    deadline = time.monotonic() + 100
+    while time.monotonic() < deadline:
+        try:
+            value = broker(cfg, "shutdown_status", {"shutdown_id": shutdown_id}, timeout=5)
+        except IdentityFailure: raise
+        except RemoteFailure as exc:
+            if exc.status != 503: raise
+        except TransportFailure:
+            pass  # A read may be repeated; connection failure is never stopped proof.
+        else:
+            if value.get("broker_stopped") is True:
+                proof = verify_stopped(value, shutdown_id, "global", expected)
+                acknowledged = broker(cfg, "shutdown_complete", {"shutdown_id": shutdown_id}, timeout=5)
+                verify_stopped(acknowledged, shutdown_id, "global", expected)
+                return proof
+            if (value.get("shutdown_id") != shutdown_id or value.get("deployment") != expected
+                    or value.get("project") != PROJECT or value.get("pending") is not True):
+                raise RuntimeError("shutdown status has no verified matching handoff")
+        time.sleep(0.2)
+    raise RuntimeError("remote broker exit/cleanup confirmation unavailable; global shutdown incomplete")
+
+
+def acer_environment(cfg):
+    paths, network = cfg["paths"], cfg["network"]
+    os.environ.update({"WORKSTATION_CONFIG": str(ROOT / "config/runner.toml"),
+        "WORKSTATION_BROKER_SOCKET": str(paths["broker_runtime_directory"] / "broker.sock"),
+        "WORKSTATION_BROKER_STATE": str(paths["base_image"].parent / "attempts"),
+        "WORKSTATION_TEMPLATE_ROOT": str(paths["base_image"].parent / "templates"),
+        "WORKSTATION_BASE_IMAGE": str(paths["base_image"]), "WORKSTATION_BROKER_LISTENER": "mtls",
+        "WORKSTATION_BROKER_LISTEN_ADDRESS": network["acer_address"],
+        "WORKSTATION_BROKER_ALLOWED_PEER": network["fossil_address"],
+        "WORKSTATION_BROKER_LISTEN_PORT": str(network["broker_port"]),
+        "WORKSTATION_BROKER_CONTROL_ID": cfg["deployment"]["control_id"],
+        "WORKSTATION_BROKER_EXECUTION_ID": cfg["deployment"]["execution_id"],
+        "WORKSTATION_BROKER_TLS_DIR": str(paths["tls_directory"]),
+        "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["fossil_address"] + "/32"]),
+        "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
+        "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")})
+
+
+def local_down(cfg):
+    print("scope=acer-local; global=false; Fossil campaign/services are not stopped by this command. Run make down on Fossil for global shutdown.", flush=True)
+    acer_environment(cfg)
+    sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
+    from gpt_trace_transport.local_templates import safe
+    from workstation_broker.preparation import same_process
+    from workstation_broker.shutdown_observer import verify_stopped
+    runtime = cfg["paths"]["broker_runtime_directory"]
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe(runtime, directory=True)
+    if runtime.stat().st_mode & 0o077: raise RuntimeError("local broker runtime is not private")
+    record_path = runtime / "broker-process.json"
+    expected = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
+    record = json.loads(safe(record_path).read_bytes()) if record_path.exists() else None
+    if record is not None and record.get("deployment") != expected:
+        raise RuntimeError("local broker identity belongs to another deployment")
+    if record is None or not same_process(record["broker_identity"]):
+        # An explicitly verified inactive lifecycle, not a network-error path.
+        python = ROOT / ".venv-workstation-broker/bin/python"
+        result = json.loads(run([python, "-B", "-m", "workstation_broker.local_shutdown"], capture=True, timeout=150))
+        if (result.get("scope") != "acer-local" or result.get("global") is not False
+                or result.get("deployment") != expected or result.get("broker_stopped") is not True
+                or result.get("inventory", {}).get("absent") is not True):
+            raise RuntimeError("local offline cleanup lacks verified absence")
+        print("Acer local shutdown complete; Fossil global shutdown remains separate; permanent data/images retained.")
+        return result
+    barrier = broker(cfg, "begin_shutdown", local=True, timeout=90)
+    if barrier.get("draining") is not True or barrier.get("project") != PROJECT:
+        raise RuntimeError("local mutation barrier unconfirmed")
+    broker(cfg, "destroy_all", local=True)
+    proof = broker(cfg, "inventory", local=True)
+    if proof.get("absent") is not True or proof.get("project") != PROJECT:
+        raise RuntimeError("local temporary resources remain")
+    shutdown_id = secrets.token_hex(32)
+    acknowledgement = broker(cfg, "shutdown", {"shutdown_id": shutdown_id, "scope": "acer-local"}, local=True, timeout=30)
+    if acknowledgement.get("shutdown_id") != shutdown_id or acknowledgement.get("shutdown") is not True:
+        raise RuntimeError("local broker shutdown handoff unconfirmed")
+    path = runtime / ("shutdown-" + shutdown_id + ".json")
+    deadline = time.monotonic() + 80
+    while time.monotonic() < deadline:
+        value = json.loads(safe(path).read_bytes())
+        if value.get("status") == "failed": raise RuntimeError("local shutdown confirmation failed: " + str(value.get("error")))
+        if value.get("status") == "stopped":
+            verify_stopped(value, shutdown_id, "acer-local", expected)
+            if same_process(value["broker_identity"]): raise RuntimeError("native broker still exists")
+            print("Acer local shutdown confirmed; Fossil campaign/services remain outside this local scope; permanent data/images retained.")
+            return value
+        time.sleep(0.2)
+    raise RuntimeError("local broker exit confirmation timed out")
 
 
 def install_unit(cfg):
@@ -342,14 +474,20 @@ def global_down(cfg):
         proof = broker(full, "inventory")
         if proof.get("absent") is not True or proof.get("project") != PROJECT:
             raise RuntimeError("Acer cleanup has no authenticated absence proof")
+        shutdown_id = secrets.token_hex(32)
+        reply = broker(full, "shutdown", {"shutdown_id": shutdown_id, "scope": "global"}, timeout=30)
+        if (reply.get("shutdown_id") != shutdown_id or reply.get("absent") is not True
+                or reply.get("shutdown") is not True):
+            raise RuntimeError("Acer broker did not acknowledge the clean shutdown handoff")
+        stopped = confirm_remote_shutdown(full, shutdown_id)
         directory = ROOT / "state/distributed"
+        for parent in (directory, *directory.parents):
+            if parent.is_symlink(): raise ValueError("unsafe cleanup journal")
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        from gpt_trace_transport.template_release import atomic_json
+        from gpt_trace_transport.local_templates import atomic_json
         atomic_json(directory / "last-cleanup.json", {"control_id": cfg["deployment"]["control_id"],
-            "execution_id": cfg["deployment"]["execution_id"], "observed_at": time.time(), "inventory": proof}, 0o600)
-        reply = broker(full, "shutdown")
-        if reply.get("absent") is not True or reply.get("shutdown") is not True:
-            raise RuntimeError("Acer broker did not acknowledge clean shutdown")
+            "execution_id": cfg["deployment"]["execution_id"], "observed_at": time.time(),
+            "inventory": proof, "broker_exit_confirmation": stopped}, 0o600)
     finally:
         # Label-scoped Docker teardown does not depend on Compose interpolation,
         # valid remote certificates, a running database, or a secret generator.
@@ -364,7 +502,7 @@ def global_down(cfg):
         after_volumes = set(run(["docker", "volume", "ls", "--format", "{{.Name}}"], capture=True).splitlines())
         if before_volumes - after_volumes:
             raise RuntimeError("pre-existing Docker volumes disappeared during shutdown")
-    print("Global shutdown acknowledged; temporary Acer resources absent; Fossil services stopped; data and permanent images retained.")
+    print("Global shutdown confirmed; Acer native broker stopped; temporary Acer resources absent; Fossil services stopped; data and permanent images retained.")
 
 
 def control_up(cfg, *, minimal=False):
@@ -395,8 +533,6 @@ def fossil(cfg, action, args):
                 "kali-workstation-controller", "workstation-gateway", "runner", "benchmark-fetch")
         build.verify_manifests(ROOT)
         return
-    if action == "publish-kali-golden":
-        raise RuntimeError("golden publication belongs to Acer's KVM publication host")
     if action in {"up", "kali_control"}:
         return control_up(cfg, minimal=action == "kali_control")
     if action == "throw_volumes":
@@ -431,7 +567,9 @@ def fossil(cfg, action, args):
     if action == "superbench-fetch":
         if not args.adapter: raise ValueError("ADAPTER is required")
         run([sys.executable, "scripts/project_state.py", "core"])
-        return compose("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter)
+        compose("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter)
+        if args.adapter == "swe-gym-lite": return preparation_fetch(cfg)
+        return
     mapping = {"auth": "superbench-auth", "run": "superbench-run", "pause": "superbench-pause",
         "resume": "superbench-resume-active", "status": "superbench-active-status",
         "start_kali": "manual-kali-start", "stop_kali": "manual-kali-stop",
@@ -457,20 +595,19 @@ def fossil(cfg, action, args):
 
 
 def acer(cfg, action, args):
-    allowed = {"requirements", "build", "up", "doctor", "status", "kali_control", "serve", "publish-kali-golden"}
+    allowed = {"requirements", "build", "up", "doctor", "status", "kali_control", "serve", "down"}
     if action not in allowed:
-        if action == "down":
-            raise RuntimeError("global shutdown is coordinated on Fossil: make down; no local-only cleanup was performed")
         raise RuntimeError("this operation belongs to Fossil; Acer never runs control-plane services")
-    host("acer", cfg, docker=action in {"requirements", "build", "publish-kali-golden"}, build_tools=action in {"requirements", "build", "publish-kali-golden"})
+    host("acer", cfg, docker=action in {"requirements", "build"}, build_tools=action in {"requirements", "build"})
     paths, network = cfg["paths"], cfg["network"]
+    if action == "down": return local_down(cfg)
     if action == "requirements":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="acer"): raise RuntimeError("Acer prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="acer", golden_build=True): raise RuntimeError("Acer prerequisites failed")
         return
     if action == "build":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="acer"): raise RuntimeError("Acer prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="acer", golden_build=True): raise RuntimeError("Acer prerequisites failed")
         domains = run(["virsh", "-c", "qemu:///system", "list", "--all", "--name"], capture=True).splitlines()
         if any(x.startswith("gpt-trace-ws-") for x in domains):
             raise RuntimeError("preserve existing attempts before installing broker/images")
@@ -482,36 +619,22 @@ def acer(cfg, action, args):
         else:
             build.build_workstation_base_image(ROOT)
             build.verify_workstation_image(ROOT)
-        install_templates(cfg)
         install_unit(cfg)
         return
-    if action == "publish-kali-golden":
-        return run([sys.executable, "infra/workstation/image/build.py", "--publish"])
     if action == "serve":
         runtime = paths["broker_runtime_directory"]
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
         runtime.chmod(0o700)
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         if limits["provider"] != "libvirt": raise ValueError("libvirt provider required")
-        os.environ.update({"WORKSTATION_CONFIG": str(ROOT / "config/runner.toml"),
-            "WORKSTATION_BROKER_SOCKET": str(runtime / "broker.sock"),
-            "WORKSTATION_BROKER_STATE": str(paths["base_image"].parent / "attempts"),
-            "WORKSTATION_TEMPLATE_ROOT": str(paths["base_image"].parent / "templates"),
-            "WORKSTATION_BASE_IMAGE": str(paths["base_image"]), "WORKSTATION_BROKER_LISTENER": "mtls",
-            "WORKSTATION_BROKER_LISTEN_ADDRESS": network["acer_address"],
-            "WORKSTATION_BROKER_ALLOWED_PEER": network["fossil_address"],
-            "WORKSTATION_BROKER_LISTEN_PORT": str(network["broker_port"]),
-            "WORKSTATION_BROKER_CONTROL_ID": cfg["deployment"]["control_id"],
-            "WORKSTATION_BROKER_EXECUTION_ID": cfg["deployment"]["execution_id"],
-            "WORKSTATION_BROKER_TLS_DIR": str(paths["tls_directory"]),
-            "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["fossil_address"] + "/32"]),
-            "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
-            "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")})
+        acer_environment(cfg)
         python = ROOT / ".venv-workstation-broker/bin/python"
         os.execv(str(python), [str(python), "-m", "workstation_broker.server"])
     if action in {"up", "kali_control", "doctor"}:
-        install_templates(cfg)
         install_unit(cfg)
+        acer_environment(cfg)
+        if (paths["base_image"].parent / "broker-drain.json").exists():
+            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=150)
         run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
         deadline = time.monotonic() + 130
         while True:
@@ -532,7 +655,7 @@ def acer(cfg, action, args):
                 raise RuntimeError("SSD cannot reserve one complete configured overlay")
 
 
-HISTORICAL = ("requirements", "build", "publish-kali-golden", "up", "doctor", "tunnels",
+HISTORICAL = ("requirements", "build", "up", "doctor", "tunnels",
     "register_apps", "start_kali", "status_kali", "stop_kali", "auth", "run", "pause", "resume",
     "status", "reset-recovery", "superbench-fetch", "export-parquet", "down", "throw_volumes", "kali_control")
 

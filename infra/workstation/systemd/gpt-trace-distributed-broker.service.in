@@ -11,6 +11,7 @@ ExecStart=/usr/bin/python3 @REPOSITORY@/scripts/distributed.py serve
 Restart=on-failure
 RestartSec=5
 KillMode=process
+Delegate=yes
 TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=yes

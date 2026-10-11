@@ -142,7 +142,7 @@ def verify_manifests(root: Path) -> None:
 
 
 def build_workstation_base_image(root: Path) -> None:
-    run([sys.executable, str(root / "infra/workstation/image/build.py"), "--install"])
+    run([sys.executable, str(root / "infra/workstation/image/build.py"), "--local"])
 
 
 def verify_workstation_image(root: Path) -> None:

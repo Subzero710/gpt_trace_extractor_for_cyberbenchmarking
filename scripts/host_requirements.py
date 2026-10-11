@@ -38,6 +38,8 @@ GOLDEN_BUILD_COMMAND_PACKAGES = {
     "virt-customize": "libguestfs-tools",
     "virt-cat": "libguestfs-tools",
     "7z": "p7zip-full",
+    "virt-copy-out": "libguestfs-tools",
+    "dpkg-deb": "dpkg",
 }
 
 
@@ -124,12 +126,19 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
     if role not in {None, "acer", "fossil"}:
         raise ValueError("unknown distributed host role")
     if role == "fossil" and golden_build:
-        raise RuntimeError("golden publication requires the Acer execution host")
+        raise RuntimeError("local golden construction requires the Acer execution host")
     failures: list[str] = []
     missing_packages: list[str] = []
 
     if platform.system() != "Linux":
         failures.append(f"Linux host required; found {platform.system()}")
+    if role == 'acer':
+        if not Path('/sys/fs/cgroup/cgroup.controllers').is_file():
+            failures.append('Acer finite preparation jobs require native cgroup v2')
+        if not hasattr(os, 'pidfd_open'):
+            failures.append('Acer finite preparation cleanup requires Linux pidfds')
+        if shutil.which('systemctl') is None:
+            failures.append('Acer requires the existing managed systemd broker unit')
     if not _debian_like():
         failures.append("requirements.txt currently targets Ubuntu/Debian hosts")
     if shutil.which("dpkg-query") is None:
@@ -216,7 +225,7 @@ def main() -> int:
     parser.add_argument(
         "--golden-build",
         action="store_true",
-        help="also require packages used only when locally building/publishing the Kali golden",
+        help="also require packages used only when locally building the Kali golden",
     )
     args = parser.parse_args()
     return 0 if verify_host_requirements(

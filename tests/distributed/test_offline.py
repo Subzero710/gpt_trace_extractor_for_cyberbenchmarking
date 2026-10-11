@@ -37,15 +37,15 @@ def load(name, path):
 
 def snapshot(root):
     return {p.relative_to(root).as_posix(): (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_mtime_ns)
-            for p in root.rglob("*") if p.is_file() and ".unified-source-patch-backups" not in p.parts}
+            for p in root.rglob("*") if p.is_file() and ".local-preparation-patch-backups" not in p.parts}
 
 
 class SourceTransactionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = ROOT / "patch_distributed.py"
+        source = ROOT / "patch_local_preparation.py"
         if not source.is_file():
-            raise RuntimeError("keep the autonomous patch_distributed.py at the repository root to test its engine")
+            raise RuntimeError("keep the autonomous patch_local_preparation.py at the repository root to test its engine")
         cls.engine = load("distributed_source_engine_test", source)
 
     def setUp(self):
@@ -74,7 +74,7 @@ class SourceTransactionTests(unittest.TestCase):
 
     def test_check_and_dry_run_leave_every_file_and_timestamp_unchanged(self):
         for mode in ("--check", "--dry-run"):
-            result = subprocess.run([sys.executable, ROOT / "patch_distributed.py", mode, "--root", self.root],
+            result = subprocess.run([sys.executable, ROOT / "patch_local_preparation.py", mode, "--root", self.root],
                 text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("without writes", result.stdout)
@@ -110,7 +110,7 @@ class SourceTransactionTests(unittest.TestCase):
         self.assertEqual(snapshot(self.root), before)
 
     def test_unknown_new_path_is_not_overwritten(self):
-        path = self.root / "shared/gpt_trace_transport/template_release.py"
+        path = self.root / "shared/gpt_trace_transport/local_templates.py"
         path.write_text("user-owned control configuration\n")
         before = snapshot(self.root)
         with self.assertRaises(self.engine.PatchError): self.engine.planned(self.root)
@@ -290,7 +290,7 @@ class SourceContractTests(unittest.TestCase):
         registry = json.loads((ROOT / "apps/registry/apps.json").read_bytes())
         sha = hashlib.sha256(json.dumps(json.loads(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual([x["manifest_sha256"] for x in registry["apps"] if x["id"] == "kali-workstation"], [sha])
-        engine = load("distributed_contract_engine_test", ROOT / "patch_distributed.py")
+        engine = load("distributed_contract_engine_test", ROOT / "patch_local_preparation.py")
         self.assertEqual(engine.blob_sha(manifest), engine.DATA["catalog"]["apps/kali-workstation/tool-manifest.json"])
 
     def test_guest_semantics_retain_the_original_golden_fingerprint(self):

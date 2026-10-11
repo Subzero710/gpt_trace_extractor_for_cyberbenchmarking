@@ -1,13 +1,10 @@
-.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet down throw_volumes kali_control
+.PHONY: requirements build up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet down throw_volumes kali_control
 
 requirements:
 	python3 scripts/distributed.py requirements
 
 build:
 	python3 scripts/distributed.py build
-
-publish-kali-golden:
-	python3 scripts/distributed.py publish-kali-golden
 
 up:
 	python3 scripts/distributed.py up

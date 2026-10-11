@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential host-only Lite builder. Failed generations are never published."""
+"""Sequential local Acer builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
 import argparse
@@ -24,6 +24,9 @@ GUEST = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/gue
 PINS = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json"
 MINICONDA = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"
 MINICONDA_SHA256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c"
+VIRTUAL_GIB = 512
+FREE_SPACE_GIB = 64
+BUILD_TIMEOUT_HOURS = 96
 
 
 def digest(path):
@@ -191,19 +194,23 @@ def make_immutable(folder):
         finally: os.close(fd)
 
 
-def publish(staged, target_root, manifest, validate):
-    """Validation failure cannot replace the current registry, even after rename."""
+def install_generation(staged, target_root, manifest, validate):
+    """Rename only sealed bytes; validate before a separate atomic activation."""
     generation = manifest["generation"]
     generations = target_root / "generations"
     generations.mkdir(mode=0o755, exist_ok=True)
     final = generations / generation
     if final.exists():
         raise RuntimeError("generation already exists; refusing any content replacement")
-    atomic_json(staged / "manifest.json", manifest)
+    existing_manifest = staged / "manifest.json"
+    if existing_manifest.exists():
+        if json.loads(existing_manifest.read_bytes()) != manifest:
+            raise RuntimeError("sealed manifest differs; preserved")
+    else: atomic_json(existing_manifest, manifest)
     make_immutable(staged)
     # Moving a directory between parents requires updating its '..' entry on
     # hosts without DAC override. Contents are already immutable; seal the top
-    # directory again immediately after rename, before validation/publication.
+    # directory again immediately after rename, before validation/activation.
     staged.chmod(0o755)
     os.rename(staged, final)
     final.chmod(0o555)
@@ -213,6 +220,9 @@ def publish(staged, target_root, manifest, validate):
     fd = os.open(generations, os.O_DIRECTORY)
     try: os.fsync(fd)
     finally: os.close(fd)
+    from workstation_broker.preparation import record_built_generation
+    operation_id = os.environ.get("GPT_TRACE_PREPARATION_ID")
+    if operation_id is not None: record_built_generation(operation_id, generation)
     try:
         validate(final, generation)
     except BaseException:
@@ -223,25 +233,33 @@ def publish(staged, target_root, manifest, validate):
             fd = os.open(directory, os.O_DIRECTORY)
             try: os.fsync(fd)
             finally: os.close(fd)
+        if operation_id is not None:
+            from workstation_broker.preparation import record_rejected_generation
+            record_rejected_generation(operation_id, generation)
         raise
     return final
 
 
 def build(args):
-    if not getattr(args, "publication", False):
-        raise RuntimeError("template builds are restricted to the permanent publication workflow")
     if os.geteuid() != 0:
-        raise RuntimeError("publication requires root on an isolated KVM build host")
+        raise RuntimeError("local preparation requires the Acer root execution broker")
+    from workstation_broker.preparation import verify_worker_claim
+    job = verify_worker_claim(args.operation_id)
+    from workstation_broker.preparation_resources import source_container_arguments
+    if (args.virtual_gib, args.free_space_gib, args.build_timeout_hours) != (VIRTUAL_GIB, FREE_SPACE_GIB, BUILD_TIMEOUT_HOURS):
+        raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
     for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", "qemu-system-x86_64", "dpkg-deb"):
         if shutil.which(executable) is None:
             raise RuntimeError("missing host build executable: " + executable)
     golden = load_module("swe_gym_kali_builder", ROOT / "infra/workstation/image/build.py")
     golden.require_host_build_runtime()
-    golden.verify()
+    golden.verify(BASE)
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
     os_tools = load_module("swe_gym_os_packages", GUEST.with_name("os_packages.py"))
     target_root = TEMPLATES / "swe-gym-lite"
     target_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    from gpt_trace_transport.local_templates import safe
+    for path in (TEMPLATES, target_root): safe(path, directory=True)
     cache_root = target_root / "build-cache"
     cache_root.mkdir(mode=0o700, exist_ok=True)
     if cache_root.is_symlink() or cache_root.stat().st_uid != 0 or cache_root.stat().st_mode & 0o077:
@@ -320,15 +338,15 @@ def build(args):
         try:
             inputs_root = staged / "build-inputs"
             inputs_root.mkdir()
-            # This one-time publication host has no control-plane deployment,
+            # Acer has no control-plane deployment,
             # credentials, Compose services or persistent campaign volumes.
             # Build only a source-fetch image and bind its private build cache.
-            image = "gpt-trace-lite-publication-source:" + digest(PINS)[:32]
-            cmd("docker", "build", "--label", "io.gpttrace.publication=source-fetch", "-t", image,
+            image = "gpt-trace-lite-local-source:" + digest(PINS)[:32]
+            cmd("docker", "build", "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
                 "-f", "apps/runner/Dockerfile", ".", cwd=ROOT, timeout=14400)
             source_cache = cache_root / "dataset"
             source_cache.mkdir(mode=0o700, exist_ok=True)
-            cmd("docker", "run", "--rm", "--network", "bridge", "--cap-drop", "ALL",
+            cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", "bridge", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
                 "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
                 "--mount", "type=bind,source=" + str(source_cache) + ",target=/source-cache",
@@ -371,7 +389,7 @@ def build(args):
             os_folder = os_parent / "swe-gym-os"
             os_manifest = json.loads((os_folder / "manifest.json").read_text())
             os_tools.verify_artifacts(os_folder, os_manifest)
-            resolver.unlink()  # Publication contains exact debs, never resolver mutations.
+            resolver.unlink()  # The local generation contains exact debs, never resolver mutations.
             shutil.rmtree(os_payload)
 
             payload = staged / "swe-gym-build"
@@ -407,7 +425,7 @@ rm -rf /opt/swe-gym-build
 import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
 module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
-json.dump(module['validate_publication'](),open('/opt/swe-gym-lite/publication-validation.json','w'))
+json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
 PY_GUEST
 '''
             provision(common, boot, payload, network=True)
@@ -417,9 +435,9 @@ PY_GUEST
             common_cache = guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json")
             atomic_json(audit / "environment-inventories.json", environments)
             atomic_json(audit / "environment-downloads.json", common_cache)
-            common_validation = guest_json(common, "/opt/swe-gym-lite/publication-validation.json")
+            common_validation = guest_json(common, "/opt/swe-gym-lite/isolation-validation.json")
             if common_validation != {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}:
-                raise RuntimeError("common publication leaked source state")
+                raise RuntimeError("common image leaked source state")
 
             offline_proofs, vcs_provenance, task_inventories = {}, {}, {}
             for logical, item in sorted(inputs["tasks"].items()):
@@ -469,7 +487,7 @@ PY_GUEST
 
             repos = staged / "repos"
             repos.mkdir()
-            templates, publications = {}, {"common": common_validation}
+            templates, isolations = {}, {"common": common_validation}
             base_record = {"path": str(BASE), "sha256": digest(BASE)}
             common_record = {"path": "common.qcow2", "sha256": digest(common)}
             for repo in repos_set:
@@ -477,11 +495,11 @@ PY_GUEST
                 overlay(image, common)
                 boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
                 boot += "module['build_repo']({}," + repr(repo) + ")\n"
-                boot += "json.dump(module['validate_publication'](),open('/opt/swe-gym-lite/publication-validation.json','w'))\nPY_GUEST\n"
+                boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\nPY_GUEST\n"
                 provision(image, boot, network=False)
                 image.chmod(0o444)
-                publications[repo] = guest_json(image, "/opt/swe-gym-lite/publication-validation.json")
-                if publications[repo] != common_validation:
+                isolations[repo] = guest_json(image, "/opt/swe-gym-lite/isolation-validation.json")
+                if isolations[repo] != common_validation:
                     raise RuntimeError("repository template leaked source or mirror state")
                 templates["swe-gym-lite/" + repo.replace("/", "_")] = {"chain": [
                     {"path": image.relative_to(staged).as_posix(), "sha256": digest(image)}, common_record, base_record]}
@@ -514,7 +532,7 @@ PY_GUEST
                 "vcs_provenance_sha256": digest(audit / 'vcs-provenance.json'),
                 "cache_provenance": {path.name: digest(path) for path in sorted(audit.glob('*.downloads.json'))},
                 "artifacts": artifacts, "task_artifacts": mapping, "templates": templates,
-                "publication_validation": publications, "offline_setups_sha256": digest(audit / 'offline-setups.json')}
+                "isolation_validation": isolations, "offline_setups_sha256": digest(audit / 'offline-setups.json')}
             # All resolved input bytes AND final QCOW2 hashes are now known. Disk
             # backings are relative, so the final directory name is not an input.
             generation = generation_identity(resolved)
@@ -533,23 +551,46 @@ PY_GUEST
                 "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0},
                 "env_mapping": {key: value['stored_name'] for key, value in inputs['environments'].items()},
                 "templates": templates, "artifacts": artifacts, "task_artifacts": mapping, "sizes": sizes,
-                "publication_validation": publications, "allocation": summary}
+                "isolation_validation": isolations, "allocation": summary}
+
+            from gpt_trace_transport.local_templates import compatibility, seal_validation, activate
+            atomic_json(staged / "manifest.json", manifest)
+            seal_validation(staged, compatibility(BASE, ROOT))
+
+            checked_images = {}
+            def image_info(path):
+                from gpt_trace_transport.local_templates import file_signature
+                value = json.loads(capture("qemu-img", "info", "--output=json", str(path)))
+                signature = file_signature(path)
+                if checked_images.get(path) != signature:
+                    command("qemu-img", "check", str(path), timeout=3600)
+                    checked_images[path] = signature
+                return value
+
+            def registry_factory(root, base):
+                return TemplateRegistry(root, base, image_info, source_root=ROOT)
 
             def validate(final, selected_generation):
-                registry = TemplateRegistry(TEMPLATES, BASE, lambda path: json.loads(capture('qemu-img','info','--output=json',str(path))), publication_build=True)
+                registry = registry_factory(TEMPLATES, BASE)
+                registry.validate_generation(selected_generation, complete=True, check_images=True)
                 for template_id in templates:
                     record = registry.select(template_id, selected_generation)
                     for logical, row in mapping.items():
-                        if row['template_id'] == template_id:
+                        if row["template_id"] == template_id:
                             registry.task_scope(record, logical)
-                if generation_identity(json.loads((final / 'resolved-inputs.json').read_text())) != selected_generation:
-                    raise RuntimeError('published resolved-input identity mismatch')
-            final = publish(staged, target_root, manifest, validate)
+                if generation_identity(json.loads((final / "resolved-inputs.json").read_text())) != selected_generation:
+                    raise RuntimeError("local resolved-input identity mismatch")
+            final = install_generation(staged, target_root, manifest, validate)
+            # Persist the sealed result BEFORE activation: a worker interruption
+            # can finish verification/activation without repeating any VM build.
+            from workstation_broker.preparation import record_built_generation
+            record_built_generation(args.operation_id, generation)
+            activate(TEMPLATES, BASE, generation, registry_factory, ROOT)
             summary['total_immutable_generation_physical_bytes'] = physical_bytes([final, *final.rglob('*')])
             print(json.dumps({"generation": generation, "invariants": manifest['invariants'], "allocation": summary}, indent=2))
             return final
         except BaseException as exc:
-            # Preserve failed stages, images, exact debs and logs. Never publish
+            # Preserve failed stages, images, exact debs and logs. Never activate
             # a new registry, reuse an unsafe v1 build, or clean diagnostics here.
             if staged.exists() and staged.stat().st_mode & 0o200:
                 (staged / 'FAILED.txt').write_text(type(exc).__name__ + ': ' + str(exc) + '\n')
@@ -560,7 +601,7 @@ PY_GUEST
 
 
 def main():
-    raise SystemExit("template builds are restricted to the permanent publication workflow")
+    raise SystemExit("Use make superbench-fetch ADAPTER=swe-gym-lite on Fossil; this local builder is an internal worker recipe")
 
 
 if __name__ == "__main__":

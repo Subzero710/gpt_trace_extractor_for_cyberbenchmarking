@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import ast
+import fcntl
+import re
+import uuid
 import hashlib
 import inspect
 import json
@@ -23,8 +25,7 @@ DEST = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
 PROVISION_TIMEOUT_SECONDS = 7200
-GOLDEN_IMAGE_REPOSITORY = "aad7xppz4fd4r8emr/gpt-trace-kali-golden"
-GOLDEN_IMAGE_ROOT = Path("/opt/gpt-trace-golden")
+BUILD_LOG = None
 
 GUEST_PACKAGES = (
     "qemu-guest-agent",
@@ -135,106 +136,17 @@ def golden_build_input_sha256() -> str:
     return hasher.hexdigest()
 
 
-def _builder_semantic_sha256(source: str) -> str:
-    """Hash image-building semantics, ignoring fingerprint/verify plumbing."""
-    tree = ast.parse(source)
-    wanted_assignments = {"SOURCE", "ARCHIVE", "ARCHIVE_SHA256", "GUEST_PACKAGES"}
-    wanted_functions = {
-        "firstboot_script",
-        "prepare_offline",
-        "provision_in_real_guest",
-    }
-    selected: dict[str, ast.AST] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            names = {
-                target.id
-                for target in node.targets
-                if isinstance(target, ast.Name)
-            }
-            for name in sorted(names & wanted_assignments):
-                selected[name] = node
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in wanted_functions:
-                selected[node.name] = node
-    missing = (wanted_assignments | wanted_functions) - set(selected)
-    if missing:
-        raise RuntimeError(
-            f"cannot fingerprint Kali builder semantics; missing {sorted(missing)!r}"
-        )
-    payload = "\n".join(
-        name + "=" + ast.dump(selected[name], include_attributes=False)
-        for name in sorted(selected)
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _legacy_golden_matches_current_inputs(metadata: dict) -> bool:
-    """Migrate old provenance only when original guest inputs still match."""
-    commit = metadata.get("repo_commit")
-    if not isinstance(commit, str) or not commit:
-        return False
-
-    exists = subprocess.run(
-        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-        cwd=ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if exists.returncode != 0:
-        return False
-
-    input_paths = (
-        "apps/kali-workstation/src/kali_workstation",
-        "apps/kali-workstation/pyproject.toml",
-        "infra/workstation/image/requirements.lock",
-        "infra/workstation/systemd/gpt-trace-workstation-agent.service",
-    )
-    diff = subprocess.run(
-        ["git", "diff", "--quiet", commit, "--", *input_paths],
-        cwd=ROOT,
-    )
-    if diff.returncode == 1:
-        return False
-    if diff.returncode != 0:
-        raise RuntimeError("git diff failed while checking legacy Kali provenance")
-
-    untracked = subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", *input_paths],
-        cwd=ROOT,
-        text=True,
-    )
-    if untracked.strip():
-        return False
-
-    try:
-        old_builder = subprocess.check_output(
-            ["git", "show", f"{commit}:infra/workstation/image/build.py"],
-            cwd=ROOT,
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return False
-    current_builder = Path(__file__).read_text(encoding="utf-8")
-    return _builder_semantic_sha256(old_builder) == _builder_semantic_sha256(
-        current_builder
-    )
 
 
-def _discard_stale_golden(reason: BaseException | str) -> None:
-    print(f"Discarding stale Kali golden image: {reason}", flush=True)
-    for path in (
-        DEST,
-        DEST.with_suffix(".tmp"),
-        DEST.with_suffix(".provenance.json"),
-        DEST.parent / "kali-packages.txt",
-        DEST.parent / "kali-python-packages.txt",
-    ):
-        path.unlink(missing_ok=True)
 
 
 def run(*cmd: str, timeout: int = 7200, **kwargs) -> subprocess.CompletedProcess:
     print("+ " + " ".join(cmd), flush=True)
+    if BUILD_LOG is not None:
+        kwargs.setdefault("stdout", BUILD_LOG)
+        kwargs.setdefault("stderr", subprocess.STDOUT)
     return subprocess.run(cmd, check=True, timeout=timeout, **kwargs)
 
 
@@ -272,8 +184,7 @@ def cached_archive() -> Path:
         if digest(CACHE_ARCHIVE) == ARCHIVE_SHA256:
             print(f"Using cached Kali archive: {CACHE_ARCHIVE}", flush=True)
             return CACHE_ARCHIVE
-        print(f"Discarding invalid cached Kali archive: {CACHE_ARCHIVE}", flush=True)
-        CACHE_ARCHIVE.unlink()
+        raise RuntimeError(f"cached official Kali archive has an invalid SHA-256; preserved: {CACHE_ARCHIVE}")
 
     partial = CACHE_ARCHIVE.with_name(CACHE_ARCHIVE.name + ".part")
     if partial.exists():
@@ -475,78 +386,133 @@ def provision_in_real_guest(image: Path) -> None:
     )
 
 
-def build() -> None:
-    """Build the golden image locally. Intended for the publishing machine only."""
-    if DEST.exists():
+def _atomic_json(path, value):
+    from gpt_trace_transport.local_templates import atomic_json
+    atomic_json(path, value, 0o600)
+
+
+def _safe_parent():
+    DEST.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    for parent in (DEST.parent, *DEST.parent.parents):
+        if parent.is_symlink() or parent.stat().st_uid != 0 or parent.stat().st_mode & 0o022:
+            raise RuntimeError("unsafe local golden storage root")
+
+
+def _commit_prepared(journal):
+    from gpt_trace_transport.local_templates import safe, sync_directory
+    if (set(journal) != {"schema", "status", "stage", "files"} or journal["schema"] != 1
+            or journal["status"] != "prepared" or re.fullmatch(r"\.golden-build-[0-9a-f]{32}", journal["stage"]) is None):
+        raise RuntimeError("unrecognized golden installation journal")
+    stage = safe(DEST.parent / journal["stage"], directory=True)
+    staged_base = stage / DEST.name
+    staged_paths = artifact_paths(staged_base)
+    if set(journal["files"]) != {p.name for p in staged_paths}:
+        raise RuntimeError("incomplete golden installation inventory")
+    for path in staged_paths:
+        safe(path, immutable=True)
+        row = journal["files"][path.name]
+        if row != {"size": path.stat().st_size, "sha256": digest(path)}:
+            raise RuntimeError("prepared golden artifact changed")
+    verify(staged_base)
+    run("qemu-img", "check", str(staged_base))
+    # Validate every final destination before the first change. A crash can be
+    # resumed from this exact journal; an unrelated existing byte is preserved.
+    for target in artifact_paths():
+        if target.exists() or target.is_symlink():
+            safe(target, immutable=True)
+            if digest(target) != journal["files"][target.name]["sha256"]:
+                raise RuntimeError("golden destination conflicts with prepared bytes; preserved")
+    # Independent metadata first, base last is the activation barrier. Keeping
+    # immutable stage hardlinks makes interrupted activation recoverable.
+    for target in (*artifact_paths()[1:], DEST):
+        if target.exists(): continue
+        source_path = stage / target.name
+        temporary = target.with_name("." + target.name + "." + uuid.uuid4().hex)
         try:
-            verify()
-        except (
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-            subprocess.SubprocessError,
-        ) as exc:
-            _discard_stale_golden(exc)
-        else:
-            return
-
-    require_host_build_runtime()
-    DEST.parent.mkdir(parents=True, exist_ok=True)
-    archive = cached_archive()
-
-    with tempfile.TemporaryDirectory(prefix="kali-build-", dir=DEST.parent) as tmp:
-        temp = Path(tmp)
-        run("7z", "x", str(archive), "-o" + str(temp / "extracted"), "-y")
-        images = list((temp / "extracted").rglob("*.qcow2"))
-        if len(images) != 1:
-            raise RuntimeError(
-                f"expected one QEMU qcow2 in archive; found {len(images)}"
-            )
-
-        image = temp / "base.qcow2"
-        run("qemu-img", "convert", "-O", "qcow2", str(images[0]), str(image))
-
-        prepare_offline(image, temp)
-        provision_in_real_guest(image)
-
-        packages = subprocess.check_output(
-            ["virt-cat", "-a", str(image), "/etc/gpt-trace-packages.txt"]
-        )
-        python_packages = subprocess.check_output(
-            ["virt-cat", "-a", str(image), "/etc/gpt-trace-python-packages.txt"]
-        )
-        (DEST.parent / "kali-packages.txt").write_bytes(packages)
-        (DEST.parent / "kali-python-packages.txt").write_bytes(python_packages)
-
-        shutil.copy(image, DEST.with_suffix(".tmp"))
-        os.replace(DEST.with_suffix(".tmp"), DEST)
-        DEST.chmod(0o444)
-
-        metadata = {
-            "source": SOURCE + ARCHIVE,
-            "source_sha256": ARCHIVE_SHA256,
-            "base_sha256": digest(DEST),
-            "build_input_sha256": golden_build_input_sha256(),
-            "repo_commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-            ).strip(),
-            "guest_agent_version": "3.0.0",
-            "browser_runtime": "CloakBrowser 0.4.8 / 146.0.7680.177.5",
-            "apt_suite": "kali-last-snapshot",
-            "apt_package_manifest_sha256": hashlib.sha256(packages).hexdigest(),
-            "python_package_manifest_sha256": hashlib.sha256(python_packages).hexdigest(),
-            "python_lock_sha256": digest(
-                ROOT / "infra/workstation/image/requirements.lock"
-            ),
-            "build_utc": datetime.now(timezone.utc).isoformat(),
-            "provisioning_network": "qemu-user-firstboot",
-        }
-        DEST.with_suffix(".provenance.json").write_text(
-            json.dumps(metadata, indent=2) + "\n"
-        )
-
+            os.link(source_path, temporary, follow_symlinks=False)
+            os.replace(temporary, target)
+            sync_directory(target.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
     verify()
+    _atomic_json(DEST.parent / "golden-install.json", {**journal, "status": "installed"})
+
+
+def build() -> None:
+    """Build locally only when absent; existing permanent bytes are never replaced."""
+    global BUILD_LOG
+    if os.geteuid() != 0: raise RuntimeError("local golden construction requires Acer root")
+    _safe_parent()
+    descriptor = os.open(DEST.parent / "golden-build.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.fstat(descriptor).st_uid != 0 or os.fstat(descriptor).st_mode & 0o077:
+            raise RuntimeError("untrusted golden build lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if DEST.exists() or DEST.is_symlink():
+            verify()  # Invalid permanent bytes cause an error, never destruction.
+            return
+        journal_path = DEST.parent / "golden-install.json"
+        if journal_path.exists():
+            from gpt_trace_transport.local_templates import safe
+            safe(journal_path)
+            journal = json.loads(journal_path.read_bytes())
+            if journal.get("status") == "prepared":
+                _commit_prepared(journal)
+                return
+            if journal.get("status") not in {"failed", "building"}:
+                raise RuntimeError("golden is absent with an unexpected installation journal")
+        if any(p.exists() or p.is_symlink() for p in artifact_paths()[1:]):
+            raise RuntimeError("partial golden without a prepared journal; permanent bytes preserved")
+        require_host_build_runtime()
+        archive = cached_archive()
+        stage = DEST.parent / (".golden-build-" + uuid.uuid4().hex)
+        stage.mkdir(mode=0o700)
+        _atomic_json(journal_path, {"schema": 1, "status": "building", "stage": stage.name})
+        try:
+            with (stage / "host-build.log").open("ab") as log:
+                BUILD_LOG = log
+                run("7z", "x", str(archive), "-o" + str(stage / "extracted"), "-y")
+                images = list((stage / "extracted").rglob("*.qcow2"))
+                if len(images) != 1:
+                    raise RuntimeError(f"expected one official QEMU image; found {len(images)}")
+                image = stage / DEST.name
+                run("qemu-img", "convert", "-O", "qcow2", str(images[0]), str(image))
+                prepare_offline(image, stage)
+                provision_in_real_guest(image)
+                packages = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-packages.txt"])
+                python_packages = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-python-packages.txt"])
+                (stage / "kali-packages.txt").write_bytes(packages)
+                (stage / "kali-python-packages.txt").write_bytes(python_packages)
+                metadata = {"source": SOURCE + ARCHIVE, "source_sha256": ARCHIVE_SHA256,
+                    "base_sha256": digest(image), "build_input_sha256": golden_build_input_sha256(),
+                    "repo_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                    "guest_agent_version": "3.0.0", "browser_runtime": "CloakBrowser 0.4.8 / 146.0.7680.177.5",
+                    "apt_suite": "kali-last-snapshot", "apt_package_manifest_sha256": hashlib.sha256(packages).hexdigest(),
+                    "python_package_manifest_sha256": hashlib.sha256(python_packages).hexdigest(),
+                    "python_lock_sha256": digest(ROOT / "infra/workstation/image/requirements.lock"),
+                    "build_utc": datetime.now(timezone.utc).isoformat(), "provisioning_network": "qemu-user-firstboot"}
+                image.with_suffix(".provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+                for path in artifact_paths(image):
+                    path.chmod(0o444)
+                    with path.open("rb") as handle: os.fsync(handle.fileno())
+                verify(image)
+                run("qemu-img", "check", str(image))
+                journal = {"schema": 1, "status": "prepared", "stage": stage.name,
+                    "files": {p.name: {"size": p.stat().st_size, "sha256": digest(p)} for p in artifact_paths(image)}}
+                _atomic_json(journal_path, journal)
+                _commit_prepared(journal)
+        except BaseException as exc:
+            (stage / "FAILED.txt").write_text(type(exc).__name__ + ": " + str(exc) + "\n")
+            # Do not erase a prepared journal: it may describe metadata already
+            # installed and is the only authority for safely completing it.
+            current = json.loads(journal_path.read_bytes())
+            if current.get("status") == "building":
+                _atomic_json(journal_path, {"schema": 1, "status": "failed", "stage": stage.name, "error": str(exc)[:2000]})
+            raise
+        finally:
+            BUILD_LOG = None
+    finally:
+        os.close(descriptor)
 
 
 def artifact_paths(base: Path | None = None) -> tuple[Path, Path, Path, Path]:
@@ -559,34 +525,20 @@ def artifact_paths(base: Path | None = None) -> tuple[Path, Path, Path, Path]:
     )
 
 
-def golden_image_ref() -> str:
-    # Full semantic input hash makes the Docker tag deterministic for exactly the
-    # guest contents expected by this checkout, without a hand-maintained version.
-    return f"{GOLDEN_IMAGE_REPOSITORY}:input-{golden_build_input_sha256()}"
 
 
 def verify(base: Path | None = None) -> None:
     base = DEST if base is None else base
+    from gpt_trace_transport.local_templates import safe
+    for path in artifact_paths(base): safe(path, immutable=True)
     provenance = base.with_suffix(".provenance.json")
     metadata = json.loads(provenance.read_text())
     if metadata["source_sha256"] != ARCHIVE_SHA256 or metadata["source"] != SOURCE + ARCHIVE:
         raise RuntimeError("Kali archive provenance differs from the pinned source")
     current_build_input = golden_build_input_sha256()
     stored_build_input = metadata.get("build_input_sha256")
-    migrate_legacy = False
-    if stored_build_input is None:
-        # Legacy migration is only meaningful for the installed canonical image.
-        if base != DEST or not _legacy_golden_matches_current_inputs(metadata):
-            raise RuntimeError(
-                "legacy Kali golden image predates build-input fingerprints and "
-                "its original guest inputs differ from the current tree"
-            )
-        migrate_legacy = True
-    elif stored_build_input != current_build_input:
-        raise RuntimeError(
-            "Kali golden image inputs changed "
-            f"(stored={stored_build_input!r}, current={current_build_input!r})"
-        )
+    if stored_build_input != current_build_input:
+        raise RuntimeError("Kali golden build-input fingerprint is missing or incompatible; existing image preserved")
     if metadata["python_lock_sha256"] != digest(
         ROOT / "infra/workstation/image/requirements.lock"
     ):
@@ -604,13 +556,6 @@ def verify(base: Path | None = None) -> None:
     )
     if info.get("format") != "qcow2" or info.get("backing-filename"):
         raise RuntimeError("base is not an independent qcow2")
-    if migrate_legacy:
-        metadata["build_input_sha256"] = current_build_input
-        provenance.write_text(json.dumps(metadata, indent=2) + "\n")
-        print(
-            "Stamped legacy Kali provenance with current build-input fingerprint",
-            flush=True,
-        )
     physical = base.stat().st_blocks * 512
     print(
         "Kali image:", base,
@@ -620,139 +565,21 @@ def verify(base: Path | None = None) -> None:
     )
 
 
-def install_from_image() -> None:
-    """Install the prebuilt golden image published on Docker Hub."""
-    if DEST.exists():
-        try:
-            verify()
-        except (
-            OSError,
-            KeyError,
-            ValueError,
-            RuntimeError,
-            subprocess.SubprocessError,
-        ) as exc:
-            _discard_stale_golden(exc)
-        else:
-            return
-
-    image_ref = golden_image_ref()
-    DEST.parent.mkdir(parents=True, exist_ok=True)
-    run("docker", "pull", image_ref)
-    container_id = ""
-    try:
-        container_id = subprocess.check_output(
-            ["docker", "create", image_ref, "/not-run"], text=True
-        ).strip()
-        if not container_id:
-            raise RuntimeError("docker create returned an empty container id")
-        with tempfile.TemporaryDirectory(prefix="kali-golden-pull-", dir=DEST.parent) as raw:
-            temp = Path(raw)
-            run(
-                "docker", "cp",
-                f"{container_id}:{GOLDEN_IMAGE_ROOT}/.",
-                str(temp),
-            )
-            staged = temp / DEST.name
-            expected = (
-                staged,
-                temp / "kali-base.provenance.json",
-                temp / "kali-packages.txt",
-                temp / "kali-python-packages.txt",
-            )
-            for path in expected:
-                if path.is_symlink() or not path.is_file():
-                    raise RuntimeError(f"golden image artifact missing or unsafe: {path.name}")
-            verify(staged)
-
-            final_paths = artifact_paths()
-            for source, target in zip(expected, final_paths, strict=True):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(source, target)
-            DEST.chmod(0o444)
-            verify()
-    finally:
-        if container_id:
-            subprocess.run(
-                ["docker", "rm", "-f", container_id],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        # The qcow2 has been copied to libvirt storage. Keeping the Docker image
-        # would duplicate several GiB on the benchmark host.
-        subprocess.run(
-            ["docker", "image", "rm", image_ref],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
 
 
-def publish_image() -> None:
-    """Build locally once, then publish the verified golden as a Docker image."""
-    requirements = ROOT / "scripts/host_requirements.py"
-    run(sys.executable, str(requirements), "--build", "--golden-build")
-    build()
-    verify()
-    image_ref = golden_image_ref()
-    metadata = json.loads(DEST.with_suffix(".provenance.json").read_text())
-    exists = subprocess.run(
-        ["docker", "buildx", "imagetools", "inspect", image_ref],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if exists.returncode == 0:
-        raise RuntimeError(
-            f"refusing to overwrite existing immutable golden tag: {image_ref}"
-        )
-
-    with tempfile.TemporaryDirectory(prefix="kali-golden-docker-") as raw:
-        context = Path(raw)
-        for source in artifact_paths():
-            shutil.copy2(source, context / source.name)
-        dockerfile = context / "Dockerfile"
-        dockerfile.write_text(
-            "FROM scratch\n"
-            f"LABEL org.opencontainers.image.title=\"gpt-trace-kali-golden\"\n"
-            f"LABEL io.gpttrace.build-input-sha256=\"{metadata['build_input_sha256']}\"\n"
-            f"LABEL io.gpttrace.base-sha256=\"{metadata['base_sha256']}\"\n"
-            "COPY kali-base.qcow2 /opt/gpt-trace-golden/kali-base.qcow2\n"
-            "COPY kali-base.provenance.json /opt/gpt-trace-golden/kali-base.provenance.json\n"
-            "COPY kali-packages.txt /opt/gpt-trace-golden/kali-packages.txt\n"
-            "COPY kali-python-packages.txt /opt/gpt-trace-golden/kali-python-packages.txt\n",
-            encoding="utf-8",
-        )
-        run(
-            "docker", "buildx", "build",
-            "--platform", "linux/amd64",
-            "--push",
-            "--tag", image_ref,
-            str(context),
-        )
-    run("docker", "buildx", "imagetools", "inspect", image_ref)
-    print(f"Published Kali golden image: {image_ref}", flush=True)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Build, publish, install, or verify the Kali golden workstation image."
-    )
+    parser = argparse.ArgumentParser(description="Build locally or verify the permanent Kali golden on Acer.")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--local", action="store_true", help="build the qcow2 locally")
-    mode.add_argument("--publish", action="store_true", help="build and push the Docker Hub golden image")
-    mode.add_argument("--verify", action="store_true", help="verify the installed qcow2")
-    mode.add_argument("--install", action="store_true", help="pull and install the prebuilt Docker Hub golden (default)")
+    mode.add_argument("--local", action="store_true", help="build locally when absent; otherwise verify")
+    mode.add_argument("--verify", action="store_true", help="verify without any image mutation")
     args = parser.parse_args()
-
-    if args.local:
-        build()
-    elif args.publish:
-        publish_image()
-    elif args.verify:
-        verify()
-    else:
-        install_from_image()
+    if args.verify: verify()
+    else: build()
     return 0
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(ROOT / "shared"))
     raise SystemExit(main())

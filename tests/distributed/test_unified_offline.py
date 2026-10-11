@@ -1,13 +1,12 @@
 """Software tests on real files and function bodies; no VM/Parquet/socket claim.
 
-Release/API/QCOW2 metadata below are explicitly synthetic test fixtures. Their
-hashes are calculated from actual fixture bytes. They are never deployment pins.
+VM execution boundaries are explicit software fixtures. No KVM/ChatGPT,
+HTTP socket or Arrow integration is claimed by these offline tests.
 """
 from __future__ import annotations
 
 import ast
 import copy
-import gzip
 import hashlib
 import importlib.util
 import io
@@ -18,7 +17,6 @@ import shutil
 import sys
 import tempfile
 import unittest
-import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "apps/workstation-broker/src"), str(ROOT / "shared"),
                str(ROOT / "apps/runner/src"), str(ROOT / "scripts")]
 sys.dont_write_bytecode = True
-from gpt_trace_transport import template_release as release
+from gpt_trace_transport import local_templates as local
 from gpt_trace_runner.superbench.normalize import normalize_messages, tools_from_provenance
 from workstation_broker.templates import TemplateRegistry
 
@@ -121,163 +119,6 @@ class ExportFunctionTests(unittest.TestCase):
         self.assertIn('REPEATABLE READ READ ONLY', actual)
 
 
-class SyntheticDownloads:
-    """Fixture API boundary only; production uses the real HTTPS GitHub client."""
-    def __init__(self, metadata, blobs):
-        self.metadata, self.blobs, self.calls = metadata, blobs, []
-    def release(self, tag):
-        self.calls.append(("release", tag))
-        if self.metadata["tag_name"] != tag: raise RuntimeError("fixture tag mismatch")
-        return self.metadata
-    def download(self, asset, output):
-        self.calls.append(("download", asset["name"]))
-        raw = self.blobs[asset["name"]]
-        # Same byte-level contract as the live downloader.
-        if len(raw) != asset["size"] or hashlib.sha256(raw).hexdigest() != release.asset_digest(asset):
-            raise ValueError("fixture transfer size/SHA-256 mismatch")
-        output.write(raw)
-
-
-class PermanentFileTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        self.base = self.root / "kali-base.qcow2"
-        self.base.write_bytes(b"synthetic file-integrity fixture, not a VM image")
-        self.base.chmod(0o444)
-        self.base.with_suffix(".provenance.json").write_text(json.dumps({"base_sha256": release.digest(self.base)}))
-        self.expected = release.compatibility(self.base)
-        contract = json.loads((ROOT / release.RUNTIME / "contract.json").read_bytes())
-        self.folder = self.root / "synthetic-build"
-        self.folder.mkdir()
-        (self.folder / "repos").mkdir()
-        (self.folder / "sources").mkdir()
-        (self.folder / "audit").mkdir()
-        (self.folder / "common.qcow2").write_bytes(b"synthetic common backing bytes")
-        templates, artifacts, mapping, proofs = {}, {}, {}, {}
-        for logical, task in sorted(contract["tasks"].items()):
-            tid = task["template_id"]
-            if tid not in templates:
-                image = self.folder / "repos" / (tid.split("/")[1] + ".qcow2")
-                image.write_bytes(("synthetic repo fixture " + tid).encode())
-                templates[tid] = {"chain": [{"path": image.relative_to(self.folder).as_posix(), "sha256": release.digest(image)},
-                    {"path": "common.qcow2", "sha256": release.digest(self.folder / "common.qcow2")},
-                    {"path": str(self.base), "sha256": release.digest(self.base)}]}
-            mapping[logical] = {"template_id": tid}
-            proofs[logical] = {"base_commit": task["base_commit"], "env_hash": task["env_hash"], "offline": True}
-            for kind in ("task_source", "setup_cache"):
-                key = hashlib.sha256((kind + logical).encode()).hexdigest()
-                path = self.folder / "sources" / key
-                path.write_bytes(("synthetic artifact " + kind + " " + logical).encode())
-                mapping[logical][kind] = key
-                artifacts[key] = {"kind": kind, "logical_task_id": logical, "allowed_template_id": tid,
-                    "source_identity": {key: task[key] for key in ("instance_id", "repo", "base_commit")},
-                    "path": path.relative_to(self.folder).as_posix(), "size": path.stat().st_size, "sha256": release.digest(path)}
-        release.atomic_json(self.folder / "audit/offline-setups.json", proofs)
-        resolved = {key: self.expected[key] for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security")}
-        clean = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
-        resolved.update(templates=templates, artifacts=artifacts, task_artifacts=mapping,
-            publication_validation={repo: clean for repo in {"common"} | {t["repo"] for t in contract["tasks"].values()}},
-            golden={"sha256": release.digest(self.base)},
-            builder_sources={(release.RUNTIME / name).as_posix(): sha for name, sha in self.expected["runtime_sources"].items()},
-            offline_setups_sha256=release.digest(self.folder / "audit/offline-setups.json"))
-        generation = hashlib.sha256(release.canonical(resolved)).hexdigest()
-        release.atomic_json(self.folder / "resolved-inputs.json", resolved)
-        manifest = {**resolved, "generation": generation, "resolved_inputs_sha256": release.digest(self.folder / "resolved-inputs.json"),
-            "invariants": {"tasks":230,"repos":11,"env_hashes":25,"unmapped_tasks":0,"missing_base_commits":0},
-            "env_mapping": {key: row["stored_name"] for key, row in contract["environments"].items()}}
-        release.atomic_json(self.folder / "manifest.json", manifest)
-        release.seal(self.folder)
-        self.destination = self.root / "synthetic-assets"
-        self.publication = release.package(self.folder, self.destination, self.expected,
-            "2e64fb633814a88939480bbf9d0b9dfdc1c4e041")
-        self.blobs = {p.name: p.read_bytes() for p in self.destination.iterdir()}
-        assets = [{"id": i+1, "name": name, "size": len(raw), "digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
-            "state": "uploaded"} for i, (name, raw) in enumerate(sorted(self.blobs.items()))]
-        self.metadata = {"id": 1, "tag_name": release.release_tag(self.expected), "draft": False,
-            "immutable": True, "assets": assets, "source_commit": self.publication["source_commit"]}
-        self.github = SyntheticDownloads(self.metadata, self.blobs)
-        self.templates = self.root / "installed-templates"
-
-    def tearDown(self):
-        # Writable directories permit removal of only this explicit test tree.
-        for path in self.root.rglob("*"):
-            if path.is_dir() and not path.is_symlink(): path.chmod(0o755)
-        self.temporary.cleanup()
-
-    def registry(self, root, base):
-        def info(path):
-            if path == self.base: return {"format": "qcow2"}
-            return {"format": "qcow2", "backing-filename": str(self.base) if path.name == "common.qcow2" else "../common.qcow2"}
-        return TemplateRegistry(root, base, info)
-
-    def install(self):
-        return release.install(self.base, self.templates, self.registry, github=self.github)
-
-    def test_real_compression_hash_install_and_offline_reuse(self):
-        generation = self.install()
-        self.assertEqual(generation, self.publication["generation"])
-        final = self.templates / "swe-gym-lite/generations" / generation
-        for name, record in self.publication["files"].items():
-            self.assertEqual((final / name).read_bytes(), (self.folder / name).read_bytes())
-            self.assertEqual(release.digest(final / name), record["sha256"])
-            self.assertFalse((final / name).stat().st_mode & 0o222)
-        self.github.calls.clear()
-        self.assertEqual(self.install(), generation)
-        self.assertEqual(self.github.calls, [])
-
-    def test_mutable_release_or_wrong_tag_cannot_activate_registry(self):
-        self.metadata["immutable"] = False
-        with self.assertRaises(ValueError): self.install()
-        self.assertFalse((self.templates / "swe-gym-lite/registry.json").exists())
-
-    def test_corrupted_download_cannot_activate_or_replace_a_generation(self):
-        name = next(name for name in self.blobs if name != "publication.json")
-        self.blobs[name] += b"corrupted"
-        with self.assertRaises(ValueError): self.install()
-        self.assertFalse((self.templates / "swe-gym-lite/registry.json").exists())
-
-    def test_every_installed_artifact_is_rechecked_on_reuse(self):
-        generation = self.install()
-        registry = self.templates / "swe-gym-lite/registry.json"
-        before = registry.read_bytes()
-        name = next(name for name in self.publication["files"] if name.startswith("sources/"))
-        path = self.templates / "swe-gym-lite/generations" / generation / name
-        path.chmod(0o644);path.write_bytes(b"modified");path.chmod(0o444)
-        with self.assertRaises(ValueError): self.install()
-        self.assertEqual(registry.read_bytes(), before)
-
-    def test_release_source_commit_is_bound_to_the_immutable_git_tag(self):
-        assets = release.validate_release(self.metadata, self.metadata["tag_name"])
-        with self.assertRaisesRegex(ValueError, "source commit"):
-            release.validate_publication(self.publication, self.expected, assets,
-                source_commit="6b22d4da8c3bf1e384917124a468d8714a85232e")
-
-    def test_manifest_path_traversal_duplicate_part_and_extra_asset_fail(self):
-        assets = release.validate_release(self.metadata, self.metadata["tag_name"])
-        original = copy.deepcopy(self.publication)
-        row = next(iter(original["files"].values()))
-        for bad in ("../outside", "/outside", "a/../../outside"):
-            changed = copy.deepcopy(original);changed["files"][bad] = row
-            with self.assertRaises(ValueError): release.validate_publication(changed, self.expected, assets)
-        changed = copy.deepcopy(original)
-        selected = next(iter(changed["files"].values()))
-        selected["parts"].append(copy.deepcopy(selected["parts"][0]))
-        with self.assertRaises(ValueError): release.validate_publication(changed, self.expected, assets)
-        with self.assertRaises(ValueError):
-            release.validate_publication(original, self.expected, {**assets, "extra": assets["publication.json"]})
-
-    def test_existing_generation_recovers_activation_without_file_replacement(self):
-        generation = self.install()
-        registry = self.templates / "swe-gym-lite/registry.json"
-        final = registry.parent / "generations" / generation
-        before = {p.relative_to(final).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns) for p in final.rglob("*") if p.is_file()}
-        registry.unlink()
-        self.assertEqual(self.install(), generation)
-        after = {p.relative_to(final).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns) for p in final.rglob("*") if p.is_file()}
-        self.assertEqual(before, after)
-
-
 class InterfaceAndShutdownTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -291,7 +132,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
             self.assertIn("python3 scripts/distributed.py " + target, make)
 
     def test_acer_refuses_control_operations_before_any_side_effect(self):
-        for action in ("run", "resume", "register_apps", "export-parquet", "down"):
+        for action in ("run", "resume", "register_apps", "export-parquet"):
             with patch.object(self.dispatch, "host") as host:
                 with self.assertRaises(RuntimeError): self.dispatch.acer({"deployment": {"role": "acer"}}, action, None)
                 host.assert_not_called()
@@ -306,22 +147,28 @@ class InterfaceAndShutdownTests(unittest.TestCase):
             ["docker", "info", "--format", "{{.ServerVersion}}"],
             ["docker", "compose", "version"], ["docker", "buildx", "version"]])
 
-    def test_only_absent_publication_leaves_gaia_available(self):
-        cfg = {"paths": {"base_image": Path("/unused/kali-base.qcow2")}}
-        with patch.object(release, "install", side_effect=release.UnpublishedRelease("fixture absence")), patch("sys.stderr", io.StringIO()) as log:
-            self.assertIsNone(self.dispatch.install_templates(cfg))
-            self.assertIn("GAIA golden remains usable", log.getvalue())
-        for error in (ValueError("mutated artifact"), RuntimeError("network unavailable")):
-            with patch.object(release, "install", side_effect=error):
-                with self.assertRaises(type(error)): self.dispatch.install_templates(cfg)
+    def test_only_explicit_lite_fetch_triggers_administrative_preparation(self):
+        from types import SimpleNamespace
+        cfg = {"deployment": {"role": "fossil"}}
+        for adapter in ("gaia", "swe-gym-lite"):
+            calls = []
+            with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "compose", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=lambda *a, **k: calls.append(("prepare", a))):
+                self.dispatch.fossil(cfg, "superbench-fetch", SimpleNamespace(adapter=adapter))
+            self.assertEqual(calls[1], ("fetch", ("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", adapter)))
+            self.assertEqual([x[0] for x in calls], ["project", "fetch"] + (["prepare"] if adapter == "swe-gym-lite" else []))
 
-    def test_publication_is_the_only_builder_and_has_no_control_compose_dependency(self):
-        builder = (ROOT / "scripts/template_publication_build.py").read_text()
-        dispatch = (ROOT / "scripts/distributed.py").read_text()
-        self.assertIn('getattr(args, "publication", False)', builder)
-        self.assertNotIn('"compose"', builder)
-        self.assertNotIn("template_publication_build", dispatch)
-        self.assertNotIn("publish_template_release", dispatch)
+    def test_no_image_build_in_up_run_or_resume(self):
+        parsed = ast.parse((ROOT / "scripts/distributed.py").read_bytes())
+        acer = next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == "acer")
+        source = ast.get_source_segment((ROOT / "scripts/distributed.py").read_text(), acer)
+        self.assertNotIn("install_templates", source)
+        build = next(n for n in acer.body if isinstance(n, ast.If) and ast.unparse(n.test) == "action == 'build'")
+        remaining = copy.deepcopy(acer)
+        remaining.body.remove(next(n for n in remaining.body if isinstance(n, ast.If) and ast.unparse(n.test) == "action == 'build'"))
+        self.assertNotIn("build_workstation_base_image", ast.unparse(remaining))
+        self.assertNotIn("build_local_templates", source)
+        main = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym_lite.py").read_text()
+        self.assertNotIn("build_local_templates", main)
 
     def test_actual_handler_drains_in_flight_operations_before_blocking_new_mutations(self):
         """Call-level handler/async-lock test; no Starlette/socket/VM assertion."""

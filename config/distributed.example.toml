@@ -1,7 +1,7 @@
 # Use offline PKI provisioning to create a complete identity-pinned local config.
 # Every historical Make command reads this role. Empty values are invalid.
-# Permanent Lite publication identity is derived from actual pins/golden bytes;
-# no release URL or artifact checksum is fabricated here.
+# Lite preparation IDs bind actual source recipes and verified local golden bytes.
+# Image construction runs only on Acer, triggered by the explicit Fossil fetch.
 [deployment]
 role = "fossil"
 control_id = "fossil"

@@ -1,8 +1,8 @@
 # SWE-Gym Lite
 
 `swe-gym-lite` uses the ordinary Kali Workstation App with runner-owned setup,
-candidate capture and native grading. Template construction is a separate host
-prerequisite. Campaigns never build missing permanent environments.
+candidate capture and native grading. Template construction is triggered only by explicit Fossil
+`make superbench-fetch ADAPTER=swe-gym-lite`. Campaigns never build missing permanent environments.
 
 ## Pinned sources and validated contract
 
@@ -22,7 +22,7 @@ Hashes use exactly `sha256(str(env_script_list).encode("utf-8")).hexdigest()[:22
 with the upstream name `testbed`. Ordered upstream environment-file path searches,
 including 404 responses, are recorded at each exact `base_commit`. The builder
 independently verifies those contents against Git objects and requires zero
-missing base commits before publication.
+missing base commits before local activation.
 
 | Repository | Tasks | Distinct envs within repo | Template suffix |
 | --- | ---: | ---: | --- |
@@ -66,7 +66,7 @@ Host mirror -> sanitized task source -> CURRENT task overlay only. The common
 image has never held any task checkout or task-source archive. Its inputs are
 only the 25 environment recipes, trusted helpers and frozen OS artifacts.
 Repo images hold safe repo identity/configuration, without source history.
-Publication inspects common and every repo image for forbidden mirror/source
+Local validation inspects common and every repo image for forbidden mirror/source
 paths and Git directories. Disposable task builder disks are deleted only after
 successful fresh offline replay; failed disks remain diagnostic state.
 
@@ -95,7 +95,7 @@ installed packages and ignored build products remain. This keeps candidate diffs
 base-relative without letting candidate setup.py/pyproject affect installation.
 Candidate clean verification extracts the SAME source artifact again.
 
-## Reproducible construction and publication
+## Reproducible local construction
 
 The golden records `kali-last-snapshot`, a mutable alias, not an immutable
 snapshot identifier. The Lite builder therefore uses two-phase APT resolution.
@@ -117,24 +117,15 @@ hashes, recipe/schema/security contract, and final common/repo QCOW2 hashes.
 Relative backing paths avoid a generation-directory hash cycle. Different
 resolved bytes cannot reuse a previous generation identity.
 
-The publication-only builder seals and validates a generation without changing a runtime registry. `scripts/publish_template_release.py` builds once per exact recipe/runtime/golden compatibility identity, calculates every real artifact digest, gzip-compresses and splits files below GitHub's asset limit, uploads all artifacts/audits/manifests to a draft Release, then publishes and verifies GitHub immutability. A retry reuses the original sealed build or uploaded bytes; it never starts a second build for the same tag. An incomplete original build is retained for diagnosis and cannot be claimed as published.
+The local builder `scripts/build_local_templates.py` runs only inside the root-owned administrative job on Acer. It reuses the pinned recipes and constructs sequential sparse images. It monitors the existing 64 GiB free-space safety margin and reports the measured common/repository/archive/setup-cache allocation. The existing per-guest build timeout remains 96 hours. Default template virtual capacity remains 512 GiB; the attempt reservation stays separately configured.
 
-The installer obtains the exact release tag derived from current compatibility, verifies the real Release API's immutable flag and asset SHA-256 digests, binds the manifest to the immutable Git tag's actual commit, validates every expanded file, and checks native backing chains plus the complete 230/11/25 replay contract. Files become read-only before a verified generation is atomically activated through `registry.json`. Existing verified generations are reused offline. Failed installation never activates a registry and never replaces a permanent generation. Runtime selection, task artifact delivery and checkpoint recovery recheck the receipt, provenance, hashes, source compatibility and recorded chain automatically. There is no manual template validation step and no local build during deployment or benchmarks.
+The complete byte inventory in `local-validation.json` binds all files to the actual source recipe, native helpers, verified golden and generation. It contains only SHA-256 values calculated from actual built bytes. Installation seals files and directories, atomically renames the complete generation, rechecks native QCOW2 chains and all task scopes, then atomically activates `registry.json`. Validation failure retains diagnostics and leaves the previous registry/generations unchanged. Completed generations are never automatically removed, including generations referenced by recovery checkpoints.
 
-The builder remains sequential and sparse, monitors the host free-space margin,
-and reports common physical bytes, 11 repo-image physical bytes, 230 source
-physical/logical bytes, setup-cache physical/logical bytes, and total unique-inode
-immutable generation allocation. Published images, artifacts, manifests and audit
-records are root-owned and read-only. Default virtual capacity is 512 GiB; the
-host attempt reservation remains separately configured.
+The broker checks owner, permissions, manifest/recipe/provenance, 230 source mappings, 11 repository templates, 25 environments, frozen OS/package audits and offline replay proofs. It verifies all bytes on installation/reuse and first selection. Subsequent tool operations validate metadata and only the backing/artifacts actually used, with SHA caches keyed by inode, size and modification/change times. Every attempt/evaluator/checkpoint retains its original generation. Missing, corrupt or incompatible local files fail before teacher interaction with `make superbench-fetch ADAPTER=swe-gym-lite` in the diagnostic. They never authorize an implicit build.
 
-## Publication and deployment
+## Preparation and deployment
 
-The publication workflow is `.github/workflows/publish-template-release.yml`. It requires a dedicated trusted x86_64 KVM build runner with label `gpt-trace-template-builder`, the matching verified Kali golden, Docker/Git/QEMU/libguestfs tools and sufficient SSD space. Its source-fetch image/container use a private publication cache, with no control-plane Compose services, deployment credentials or campaign volumes. The `template-publication` environment supplies `TEMPLATE_PUBLISH_TOKEN` with repository Contents/Administration write access. The publisher enables and verifies GitHub release immutability before building; deployments use public downloads or a read-only `GH_TOKEN`. Source must be committed and clean to bind publication to an exact commit. Publication is explicit and separate from deployments.
-
-No published template Release or artifact digest is asserted by the source configuration. If an exact permanent Release does not exist, Lite remains unavailable with an explicit diagnostic; selecting Lite fails before teacher allocation or attempt creation. GAIA can continue using its verified golden. Mutable, corrupted or incompatible publications abort deployment. Installation cannot fall back to a build, a mutable tag or a fabricated checksum.
-
-On Acer, after provisioning its role configuration:
+After installing the role configuration, on Acer:
 
 ```bash
 sudo make requirements
@@ -143,7 +134,7 @@ sudo make up
 sudo make doctor
 ```
 
-These operations retrieve/install or verify previously published templates. On Fossil:
+Build prepares the broker and local pinned Kali golden. Up starts only the broker; neither prepares Lite. On Fossil:
 
 ```bash
 sudo make build
@@ -156,7 +147,13 @@ make status
 make export-parquet
 ```
 
-Before teacher interaction or committing active-run state, the selected template identities/source fingerprints are checked. A permanent generation selected by a checkpoint remains fixed even if a future registry changes. Failed download/installation stages and original publication diagnostics are retained; ordinary deployment never resolves OS/Python dependencies or provisions template guests. Default virtual publication capacity remains 512 GiB and the separate attempt reservation remains configured in `config/runner.toml`.
+Fetch first runs the unchanged benchmark source fetcher, which verifies the official pinned dataset and exact task contract. Fossil and Acer then compare their source/recipe fingerprints. A preparation ID is derived from these exact inputs and the actual verified golden. Only Fossil's administrative certificate/token, exact source address and existing pinned mTLS transport can start/query the job. Controller/MCP/model/guest credentials cannot access preparation, lifecycle or evaluator routes. There is no shell RPC, arbitrary command or task-controlled installation path.
+
+The native broker starts one detached, finite worker and responds immediately. Short status requests report `starting`, `running`, `validating`, `ready`, or an explicit terminal error. A root-only state directory and an inherited flock identify the job across disconnects and broker restarts. PID, boot ID, start time and private process session prevent ambiguous duplicate mutations. A lost response never causes an automatic start retry. Rerunning the explicit fetch rediscovers the ID; only a proved-dead failed/interrupted job can be retried. Sealed results interrupted before activation can be validated and activated without rebuilding. Failed build stages, logs and original valid generations remain available for investigation.
+
+Fetch returns success only after complete validation and activation, and records the actual generation. Permanent reuse checks the full immutable inventory, provenance and recorded integrity signatures. GAIA fetch remains unchanged and does not invoke the Lite builder. Source/dependency downloads needed for this local construction are verified by the existing pins, Git commits, package hashes and resolved provenance. No external image publication or image registry is used.
+
+`make down` on Fossil drains both runtime mutations and finite preparation workers, destroys only project-owned temporary resources, proves their absence and requests native broker exit. A finite, admin-only mTLS confirmation child reuses the existing listener after the actual broker PID/start-time has disappeared, audits absence again, confirms the fresh shutdown ID, and exits. A failed connection is never absence or broker-exit evidence. Acer `make down` performs local cleanup/exit and explicitly reports that Fossil campaign/services are outside this local scope. Golden, templates, permanent sources/environments, PostgreSQL, Docker volumes, traces and checkpoints are retained.
 
 ## Grading and recovery
 
@@ -212,31 +209,22 @@ Kali, normal App tools, pause/rate-limit behavior and unfiltered typed Parquet e
 
 ## Validation and operational limit
 
-The original 314-test baseline is retained. With the actual pinned parquet
-available, the implementation validation passed all 401 tests with zero skips
-(42 unchanged upstream escape-sequence warnings). Regression coverage additionally
-checks real multi-commit Git sanitization and exact submodules, ignored/unreachable
-history attacks, task-scoped delivery, >256 MiB streaming, evaluator identity and
-network isolation, hidden-data routing, clean setup before candidate application,
-exact checkpoint recovery/abandonment, actual Debian artifact metadata/integrity,
-resolved generation identity and atomic publication. These tests model libvirt;
-real KVM construction and smoke execution are separate acceptance gates.
+`python3 patch_local_preparation.py --self-test` applies the complete migration to a disposable copy and exercises source transactions, real file hashes/permissions, local activation, job tracking/restart/disconnect/cancellation, admin scope, shutdown proofs, existing capture/export functions and the actual TLS record engine offline. Synthetic QCOW2 metadata and package inventories in software tests are identified as fixtures; these checks do not execute KVM or ChatGPT or claim physical benchmark success.
 
-With runner test dependencies and broker installed:
+With the declared runner/broker/guest test dependencies installed in compatible environments:
 
 ```bash
 GPT_TRACE_SUPERBENCH_SOURCE_ROOT=/absolute/path/to/fetched/sources \
-PYTHONPATH=apps/runner/src:apps/workstation-broker/src:apps/kali-workstation/src:apps/mcp-gateway/src \
+PYTHONPATH=shared:apps/runner/src:apps/workstation-broker/src:apps/kali-workstation/src:apps/mcp-gateway/src \
 python -m pytest apps/runner/tests apps/workstation-broker/tests \
   apps/kali-workstation/tests apps/mcp-gateway/tests -q
 ```
 
-That directory must contain
-`swe-gym-lite/train-00000-of-00001.parquet` with the pinned checksum. Without the
-source-root variable, the live parquet test is skipped. Original pinned harness
-escape-sequence syntax warnings are retained without altering upstream bytes.
+The source root must contain `swe-gym-lite/train-00000-of-00001.parquet` with the pinned checksum. The live dataset test reports its prerequisite when absent. Native source sanitization, exact submodules, scoped delivery, isolated evaluator, hidden-data routing, clean setup before candidate application, grading and checkpoint recovery retain their existing regression tests. `python3 scripts/distributed.py acceptance --adapter swe-gym-lite` on Fossil is the separate physical acceptance operation. It requires actual hosts and a successfully prepared generation; offline source checks never substitute for it.
 
-No real host template generation or ChatGPT smoke campaign was executed in the
-implementation workspace. The host commands must build and validate all 12
-permanent images before a campaign starts. Fresh offline setup replay and native
-end-to-end host execution remain operational acceptance checks.
+The shutdown admission barrier is durable across broker restarts. Explicit Acer `make up` reopens it only after the managed broker and confirmation child are stopped and a fresh ownership audit proves temporary project resources absent. It never repairs templates or destroys resources while starting.
+
+
+Finite preparations inherit a root-only cgroup v2 subtree of the existing `gpt-trace-distributed-broker.service` (`Delegate=yes`). Libguestfs uses its direct backend so detached helper processes remain inside this job's subtree. The durable job records this scope alongside PID/boot identity. Cleanup uses pidfds and, when required, the kernel subtree kill, then verifies the populated event and removes only the empty temporary scope. Source-fetch containers carry project, execution, preparation and attempt labels plus a fixed derived name; cleanup rechecks their identity, stops/removes only these temporary containers, and never prunes volumes or images. Unknown scopes, foreign container identities or unavailable inventory block a success claim. Fetch waits for the finite worker and its auxiliary resources to finish before reporting readiness.
+
+The software tests use explicitly simulated cgroup control-file effects and Docker responses around real finite Python children, locks and immutable files. They do not exercise native cgroup, Docker, KVM, network listeners or physical benchmark integration. Native cgroup semantics follow the [Linux kernel interface](https://docs.kernel.org/admin-guide/cgroup-v2.html); delegation belongs to the [existing systemd unit](https://systemd.io/CGROUP_DELEGATION/).

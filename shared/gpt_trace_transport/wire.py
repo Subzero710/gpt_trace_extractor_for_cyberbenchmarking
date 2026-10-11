@@ -24,12 +24,19 @@ CONTROLLER_ACTIONS = frozenset({
 READ_ACTIONS = frozenset({
     "probe", "inventory", "reconcile_attempt", "inspect_attempt", "assert_absent",
     "inspect_evaluators", "preflight_templates", "artifact_read", "evaluator_artifact_read",
+    "template_preparation_probe", "template_preparation_status", "shutdown_status",
 })
 PRIVATE = tuple(ipaddress.ip_network(x) for x in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 
 
 class TransportFailure(RuntimeError):
     """The request has no verified outcome. This never means a VM is absent."""
+
+
+class RemoteFailure(TransportFailure):
+    def __init__(self, action, status, raw):
+        self.status = status
+        super().__init__(f"broker {action}: HTTP {status}: {raw[:1000].decode(errors='replace')}")
 
 
 class IdentityFailure(TransportFailure):
@@ -218,7 +225,7 @@ class WireClient:
         status, raw = self.exchange("POST", "/v1/" + action,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), "Bearer " + credential, timeout=timeout)
         if status != 200:
-            raise TransportFailure(f"broker {action}: HTTP {status}: {raw[:1000].decode(errors='replace')}")
+            raise RemoteFailure(action, status, raw)
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError) as exc:

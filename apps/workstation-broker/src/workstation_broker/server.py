@@ -282,12 +282,16 @@ add rule inet {table} input iifname "{bridge}" drop
     def preflight_templates(self, template_ids) -> dict:
         if not isinstance(template_ids, list) or len(template_ids) > 256:
             raise ValueError("invalid template preflight selection")
-        selected = {value: self.templates.select(value) for value in sorted(set(template_ids))}
-        for record in selected.values():
-            _, manifest = self.templates.manifest(record)
-            for logical, row in manifest["task_artifacts"].items():
-                if row.get("template_id") == record["template_id"]:
-                    self.templates.task_scope(record, logical)
+        try:
+            selected = {value: self.templates.select(value) for value in sorted(set(template_ids))}
+            for record in selected.values():
+                _, manifest = self.templates.manifest(record)
+                for logical, row in manifest["task_artifacts"].items():
+                    if row.get("template_id") == record["template_id"]:
+                        self.templates.task_scope(record, logical)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("SWE-Gym Lite local artifacts are unavailable/incompatible: " + str(exc) +
+                "; run make superbench-fetch ADAPTER=swe-gym-lite on Fossil") from exc
         return {"templates": selected}
 
     async def create(self, ident: dict, template_id: str | None = None, logical_task_id=None, *, _selection=None) -> dict:
@@ -862,8 +866,10 @@ def inventory(broker) -> dict:
         if match:
             if match[1] not in known_keys: raise ValueError("orphan firewall lacks ownership evidence; preserve it")
             tables.append(line.strip())
-    return {"project": PROJECT, "domains": domains, "networks": networks, "firewall_tables": tables,
-            "states": states, "absent": not (domains or networks or tables or states)}
+    manager = getattr(broker, "preparations", None)
+    preparations = manager.inventory() if manager is not None else []
+    return {"project": PROJECT, "preparations": preparations, "domains": domains, "networks": networks, "firewall_tables": tables,
+            "states": states, "absent": not (domains or networks or tables or states or preparations)}
 
 
 def create_app(broker: Broker) -> Starlette:
@@ -893,23 +899,40 @@ def create_app(broker: Broker) -> Starlette:
                 raise ValueError("broker request must be an object")
             async with operation_lock:
                 if action == "begin_shutdown":
+                    if payload: raise ValueError("shutdown barrier takes no parameters")
+                    marker = getattr(broker, "drain_file", None)
+                    if marker is not None:
+                        from workstation_broker.admission import mark_draining
+                        mark_draining(marker)
                     broker.draining = True
+                    manager = getattr(broker, "preparations", None)
+                    if manager is not None: await asyncio.to_thread(manager.cancel_all)
                     return JSONResponse({"draining": True, "project": PROJECT})
                 if getattr(broker, "draining", False) and action not in {
                         "probe", "inventory", "deployment_probe", "destroy_all", "destroy_attempt",
-                        "abandon_attempt", "assert_absent", "shutdown"}:
+                        "abandon_attempt", "assert_absent", "shutdown", "shutdown_status", "template_preparation_status"}:
                     raise RuntimeError("broker is draining for global shutdown; attempt mutations are blocked")
                 if action == "shutdown":
                     proof = inventory(broker)
                     callback = getattr(broker, "shutdown_callback", None)
                     if not proof["absent"] or not getattr(broker, "draining", False) or callback is None:
                         raise RuntimeError("broker shutdown requires drained, absent project resources")
+                    from workstation_broker.shutdown_observer import request_observation
+                    acknowledgement = await asyncio.to_thread(request_observation, broker, payload, proof)
                     from starlette.background import BackgroundTask
                     async def stop_server():
                         await asyncio.sleep(0.5)
                         callback()
-                    return JSONResponse({"project": PROJECT, "absent": True, "shutdown": True},
-                                        background=BackgroundTask(stop_server))
+                    return JSONResponse(acknowledgement, background=BackgroundTask(stop_server))
+                if action == "shutdown_status":
+                    from workstation_broker.shutdown_observer import pending_status
+                    return JSONResponse(pending_status(payload))
+                if action in {"template_preparation_probe", "prepare_templates", "template_preparation_status"}:
+                    manager = getattr(broker, "preparations", None)
+                    if manager is None: raise RuntimeError("native administrative preparation manager is unavailable")
+                    handler = {"template_preparation_probe": manager.probe,
+                        "prepare_templates": manager.start, "template_preparation_status": manager.status}[action]
+                    return JSONResponse(await asyncio.to_thread(handler, payload))
                 if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
                 if action == "inventory": return JSONResponse(inventory(broker))
                 if action == "deployment_probe":
@@ -992,6 +1015,8 @@ def main():
         raise RuntimeError("broker tokens are missing or too short")
     if hmac.compare_digest(admin_token, controller_token):
         raise RuntimeError("broker admin and controller tokens must be distinct")
+    from gpt_trace_transport.local_templates import golden_builder
+    golden_builder().verify(Path(os.environ["WORKSTATION_BASE_IMAGE"]))
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
     broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), Path(os.environ["WORKSTATION_BASE_IMAGE"]),
                     admin_token, controller_token,
@@ -1004,10 +1029,31 @@ def main():
                     max_transfer_bytes=config["max_transfer_bytes"], max_seed_bytes=config["max_seed_bytes"],
                     egress_allow_cidrs=tuple(config["egress_allow_cidrs"]),
                     template_root=Path(os.environ["WORKSTATION_TEMPLATE_ROOT"]) if "WORKSTATION_TEMPLATE_ROOT" in os.environ else None)
+    from workstation_broker.preparation import PreparationManager
+    broker.preparations = PreparationManager(broker.base, broker.templates.root, broker.templates)
+    from workstation_broker.admission import read_barrier, deployment
+    broker.drain_file = broker.base.parent / "broker-drain.json"
+    if broker.drain_file.exists():
+        read_barrier(broker.drain_file, deployment())
+        broker.draining = True
     uds = Path(os.environ["WORKSTATION_BROKER_SOCKET"])
     uds.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if uds.exists():
-        uds.unlink()
+    from workstation_broker.preparation import process_identity
+    from gpt_trace_transport.local_templates import atomic_json
+    record_path = uds.parent / "broker-process.json"
+    if record_path.exists():
+        from gpt_trace_transport.local_templates import safe
+        from workstation_broker.preparation import same_process
+        previous = json.loads(safe(record_path).read_bytes())
+        if previous.get("deployment") != deployment() or same_process(previous["broker_identity"]):
+            raise RuntimeError("another native broker identity/process owns this runtime; preserve it")
+    if uds.is_symlink(): raise RuntimeError("untrusted native broker socket")
+    if uds.exists(): uds.unlink()
+    stamp = process_identity(os.getpid())
+    if stamp is None: raise RuntimeError("Acer native process identity is unavailable")
+    atomic_json(record_path, {"schema": 1, "broker_identity": stamp,
+        "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
+        "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}, 0o600)
     from gpt_trace_transport.gateway import start_from_env
     listener = start_from_env(uds)
     try:

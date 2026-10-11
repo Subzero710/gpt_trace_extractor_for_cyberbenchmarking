@@ -14,7 +14,7 @@ import pytest
 from gpt_trace_runner.superbench.adapters.swe_gym import guest_runtime, os_packages
 
 ROOT = Path(__file__).resolve().parents[3]
-spec = importlib.util.spec_from_file_location("lite_template_builder", ROOT / "scripts/template_publication_build.py")
+spec = importlib.util.spec_from_file_location("lite_template_builder", ROOT / "scripts/build_local_templates.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
@@ -115,7 +115,7 @@ def test_any_resolved_dependency_change_changes_final_generation(component):
     assert builder.generation_identity(resolved) != builder.generation_identity(changed)
 
 
-def test_publication_build_validates_without_activating_runtime_registry(tmp_path):
+def test_sealed_local_build_validates_before_activating_runtime_registry(tmp_path):
     target = tmp_path / "templates"
     target.mkdir()
     registry = target / "registry.json"
@@ -129,24 +129,24 @@ def test_publication_build_validates_without_activating_runtime_registry(tmp_pat
         assert registry.read_bytes() == old and generation == "a"*64
         assert not final.stat().st_mode & 0o222
         assert not (final / "disk.qcow2").stat().st_mode & 0o222
-        raise RuntimeError("publication validation failed")
-    with pytest.raises(RuntimeError): builder.publish(staged, target, manifest, reject)
+        raise RuntimeError("local validation failed")
+    with pytest.raises(RuntimeError): builder.install_generation(staged, target, manifest, reject)
     assert registry.read_bytes() == old
     second = target / ".build-ok"
     second.mkdir()
     (second / "disk.qcow2").write_bytes(b"new disk")
-    builder.publish(second, target, {"generation":"b"*64}, lambda *args: None)
+    builder.install_generation(second, target, {"generation":"b"*64}, lambda *args: None)
     assert registry.read_bytes() == old
 
 
 @pytest.mark.parametrize("payload", ["builder-mirrors", "repos", "task-sources", "dependency.git"])
-def test_guest_publication_rejects_every_source_directory(tmp_path, monkeypatch, payload):
+def test_guest_isolation_rejects_every_source_directory(tmp_path, monkeypatch, payload):
     root = tmp_path / "guest"
     root.mkdir()
     monkeypatch.setattr(guest_runtime, "ROOT", root)
-    assert guest_runtime.validate_publication() == {"builder_mirrors":0,"repo_mirrors":0,"task_sources":0,"checkouts":0}
+    assert guest_runtime.validate_isolation() == {"builder_mirrors":0,"repo_mirrors":0,"task_sources":0,"checkouts":0}
     (root / payload).mkdir()
-    with pytest.raises(RuntimeError): guest_runtime.validate_publication()
+    with pytest.raises(RuntimeError): guest_runtime.validate_isolation()
 
 
 def test_common_recipe_never_runs_floating_apt_or_builds_task_sources():

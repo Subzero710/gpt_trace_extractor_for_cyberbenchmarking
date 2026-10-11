@@ -21,50 +21,12 @@ def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 
 @pytest.fixture
 def files(tmp_path):
-    root = tmp_path/"templates"
-    folder = root/"swe-gym-lite/generations/staging"
-    (folder/"repos").mkdir(parents=True)
-    (folder/"sources").mkdir()
-    base = tmp_path/"kali-base.qcow2"
-    common, repo = folder/"common.qcow2", folder/"repos/python_mypy.qcow2"
-    for path, raw in ((base, b"kali"), (common, b"common"), (repo, b"repo")):
-        path.write_bytes(raw)
-        path.chmod(0o444)
-    artifacts, task_artifacts = {}, {}
-    for logical in ('task-1', 'task-2'):
-        task_artifacts[logical] = {'template_id': ID}
-        for kind in ('task_source', 'setup_cache'):
-            key = hashlib.sha256((kind + logical).encode()).hexdigest()
-            path = folder/'sources'/key
-            path.write_bytes((logical + kind).encode())
-            path.chmod(0o444)
-            task_artifacts[logical][kind] = key
-            artifacts[key] = {'path':'sources/'+key,'size':path.stat().st_size,'sha256':sha(path),
-                'allowed_template_id':ID,'logical_task_id':logical,'kind':kind,
-                'source_identity':{'instance_id':logical,'repo':'python/mypy','base_commit':'0'*40}}
-    resolved = {"schema_version": 2, 'recipe_version':2, 'security':SECURITY_CONTRACT,
-                'pins':{'recipe_version':2,'schema_version':2}, 'source_fingerprint': "f"*64,
-                'artifacts':artifacts,'task_artifacts':task_artifacts,'publication_validation':{},
-                "templates": {ID: {"chain": [{"path": "repos/python_mypy.qcow2", "sha256": sha(repo)},
-                     {"path": "common.qcow2", "sha256": sha(common)}, {"path": str(base), "sha256": sha(base)}]}}}
-    encoded = json.dumps(resolved,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
-    generation = hashlib.sha256(encoded).hexdigest()
-    final = folder.with_name(generation)
-    folder.rename(final)
-    folder, common, repo = final, final/'common.qcow2', final/'repos/python_mypy.qcow2'
-    (folder/'resolved-inputs.json').write_bytes(encoded)
-    (folder/'resolved-inputs.json').chmod(0o444)
-    manifest = {**resolved,'generation':generation,'resolved_inputs_sha256':hashlib.sha256(encoded).hexdigest()}
-    (folder/"manifest.json").write_text(json.dumps(manifest))
-    (folder/"manifest.json").chmod(0o444)
-    registry_path = root/"swe-gym-lite/registry.json"
-    registry_path.write_text(json.dumps({"schema_version": 2, "generation": generation}))
-    infos = {base: {"format": "qcow2"}, common: {"format": "qcow2", "backing-filename": str(base)},
-             repo: {"format": "qcow2", "backing-filename": "../common.qcow2"}}
-    registry = TemplateRegistry(root, base, lambda path: infos[path], publication_build=True)
-    return SimpleNamespace(root=root, folder=folder, base=base, common=common, repo=repo,
-        manifest=manifest, registry_path=registry_path, registry=registry, infos=infos,generation=generation,
-        artifacts=artifacts,task_artifacts=task_artifacts)
+    if os.geteuid() != 0: pytest.skip("root ownership is required for local host-trust fixtures")
+    import sys
+    root = Path(__file__).resolve().parents[3]
+    sys.path[:0] = [str(root / "shared"), str(root / "tests/distributed")]
+    from template_fixtures import fixture
+    return fixture(tmp_path)
 
 
 def test_registry_resolves_relative_backing_against_image_not_cwd(files, tmp_path, monkeypatch):
@@ -93,16 +55,20 @@ def test_registry_rejects_symlink_mutable_digest_and_backing_mismatch(files, tmp
     files.infos[files.repo]["backing-filename"] = "../missing.qcow2"
     with pytest.raises(ValueError, match="backing"): files.registry.select(ID)
     files.infos[files.repo]["backing-filename"] = "../common.qcow2"
+    files.repo.parent.chmod(0o755)
     files.repo.unlink()
     elsewhere = tmp_path/"elsewhere"
     elsewhere.write_bytes(b"repo")
     files.repo.symlink_to(elsewhere)
+    files.repo.parent.chmod(0o555)
     with pytest.raises(ValueError, match="untrusted"): files.registry.select(ID)
 
 
-def test_recovery_uses_original_generation_after_registry_publication(files):
+def test_recovery_uses_original_generation_after_registry_activation(files):
     selected = files.registry.select(ID)
+    files.registry_path.chmod(0o644)
     files.registry_path.write_text(json.dumps({"schema_version": 2, "generation": "b"*64}))
+    files.registry_path.chmod(0o444)
     assert files.registry.verify_record(selected) == selected
     with pytest.raises(ValueError, match="identity changed"):
         files.registry.verify_record({**selected, "backing_sha256": "0"*64})
@@ -160,7 +126,7 @@ async def test_broker_overlay_inspect_destroy_and_normal_golden(files, tmp_path,
     async def rpc(ident, method, args): return {"identity": ident, "guest_agent_version": "3.0.0"}
     monkeypatch.setattr(broker, "rpc", rpc)
     before = {path: path.read_bytes() for path in (files.base, files.common, files.repo)}
-    result = await broker.create(IDENT, ID, "task-1")
+    result = await broker.create(IDENT, ID, files.task1)
     assert result["template_id"] == ID and created_backings == [str(files.repo)]
     assert result["backing_sha256"] == sha(files.repo)
     stored = broker._read(IDENT)
@@ -192,7 +158,7 @@ async def test_templated_creation_failure_preserves_attempt_for_operator(files, 
     monkeypatch.setattr(broker, "_mount", fail_mount)
     monkeypatch.setattr(broker, "destroy", lambda *args, **kwargs: destroyed.append(args))
     with pytest.raises(RuntimeError, match="quota reservation"):
-        await broker.create(IDENT, ID, "task-1")
+        await broker.create(IDENT, ID, files.task1)
     assert (broker.root / suffix(IDENT)).is_dir()
     assert destroyed == []
     assert files.repo.read_bytes() == b"repo"
@@ -213,11 +179,11 @@ def test_explicit_abandon_is_idempotent_after_partial_cleanup(files, tmp_path, m
 
 
 def test_task_cannot_request_sibling_or_unknown_artifact(files):
-    record = {**files.registry.select(ID), "logical_task_id":"task-1"}
-    own = files.task_artifacts["task-1"]["task_source"]
+    record = {**files.registry.select(ID), "logical_task_id":files.task1}
+    own = files.task_artifacts[files.task1]["task_source"]
     assert files.registry.artifact(record, own)["host_path"] == files.folder / files.artifacts[own]["path"]
     with pytest.raises(ValueError, match="another task"):
-        files.registry.artifact(record, files.task_artifacts["task-2"]["task_source"])
+        files.registry.artifact(record, files.task_artifacts[files.task2]["task_source"])
     with pytest.raises(ValueError, match="unknown"):
         files.registry.artifact(record, "0"*64)
     with pytest.raises(ValueError): files.registry.artifact(record, "../../host")
@@ -225,8 +191,8 @@ def test_task_cannot_request_sibling_or_unknown_artifact(files):
 
 @pytest.mark.parametrize("attack", ["traversal", "absolute", "symlink", "bytes", "size", "mutable", "owner"])
 def test_template_artifact_security_contract(files, monkeypatch, attack):
-    record = {**files.registry.select(ID), "logical_task_id":"task-1"}
-    key = files.task_artifacts["task-1"]["task_source"]
+    record = {**files.registry.select(ID), "logical_task_id":files.task1}
+    key = files.task_artifacts[files.task1]["task_source"]
     row = files.artifacts[key]
     path = files.folder / row["path"]
     # Exercise the path validator independently of the earlier manifest Merkle
@@ -235,8 +201,10 @@ def test_template_artifact_security_contract(files, monkeypatch, attack):
     if attack == "traversal": row["path"] = "../outside"
     elif attack == "absolute": row["path"] = str(files.base)
     elif attack == "symlink":
+        path.parent.chmod(0o755)
         path.unlink()
         path.symlink_to(files.base)
+        path.parent.chmod(0o555)
     elif attack == "bytes":
         path.chmod(0o644)
         path.write_bytes(b"mutated")
@@ -255,7 +223,9 @@ def test_template_artifact_security_contract(files, monkeypatch, attack):
 @pytest.mark.parametrize("attack", ["registry-v1", "manifest-v1", "recipe-v1", "missing-artifacts", "missing-security", "manifest-mutation", "resolved-mutation"])
 def test_old_or_incomplete_security_generation_is_rejected(files, attack):
     if attack == "registry-v1":
+        files.registry_path.chmod(0o644)
         files.registry_path.write_text(json.dumps({"schema_version":1,"generation":files.generation}))
+        files.registry_path.chmod(0o444)
     elif attack == "resolved-mutation":
         path = files.folder / "resolved-inputs.json"
         path.chmod(0o644)
@@ -275,7 +245,11 @@ def test_old_or_incomplete_security_generation_is_rejected(files, attack):
     with pytest.raises(ValueError): files.registry.select(ID)
 
 
-def test_runtime_refuses_a_generation_without_permanent_release_provenance(files):
+def test_runtime_refuses_a_generation_without_local_validation(files):
+    path = files.folder / "local-validation.json"
+    files.folder.chmod(0o755)
+    path.unlink()
+    files.folder.chmod(0o555)
     registry = TemplateRegistry(files.root, files.base, lambda path: files.infos[path])
     with pytest.raises((ValueError, FileNotFoundError)):
         registry.select(ID)

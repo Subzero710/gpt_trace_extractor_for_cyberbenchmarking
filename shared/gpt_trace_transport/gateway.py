@@ -116,11 +116,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "" if is_health else "Bearer " + role[2], timeout=self.server.operation_timeout)
             self.connection.settimeout(30)
             self.respond(status, data)
+            completed = getattr(self.server.upstream, "response_sent", None)
+            if completed is not None:
+                completed(self.command, self.path, status, bytes(raw), role[0])
         except (TransportFailure, OSError, TimeoutError):
             self.fail(503, "broker communication failed; VM outcome unconfirmed; reconcile before any retry")
 
 
-def start_from_env(socket_path: Path):
+def start_from_env(socket_path: Path | None, *, upstream=None, operation_timeout=1900):
     if os.environ.get("WORKSTATION_BROKER_LISTENER", "unix") == "unix":
         return None
     if os.environ["WORKSTATION_BROKER_LISTENER"] != "mtls":
@@ -147,7 +150,10 @@ def start_from_env(socket_path: Path):
             role, "urn:gpt-trace:" + os.environ["WORKSTATION_BROKER_CONTROL_ID"] + ":" + role, credential)
     if len(roles) != 2 or len({row[2] for row in roles.values()}) != 2:
         raise ValueError("client certificates and tokens must be distinct")
-    server = Gateway((address, port), context, WireClient(Endpoint("unix", socket_path)), roles, peer)
+    if upstream is None:
+        if socket_path is None: raise ValueError("native upstream socket required")
+        upstream = WireClient(Endpoint("unix", socket_path))
+    server = Gateway((address, port), context, upstream, roles, peer, timeout=operation_timeout)
     thread = threading.Thread(target=server.serve_forever, name="private-broker-mtls", daemon=True)
     thread.start()
     return server

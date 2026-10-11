@@ -14,11 +14,8 @@ SECURITY_CONTRACT = {"task_scoped_sources": 1, "broker_streaming": 1,
 
 
 def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    from gpt_trace_transport.local_templates import digest
+    return digest(path)
 
 
 def trusted(path: Path, root: Path) -> Path:
@@ -44,15 +41,58 @@ def backing(info: dict, image: Path) -> Path | None:
 
 
 class TemplateRegistry:
-    def __init__(self, root: Path, base: Path, image_info, *, publication_build=False):
+    def __init__(self, root: Path, base: Path, image_info, *, source_root=None):
         self.root = root.absolute()
         self.base = base.absolute()
         self.image_info = image_info
         self._digests = {}
-        if type(publication_build) is not bool: raise ValueError("invalid publication context")
-        self.publication_build = publication_build
-        self._release_expected = None
-        self._release_checks = {}
+        from gpt_trace_transport.local_templates import ROOT
+        self.source_root = Path(source_root) if source_root is not None else ROOT
+        self._expected = None
+        self._generation_checks = {}
+        self._golden_signature = None
+
+    def expected(self):
+        from gpt_trace_transport.local_templates import compatibility, file_signature
+        signature = tuple(file_signature(p) for p in (self.base,
+            self.base.with_suffix(".provenance.json"), self.base.parent / "kali-packages.txt",
+            self.base.parent / "kali-python-packages.txt"))
+        if self._expected is None or self._golden_signature != signature:
+            self._expected = compatibility(self.base, self.source_root, hasher=self.immutable_sha256)
+            self._golden_signature = signature
+        return self._expected
+
+    def validate_generation(self, generation, *, complete=False, check_images=False):
+        from gpt_trace_transport.local_templates import (file_signature, verify_manifest,
+            verify_local_validation, safe)
+        if SHA.fullmatch(str(generation)) is None: raise ValueError("invalid local generation ID")
+        folder = self.root / "swe-gym-lite/generations" / generation
+        safe(folder, immutable=True, directory=True)
+        manifest_path = trusted(folder / "manifest.json", self.root)
+        manifest = json.loads(manifest_path.read_bytes())
+        if manifest.get("generation") != generation: raise ValueError("local generation identity differs")
+        files = [folder / n for n in ("manifest.json", "resolved-inputs.json", "local-validation.json", "audit/offline-setups.json")]
+        expected = self.expected()
+        signature = (tuple(file_signature(p) for p in files), self._golden_signature)
+        first = self._generation_checks.get(generation) != signature
+        if complete or first:
+            verify_manifest(folder, expected, source_root=self.source_root)
+            verify_local_validation(folder, manifest, expected=expected, hasher=self.immutable_sha256)
+            self._generation_checks[generation] = signature
+        else:
+            verify_local_validation(folder, manifest, expected=expected, hasher=self.immutable_sha256, complete=False)
+        if check_images:
+            for row in manifest["templates"].values(): self._verify_chain(folder, row["chain"])
+        return manifest
+
+    def current_generation(self, *, complete=False, check_images=False):
+        path = trusted(self.root / "swe-gym-lite/registry.json", self.root)
+        if path.stat().st_mode & 0o222: raise ValueError("template registry became mutable")
+        value = json.loads(path.read_bytes())
+        if set(value) != {"schema_version", "generation"} or value["schema_version"] != 2:
+            raise ValueError("invalid local template registry")
+        self.validate_generation(value["generation"], complete=complete, check_images=check_images)
+        return value["generation"]
 
     def immutable_sha256(self, path):
         stat = path.stat()
@@ -65,7 +105,12 @@ class TemplateRegistry:
             self._digests[path] = old
         return old[1]
 
-    def select(self, template_id: str, generation: str | None = None) -> dict:
+    def select(self, template_id, generation=None):
+        try: return self._select(template_id, generation)
+        except (OSError, ValueError) as exc:
+            raise ValueError(str(exc) + "; run make superbench-fetch ADAPTER=swe-gym-lite on Fossil") from exc
+
+    def _select(self, template_id: str, generation: str | None = None) -> dict:
         if not isinstance(template_id, str) or ID.fullmatch(template_id) is None:
             raise ValueError("invalid workstation template ID")
         namespace, _ = template_id.split("/")
@@ -93,30 +138,25 @@ class TemplateRegistry:
         resolved = json.loads(resolved_path.read_text())
         encoded = json.dumps(resolved, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         if hashlib.sha256(encoded).hexdigest() != generation or any(manifest.get(key) != resolved.get(key) for key in
-                ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "publication_validation")):
+                ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation")):
             raise ValueError("template generation content identity mismatch")
-        if not self.publication_build:
-            from gpt_trace_transport.template_release import compatibility, verify_manifest, verify_receipt
-            if self._release_expected is None:
-                self._release_expected = compatibility(self.base, hasher=self.immutable_sha256)
-            files = [manifest_path, resolved_path, manifest_path.parent / "release-receipt.json",
-                     manifest_path.parent / "publication.json", manifest_path.parent / "audit/offline-setups.json"]
-            signature = tuple((p.stat().st_dev, p.stat().st_ino, p.stat().st_size, p.stat().st_mode,
-                p.stat().st_uid, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in files)
-            if self._release_checks.get(generation) != signature:
-                verify_manifest(manifest_path.parent, self._release_expected)
-                verify_receipt(manifest_path.parent, manifest, expected=self._release_expected,
-                               hasher=self.immutable_sha256)
-                self._release_checks[generation] = signature
-            verify_receipt(manifest_path.parent, manifest, expected=self._release_expected,
-                           hasher=self.immutable_sha256, complete=False)
+        self.validate_generation(generation)
         source = manifest.get("source_fingerprint")
         if not isinstance(source, str) or SHA.fullmatch(source) is None:
             raise ValueError("invalid template source fingerprint")
         row = manifest.get("templates", {}).get(template_id)
         if not isinstance(row, dict) or not isinstance(row.get("chain"), list) or len(row["chain"]) < 2:
             raise ValueError("unknown/incomplete workstation template")
+        self._verify_chain(manifest_path.parent, row["chain"])
         chain = row["chain"]
+        paths = [manifest_path.parent / chain[0]["path"]]
+        return {"template_id": template_id, "backing_path": str(paths[0]),
+                "backing_sha256": chain[0]["sha256"], "template_generation": generation,
+                "template_source_fingerprint": source}
+
+    def _verify_chain(self, folder, chain):
+        if len(chain) != 3 or chain[1].get("path") != "common.qcow2":
+            raise ValueError("template must use repo -> common -> Kali chain")
         paths = []
         for index, record in enumerate(chain):
             raw = record.get("path")
@@ -127,15 +167,15 @@ class TemplateRegistry:
             if not path.is_absolute():
                 if ".." in path.parts:
                     raise ValueError("template traversal")
-                path = manifest_path.parent / path
+                path = folder / path
             if index == len(chain) - 1:
                 if path != self.base:
                     raise ValueError("template chain does not end in the installed Kali golden")
-                if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o222:
+                if path.is_symlink() or not path.is_file() or path.stat().st_uid != 0 or path.stat().st_mode & 0o222:
                     raise ValueError("Kali golden is mutable or missing")
             else:
                 trusted(path, self.root)
-                if not path.is_relative_to(manifest_path.parent) or not path.is_file() or path.stat().st_mode & 0o222:
+                if not path.is_relative_to(folder) or not path.is_file() or path.stat().st_mode & 0o222:
                     raise ValueError("template image is mutable, missing, or outside generation")
             if self.immutable_sha256(path) != digest:
                 raise ValueError("template image digest mismatch")
@@ -147,9 +187,7 @@ class TemplateRegistry:
             expected = paths[index + 1].resolve() if index + 1 < len(paths) else None
             if info.get("format") != "qcow2" or backing(info, path) != expected:
                 raise ValueError("template backing chain mismatch")
-        return {"template_id": template_id, "backing_path": str(paths[0]),
-                "backing_sha256": chain[0]["sha256"], "template_generation": generation,
-                "template_source_fingerprint": source}
+        return paths
 
     def verify_record(self, record: dict) -> dict:
         expected = self.select(record.get("template_id"), record.get("template_generation"))

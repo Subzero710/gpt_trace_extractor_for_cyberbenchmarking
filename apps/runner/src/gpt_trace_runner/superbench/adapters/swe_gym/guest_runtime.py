@@ -252,7 +252,7 @@ def warm_task(item, artifact):
     # The cloned environment already contains the frozen baseline distributions.
     # Download only added/changed packages; conda-only baseline distributions
     # need not exist on PyPI. VCS distributions retain their exact source commit.
-    # A clean offline replay below is the publication criterion.
+    # A clean offline replay below is the local activation criterion.
     requirements = run(str(prefix / "bin/python"), "-m", "pip", "list", "--format=json").decode()
     packages = json.loads(requirements)
     stored = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"])
@@ -377,7 +377,7 @@ raise SystemExit("unsupported offline apt-get recipe")
 
 
 def freeze_downloads():
-    """Content-addressed wheelhouse provenance, verified before publication."""
+    """Content-addressed wheelhouse provenance, verified before local activation."""
     records = {}
     for path in sorted((ROOT / "wheelhouse").rglob("*")):
         if path.is_file():
@@ -401,16 +401,16 @@ def build_common(inputs):
     caches = {"conda": file_inventory(Path("/opt/miniconda3/pkgs")),
               "pip": file_inventory(Path("/root/.cache/pip")), "recipe_caches": file_inventory(ROOT / "caches")}
     (ROOT / "environment-cache-provenance.json").write_text(json.dumps(caches, sort_keys=True))
-    validate_publication()
+    validate_isolation()
     shell(["chmod -R a+rX " + shlex.quote(str(ROOT)), "chmod -R a+rX /opt/miniconda3"], cwd=ROOT)
 
 
 def build_repo(inputs, repo):
     (ROOT / "repo.json").write_text(json.dumps({"repo": repo, "template_id": "swe-gym-lite/" + repo_name(repo)}))
-    validate_publication()
+    validate_isolation()
 
 
-def validate_publication():
+def validate_isolation():
     for path in (ROOT / "builder-mirrors", ROOT / "repos", ROOT / "incoming.git", ROOT / "task-sources",
                  Path("/opt/swe-gym-build"), Path("/testbed"), Path("/var/lib/gpt-trace-template-artifacts")):
         if path.exists() or path.is_symlink():
