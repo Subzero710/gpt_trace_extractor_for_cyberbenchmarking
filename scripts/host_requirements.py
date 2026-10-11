@@ -76,6 +76,8 @@ def _debian_like() -> bool:
 
 
 def _package_installed(name: str) -> bool:
+    if name == "p7zip-full" and _package_installed("7zip"):
+        return shutil.which("7z") is not None
     result = subprocess.run(
         ["dpkg-query", "-W", "-f=${Status}", name],
         stdout=subprocess.PIPE,
