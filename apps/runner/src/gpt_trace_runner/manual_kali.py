@@ -245,7 +245,7 @@ class ManualKaliManager:
     async def _runtime_probe(
         self,
         state: ManualKaliState,
-    ) -> tuple[bool, dict | None, str | None]:
+    ) -> tuple[bool | None, dict | None, str | None]:
         try:
             metadata = await self.lifecycle.runtime_metadata(
                 self.task,
@@ -254,6 +254,11 @@ class ManualKaliManager:
                 attempt=state.attempt,
             )
         except AppInfrastructureError as exc:
+            try:
+                await self.lifecycle.runtime.assert_absent(self.task, self._environments(state),
+                    state.task_fingerprint, attempt=state.attempt)
+            except AppInfrastructureError:
+                return None, None, str(exc)
             return False, None, str(exc)
         return True, metadata, None
 
@@ -281,7 +286,7 @@ class ManualKaliManager:
             probe_state
         )
 
-        if gateway_error is not None:
+        if gateway_error is not None or runtime_ok is None:
             status = "unavailable"
         elif isinstance(active, dict) and active.get("task_id") != MANUAL_TASK_ID:
             status = "benchmark-owned"

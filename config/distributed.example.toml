@@ -1,0 +1,24 @@
+# Use distributed PKI provisioning to create a complete identity-pinned config.
+[deployment]
+role = "fossil"
+control_id = "fossil"
+execution_id = "acer"
+bundle_manifest_sha256 = ""
+
+[network]
+acer_address = ""
+fossil_address = ""
+server_name = ""
+broker_port = 9443
+
+[paths]
+tls_directory = ".secrets/distributed"
+base_image = "/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"
+broker_runtime_directory = "state/broker"
+storage_root = "/srv/stockage/cyber-dataset"
+
+[storage]
+postgres_data = "gpt-trace-extractor_postgres_data"
+browser_profile = "gpt-trace-extractor_browser_profile"
+runner_state = "gpt-trace-extractor_runner_state"
+benchmark_sources = "gpt-trace-extractor_benchmark_sources"

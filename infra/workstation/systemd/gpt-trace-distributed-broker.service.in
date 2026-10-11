@@ -1,0 +1,19 @@
+[Unit]
+Description=Cyber Dataset private Acer KVM broker
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@REPOSITORY@
+ExecStart=/usr/bin/python3 @REPOSITORY@/scripts/distributed.py acer serve
+Restart=on-failure
+RestartSec=5
+KillMode=process
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

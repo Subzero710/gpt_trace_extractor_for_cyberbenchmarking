@@ -1,0 +1,21 @@
+{
+  "sha256": "a3c073006b19f467a8648e2bf8a07fcc312b2e45bb17f5b4ad5ce1e82e70a1c2",
+  "replacements": [
+    [
+      "import httpx\n",
+      "import httpx\n\nfrom gpt_trace_transport.async_client import make_client\n"
+    ],
+    [
+      "        self.client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(broker_socket)),\n                                        base_url=\"http://broker\", timeout=httpx.Timeout(1850, connect=10), trust_env=False)",
+      "        self.client = make_client(broker_socket)"
+    ],
+    [
+      "        response = await self.client.post(f\"/v1/{operation}\", json=payload,\n                                          headers={\"authorization\": f\"Bearer {self.broker_token}\"})",
+      "        try:\n            response = await self.client.post(f\"/v1/{operation}\", json=payload,\n                headers={\"authorization\": f\"Bearer {self.broker_token}\"})\n        except httpx.HTTPError as exc:\n            raise RuntimeError(\"broker connection failed; workstation outcome unconfirmed\") from exc"
+    ],
+    [
+      "        return response.json()",
+      "        try:\n            result = response.json()\n        except ValueError as exc:\n            raise RuntimeError(\"invalid broker JSON; workstation outcome unconfirmed\") from exc\n        if not isinstance(result, dict):\n            raise RuntimeError(\"broker response must be an object\")\n        return result"
+    ]
+  ]
+}

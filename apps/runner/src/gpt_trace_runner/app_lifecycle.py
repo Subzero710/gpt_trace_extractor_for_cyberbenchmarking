@@ -25,7 +25,7 @@ class AppLifecycle:
         self.token_file = token_file
         self.runtime = runtime
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(180.0, connect=10.0),
+            timeout=httpx.Timeout(1900.0, connect=10.0),
             trust_env=False,
         )
         self._owns_client = client is None
@@ -275,7 +275,7 @@ class AppLifecycle:
                 f"{tool.control_endpoint.rstrip('/')}/control/seed",
                 content=archive,
                 headers={**self._headers(), "content-type": "application/x-tar"},
-                timeout=180.0,
+                timeout=1900.0,
             )
         except httpx.HTTPError as exc:
             raise AppInfrastructureError("kali-workstation gateway transport failed for /control/seed") from exc
@@ -360,6 +360,9 @@ class AppLifecycle:
                 await self._seed_workspace(task, tool)
             return runtime
         except Exception as prepare_error:
+            if getattr(self.runtime, "remote", False) and isinstance(prepare_error, AppInfrastructureError):
+                # Preserve the journal, VM and binding for authenticated reconciliation.
+                raise
             if task.workstation_template is not None:
                 # Preserve the selected VM for diagnosis and same-attempt resume.
                 raise

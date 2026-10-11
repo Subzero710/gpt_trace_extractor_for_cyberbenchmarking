@@ -1,0 +1,15 @@
+**
+!apps/
+!apps/runner/
+!apps/runner/**
+!apps/kali-workstation/
+!apps/kali-workstation/**
+!shared/
+!shared/**
+!scripts/
+!scripts/distributed_acceptance.py
+!scripts/teacher_gpu_doctor.py
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.pytest_cache/

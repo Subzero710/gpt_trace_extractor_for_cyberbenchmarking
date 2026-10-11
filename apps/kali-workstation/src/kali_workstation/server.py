@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+from gpt_trace_transport.async_client import make_client
 import mcp.types as types
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager, TransportSecuritySettings
@@ -50,8 +52,7 @@ class WorkstationController:
         self.broker_token = broker_token
         self.max_seed = max_seed
         self.max_transfer = max_transfer
-        self.client = httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(broker_socket)),
-                                        base_url="http://broker", timeout=httpx.Timeout(1850, connect=10), trust_env=False)
+        self.client = make_client(broker_socket)
         self.active: dict | None = None
 
     def backend_token(self, environment_id: str) -> str:
@@ -66,11 +67,20 @@ class WorkstationController:
         payload = {**ident}
         if method is not None: payload["method"] = method
         if args is not None: payload["args"] = args
-        response = await self.client.post(f"/v1/{operation}", json=payload,
-                                          headers={"authorization": f"Bearer {self.broker_token}"})
+        try:
+            response = await self.client.post(f"/v1/{operation}", json=payload,
+                headers={"authorization": f"Bearer {self.broker_token}"})
+        except httpx.HTTPError as exc:
+            raise RuntimeError("broker connection failed; workstation outcome unconfirmed") from exc
         if response.status_code != 200:
             raise RuntimeError(f"broker {operation} failed: {response.text[:1000]}")
-        return response.json()
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise RuntimeError("invalid broker JSON; workstation outcome unconfirmed") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("broker response must be an object")
+        return result
 
     async def call(self, name: str, arguments: dict) -> dict:
         if self.active is None: raise RuntimeError("no active workstation")

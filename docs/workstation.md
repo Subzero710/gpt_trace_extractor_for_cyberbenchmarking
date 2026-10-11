@@ -57,3 +57,7 @@ runtimes. A new registry publication never changes an existing attempt's
 backing generation or selected artifact scope. The guest streaming addition
 changes the golden semantic build-input hash; old golden artifacts must be
 rebuilt/installed before using schema-2 Lite templates.
+
+## Separate physical hosts
+
+[Distributed operations](distributed.md) put all App/control services on Fossil and every VM, immutable template, artifact stage and evaluator on Acer. Broker absence requires an authenticated resource audit; transport errors retain journals and never imply destruction. The MCP manifest and vsock guest contracts are unchanged.

@@ -1,0 +1,480 @@
+{
+  "name": "gpt-trace-extractor",
+  "services": {
+    "postgres": {
+      "image": "postgres:17-alpine",
+      "environment": {
+        "POSTGRES_DB": "gpt_traces",
+        "POSTGRES_USER": "gpt_traces",
+        "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD:-}"
+      },
+      "volumes": [
+        "postgres_data:/var/lib/postgresql/data"
+      ],
+      "networks": [
+        "core_internal"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U gpt_traces -d gpt_traces"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "retries": 20
+      },
+      "restart": "unless-stopped"
+    },
+    "storage": {
+      "build": {
+        "context": "./apps/storage",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "environment": {
+        "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD:-}"
+      },
+      "depends_on": {
+        "postgres": {
+          "condition": "service_healthy"
+        }
+      },
+      "networks": [
+        "core_internal"
+      ],
+      "ports": [
+        "127.0.0.1:8080:8080"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 20
+      },
+      "restart": "unless-stopped"
+    },
+    "benchmark-fetch": {
+      "profiles": [
+        "benchmark-fetch"
+      ],
+      "build": {
+        "context": ".",
+        "dockerfile": "./apps/runner/Dockerfile",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "environment": {
+        "BENCHMARK_SOURCE_TOKEN": "${BENCHMARK_SOURCE_TOKEN:-}",
+        "GPT_TRACE_SUPERBENCH_SOURCE_ROOT": "/data/state/superbench/sources"
+      },
+      "volumes": [
+        "benchmark_sources:/data/state/superbench/sources"
+      ],
+      "networks": [
+        "benchmark_source_egress"
+      ],
+      "entrypoint": [
+        "gpt-trace",
+        "superbench-fetch"
+      ],
+      "restart": "no"
+    },
+    "runner": {
+      "profiles": [
+        "runner"
+      ],
+      "build": {
+        "context": ".",
+        "dockerfile": "./apps/runner/Dockerfile",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "environment": {
+        "TEACHER_BROWSER_PUBLIC_URL": "${TEACHER_BROWSER_PUBLIC_URL:-}",
+        "WORKSTATION_BROKER_TRANSPORT": "mtls",
+        "WORKSTATION_BROKER_URL": "${DIST_BROKER_URL:?}",
+        "WORKSTATION_BROKER_ADDRESS": "${DIST_BROKER_ADDRESS:?}",
+        "WORKSTATION_BROKER_CA_FILE": "/run/secrets/broker_ca",
+        "WORKSTATION_BROKER_CERT_FILE": "/run/secrets/broker_admin_crt",
+        "WORKSTATION_BROKER_KEY_FILE": "/run/secrets/broker_admin_key",
+        "WORKSTATION_BROKER_SERVER_SHA256": "${DIST_SERVER_SHA256:?}",
+        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:?}"
+      },
+      "secrets": [
+        {
+          "source": "app_control_token",
+          "target": "app_control_token"
+        },
+        {
+          "source": "workstation_broker_admin_token",
+          "target": "workstation_broker_admin_token"
+        },
+        {
+          "source": "broker_ca",
+          "target": "broker_ca"
+        },
+        {
+          "source": "broker_admin_crt",
+          "target": "broker_admin_crt"
+        },
+        {
+          "source": "broker_admin_key",
+          "target": "broker_admin_key"
+        }
+      ],
+      "volumes": [
+        "./exports:/data/exports",
+        "./apps:/data/apps:ro",
+        "./config:/data/config:ro",
+        "./Makefile:/repo/Makefile:ro",
+        "browser_profile:/browser-profile:ro",
+        "runner_state:/data/state",
+        "benchmark_sources:/data/state/superbench/sources:ro"
+      ],
+      "networks": [
+        "core_internal",
+        "app_control",
+        "broker_private_egress"
+      ],
+      "depends_on": {
+        "storage": {
+          "condition": "service_healthy"
+        },
+        "teacher-browser": {
+          "condition": "service_healthy"
+        },
+        "workstation-gateway": {
+          "condition": "service_healthy"
+        },
+        "kali-workstation-controller": {
+          "condition": "service_started"
+        }
+      },
+      "stdin_open": true,
+      "tty": true,
+      "restart": "no"
+    },
+    "teacher-browser": {
+      "build": {
+        "context": "./infra/browser",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "environment": {
+        "DISPLAY": ":99",
+        "BROWSER_CLIPBOARD_PORT": "8765",
+        "BROWSER_KASM_USERNAME": "kasm_user",
+        "BROWSER_KASM_PASSWORD_FILE": "/run/secrets/teacher_browser_password",
+        "BROWSER_DRI_NODE": "/dev/dri/renderD128",
+        "BROWSER_GPU_REQUIRED": "1"
+      },
+      "devices": [
+        "/dev/dri/renderD128:/dev/dri/renderD128"
+      ],
+      "volumes": [
+        "browser_profile:/profile"
+      ],
+      "secrets": [
+        {
+          "source": "teacher_browser_password",
+          "target": "teacher_browser_password"
+        }
+      ],
+      "networks": [
+        "core_internal",
+        "ui_egress"
+      ],
+      "ports": [
+        "127.0.0.1:9222:9222"
+      ],
+      "expose": [
+        "6901"
+      ],
+      "shm_size": "2gb",
+      "security_opt": [
+        "seccomp=./infra/browser/seccomp_profile.json"
+      ],
+      "init": true,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "/usr/local/bin/browser-healthcheck"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 20,
+        "start_period": "15s"
+      },
+      "restart": "unless-stopped"
+    },
+    "teacher-browser-tunnel": {
+      "image": "cloudflare/cloudflared:latest",
+      "command": [
+        "tunnel",
+        "--no-autoupdate",
+        "--metrics",
+        "0.0.0.0:2000",
+        "run",
+        "--token",
+        "${TEACHER_BROWSER_TUNNEL_TOKEN:-}"
+      ],
+      "depends_on": {
+        "teacher-browser": {
+          "condition": "service_healthy"
+        }
+      },
+      "networks": [
+        "ui_egress"
+      ],
+      "mem_limit": "256m",
+      "mem_reservation": "64m",
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "cloudflared",
+          "tunnel",
+          "--metrics",
+          "127.0.0.1:2000",
+          "ready"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 12,
+        "start_period": "150s"
+      },
+      "restart": "unless-stopped"
+    },
+    "workstation-gateway": {
+      "build": {
+        "context": "./apps/mcp-gateway",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "container_name": "gpt-trace-workstation-gateway",
+      "environment": {
+        "GATEWAY_APP_ID": "kali-workstation",
+        "GATEWAY_BACKEND_PREFIX": "kali-workstation-controller",
+        "APP_CONTROL_TOKEN_FILE": "/run/secrets/app_control_token"
+      },
+      "secrets": [
+        {
+          "source": "app_control_token",
+          "target": "app_control_token"
+        }
+      ],
+      "networks": [
+        "app_control"
+      ],
+      "ports": [
+        "127.0.0.1:8011:8000"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "DAC_READ_SEARCH"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 64,
+      "mem_limit": "256m",
+      "cpus": 0.5,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 20
+      },
+      "restart": "unless-stopped"
+    },
+    "mcp-tunnel-workstation": {
+      "profiles": [
+        "app-tunnels"
+      ],
+      "image": "ghcr.io/openai/tunnel-client:v0.0.14",
+      "entrypoint": [
+        "/usr/bin/tunnel-client"
+      ],
+      "command": [
+        "run",
+        "--log.level=info",
+        "--log.format=struct-text"
+      ],
+      "environment": {
+        "CONTROL_PLANE_TUNNEL_ID": "${APP_KALI_WORKSTATION_TUNNEL_ID:-}",
+        "CONTROL_PLANE_API_KEY": "${CONTROL_PLANE_API_KEY:-}",
+        "MCP_SERVER_URL": "http://workstation-gateway:8000/mcp",
+        "HEALTH_LISTEN_ADDR": ":8080",
+        "HOME": "/tmp/tunnel-home"
+      },
+      "depends_on": {
+        "workstation-gateway": {
+          "condition": "service_healthy"
+        }
+      },
+      "networks": [
+        "app_control",
+        "mcp_tunnel_egress"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=16m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 128,
+      "mem_limit": "256m",
+      "cpus": 0.5,
+      "restart": "unless-stopped"
+    },
+    "kali-workstation-controller": {
+      "build": {
+        "context": ".",
+        "dockerfile": "./apps/kali-workstation/Dockerfile",
+        "labels": {
+          "io.gpttrace.project": "gpt-trace-extractor"
+        }
+      },
+      "environment": {
+        "WORKSTATION_BROKER_SOCKET": "/run/workstation-broker/broker.sock",
+        "MCP_TOOL_MANIFEST": "/app/tool-manifest.json",
+        "WORKSTATION_CONFIG": "/app/config/runner.toml",
+        "APP_CONTROL_TOKEN_FILE": "/run/secrets/app_control_token",
+        "WORKSTATION_BROKER_TOKEN_FILE": "/run/secrets/workstation_broker_controller_token",
+        "WORKSTATION_BROKER_TRANSPORT": "mtls",
+        "WORKSTATION_BROKER_URL": "${DIST_BROKER_URL:?}",
+        "WORKSTATION_BROKER_ADDRESS": "${DIST_BROKER_ADDRESS:?}",
+        "WORKSTATION_BROKER_CA_FILE": "/run/secrets/broker_ca",
+        "WORKSTATION_BROKER_CERT_FILE": "/run/secrets/broker_controller_crt",
+        "WORKSTATION_BROKER_KEY_FILE": "/run/secrets/broker_controller_key",
+        "WORKSTATION_BROKER_SERVER_SHA256": "${DIST_SERVER_SHA256:?}",
+        "WORKSTATION_CONTROL_PLANE_ADDRESS": "${DIST_CONTROL_ADDRESS:?}"
+      },
+      "volumes": [
+        "./config/runner.toml:/app/config/runner.toml:ro"
+      ],
+      "secrets": [
+        {
+          "source": "app_control_token",
+          "target": "app_control_token"
+        },
+        {
+          "source": "workstation_broker_controller_token",
+          "target": "workstation_broker_controller_token"
+        },
+        {
+          "source": "broker_ca",
+          "target": "broker_ca"
+        },
+        {
+          "source": "broker_controller_crt",
+          "target": "broker_controller_crt"
+        },
+        {
+          "source": "broker_controller_key",
+          "target": "broker_controller_key"
+        }
+      ],
+      "networks": [
+        "app_control",
+        "broker_private_egress"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,size=64m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "restart": "unless-stopped"
+    }
+  },
+  "volumes": {
+    "postgres_data": {
+      "external": true,
+      "name": "${DIST_VOLUME_POSTGRES_DATA:?}"
+    },
+    "browser_profile": {
+      "external": true,
+      "name": "${DIST_VOLUME_BROWSER_PROFILE:?}"
+    },
+    "runner_state": {
+      "external": true,
+      "name": "${DIST_VOLUME_RUNNER_STATE:?}"
+    },
+    "benchmark_sources": {
+      "external": true,
+      "name": "${DIST_VOLUME_BENCHMARK_SOURCES:?}"
+    }
+  },
+  "networks": {
+    "core_internal": {
+      "internal": true
+    },
+    "app_control": {
+      "internal": true
+    },
+    "mcp_tunnel_egress": null,
+    "benchmark_source_egress": null,
+    "ui_egress": null,
+    "broker_private_egress": {
+      "driver": "bridge"
+    }
+  },
+  "secrets": {
+    "app_control_token": {
+      "file": "./.secrets/app_control_token"
+    },
+    "workstation_broker_admin_token": {
+      "file": "${DIST_TLS_DIRECTORY:?}/workstation_broker_admin_token"
+    },
+    "workstation_broker_controller_token": {
+      "file": "${DIST_TLS_DIRECTORY:?}/workstation_broker_controller_token"
+    },
+    "teacher_browser_password": {
+      "file": "./.secrets/teacher_browser_password"
+    },
+    "broker_admin_crt": {
+      "file": "${DIST_TLS_DIRECTORY:?}/admin.crt"
+    },
+    "broker_admin_key": {
+      "file": "${DIST_TLS_DIRECTORY:?}/admin.key"
+    },
+    "broker_controller_crt": {
+      "file": "${DIST_TLS_DIRECTORY:?}/controller.crt"
+    },
+    "broker_controller_key": {
+      "file": "${DIST_TLS_DIRECTORY:?}/controller.key"
+    },
+    "broker_ca": {
+      "file": "${DIST_TLS_DIRECTORY:?}/ca.crt"
+    }
+  }
+}

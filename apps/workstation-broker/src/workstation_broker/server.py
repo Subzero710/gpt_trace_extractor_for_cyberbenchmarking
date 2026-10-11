@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from .computer import capture, input_events
 from .templates import TemplateRegistry, backing
+from gpt_trace_transport.wire import CONTROLLER_ACTIONS
 
 PORT = 17171
 MAX_BODY = 32 * 1024 * 1024
@@ -192,6 +193,18 @@ class Broker:
         table = "gt_" + suffix(ident)
         exception_rules = "\n".join(f'add rule inet {table} forward iifname "{bridge}" ip daddr {cidr} accept'
                                     for cidr in self.egress_allow_cidrs)
+        control_cidrs = json.loads(os.environ.get("WORKSTATION_CONTROL_PLANE_CIDRS", "[]"))
+        if not isinstance(control_cidrs, list):
+            raise ValueError("invalid control-plane firewall configuration")
+        control_rules = []
+        for cidr in control_cidrs:
+            network = ipaddress.ip_network(cidr, strict=True)
+            if network.version != 4 or str(network) != cidr:
+                raise ValueError("control-plane deny routes must be canonical IPv4 CIDRs")
+            control_rules.append(f'add rule inet {table} forward iifname "{bridge}" ip daddr {cidr} drop')
+        if os.environ.get("WORKSTATION_BROKER_LISTENER") == "mtls" and not control_rules:
+            raise ValueError("distributed broker requires explicit control-plane deny routes")
+        control_rules = "\n".join(control_rules)
         # DNS is accepted only to dnsmasq on this attempt's bridge. DHCP discover
         # is necessarily broadcast before the guest owns an address, while renewals
         # may be unicast to the bridge gateway. No other host-local service is exposed.
@@ -199,6 +212,7 @@ class Broker:
 add chain inet {table} forward {{ type filter hook forward priority -50; policy accept; }}
 add chain inet {table} input {{ type filter hook input priority -50; policy accept; }}
 add rule inet {table} forward iifname "{bridge}" meta nfproto ipv6 drop
+{control_rules}
 {exception_rules}
 add rule inet {table} forward iifname "{bridge}" ip daddr {{ {', '.join(BLOCKED_EGRESS)} }} drop
 add rule inet {table} input iifname "{bridge}" ip daddr {gateway_ip} udp dport 53 accept
@@ -365,7 +379,9 @@ add rule inet {table} input iifname "{bridge}" drop
             if proposed.overlaps(existing):
                 raise ValueError(f"workstation network conflicts with host route {existing}")
         bridge = "gt" + suffix(ident)[:10]
-        net = (f"<network><name>{network}</name><forward mode='nat'/>"
+        owner = ET.Element("metadata")
+        ET.SubElement(owner, f"{{{META_NS}}}attempt").text = json.dumps({"project": PROJECT, "identity": ident}, sort_keys=True)
+        net = (f"<network><name>{network}</name>" + ET.tostring(owner, encoding="unicode") + "<forward mode='nat'/>"
                f"<bridge name='{bridge}' stp='off' delay='0'/>"
                f"<ip address='{subnet}.1' netmask='255.255.255.0'>"
                f"<dhcp><range start='{subnet}.10' end='{subnet}.200'/></dhcp></ip></network>").encode()
@@ -512,6 +528,16 @@ add rule inet {table} input iifname "{bridge}" drop
             return
         domains = run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
         if name in domains:
+            xml = ET.fromstring(run("virsh", "-c", "qemu:///system", "dumpxml", name))
+            owner = xml.find(f"./metadata/{{{META_NS}}}attempt")
+            recorded = json.loads(owner.text or "null") if owner is not None else None
+            if not isinstance(recorded, dict) or recorded.get("project") != PROJECT:
+                raise ValueError("refusing destruction of an unowned domain")
+            recorded_identity = identity(recorded)
+            if "gpt-trace-ws-" + suffix(recorded_identity) != name:
+                raise ValueError("domain metadata/name ownership mismatch")
+            if recorded_identity != ident:
+                raise ValueError("domain attempt identity mismatch before destruction")
             state = run("virsh", "-c", "qemu:///system", "domstate", name).decode().strip()
             if state == "running":
                 run("virsh", "-c", "qemu:///system", "destroy", name)
@@ -545,6 +571,14 @@ add rule inet {table} input iifname "{bridge}" drop
         network = f"gpt-trace-net-{key}"
         domains = run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
         if name in domains:
+            xml = ET.fromstring(run("virsh", "-c", "qemu:///system", "dumpxml", name))
+            owner = xml.find(f"./metadata/{{{META_NS}}}attempt")
+            recorded = json.loads(owner.text or "null") if owner is not None else None
+            if not isinstance(recorded, dict) or recorded.get("project") != PROJECT:
+                raise ValueError("refusing destruction of an unowned domain")
+            recorded_identity = identity(recorded)
+            if "gpt-trace-ws-" + suffix(recorded_identity) != name:
+                raise ValueError("domain metadata/name ownership mismatch")
             state = run("virsh", "-c", "qemu:///system", "domstate", name).decode().strip()
             if state == "running":
                 run("virsh", "-c", "qemu:///system", "destroy", name)
@@ -563,6 +597,7 @@ add rule inet {table} input iifname "{bridge}" drop
             shutil.rmtree(directory, ignore_errors=False)
 
     def destroy_all(self) -> dict:
+        inventory(self)  # Audit ownership before the first mutation.
         removed = []
         orphaned = []
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -611,6 +646,8 @@ add rule inet {table} input iifname "{bridge}" drop
                             if re.fullmatch(r"table inet gt_[0-9a-f]{20}", line.strip())]
         if remaining or remaining_tables:
             raise ValueError(f"project resources remain: {remaining + remaining_tables}")
+        if not inventory(self)["absent"]:
+            raise ValueError("authenticated cleanup audit still finds project resources")
         return {"removed": removed, "orphaned": sorted(set(orphaned))}
 
     async def rpc(self, ident: dict, method: str, args: dict) -> dict:
@@ -777,12 +814,60 @@ def recv_exact(connection: socket.socket, length: int) -> bytes:
     return bytes(result)
 
 
+def inventory(broker) -> dict:
+    """Read-only ownership audit. It includes partial allocation and stopped guests."""
+    domains, networks, tables, states = [], [], [], []
+    known_keys = set()
+    for directory in broker.root.iterdir():
+        if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{20}", directory.name):
+            raise ValueError("untrusted broker state entry")
+        known_keys.add(directory.name)
+        state = directory / "state.json"
+        if state.exists():
+            if state.is_symlink(): raise ValueError("untrusted broker state file")
+            value = json.loads(state.read_text())
+            ident = identity(value["identity"])
+            if suffix(ident) != directory.name or value.get("metadata", {}).get("project") != PROJECT:
+                raise ValueError("broker state ownership mismatch")
+            states.append({"key": directory.name, "identity": ident})
+        else:
+            states.append({"key": directory.name, "partial": True})
+    for name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines():
+        if not name.startswith("gpt-trace-ws-"): continue
+        xml = ET.fromstring(run("virsh", "-c", "qemu:///system", "dumpxml", name))
+        owner = xml.find(f"./metadata/{{{META_NS}}}attempt")
+        value = json.loads(owner.text or "null") if owner is not None else None
+        if not isinstance(value, dict) or value.get("project") != PROJECT:
+            raise ValueError("project-prefixed domain lacks verified project ownership")
+        ident = identity(value)
+        key = suffix(ident)
+        if name != "gpt-trace-ws-" + key: raise ValueError("domain name/identity mismatch")
+        known_keys.add(key)
+        domains.append({"name": name, "identity": ident})
+    for name in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines():
+        if not name.startswith("gpt-trace-net-"): continue
+        xml = ET.fromstring(run("virsh", "-c", "qemu:///system", "net-dumpxml", name))
+        owner = xml.find(f"./metadata/{{{META_NS}}}attempt")
+        key = name.removeprefix("gpt-trace-net-")
+        if owner is not None:
+            value = json.loads(owner.text or "null")
+            if value.get("project") != PROJECT or suffix(identity(value["identity"])) != key:
+                raise ValueError("network project ownership mismatch")
+            known_keys.add(key)
+        elif key not in known_keys:
+            raise ValueError("legacy orphan network lacks ownership evidence; preserve it")
+        networks.append(name)
+    for line in run("nft", "list", "tables").decode().splitlines():
+        match = re.fullmatch(r"table inet gt_([0-9a-f]{20})", line.strip())
+        if match:
+            if match[1] not in known_keys: raise ValueError("orphan firewall lacks ownership evidence; preserve it")
+            tables.append(line.strip())
+    return {"project": PROJECT, "domains": domains, "networks": networks, "firewall_tables": tables,
+            "states": states, "absent": not (domains or networks or tables or states)}
+
+
 def create_app(broker: Broker) -> Starlette:
-    controller_actions = frozenset({
-        "inspect_attempt", "rpc", "capture_screen", "send_input",
-        "artifact_stage_begin", "artifact_stage_chunk", "artifact_stage_end",
-        "artifact_stage_abort", "artifact_export", "artifact_import", "artifact_read",
-    })
+    controller_actions = CONTROLLER_ACTIONS
 
     async def health(_: Request):
         return JSONResponse({"status": "ok", "project": PROJECT})
@@ -804,6 +889,12 @@ def create_app(broker: Broker) -> Starlette:
             if not isinstance(payload, dict):
                 raise ValueError("broker request must be an object")
             if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
+            if action == "inventory": return JSONResponse(inventory(broker))
+            if action == "deployment_probe":
+                configured = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
+                return JSONResponse({"status": "ok", "project": PROJECT,
+                    "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"],
+                    "workstation_sha256": hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
             if action == "destroy_all": return JSONResponse(broker.destroy_all())
             if action == "preflight_templates":
                 return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
@@ -838,6 +929,13 @@ def create_app(broker: Broker) -> Starlette:
                 elif operation == "artifact_stage_abort": result = broker.stage_abort(evaluator, args)
                 elif operation == "artifact_import": result = await broker.import_artifact(evaluator, args)
                 else: raise ValueError("unknown evaluator operation")
+            elif action == "reconcile_attempt":
+                try:
+                    broker.assert_absent(ident)
+                except ValueError:
+                    result = {"state": "present", "identity": ident, "runtime": await broker.inspect_verified(ident)}
+                else:
+                    result = {"state": "absent", "identity": ident}
             elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
             elif action == "destroy_attempt":
                 broker.destroy(ident); result = {"destroyed": True}
@@ -888,7 +986,14 @@ def main():
     uds.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if uds.exists():
         uds.unlink()
-    uvicorn.run(create_app(broker), uds=str(uds), log_level="info")
+    from gpt_trace_transport.gateway import start_from_env
+    listener = start_from_env(uds)
+    try:
+        uvicorn.run(create_app(broker), uds=str(uds), log_level="info")
+    finally:
+        if listener is not None:
+            listener.shutdown()
+            listener.server_close()
 
 
 if __name__ == "__main__":

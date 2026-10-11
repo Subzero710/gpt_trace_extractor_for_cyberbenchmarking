@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / ".env"
 SECRETS_DIR = ROOT / ".secrets"
 CONTROL_TOKEN = SECRETS_DIR / "app_control_token"
-BROKER_ADMIN_TOKEN = SECRETS_DIR / "workstation_broker_admin_token"
-BROKER_CONTROLLER_TOKEN = SECRETS_DIR / "workstation_broker_controller_token"
+BROKER_ADMIN_TOKEN = Path(os.environ.get("WORKSTATION_BROKER_ADMIN_TOKEN_FILE", str(SECRETS_DIR / "workstation_broker_admin_token")))
+BROKER_CONTROLLER_TOKEN = Path(os.environ.get("WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE", str(SECRETS_DIR / "workstation_broker_controller_token")))
 TEACHER_BROWSER_PASSWORD = SECRETS_DIR / "teacher_browser_password"
 
 KNOWN_SECRET_KEYS = {

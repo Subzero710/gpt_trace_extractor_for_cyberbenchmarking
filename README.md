@@ -67,3 +67,7 @@ make stop_kali
 `start_kali` returns after the VM is ready; it does not keep a terminal process alive. Its identity is persisted atomically in the runner state volume, so `status_kali` and `stop_kali` work from a later Cockpit/SSH session. `stop_kali` resets the controller, detaches the gateway, destroys the libvirt attempt, verifies cleanup, and removes the persisted manual state. Manual Kali and Superbench ownership are mutually exclusive.
 
 `make register_apps` is the separate interactive App-registration helper. It may create a temporary registration VM, but `make tunnels` never does.
+
+## Deployment on Fossil and Acer
+
+The supported private mTLS deployment and verified non-destructive migration are documented in [docs/distributed.md](docs/distributed.md). Use `make fossil-*` for the control plane and `make acer-*` for KVM; the original targets retain the single-host architecture.

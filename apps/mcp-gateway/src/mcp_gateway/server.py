@@ -279,7 +279,7 @@ def create_app(state: GatewayState) -> Starlette:
                     "authorization": f"Bearer {active.backend_token}",
                     "content-type": "application/x-tar",
                 },
-                timeout=180.0,
+                timeout=1900.0,
             )
         except ValueError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=413)
@@ -314,7 +314,7 @@ def create_app(state: GatewayState) -> Starlette:
                         if total > MAX_SEED_UPLOAD_BYTES:
                             raise ValueError("artifact too large")
                         yield chunk
-                response = await state.client.post(url, headers=headers, content=body(), timeout=180)
+                response = await state.client.post(url, headers=headers, content=body(), timeout=1900.0)
                 return JSONResponse(response.json(), status_code=response.status_code)
             outbound = state.client.build_request("GET", url, headers=headers)
             response = await state.client.send(outbound, stream=True)
@@ -373,7 +373,7 @@ def create_app(state: GatewayState) -> Starlette:
                 f"{active.backend_url}/control/{operation}",
                 json=payload,
                 headers={"authorization": f"Bearer {active.backend_token}"},
-                timeout=180.0,
+                timeout=1900.0,
             )
         except httpx.HTTPError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=503)

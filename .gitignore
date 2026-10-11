@@ -17,3 +17,8 @@ exports/*.parquet
 .DS_Store
 .idea/
 /exports/
+
+# Distributed source migration and deployment-local configuration.
+.distributed-patch-backups/
+config/distributed.toml
+state/distributed/

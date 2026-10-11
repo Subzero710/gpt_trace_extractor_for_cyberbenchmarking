@@ -634,6 +634,9 @@ class BenchmarkRunner:
             self.journal.clear_capture()
             self.console.print(f"[green]{task.task_id}: completed ({len(captured.messages)} messages)[/]")
         except Exception as exc:
+            if getattr(self.lifecycle.runtime, "remote", False) and isinstance(exc, AppInfrastructureError):
+                # A network failure cannot finalize, delete or clear this attempt.
+                raise
             if phase == "starting" and started is None and isinstance(exc, StorageConflict):
                 self.journal.clear()
             elif task.task_id not in self.runtime_hooks and phase in {"starting", "apps_prepared", "composer_dirty"} and started is not None and not isinstance(exc, StorageError):

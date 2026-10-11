@@ -69,6 +69,21 @@ def _hash_component(
     hasher.update(payload)
 
 
+def guest_source_bytes(path: Path) -> bytes:
+    raw = path.read_bytes()
+    if path == ROOT / "apps/kali-workstation/src/kali_workstation/server.py":
+        guard = json.loads((ROOT / "infra/workstation/image/host-controller-input.json").read_text())
+        source = raw.decode("utf-8")
+        for old, new in reversed(guard["replacements"]):
+            if source.count(new) != 1:
+                raise RuntimeError("unknown controller revision in guest fingerprint; refuse golden reuse")
+            source = source.replace(new, old, 1)
+        raw = source.encode("utf-8")
+        if hashlib.sha256(raw).hexdigest() != guard["sha256"]:
+            raise RuntimeError("host-only controller fingerprint reconstruction failed")
+    return raw
+
+
 def golden_build_input_sha256() -> str:
     """Fingerprint repo/upstream inputs that change guest runtime semantics."""
     hasher = hashlib.sha256()
@@ -107,14 +122,15 @@ def golden_build_input_sha256() -> str:
             raise RuntimeError(
                 f"Kali workstation guest source contains symlink: {path}"
             )
-    source_files = [path for path in source_entries if path.is_file()]
+    source_files = [path for path in source_entries if path.is_file()
+                    and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}]
     if not source_files:
         raise RuntimeError("Kali workstation guest source tree is empty")
     for path in source_files:
         _hash_component(
             hasher,
             path.relative_to(ROOT).as_posix(),
-            path.read_bytes(),
+            guest_source_bytes(path),
         )
     return hasher.hexdigest()
 

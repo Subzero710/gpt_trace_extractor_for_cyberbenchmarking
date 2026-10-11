@@ -11,6 +11,9 @@ from typing import Any, Protocol
 
 import httpx
 
+from gpt_trace_transport.async_client import make_client, distributed
+from gpt_trace_transport.wire import token as broker_token
+
 from .exceptions import AppInfrastructureError
 from .models import BenchmarkTask
 from .workstation_template import validate_template_id
@@ -59,8 +62,8 @@ class LibvirtWorkstationProvider:
         self.socket = socket
         self.token_file = token_file
         self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(socket)),
-                                                   base_url="http://broker", timeout=httpx.Timeout(200, connect=10), trust_env=False)
+        self.remote = distributed()
+        self.client = client or make_client(socket)
 
     async def close(self) -> None:
         if self._owns_client: await self.client.aclose()
@@ -74,12 +77,18 @@ class LibvirtWorkstationProvider:
                 "environment_id": environments[APP_ID], "fingerprint": fingerprint}
 
     async def _request(self, name: str, identity: dict) -> dict:
-        token = self.token_file.read_text().strip()
-        response = await self.client.post(f"/v1/{name}", json=identity,
-                                          headers={"authorization": f"Bearer {token}"}, timeout=1850)
+        try:
+            token = broker_token(self.token_file, strict=self.remote)
+            response = await self.client.post(f"/v1/{name}", json=identity,
+                headers={"authorization": f"Bearer {token}"}, timeout=1900)
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
+            raise AppInfrastructureError(f"broker {name} communication failed; VM outcome unconfirmed; reconcile explicitly") from exc
         if response.status_code != 200:
             raise AppInfrastructureError(f"broker {name}: HTTP {response.status_code}: {response.text[:1000]}")
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AppInfrastructureError("broker returned invalid JSON; VM outcome unconfirmed") from exc
         if not isinstance(data, dict): raise AppInfrastructureError("invalid broker response")
         return data
 
@@ -90,6 +99,12 @@ class LibvirtWorkstationProvider:
         if name == "create_attempt" and task.workstation_template is not None:
             payload["template_id"] = validate_template_id(task.workstation_template)
             payload["logical_task_id"] = task.template_task_id
+        if name == "create_attempt" and self.remote:
+            reconciliation = await self._request("reconcile_attempt", identity)
+            if reconciliation.get("identity") != identity or reconciliation.get("state") not in {"present", "absent"}:
+                raise AppInfrastructureError("broker reconciliation identity/outcome mismatch")
+            if reconciliation["state"] == "present":
+                name = "inspect_attempt"
         details = await self._request(name, payload)
         if details.get("identity") != identity or details.get("provider") != "libvirt":
             raise AppInfrastructureError("broker attempt identity mismatch")
@@ -119,7 +134,11 @@ class LibvirtWorkstationProvider:
 
     async def destroy(self, task, environments, fingerprint, *, attempt):
         identity = self._identity(task, environments, fingerprint, attempt)
-        if identity is not None: await self._request("destroy_attempt", identity)
+        if identity is not None:
+            await self._request("destroy_attempt", identity)
+            if self.remote:
+                if await self._request("assert_absent", identity) != {"absent": True}:
+                    raise AppInfrastructureError("remote destruction lacks verified absence")
 
     async def assert_absent(self, task, environments, fingerprint, *, attempt):
         identity = self._identity(task, environments, fingerprint, attempt)
@@ -228,6 +247,8 @@ class LibvirtWorkstationProvider:
             if task.workstation_template is not None:
                 await self._request("abandon_evaluators", ident)
             await self._request("abandon_attempt", ident)
+            if self.remote and await self._request("assert_absent", ident) != {"absent": True}:
+                raise AppInfrastructureError("remote abandonment lacks verified absence")
 
 
 @dataclass(frozen=True)
