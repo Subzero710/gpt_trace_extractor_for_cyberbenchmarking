@@ -44,11 +44,15 @@ def backing(info: dict, image: Path) -> Path | None:
 
 
 class TemplateRegistry:
-    def __init__(self, root: Path, base: Path, image_info):
+    def __init__(self, root: Path, base: Path, image_info, *, publication_build=False):
         self.root = root.absolute()
         self.base = base.absolute()
         self.image_info = image_info
         self._digests = {}
+        if type(publication_build) is not bool: raise ValueError("invalid publication context")
+        self.publication_build = publication_build
+        self._release_expected = None
+        self._release_checks = {}
 
     def immutable_sha256(self, path):
         stat = path.stat()
@@ -91,6 +95,21 @@ class TemplateRegistry:
         if hashlib.sha256(encoded).hexdigest() != generation or any(manifest.get(key) != resolved.get(key) for key in
                 ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "publication_validation")):
             raise ValueError("template generation content identity mismatch")
+        if not self.publication_build:
+            from gpt_trace_transport.template_release import compatibility, verify_manifest, verify_receipt
+            if self._release_expected is None:
+                self._release_expected = compatibility(self.base, hasher=self.immutable_sha256)
+            files = [manifest_path, resolved_path, manifest_path.parent / "release-receipt.json",
+                     manifest_path.parent / "publication.json", manifest_path.parent / "audit/offline-setups.json"]
+            signature = tuple((p.stat().st_dev, p.stat().st_ino, p.stat().st_size, p.stat().st_mode,
+                p.stat().st_uid, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in files)
+            if self._release_checks.get(generation) != signature:
+                verify_manifest(manifest_path.parent, self._release_expected)
+                verify_receipt(manifest_path.parent, manifest, expected=self._release_expected,
+                               hasher=self.immutable_sha256)
+                self._release_checks[generation] = signature
+            verify_receipt(manifest_path.parent, manifest, expected=self._release_expected,
+                           hasher=self.immutable_sha256, complete=False)
         source = manifest.get("source_fingerprint")
         if not isinstance(source, str) or SHA.fullmatch(source) is None:
             raise ValueError("invalid template source fingerprint")

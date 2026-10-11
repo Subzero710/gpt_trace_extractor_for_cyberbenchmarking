@@ -868,6 +868,9 @@ def inventory(broker) -> dict:
 
 def create_app(broker: Broker) -> Starlette:
     controller_actions = CONTROLLER_ACTIONS
+    # Serializing native actions makes the shutdown barrier wait for every
+    # in-flight transfer/create/input operation before absence can be proved.
+    operation_lock = asyncio.Lock()
 
     async def health(_: Request):
         return JSONResponse({"status": "ok", "project": PROJECT})
@@ -888,74 +891,93 @@ def create_app(broker: Broker) -> Starlette:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("broker request must be an object")
-            if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
-            if action == "inventory": return JSONResponse(inventory(broker))
-            if action == "deployment_probe":
-                configured = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
-                return JSONResponse({"status": "ok", "project": PROJECT,
-                    "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"],
-                    "workstation_sha256": hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
-            if action == "destroy_all": return JSONResponse(broker.destroy_all())
-            if action == "preflight_templates":
-                return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
-            ident = identity(payload)
-            if controller and not admin and (ident.get("purpose") == "evaluator" or
-                    (action == "rpc" and str(payload.get("method", "")).startswith("template_import_"))):
-                return JSONResponse({"detail": "trusted runtime operation forbidden for controller token"}, status_code=403)
-            if action == "create_attempt":
-                if ident.get("purpose") is not None:
-                    raise ValueError("isolated runtimes require create_evaluator")
-                result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
-            elif action == "create_evaluator":
-                if type(payload.get("abandon_stale", False)) is not bool:
-                    raise ValueError("invalid evaluator recovery flag")
-                result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
-            elif action == "inspect_evaluators": result = broker.inspect_evaluators(ident)
-            elif action == "destroy_evaluator": result = broker.destroy_evaluator(ident, payload.get("evaluator_retry"))
-            elif action == "abandon_evaluators": result = broker.abandon_evaluators(ident)
-            elif action == "materialize_template_artifact":
-                result = await broker.materialize_template_artifact(ident, payload.get("artifact_id"))
-            elif action.startswith("evaluator_"):
-                evaluator = broker.evaluator_identity(ident, payload.get("evaluator_retry"))
-                operation = action.removeprefix("evaluator_")
-                args = payload.get("args", {})
-                if operation == "rpc": result = await broker.rpc(evaluator, payload.get("method"), args)
-                elif operation == "materialize_template_artifact": result = await broker.materialize_template_artifact(evaluator, payload.get("artifact_id"))
-                elif operation == "artifact_export": result = await broker.export_artifact(evaluator, args)
-                elif operation == "artifact_read": result = broker.artifact_chunk(evaluator, args)
-                elif operation == "artifact_stage_begin": result = broker.stage_begin(evaluator)
-                elif operation == "artifact_stage_chunk": result = broker.stage_chunk(evaluator, args)
-                elif operation == "artifact_stage_end": result = broker.stage_end(evaluator, args)
-                elif operation == "artifact_stage_abort": result = broker.stage_abort(evaluator, args)
-                elif operation == "artifact_import": result = await broker.import_artifact(evaluator, args)
-                else: raise ValueError("unknown evaluator operation")
-            elif action == "reconcile_attempt":
-                try:
-                    broker.assert_absent(ident)
-                except ValueError:
-                    result = {"state": "present", "identity": ident, "runtime": await broker.inspect_verified(ident)}
-                else:
-                    result = {"state": "absent", "identity": ident}
-            elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
-            elif action == "destroy_attempt":
-                broker.destroy(ident); result = {"destroyed": True}
-            elif action == "abandon_attempt":
-                broker.destroy(ident, strict=False); result = {"destroyed": True}
-            elif action == "assert_absent":
-                broker.assert_absent(ident); result = {"absent": True}
-            elif action == "rpc":
-                result = await broker.rpc(ident, payload.get("method"), payload.get("args", {}))
-            elif action == "capture_screen": result = await asyncio.to_thread(broker.screen, ident)
-            elif action == "send_input": result = await asyncio.to_thread(broker.input, ident, payload.get("args", {}))
-            elif action == "artifact_stage_begin": result = broker.stage_begin(ident)
-            elif action == "artifact_stage_chunk": result = broker.stage_chunk(ident, payload.get("args", {}))
-            elif action == "artifact_stage_end": result = broker.stage_end(ident, payload.get("args", {}))
-            elif action == "artifact_stage_abort": result = broker.stage_abort(ident, payload.get("args", {}))
-            elif action == "artifact_export": result = await broker.export_artifact(ident, payload.get("args", {}))
-            elif action == "artifact_import": result = await broker.import_artifact(ident, payload.get("args", {}))
-            elif action == "artifact_read": result = broker.artifact_chunk(ident, payload.get("args", {}))
-            else: return JSONResponse({"detail": "unknown broker operation"}, status_code=404)
-            return JSONResponse(result)
+            async with operation_lock:
+                if action == "begin_shutdown":
+                    broker.draining = True
+                    return JSONResponse({"draining": True, "project": PROJECT})
+                if getattr(broker, "draining", False) and action not in {
+                        "probe", "inventory", "deployment_probe", "destroy_all", "destroy_attempt",
+                        "abandon_attempt", "assert_absent", "shutdown"}:
+                    raise RuntimeError("broker is draining for global shutdown; attempt mutations are blocked")
+                if action == "shutdown":
+                    proof = inventory(broker)
+                    callback = getattr(broker, "shutdown_callback", None)
+                    if not proof["absent"] or not getattr(broker, "draining", False) or callback is None:
+                        raise RuntimeError("broker shutdown requires drained, absent project resources")
+                    from starlette.background import BackgroundTask
+                    async def stop_server():
+                        await asyncio.sleep(0.5)
+                        callback()
+                    return JSONResponse({"project": PROJECT, "absent": True, "shutdown": True},
+                                        background=BackgroundTask(stop_server))
+                if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
+                if action == "inventory": return JSONResponse(inventory(broker))
+                if action == "deployment_probe":
+                    configured = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
+                    return JSONResponse({"status": "ok", "project": PROJECT,
+                        "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"],
+                        "workstation_sha256": hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
+                if action == "destroy_all": return JSONResponse(broker.destroy_all())
+                if action == "preflight_templates":
+                    return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
+                ident = identity(payload)
+                if controller and not admin and (ident.get("purpose") == "evaluator" or
+                        (action == "rpc" and str(payload.get("method", "")).startswith("template_import_"))):
+                    return JSONResponse({"detail": "trusted runtime operation forbidden for controller token"}, status_code=403)
+                if action == "create_attempt":
+                    if ident.get("purpose") is not None:
+                        raise ValueError("isolated runtimes require create_evaluator")
+                    result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
+                elif action == "create_evaluator":
+                    if type(payload.get("abandon_stale", False)) is not bool:
+                        raise ValueError("invalid evaluator recovery flag")
+                    result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
+                elif action == "inspect_evaluators": result = broker.inspect_evaluators(ident)
+                elif action == "destroy_evaluator": result = broker.destroy_evaluator(ident, payload.get("evaluator_retry"))
+                elif action == "abandon_evaluators": result = broker.abandon_evaluators(ident)
+                elif action == "materialize_template_artifact":
+                    result = await broker.materialize_template_artifact(ident, payload.get("artifact_id"))
+                elif action.startswith("evaluator_"):
+                    evaluator = broker.evaluator_identity(ident, payload.get("evaluator_retry"))
+                    operation = action.removeprefix("evaluator_")
+                    args = payload.get("args", {})
+                    if operation == "rpc": result = await broker.rpc(evaluator, payload.get("method"), args)
+                    elif operation == "materialize_template_artifact": result = await broker.materialize_template_artifact(evaluator, payload.get("artifact_id"))
+                    elif operation == "artifact_export": result = await broker.export_artifact(evaluator, args)
+                    elif operation == "artifact_read": result = broker.artifact_chunk(evaluator, args)
+                    elif operation == "artifact_stage_begin": result = broker.stage_begin(evaluator)
+                    elif operation == "artifact_stage_chunk": result = broker.stage_chunk(evaluator, args)
+                    elif operation == "artifact_stage_end": result = broker.stage_end(evaluator, args)
+                    elif operation == "artifact_stage_abort": result = broker.stage_abort(evaluator, args)
+                    elif operation == "artifact_import": result = await broker.import_artifact(evaluator, args)
+                    else: raise ValueError("unknown evaluator operation")
+                elif action == "reconcile_attempt":
+                    try:
+                        broker.assert_absent(ident)
+                    except ValueError:
+                        result = {"state": "present", "identity": ident, "runtime": await broker.inspect_verified(ident)}
+                    else:
+                        result = {"state": "absent", "identity": ident}
+                elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
+                elif action == "destroy_attempt":
+                    broker.destroy(ident); result = {"destroyed": True}
+                elif action == "abandon_attempt":
+                    broker.destroy(ident, strict=False); result = {"destroyed": True}
+                elif action == "assert_absent":
+                    broker.assert_absent(ident); result = {"absent": True}
+                elif action == "rpc":
+                    result = await broker.rpc(ident, payload.get("method"), payload.get("args", {}))
+                elif action == "capture_screen": result = await asyncio.to_thread(broker.screen, ident)
+                elif action == "send_input": result = await asyncio.to_thread(broker.input, ident, payload.get("args", {}))
+                elif action == "artifact_stage_begin": result = broker.stage_begin(ident)
+                elif action == "artifact_stage_chunk": result = broker.stage_chunk(ident, payload.get("args", {}))
+                elif action == "artifact_stage_end": result = broker.stage_end(ident, payload.get("args", {}))
+                elif action == "artifact_stage_abort": result = broker.stage_abort(ident, payload.get("args", {}))
+                elif action == "artifact_export": result = await broker.export_artifact(ident, payload.get("args", {}))
+                elif action == "artifact_import": result = await broker.import_artifact(ident, payload.get("args", {}))
+                elif action == "artifact_read": result = broker.artifact_chunk(ident, payload.get("args", {}))
+                else: return JSONResponse({"detail": "unknown broker operation"}, status_code=404)
+                return JSONResponse(result)
         except (ValueError, RuntimeError, OSError, TimeoutError, json.JSONDecodeError) as exc:
             return JSONResponse({"detail": str(exc)[:1000]}, status_code=409)
 
@@ -989,7 +1011,9 @@ def main():
     from gpt_trace_transport.gateway import start_from_env
     listener = start_from_env(uds)
     try:
-        uvicorn.run(create_app(broker), uds=str(uds), log_level="info")
+        server = uvicorn.Server(uvicorn.Config(create_app(broker), uds=str(uds), log_level="info"))
+        broker.shutdown_callback = lambda: setattr(server, "should_exit", True)
+        server.run()
     finally:
         if listener is not None:
             listener.shutdown()

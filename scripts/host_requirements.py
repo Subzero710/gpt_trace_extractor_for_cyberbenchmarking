@@ -117,7 +117,14 @@ def _probe_venv() -> tuple[bool, str]:
         return False, str(exc)
 
 
-def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True) -> bool:
+def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True, role: str | None = None) -> bool:
+    if role is None and (ROOT / "config/distributed.toml").exists():
+        import tomllib
+        role = tomllib.loads((ROOT / "config/distributed.toml").read_text())["deployment"]["role"]
+    if role not in {None, "acer", "fossil"}:
+        raise ValueError("unknown distributed host role")
+    if role == "fossil" and golden_build:
+        raise RuntimeError("golden publication requires the Acer execution host")
     failures: list[str] = []
     missing_packages: list[str] = []
 
@@ -130,7 +137,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
 
     packages: tuple[str, ...] = ()
     try:
-        base_packages = load_packages()
+        base_packages = load_packages(ROOT / "requirements-control.txt" if role == "fossil" else REQUIREMENTS)
         extra_packages = load_packages(GOLDEN_BUILD_REQUIREMENTS) if golden_build else ()
         packages = tuple(dict.fromkeys((*base_packages, *extra_packages)))
     except RuntimeError as exc:
@@ -139,7 +146,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
     if packages and shutil.which("dpkg-query") is not None:
         missing_packages = [package for package in packages if not _package_installed(package)]
 
-    command_packages = dict(COMMAND_PACKAGES)
+    command_packages = {key: value for key, value in COMMAND_PACKAGES.items() if role != "fossil" or key in {"ip", "curl", "git"}}
     if golden_build:
         command_packages.update(GOLDEN_BUILD_COMMAND_PACKAGES)
     for command, package in command_packages.items():
@@ -171,7 +178,7 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
             if not ok:
                 failures.append(f"{label} unavailable" + (f": {detail}" if detail else ""))
 
-    if require_root and os.geteuid() != 0:
+    if require_root and role != "fossil" and os.geteuid() != 0:
         failures.append("hybrid build must run as root; use `sudo make build`")
 
     if missing_packages:

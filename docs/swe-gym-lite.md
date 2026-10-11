@@ -117,11 +117,9 @@ hashes, recipe/schema/security contract, and final common/repo QCOW2 hashes.
 Relative backing paths avoid a generation-directory hash cycle. Different
 resolved bytes cannot reuse a previous generation identity.
 
-Publication moves `.build-<random>` to `generations/<content-id>`, seals all files
-and directories, validates through the broker, and atomically replaces
-`registry.json`. Failed validation restores/preserves the build stage and leaves
-the old registry untouched. Recipe/schema-1 generations are rejected. Adapter
-version 2 gives new run-row identities while source instance IDs stay unchanged.
+The publication-only builder seals and validates a generation without changing a runtime registry. `scripts/publish_template_release.py` builds once per exact recipe/runtime/golden compatibility identity, calculates every real artifact digest, gzip-compresses and splits files below GitHub's asset limit, uploads all artifacts/audits/manifests to a draft Release, then publishes and verifies GitHub immutability. A retry reuses the original sealed build or uploaded bytes; it never starts a second build for the same tag. An incomplete original build is retained for diagnosis and cannot be claimed as published.
+
+The installer obtains the exact release tag derived from current compatibility, verifies the real Release API's immutable flag and asset SHA-256 digests, binds the manifest to the immutable Git tag's actual commit, validates every expanded file, and checks native backing chains plus the complete 230/11/25 replay contract. Files become read-only before a verified generation is atomically activated through `registry.json`. Existing verified generations are reused offline. Failed installation never activates a registry and never replaces a permanent generation. Runtime selection, task artifact delivery and checkpoint recovery recheck the receipt, provenance, hashes, source compatibility and recorded chain automatically. There is no manual template validation step and no local build during deployment or benchmarks.
 
 The builder remains sequential and sparse, monitors the host free-space margin,
 and reports common physical bytes, 11 repo-image physical bytes, 230 source
@@ -130,52 +128,35 @@ immutable generation allocation. Published images, artifacts, manifests and audi
 records are root-owned and read-only. Default virtual capacity is 512 GiB; the
 host attempt reservation remains separately configured.
 
-## Real-host commands
+## Publication and deployment
 
-Use the dedicated Ubuntu/KVM host with the existing runtime requirements and
-packages in `requirements-golden-build.txt`. The builder requires Docker, Git,
-QEMU, `virt-customize`, `virt-cat`, `virt-copy-out` and `dpkg-deb`. Stop active/manual
-attempts before replacing the installed Kali base. The internal guest streaming
-capability changes the golden build-input hash: build/install the golden from this
-checkout (or publish that matching image on the publishing host) before Lite builds.
+The publication workflow is `.github/workflows/publish-template-release.yml`. It requires a dedicated trusted x86_64 KVM build runner with label `gpt-trace-template-builder`, the matching verified Kali golden, Docker/Git/QEMU/libguestfs tools and sufficient SSD space. Its source-fetch image/container use a private publication cache, with no control-plane Compose services, deployment credentials or campaign volumes. The `template-publication` environment supplies `TEMPLATE_PUBLISH_TOKEN` with repository Contents/Administration write access. The publisher enables and verifies GitHub release immutability before building; deployments use public downloads or a read-only `GH_TOKEN`. Source must be committed and clean to bind publication to an exact commit. Publication is explicit and separate from deployments.
+
+No published template Release or artifact digest is asserted by the source configuration. If an exact permanent Release does not exist, Lite remains unavailable with an explicit diagnostic; selecting Lite fails before teacher allocation or attempt creation. GAIA can continue using its verified golden. Mutable, corrupted or incompatible publications abort deployment. Installation cannot fall back to a build, a mutable tag or a fabricated checksum.
+
+On Acer, after provisioning its role configuration:
 
 ```bash
-# On the KVM image-building host, build the matching golden locally:
-sudo python3 infra/workstation/image/build.py --local
-# Deploy the matching golden and rebuild/start the runtime containers.
-make build
+sudo make requirements
+sudo make build
+sudo make up
+sudo make doctor
+```
+
+These operations retrieve/install or verify previously published templates. On Fossil:
+
+```bash
+sudo make build
 make up
 make superbench-fetch ADAPTER=swe-gym-lite
-sudo make swe-gym-lite-templates
-make template-doctor ADAPTER=swe-gym-lite
 make doctor
 make auth
 make run ADAPTER=swe-gym-lite LIMIT=1
 make status
+make export-parquet
 ```
 
-Optional sparse capacity, margin and per-VM deadline:
-
-```bash
-sudo make swe-gym-lite-templates \
-  TEMPLATE_BUILD_ARGS="--virtual-gib 512 --free-space-gib 64 --build-timeout-hours 96"
-```
-
-Read the builder's physical-size report. Failed `.build-<id>` directories retain
-host logs and guest disks. Guest logs are in `/var/log/swe-gym-lite-builder.log`
-and `/opt/swe-gym-lite/logs/`; inspect stopped images with `virt-cat`.
-
-After a successful single-task smoke:
-
-```bash
-make run ADAPTER=swe-gym-lite LIMIT=11
-make run ADAPTER=swe-gym-lite LIMIT=25
-make run ADAPTER=swe-gym-lite
-```
-
-Completed rows are skipped under the existing contract checks. Each new campaign
-preflights its selected immutable templates before committing active-run state
-or connecting the teacher; unselected dataset sources are not discovered.
+Before teacher interaction or committing active-run state, the selected template identities/source fingerprints are checked. A permanent generation selected by a checkpoint remains fixed even if a future registry changes. Failed download/installation stages and original publication diagnostics are retained; ordinary deployment never resolves OS/Python dependencies or provisions template guests. Default virtual publication capacity remains 512 GiB and the separate attempt reservation remains configured in `config/runner.toml`.
 
 ## Grading and recovery
 
@@ -227,7 +208,7 @@ make resume
 Neither durable phase resumes ChatGPT generation. Conversation deletion connects
 the teacher browser only after evaluation completes. Unexpected infrastructure
 errors never skip tasks or automatically delete diagnostic guests. GAIA/manual
-Kali, normal App tools, pause/rate-limit behavior and typed SFT export stay intact.
+Kali, normal App tools, pause/rate-limit behavior and unfiltered typed Parquet export stay intact.
 
 ## Validation and operational limit
 

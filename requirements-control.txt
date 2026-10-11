@@ -1,0 +1,8 @@
+# Fossil control-plane host packages. Application dependencies remain in Docker.
+python3-venv
+iproute2
+util-linux
+curl
+ca-certificates
+git
+openssl

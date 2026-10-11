@@ -1,91 +1,65 @@
-.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet export-sft down throw_volumes kali_control swe-gym-lite-templates template-doctor
+.PHONY: requirements build publish-kali-golden up doctor tunnels register_apps start_kali status_kali stop_kali auth run pause resume status reset-recovery superbench-fetch export-parquet down throw_volumes kali_control
 
 requirements:
-	python3 scripts/host_requirements.py
+	python3 scripts/distributed.py requirements
 
 build:
-	python3 scripts/build.py
+	python3 scripts/distributed.py build
 
 publish-kali-golden:
-	python3 infra/workstation/image/build.py --publish
+	python3 scripts/distributed.py publish-kali-golden
 
 up:
-	python3 scripts/project_state.py core
-	python3 scripts/workstation_broker.py start
-	docker compose up -d --wait --wait-timeout 300 postgres storage teacher-browser teacher-browser-tunnel kali-workstation-controller workstation-gateway
+	python3 scripts/distributed.py up
 
-kali_control:
-	python3 scripts/project_state.py core
-	python3 scripts/workstation_broker.py start
-	docker compose up -d --wait --wait-timeout 120 kali-workstation-controller workstation-gateway
+doctor:
+	python3 scripts/distributed.py doctor
 
-doctor: up
-	python3 scripts/host_doctor.py
-	docker compose run --rm --no-deps runner doctor
+tunnels:
+	python3 scripts/distributed.py tunnels
 
-tunnels: up
-	python3 scripts/tunnels.py
+register_apps:
+	python3 scripts/distributed.py register_apps
 
-register_apps: tunnels
-	docker compose run --rm --no-deps runner register-apps
+start_kali:
+	python3 scripts/distributed.py start_kali
 
-start_kali: tunnels
-	docker compose run --rm --no-deps runner manual-kali-start
+status_kali:
+	python3 scripts/distributed.py status_kali
 
-status_kali: kali_control
-	docker compose run --rm --no-deps runner manual-kali-status
+stop_kali:
+	python3 scripts/distributed.py stop_kali
 
-stop_kali: kali_control
-	docker compose run --rm --no-deps runner manual-kali-stop
+auth:
+	python3 scripts/distributed.py auth
 
-auth: tunnels
-	python3 scripts/project_state.py core
-	docker compose run --rm --no-deps runner superbench-auth
-
-run: tunnels
-	python3 scripts/project_state.py core
-	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-run $(if $(ADAPTER),--adapter $(ADAPTER),) $(if $(LIMIT),--limit $(LIMIT),)
+run:
+	python3 scripts/distributed.py run $(if $(ADAPTER),--adapter "$(ADAPTER)",) $(if $(LIMIT),--limit "$(LIMIT)",)
 
 pause:
-	python3 scripts/project_state.py core
-	docker compose run --rm --no-deps runner superbench-pause
+	python3 scripts/distributed.py pause
 
-resume: tunnels
-	python3 scripts/project_state.py core
-	GPT_TRACE_RUNNER_BUILD_ID=$$(git rev-parse HEAD) docker compose run --rm --no-deps -e GPT_TRACE_RUNNER_BUILD_ID runner superbench-resume-active
+resume:
+	python3 scripts/distributed.py resume
 
 status:
-	python3 scripts/project_state.py core
-	docker compose run --rm --no-deps runner superbench-active-status
+	python3 scripts/distributed.py status
 
 reset-recovery:
-	@test -n "$(TASK)" || (echo "usage: sudo make reset-recovery TASK=<run_task_id>" >&2; exit 2)
-	python3 scripts/project_state.py core
-	docker compose run --rm --no-deps runner superbench-reset-recovery "$(TASK)" --yes
-
-throw_volumes:
-	python3 scripts/throw_volumes.py
-
-down:
-	python3 scripts/down.py
+	python3 scripts/distributed.py reset-recovery $(if $(TASK),--task "$(TASK)",)
 
 superbench-fetch:
-	@test -n "$(ADAPTER)" || (echo "usage: make superbench-fetch ADAPTER=<adapter_id>" >&2; exit 2)
-	docker compose run --rm --no-deps benchmark-fetch --adapter "$(ADAPTER)"
-
-swe-gym-lite-templates:
-	python3 scripts/build_swe_gym_lite_templates.py $(TEMPLATE_BUILD_ARGS)
-
-template-doctor: kali_control
-	@test -n "$(ADAPTER)" || (echo "usage: make template-doctor ADAPTER=<adapter_id>" >&2; exit 2)
-	docker compose run --rm --no-deps runner superbench-template-doctor --adapter "$(ADAPTER)"
+	python3 scripts/distributed.py superbench-fetch $(if $(ADAPTER),--adapter "$(ADAPTER)",)
 
 export-parquet:
-	python3 scripts/project_state.py core
-	@mkdir -p exports
-	docker compose run --rm --no-deps runner export-parquet /data/exports/corpus.parquet
+	python3 scripts/distributed.py export-parquet
 
-export-sft: export-parquet
-	python3 scripts/project_state.py core
-	@mkdir -p exports
-	docker compose run --rm --no-deps runner export-sft /data/exports/corpus.parquet /data/exports/sft.parquet
+down:
+	python3 scripts/distributed.py down
+
+throw_volumes:
+	python3 scripts/distributed.py throw_volumes
+
+kali_control:
+	python3 scripts/distributed.py kali_control
+

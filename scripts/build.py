@@ -323,26 +323,18 @@ def status(root: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Hybrid host/KVM plus project-isolated Docker build/cache lifecycle."
-    )
+    parser = argparse.ArgumentParser(description="Role-aware source build and project build-cache lifecycle.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--clean", action="store_true")
     mode.add_argument("--status", action="store_true")
     args = parser.parse_args()
-
-    root = Path(__file__).resolve().parents[1]
-    if args.clean:
-        clean(root)
-    elif args.status:
-        status(root)
+    import distributed
+    if args.clean or args.status:
+        cfg = distributed.config(credentials=False)
+        distributed.host(cfg["deployment"]["role"], cfg, build_tools=True)
+        (clean if args.clean else status)(Path(__file__).resolve().parents[1])
     else:
-        verify_host_requirements(root)
-        build_host_broker(root)
-        build_control_plane(root)
-        verify_manifests(root)
-        build_workstation_base_image(root)
-        verify_workstation_image(root)
+        distributed.main(["build"])
     return 0
 
 

@@ -1,0 +1,23 @@
+name: Publish immutable Lite templates once
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: permanent-lite-template-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    # A dedicated trusted KVM build host; never a Fossil deployment runner.
+    runs-on: [self-hosted, Linux, X64, gpt-trace-template-builder]
+    timeout-minutes: 7200
+    environment: template-publication
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified v4
+        with:
+          persist-credentials: false
+      - name: Publish or resume the single original build
+        env:
+          TEMPLATE_PUBLISH_TOKEN: ${{ secrets.TEMPLATE_PUBLISH_TOKEN }}
+        run: sudo --preserve-env=TEMPLATE_PUBLISH_TOKEN python3 scripts/publish_template_release.py

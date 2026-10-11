@@ -1,6 +1,6 @@
 """Offline tests of real PKI files, source transactions and configuration contracts.
 
-They do not simulate a VM, successful TLS handshake or production deployment.
+They run the actual TLS record engine offline, with no VM, socket or deployment claim.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def load(name, path):
 
 def snapshot(root):
     return {p.relative_to(root).as_posix(): (p.read_bytes(), stat.S_IMODE(p.stat().st_mode), p.stat().st_mtime_ns)
-            for p in root.rglob("*") if p.is_file() and ".distributed-patch-backups" not in p.parts}
+            for p in root.rglob("*") if p.is_file() and ".unified-source-patch-backups" not in p.parts}
 
 
 class SourceTransactionTests(unittest.TestCase):
@@ -53,19 +53,12 @@ class SourceTransactionTests(unittest.TestCase):
         self.root = Path(self.temp.name) / "repository"
         self.root.mkdir()
         # Derive a fixture only from actual checked-out sources and verify every original Git blob.
-        for name, expected in self.engine.DATA["catalog"].items():
-            raw = (ROOT / name).read_bytes()
-            if self.engine.blob_sha(raw) != expected and name in self.engine.DATA["patches"]:
-                source = raw.decode()
-                for old, new in reversed(self.engine.DATA["patches"][name]):
-                    source = self.engine.replace_exact(source, new, old, name)
-                raw = source.encode()
-            if name not in self.engine.EDITABLE_SOURCE_CONFIG:
-                self.assertEqual(self.engine.blob_sha(raw), expected, name)
+        for name, raw in self.engine.baseline(ROOT).items():
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
-            path.chmod(stat.S_IMODE((ROOT / name).stat().st_mode))
+            current = ROOT / name
+            path.chmod(stat.S_IMODE(current.stat().st_mode) if current.exists() else self.engine.DATA["modes"][name])
         self.before = snapshot(self.root)
 
     def tearDown(self):
@@ -117,7 +110,7 @@ class SourceTransactionTests(unittest.TestCase):
         self.assertEqual(snapshot(self.root), before)
 
     def test_unknown_new_path_is_not_overwritten(self):
-        path = self.root / "compose.control.yaml"
+        path = self.root / "shared/gpt_trace_transport/template_release.py"
         path.write_text("user-owned control configuration\n")
         before = snapshot(self.root)
         with self.assertRaises(self.engine.PatchError): self.engine.planned(self.root)
@@ -141,13 +134,13 @@ class SourceTransactionTests(unittest.TestCase):
         original = self.engine.atomic
         reached = []
         def fail_once(root, name, raw, *args, **kwargs):
-            if name == "compose.control.yaml" and not reached:
+            if name == "scripts/distributed.py" and not reached:
                 reached.append(name)
                 raise OSError("injected source disk write failure")
             return original(root, name, raw, *args, **kwargs)
         with patch.object(self.engine, "atomic", fail_once):
             with self.assertRaises(OSError): self.apply()
-        self.assertEqual(reached, ["compose.control.yaml"])
+        self.assertEqual(reached, ["scripts/distributed.py"])
         restored = snapshot(self.root)
         self.assertEqual({name: value[:2] for name, value in restored.items()},
                          {name: value[:2] for name, value in self.before.items()})
@@ -176,6 +169,19 @@ class SourceTransactionTests(unittest.TestCase):
         before = snapshot(self.root)
         with self.assertRaises(self.engine.PatchError): self.rollback()
         self.assertEqual(snapshot(self.root), before)
+
+    def test_incomplete_or_unowned_transaction_cannot_restore_any_file(self):
+        self.apply()
+        manifest = self.root / self.engine.journal_path(self.engine.latest(self.root))
+        original = json.loads(manifest.read_bytes())
+        for attack in ("omitted-file", "unowned-directory"):
+            changed = json.loads(json.dumps(original))
+            if attack == "omitted-file": changed["files"].pop()
+            else: changed["created_directories"].append("state/persistent-user-data")
+            manifest.write_text(json.dumps(changed))
+            before = snapshot(self.root)
+            with self.assertRaises(self.engine.PatchError): self.rollback()
+            self.assertEqual(snapshot(self.root), before)
 
     def test_verify_reports_incomplete_source_instead_of_success(self):
         with self.assertRaises(self.engine.PatchError): self.engine.verify(self.root, quiet=True)

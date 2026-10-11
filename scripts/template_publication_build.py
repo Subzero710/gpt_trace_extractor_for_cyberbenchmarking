@@ -224,13 +224,14 @@ def publish(staged, target_root, manifest, validate):
             try: os.fsync(fd)
             finally: os.close(fd)
         raise
-    atomic_json(target_root / "registry.json", {"schema_version": 2, "generation": generation})
     return final
 
 
 def build(args):
+    if not getattr(args, "publication", False):
+        raise RuntimeError("template builds are restricted to the permanent publication workflow")
     if os.geteuid() != 0:
-        raise RuntimeError("run sudo make swe-gym-lite-templates")
+        raise RuntimeError("publication requires root on an isolated KVM build host")
     for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", "qemu-system-x86_64", "dpkg-deb"):
         if shutil.which(executable) is None:
             raise RuntimeError("missing host build executable: " + executable)
@@ -319,9 +320,20 @@ def build(args):
         try:
             inputs_root = staged / "build-inputs"
             inputs_root.mkdir()
-            cmd("docker", "compose", "run", "--rm", "--no-deps", "--entrypoint", "python", "-v",
-                str(inputs_root) + ":/build-inputs", "benchmark-fetch", "-m",
-                "gpt_trace_runner.superbench.adapters.swe_gym.source", "--export", "/build-inputs", cwd=ROOT)
+            # This one-time publication host has no control-plane deployment,
+            # credentials, Compose services or persistent campaign volumes.
+            # Build only a source-fetch image and bind its private build cache.
+            image = "gpt-trace-lite-publication-source:" + digest(PINS)[:32]
+            cmd("docker", "build", "--label", "io.gpttrace.publication=source-fetch", "-t", image,
+                "-f", "apps/runner/Dockerfile", ".", cwd=ROOT, timeout=14400)
+            source_cache = cache_root / "dataset"
+            source_cache.mkdir(mode=0o700, exist_ok=True)
+            cmd("docker", "run", "--rm", "--network", "bridge", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
+                "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
+                "--mount", "type=bind,source=" + str(source_cache) + ",target=/source-cache",
+                image, "-m", "gpt_trace_runner.superbench.adapters.swe_gym.source",
+                "--export", "/build-inputs", "--source-root", "/source-cache", cwd=ROOT)
             inputs = json.loads((inputs_root / "inputs.json").read_text())
             pins = json.loads(PINS.read_text())
             if inputs["pins"] != pins or pins["recipe_version"] != 2 or pins["schema_version"] != 2:
@@ -524,7 +536,7 @@ PY_GUEST
                 "publication_validation": publications, "allocation": summary}
 
             def validate(final, selected_generation):
-                registry = TemplateRegistry(TEMPLATES, BASE, lambda path: json.loads(capture('qemu-img','info','--output=json',str(path))))
+                registry = TemplateRegistry(TEMPLATES, BASE, lambda path: json.loads(capture('qemu-img','info','--output=json',str(path))), publication_build=True)
                 for template_id in templates:
                     record = registry.select(template_id, selected_generation)
                     for logical, row in mapping.items():
@@ -535,6 +547,7 @@ PY_GUEST
             final = publish(staged, target_root, manifest, validate)
             summary['total_immutable_generation_physical_bytes'] = physical_bytes([final, *final.rglob('*')])
             print(json.dumps({"generation": generation, "invariants": manifest['invariants'], "allocation": summary}, indent=2))
+            return final
         except BaseException as exc:
             # Preserve failed stages, images, exact debs and logs. Never publish
             # a new registry, reuse an unsafe v1 build, or clean diagnostics here.
@@ -547,16 +560,8 @@ PY_GUEST
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--virtual-gib", type=int, default=512)
-    parser.add_argument("--free-space-gib", type=int, default=64)
-    parser.add_argument("--build-timeout-hours", type=int, default=96)
-    args = parser.parse_args()
-    if not 128 <= args.virtual_gib <= 2048 or args.free_space_gib < 32 or not 1 <= args.build_timeout_hours <= 336:
-        parser.error("invalid sparse capacity, free-space margin, or build deadline")
-    build(args)
+    raise SystemExit("template builds are restricted to the permanent publication workflow")
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
     main()

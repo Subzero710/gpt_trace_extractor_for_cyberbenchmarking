@@ -343,76 +343,8 @@ def _verify_no_execution_resources(project: str) -> None:
 
 
 def main() -> int:
-    config = _compose_config()
-    project = config["name"]
-    configured_volumes = _configured_volumes(config)
-
-    # Snapshot only. No resource creation is allowed anywhere in this script.
-    preexisting_volumes = {
-        actual
-        for actual in configured_volumes.values()
-        if _volume_exists(actual)
-    }
-
-    print(
-        f"Down project {project!r}: stop/remove only; nothing will be started or created.",
-        flush=True,
-    )
-
-    # Freeze the source of new mutations first: force-remove runner/auth/doctor
-    # one-offs that already exist.
-    runner_containers = _container_ids(
-        f"label=com.docker.compose.project={project}",
-        "label=com.docker.compose.service=runner",
-    )
-    _remove_containers(runner_containers)
-
-    # If postgres already happens to be running, close DB 'running' rows before
-    # stopping it. If it is not running, do not start it.
-    postgres_container = _postgres_running_container(project)
-    _interrupt_running_rows_if_possible(postgres_container)
-
-    # Purge local recovery markers directly from an already-existing volume.
-    _clear_runner_state_without_container(configured_volumes)
-
-    # Destroy owned libvirt attempts while the trusted broker is still available.
-    _run([sys.executable, "scripts/workstation_broker.py", "stop"])
-
-    # This is the only Compose lifecycle command: DOWN. No --volumes.
-    _run(
-        [
-            "docker",
-            "compose",
-            "--profile",
-            "runner",
-            "--profile",
-            "app-tunnels",
-            "down",
-            "--remove-orphans",
-            "--timeout",
-            "10",
-        ]
-    )
-
-    # Final idempotent cleanup/verification.
-    _verify_no_execution_resources(project)
-
-    # Prove down did not delete any persistent volume that existed beforehand.
-    lost_volumes = sorted(
-        name for name in preexisting_volumes if not _volume_exists(name)
-    )
-    if lost_volumes:
-        raise DownError(
-            "persistent volume(s) disappeared during down: "
-            + ", ".join(lost_volumes)
-        )
-
-    preserved = ", ".join(sorted(preexisting_volumes)) or "(none existed)"
-    print(
-        "down complete: zero active project containers and workstation attempts; "
-        f"pre-existing volumes preserved: {preserved}",
-        flush=True,
-    )
+    import distributed
+    distributed.main(["down", *sys.argv[1:]])
     return 0
 
 

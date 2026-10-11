@@ -164,27 +164,6 @@ def doctor() -> None:
     asyncio.run(main())
 
 
-@app.command("superbench-template-doctor")
-def superbench_template_doctor(adapter: str = typer.Option(..., "--adapter")) -> None:
-    """Validate selected immutable templates without booting a VM or teacher."""
-    async def main():
-        from .superbench.registry import AdapterRegistry
-        from .superbench.service import campaign, to_benchmark_task
-        settings = Settings()
-        registry = AppRegistry.load(settings.app_registry_path)
-        selected = AdapterRegistry.discover().get(adapter)
-        tasks = [to_benchmark_task(task, registry, campaign(settings), selected) for task in selected.discover_tasks()]
-        lifecycle = make_lifecycle(settings, tasks)
-        try:
-            result = await lifecycle.preflight_templates(tasks)
-            expected = {task.metadata.get("source_fingerprint") for task in selected.discover_tasks()
-                        if task.workstation_template is not None}
-            if expected and any(row["template_source_fingerprint"] not in expected for row in result["templates"].values()):
-                raise RecoveryIncomplete("template sources differ from the pinned adapter")
-            console.print(json.dumps(result, indent=2))
-        finally:
-            await lifecycle.close()
-    asyncio.run(main())
 
 
 @app.command("register-apps")
@@ -346,16 +325,6 @@ def export_parquet(
     asyncio.run(main())
 
 
-@app.command("export-sft")
-def export_sft(
-    corpus: Path = typer.Argument(Path("/data/exports/corpus.parquet"), exists=True, dir_okay=False),
-    output: Path = typer.Argument(Path("/data/exports/sft.parquet")),
-    verdict: list[str] = typer.Option([], "--verdict", help="Optional pass/fail/unevaluated row filter; repeatable. Defaults to pass."),
-) -> None:
-    from .superbench.exporter import derive_sft
-
-    count = derive_sft(corpus, output, verdicts=verdict)
-    console.print(f"derived {count} SFT rows from {corpus} -> {output}")
 
 @app.command("superbench-pause")
 def superbench_pause():

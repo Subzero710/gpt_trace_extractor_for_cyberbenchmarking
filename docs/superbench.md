@@ -6,7 +6,7 @@ A source task is identified by its adapter task ID. A stored trajectory ID is de
 
 Native evaluation happens after the teacher trajectory/runtime provenance is captured and before App reset. `EvaluationResult` contains `verdict` (`pass`/`fail`), optional score, details and evaluator metadata. Infrastructure failure remains separate in the run status.
 
-PostgreSQL is authoritative. `make export-parquet` produces the canonical typed corpus. `make export-sft` derives a tool-validated training view and, by default, keeps only native `pass` trajectories; `--verdict` can explicitly select another evaluation class for analysis. The storage JSONL stream remains an internal transport used by the canonical exporter.
+PostgreSQL is authoritative. `make export-parquet` is the only corpus export. The internal JSONL stream includes all rows with captured messages (SQL NULL and JSON null mean no capture), regardless of execution status or evaluation. Pass, fail and unevaluated captures are retained without a verdict filter. PostgreSQL uses one repeatable-read, read-only snapshot. The Parquet writer preserves normalized messages, tool calls/results, original captured messages, App manifests/provenance, storage/runtime/dataset metadata and evaluations. Every row is validated; duplicate trajectory IDs, invalid types or non-finite evaluation scores abort the export without replacing the previous file.
 
 ## Benchmark source fetching
 
@@ -18,7 +18,7 @@ A gated source can consume `BENCHMARK_SOURCE_TOKEN` during fetch. Normal Superbe
 
 ## GAIA smoke run
 
-The built-in `gaia` adapter pins the official GAIA repository at revision `682dd723ee1e1697e00360edccf2366dc8418dd9`, using the 2023 validation Level-1 split and GAIA's native answer normalization.
+The built-in `gaia` adapter pins the official GAIA repository at revision `682dd723ee1e1697e00360edccf2366dc8418dd9`, using the 2023 validation Level-3 split and GAIA's native answer normalization.
 
 The adapter exposes local MCP Apps only when the pinned GAIA task metadata or source file makes that capability relevant. It never requires an App invocation. Source files are seeded into `/workspace/attachments/` rather than uploaded directly to ChatGPT, and the agent decides whether to use the available capability.
 
@@ -51,4 +51,4 @@ To add a benchmark, implement `BenchmarkAdapter`, return `TaskSpec` values, pres
 
 Recovery remains journal-first. A pending journal is reconciled against its exact source task, adapter version and teacher campaign before new work is scheduled. Completed rows are immutable and are skipped only when the current pre-materialization task contract fingerprint still matches; this check includes prompt/source metadata, direct source artifacts/workspaces and current App contracts. Failed infrastructure attempts may be retried.
 
-`export-sft` is fail-closed for tool-use structure: tool calls must name declared stable tools, call IDs must be unique, tool results must reference prior calls exactly once, and every call must have a result.
+The single Parquet export records tool-coherence diagnostics in `validation_json`: declared/stable names, unique call IDs, preceding calls, result names, duplicate results and unanswered calls. Partial or ambiguous tool traces remain exported with their original messages; a missing result is never invented and a failed/unevaluated trajectory is never discarded. `raw_messages_json` and `app_provenance_json` preserve the exact source data alongside the typed normalized view.

@@ -1,409 +1,124 @@
-# Fossil Control Plane / Acer Execution Plane
+# Distributed deployment
 
-## Scope and validation status
+All historical Make operations route through `scripts/distributed.py`; the only role selector is the local `config/distributed.toml`. The checkout requires that file and does not guess a host role or fall back to a combined deployment. The pinned workstation/MCP/guest contracts and adapter recipes remain unchanged.
 
-This migration is pinned to the actually read repository commit
-`6b22d4da8c3bf1e384917124a468d8714a85232e`. It preserves the Kali MCP 3.0.0
-manifest, App registry, guest vsock protocol, immutable source scopes, evaluator
-restrictions, storage schema, teacher identity and existing single-host targets.
+| Command | Acer execution host | Fossil control host |
+| --- | --- | --- |
+| `make requirements` | Native KVM packages, Docker image acquisition, Python venv | Control-host packages, Docker/Compose/Buildx; no KVM probes |
+| `make build` | Native broker, verified permanent golden/templates, managed unit | Control Docker images, registry pins, only new empty storage |
+| `make up`, `make kali_control` | Start native private broker | Start control services, or controller/gateway only |
+| `make doctor` | Storage, golden/template integrity, broker inventory | Nouveau + actual teacher GPU gate + runner's real Acer runtime smoke |
+| `make status` | Authenticated local project inventory | Durable active-run status |
+| `make run`, `make resume`, `make pause` | Refused: control-host operations | ChatGPT/MCP orchestration and preserved recovery |
+| `make register_apps`, manual Kali commands | Refused: control-host operations | Existing registration/manual lifecycle, VM allocated on Acer |
+| `make export-parquet` | Refused: control-host operation | One atomic, unfiltered capture corpus |
+| `make down` | Refused: global shutdown belongs to Fossil | Drain/audit/destroy Acer temporary resources, stop services, retain data/images |
+| `make publish-kali-golden` | Explicit verified golden publication | Refused: no KVM on Fossil |
+| `make throw_volumes` | Refused | Existing explicit THROW confirmation and destructive reset |
 
-Source checking, Python parsing and configuration checking are not deployment
-tests. The development sandbox does not provide KVM, Docker, the existing Python
-application dependencies or permission to create sockets. The real socket/TLS
-suite and both physical-host acceptance commands must be run before collecting
-a corpus. Twenty offline tests passed in that sandbox: source transactions,
-rollback/idempotence, PKI validation, manifest/golden contracts and an actual
-OpenSSL mTLS handshake/encrypted byte exchange through MemoryBIO. MemoryBIO
-does not exercise sockets, HTTP, the broker or either physical host. No network
-TLS, KVM, hardware, MCP or full benchmark success is asserted here.
+## Physical and storage boundaries
 
-## Architecture and interfaces
+Both hosts require Ubuntu 26.04 and Python >=3.12. Acer requires root for its native broker, /dev/kvm, libvirt, nftables and local SSD image storage. Docker on Acer is used to acquire/package permanent images, never to launch the control plane. Fossil checks its own assigned private IPv4 address and Docker capabilities, never /dev/kvm or libvirt. The standard amd64 Ubuntu baseline is used; do not install an opt-in AVX2/v3 build on an older CPU without verifying its instruction support.
 
-Fossil runs the nine existing Compose services, including the runner and source
-fetch one-offs. `compose.control.yaml` is a standalone Compose document (JSON,
-which is valid YAML), with the original project name and explicitly named external
-volumes. `core_internal` and `app_control` stay internal. Only the runner and
-Kali controller additionally join `broker_private_egress`; there is no incoming
-LAN service on that bridge. Storage and CDP remain loopback-only. Teacher
-KasmVNC and both tunnels retain their original Docker networks and routing.
+`config/runner.toml` is authoritative for the guest limits: 5120 MiB, 6 vCPUs and a 64 GiB reserved overlay are preserved. SWE-Gym Lite needs a teacher and separate evaluator concurrently. Two configured guests total 10240 MiB; an 8 GiB Acer therefore needs measured usable memory/swap and actual sustained acceptance. No source edit silently reduces memory/vCPU/disk dimensions. QEMU reservations must fit the local SSD; the complete template generation must fit before installation. There is no claimed hardware result in a source-only check.
 
-Acer runs only the privileged native broker and libvirt/QEMU guests. Its broker
-serves the existing Unix socket and a small bounded mTLS HTTP front end in the
-same process. Only Fossil's configured LAN source address is admitted. The
-listener binds the configured RFC1918 address, never `0.0.0.0` or a public
-address. Libvirt, QMP, AF_VSOCK and golden/template files never cross the LAN.
+Fossil uses `compose.control.yaml` with PostgreSQL 17, storage, persistent teacher browser/tunnel, MCP gateway/controller/tunnel, runner and benchmark fetcher. Existing internal control/storage networks remain internal. Only runner and controller receive the private broker egress route and their own client key/certificate. No Docker/libvirt socket, KVM device or Acer Unix socket is mounted. The teacher-browser identity/profile, benchmark source cache, database and runner state remain dedicated persistent volumes.
 
-Both Python clients share one transport package. Unix mode retains the existing
-HTTPX AF_UNIX transport. Explicit mTLS mode uses a private numeric destination,
-CA validation, a required DNS SAN, a pinned server certificate verified before
-sending a token, and distinct pinned admin/controller client certificates and
-tokens. The front end binds each client certificate to its original token scope;
-the native broker independently checks the token and trusted operation scope.
-There is no downgrade, public broker, proxy-environment routing or automatic
-replay of a mutating request. A later operation makes a new authenticated
-connection. Timeouts are 10 seconds for connection and at most 1900 seconds for
-an operation, allowing the existing 1810/1850-second guest RPC contracts.
+The explicit four volume names in `[storage]` must resolve to distinct, nonoverlapping directories under `[paths].storage_root`. Build initializes new empty directories/volumes only. Existing data outside that root requires verified cold migration; it is never adopted, renamed or copied implicitly. Use the same volume names on the intended control host. Never start two writable PostgreSQL instances over the same volume.
 
-Frames and responses are capped at 32 MiB. Artifact and seed traffic retain
-their existing 1 MiB chunks, bounded totals and end-to-end hashes. Only existing
-broker operations handle guest artifacts; no remote host path is accepted.
+## Private configuration and PKI
 
-The cohost assumptions removed are the provider/controller Unix-only HTTPX
-constructors, runner/controller socket bind mounts, combined KVM/Docker build
-and host doctor, `make up` starting a local broker, and shutdown coupling local
-VM destruction to Docker and erasing recovery markers. Tunnels, gateway URLs,
-teacher CDP, database, exports and benchmark state all remain local to Fossil.
-The old `scripts/down.py` retains its historical single-host semantics; use the
-explicit distributed targets for the new architecture.
-
-The original golden fingerprint included the unused host controller source.
-`host-controller-input.json` reverses only the reviewed host-only edits before
-hashing that input; its original SHA256 is checked. Guest code/locks/provisioning
-are unchanged, so the original golden input fingerprint remains exactly
-`4130895e6f37115739a3b832d8b5e6ce3c371a403968cda95c57a249e4a0f29e`.
-Unknown controller revisions stop golden reuse rather than inventing a tag.
-
-## Source migration
-
-At the repository root, with Python >=3.12:
-
-```bash
-python3 patch_distributed.py --check
-python3 patch_distributed.py --dry-run
-python3 patch_distributed.py --apply
-python3 patch_distributed.py --verify
-```
-
-The patch validates the complete pinned file catalog before any source write,
-precomputes transformations, parses produced modules/configurations, records
-backups and journal hashes, and replaces files atomically. A second apply does
-not rewrite compliant files. It never invokes runtime operations, reads secrets,
-modifies `/etc`, adjusts partitions/firewalls, or touches live VM/Docker data.
-`--rollback` refuses to overwrite any later edit, including new generated files.
-
-## Prerequisites and placement
-
-Use Ubuntu 26.04.1 on both hosts. Set the actual private IPv4 addresses and a
-chosen broker DNS certificate identity during provisioning below. The DNS
-identity need not resolve: the client connects to the explicitly configured
-numeric address and verifies the hostname separately. Verify SSH host keys by
-an independent channel before copying secrets or backups between hosts.
-
-On Acer, install the existing host requirements, Python venv support, libvirt,
-KVM, nftables and Docker Engine for the unchanged verified golden **artifact
-installer**. No control-plane container is built or started there. Create
-`/var/lib/libvirt/images/gpt-trace` on the local SSD and keep golden, templates,
-reservation files, artifact stages and overlays there. `acer doctor/build`
-verify a nonrotational local block device and KVM/libvirt access.
-
-On Fossil, install Python >=3.12, OpenSSL, iproute2, git and Docker
-Engine/Compose/Buildx. KVM and libvirt are not required or inspected. Ensure the
-configured `/srv/stockage/cyber-dataset` is on Fossil's intended MergerFS storage.
-The volume initialization command creates explicit bind-backed external volumes
-there; it never adopts nonempty unrecognized data or alters an existing volume.
-
-Use the standard `amd64` Ubuntu image/packages on Fossil. Canonical documents
-the standard baseline separately from the optional `amd64v3` variant, which
-requires AVX2 and other later instructions. Do not opt this i5-2500 into that
-variant. This OS distinction still does not validate the pinned Chromium binary
-or its GPU path; the running-browser probe below remains mandatory. See
-[Canonical architecture baselines](https://documentation.ubuntu.com/project/how-ubuntu-is-made/concepts/supported-architectures/)
-and [Ubuntu 26.04 LTS changes](https://documentation.ubuntu.com/release-notes/26.04/summary-for-lts-users/).
-
-The versioned resource values remain `memory_mb=5120`, `vcpus=6`, and
-`overlay_quota_gb=64`, and remain configurable in `config/runner.toml`. Copy the
-same workstation table to both hosts. The authenticated deployment probe checks
-that the table hashes match. One teacher and one isolated evaluator together
-configure 10240 MiB of guest RAM, exceeding Acer's stated 8 GiB physical RAM.
-Real simultaneous RSS/swap capacity and two complete overlay reservations must
-be measured on Acer. This patch does not silently resize a guest or claim that
-the stated physical memory guarantees evaluator execution.
-
-## Verified cold backup before switching
-
-On the existing single-host installation, pause the campaign and wait for the
-runner to finish the current task. Stop manual Kali cleanly. Record active-run,
-teacher identity, source cache and storage status. Stop all project containers
-without deleting volumes, including one-off runners. Confirm with `docker ps`.
-
-```bash
-make pause
-make status
-make stop_kali
-docker compose --profile runner --profile app-tunnels stop
-sudo python3 scripts/distributed.py backup --directory /path/to/new-cold-backup
-```
-
-Use a real destination on an appropriate disk. Backup refuses running project
-containers and writes all four cold volume archives plus deployment secrets and
-the original workstation config. It prints the backup manifest SHA256. Keep
-that digest through an independent channel and verify it on Fossil before
-restoration; restore then validates every archive hash and all member paths
-before extracting anything. Cold PostgreSQL restoration uses the unchanged
-PostgreSQL 17 image. Preserve the original volumes and source-host backup until
-the physical acceptance and corpus/export comparison pass.
-
-Active QCOW2 overlays are not copied or modified by this procedure. If a
-campaign has an unfinished attempt, keep its Acer VM/storage and exact runner
-journal; do not migrate its backing generation mid-attempt. If the old execution
-host is not Acer, finish or explicitly abandon that attempt before moving the
-golden/templates offline. Copy only immutable verified golden/template artifacts
-and their provenance to Acer, keeping root ownership and read-only modes.
-
-## Certificates, tokens and configuration
-
-Run the dedicated CA provisioning on a trusted offline administration machine
-with the patched repository and OpenSSL. Supply the real values for the shell
-variables below; never put private keys or tokens in Git. Reuse the existing
-broker tokens with `--tokens-from` during migration, preserving all App-control
-tokens and teacher credentials separately. For a fresh install, omit that option.
+Use an existing trusted provisioning host with OpenSSL. Select actual assigned RFC1918 IPv4 addresses and a broker DNS certificate identity; the transport connects to the numeric Acer address with that DNS SNI identity. Keep the CA private key offline. Provision complete distinct credential bundles:
 
 ```bash
 PYTHONPATH=shared python3 -m gpt_trace_transport.pki \
-  --output .secrets/new-distributed-authority \
-  --server-name "$BROKER_DNS_NAME" \
-  --acer-address "$ACER_IP" --fossil-address "$FOSSIL_IP" \
-  --control-id fossil --execution-id acer --port 9443 \
-  --tokens-from .secrets
+  --output /path/to/new-private-pki \
+  --server-name "$BROKER_NAME" \
+  --acer-address "$ACER_IP" --fossil-address "$FOSSIL_IP"
 ```
 
-The output contains `authority`, `acer`, and `fossil` directories. Keep the CA
-private key offline. Acer receives only its server key, the two public client
-certificates and broker tokens. Fossil receives its distinct admin/controller
-keys and tokens, and the public server certificate. The creation result gives
-each bundle manifest digest and the server certificate fingerprint.
+An existing deployment can supply `--tokens-from` to preserve its two broker-token identities. The generated per-role `distributed.toml` contains the actual bundle-manifest SHA-256; verify it out of band when transferring the corresponding bundle. Install the generated local-role configuration at `config/distributed.toml` and its credential files in the configured `.secrets/distributed` directory. Preserve a mode-0700 credential directory, mode-0600 private keys/tokens and root/operator ownership. Fossil has only admin/controller client private keys; Acer has only the server private key. The CA private key belongs to neither deployment bundle. Configurations reject symlinks, unknown/missing fields, mismatched host identities, public/equal addresses, certificate/key/token/provenance changes and expired credentials.
 
-Copy the appropriate bundle to `.secrets/distributed` on each host with an
-SSH-host-key-verified channel. Copy its `distributed.toml` to
-`config/distributed.toml`. Keep `.secrets` and the bundle directory at 0700,
-private keys at 0600, and initially tokens at 0600. The existing Compose token
-materializer may set tokens to 0444 behind the private directory; keys never use
-that exception. Confirm the printed manifest SHA256 on both destinations
-through the independent channel. Configuration loading verifies every bundle
-hash, role, host identity, address, certificate purpose, expiration and key mode.
-Never copy the authority or the other host's private key to a runtime machine.
+The server requires mTLS, the exact Fossil source address, pinned role-specific client certificates and matching role-specific tokens. A controller credential cannot create/destroy attempts, change templates, allocate evaluators or shut down the broker. The runner pins the real server certificate fingerprint before sending its token. There is no proxy, unverified TLS, Unix/HTTPS downgrade or automatic mutation replay after a network loss.
 
-Configure the storage volume names from the original rendered Compose metadata.
-Existing names are preserved when their data already reside in the required
-Fossil storage root. For cross-host restoration use fresh empty Fossil bind-backed
-volumes, retaining the original data and restoring the exact teacher identity,
-runner state and source bytes. All operational addresses, host identities,
-paths and volume names are in the generated non-secret TOML.
+Allow only Fossil's configured address to reach the private broker port. Apply the corresponding host/VPN firewall policy. Guest nftables deny Fossil's /32 before any explicit egress exception; guests cannot route to broker/control secrets or service ports. Each teacher VM still has its private libvirt NAT network and host DNS/DHCP-only input. Evaluators have no NIC, desktop, model route or shared filesystem.
 
-Only the Acer broker port may cross this LAN boundary. Configure the host/LAN
-firewall to accept it from Fossil's configured source address and reject every
-other source, independently of mTLS. Inspect `ip route get "$ACER_IP"` on Fossil
-to confirm the selected source matches the configured address. There is no
-automatic host firewall installation. Existing per-attempt nftables rules still
-block private/IPv6 destinations and limit Acer input to DHCP/DNS. An explicit
-Fossil /32 drop precedes every configured private target exception. Keep all
-Fossil control addresses out of `egress_allow_cidrs`; additional control aliases
-must not be introduced as benchmark target networks.
+Fossil's `.env` contains the existing PostgreSQL, independent teacher Kasm password/tunnel token/public HTTPS origin, OpenAI control-plane key, App tunnel ID and any gated benchmark source token. Provisioning never copies ChatGPT cookies, database files or these App credentials into a guest or an Acer bundle. The existing Kasm login form, internal Basic auth, pinned CloakBrowser, sandbox, Cloudflare routing and loopback CDP boundary are preserved.
 
-For rotation, provision a new dedicated generation offline, keep the existing
-tokens via `--tokens-from`, verify and replace both bundles/config pins during a
-paused campaign, and restart the broker/control containers. A broker restart
-does not destroy VMs. Reconcile interrupted requests after restart; do not replay
-an input, shell command or upload chunk whose outcome is unconfirmed.
+## Permanent templates
 
-## Acer installation and start
+The explicit one-time publisher is the workflow `.github/workflows/publish-template-release.yml`; see [the Lite guide](swe-gym-lite.md) for its build host and credential prerequisites. The tag is computed from the pinned source recipe, exact guest runtime sources/security contract and actual verified installed golden SHA. It is a lookup identity, not a claim that a Release already exists. Publication checks/enables GitHub immutability, builds at most once, retains diagnostics, calculates all real hashes, uploads a complete draft and verifies publication. No repository release or checksum is invented by deployment configuration.
 
-With the Acer bundle/config installed and immutable data on its SSD:
+On Acer, `make build` and `make up` retrieve the matching real permanent Release when not installed. Installation validates immutable API asset digests, the tag's source commit, every compressed part and expanded file, golden/harness compatibility, resolved-input generation identity, coverage/replay proofs, QCOW2 chains and task-scoped source/cache maps. It seals the entire generation and activates the registry atomically only after all checks. A root-owned read-only receipt and publication manifest bind installed bytes to the actual release. A missing Release explicitly reports Lite unavailable while allowing GAIA's verified golden and the broker to operate; selecting Lite then fails before any teacher allocation or attempt. Mutable, corrupted or incompatible publications and network/authentication failures abort installation/deployment. There is never a build fallback. A verified installed generation is reused entirely offline. Runtime selection, artifact delivery, evaluator allocation and checkpoint recovery recheck receipt metadata and every used backing/artifact; installation and reuse check all files. Permanent generations are never deleted by shutdown.
+
+## Deployment and operation
+
+After both role configurations and the permanent publication prerequisites exist, on Acer:
 
 ```bash
-sudo make acer-build
-sudo make acer-unit
-sudo install -m 0644 state/distributed/gpt-trace-distributed-broker.service \
-  /etc/systemd/system/gpt-trace-distributed-broker.service
-sudo systemctl daemon-reload
-sudo systemctl enable gpt-trace-distributed-broker.service
-sudo make acer-up
-sudo make acer-doctor
-sudo make acer-status
+sudo make requirements
+sudo make build
+sudo make up
+sudo make doctor
+sudo make status
 ```
 
-Unit installation is an explicit runtime deployment action, not an action of
-`patch_distributed.py`. The unit launches only the broker on Acer. The build
-refuses known project domains before golden installation and never discards an
-existing golden after a failed verification. Template construction is the
-existing native host builder:
+The managed systemd unit is installed during build/up with the exact checkout path; an unrelated existing unit is refused. Its entry point selects Acer from configuration, starts the native mTLS broker and exposes no guest/admin endpoint to the model. No control Docker service starts here.
+
+On Fossil, with an existing usable Docker installation and correct storage:
 
 ```bash
-sudo make acer-templates
-```
-
-Its pinned upstream task/template source acquisition runs on Acer for immutable
-execution artifacts. It is not a Superbench service and no runner container is
-started. Golden/template installation and benchmarking are separate operations.
-
-## Fossil installation and start
-
-Preserve or restore the original `.env`, App-control token and teacher password
-securely from `local-secrets.tar`; do not overwrite the new distributed bundle.
-They are validated by the unchanged project state/tunnel workflows. Never log
-or publish their content.
-
-```bash
-sudo make fossil-init-storage
-# For an existing installation migrated to empty Fossil volumes:
-sudo make fossil-restore BACKUP=/path/to/verified-cold-backup
-make fossil-build
-make fossil-up
-make fossil-doctor
-make fossil-tunnels
-make fossil-auth
-make fossil-start-kali
-make fossil-status-kali
-# Use the existing Kali Workstation MCP App; its browser runs inside Acer's VM.
-make fossil-stop-kali
-```
-
-The real teacher probe connects to the running, pinned headed Chromium and
-checks CDP GPU feature status, the actual GPU renderer and WebGL rendering/readback.
-It also checks Nouveau on the host and the existing non-root/sandbox/X11/Kasm
-health contracts. It closes only its temporary page and Playwright connection.
-The i5-2500's lack of AVX2 and the presence of `/dev/dri/renderD128` do not prove
-this Chromium build works. Startup plus the actual probe are the acceptance
-gate. A software renderer or failed GPU/CPU/browser probe exits nonzero; there
-is no renderer, browser or sandbox downgrade.
-
-## Benchmark, traces and exports
-
-```bash
-make fossil-fetch ADAPTER=gaia
-make fossil-run ADAPTER=gaia LIMIT=3
-make fossil-status
-make fossil-pause
-make fossil-resume
-make fossil-export-parquet
-make fossil-export-sft
-```
-
-These invoke the original scheduler, PostgreSQL API, provenance, trace capture
-and typed exporters on Fossil. Completed rows and existing sources are retained.
-Run the native Lite path after fetching pinned Lite sources on Fossil and
-building/publishing matching immutable templates on Acer:
-
-```bash
-make fossil-fetch ADAPTER=swe-gym-lite
-make fossil-template-doctor ADAPTER=swe-gym-lite
-make fossil-acceptance ADAPTER=swe-gym-lite
-make fossil-run ADAPTER=swe-gym-lite LIMIT=1
-```
-
-The actual full benchmark still requires the existing registered App and teacher
-authentication. No substitute trace, evaluation result or success is generated.
-
-## Network loss, crash recovery and shutdown
-
-Communication failure never means absence. Remote creation first asks the
-authenticated broker to prove absence or rediscover the exact surviving
-identity. A partial/stopped runtime that cannot be verified is preserved and
-blocks progress. A lost creation response is never handled by replaying creation.
-Unknown shell/input/upload outcomes require inspection. Template evaluator
-ownership/checkpoints and explicit stale-evaluator recovery retain their original
-contracts. Distributed infrastructure errors retain the runner journal/VM/binding.
-
-```bash
-make fossil-reconcile
-make fossil-status
-make fossil-status-kali
-make fossil-resume
-# Explicit abandonment only for a matching pending benchmark journal:
-make fossil-reset-recovery TASK=the_exact_run_task_id
-```
-
-After a controller/gateway restart, the normal resume path rebinds the exact
-broker-verified attempt. After an Acer broker crash/restart, all libvirt/state/
-backing/fingerprint checks still apply. Inspect `sudo make acer-status` for
-partial allocation, evaluator retries and stopped resources. Unknown ownership
-blocks destruction instead of deleting a similarly named domain/network.
-
-```bash
-make fossil-pause
-make fossil-down
-sudo make acer-down
-```
-
-Fossil down stops one-off runners, audits/destroys owned Acer resources, checks
-authenticated absence and stops the control containers without deleting volumes
-or recovery markers. If Acer is unreachable, control containers still stop and
-the command exits nonzero; VM cleanup remains unconfirmed. Restore connectivity
-and reconcile before claiming a clean shutdown. Acer down audits locally and
-stops its broker only after all project resources are proven absent.
-
-## Tests and two-machine acceptance
-
-```bash
-python3 -B -m unittest discover -s tests/distributed -p test_offline.py -v
-make distributed-test
-make fossil-doctor
-make fossil-acceptance
-make fossil-acceptance ADAPTER=swe-gym-lite
-```
-
-Run the existing application tests in separate environments. The existing
-runner requires CloakBrowser >=0.5 while the Kali package pins 0.4.8; installing
-both projects in one environment has a pre-existing dependency conflict. Their
-Docker images and these test environments keep those pins separate:
-
-```bash
-for app in runner kali-workstation mcp-gateway storage; do
-  python3 -m venv "state/distributed/tests/$app"
-  "state/distributed/tests/$app/bin/python" -m pip install -e shared -e "apps/$app[test]"
-  "state/distributed/tests/$app/bin/python" -m pytest "apps/$app/tests" || exit "$?"
-done
-python3 -m venv state/distributed/tests/broker
-state/distributed/tests/broker/bin/python -m pip install -e shared \
-  -e apps/workstation-broker 'pytest>=8.3,<9' 'pytest-asyncio>=0.25,<1' 'httpx>=0.28,<1'
-state/distributed/tests/broker/bin/python -m pytest apps/workstation-broker/tests infra/browser/tests
-```
-
-The stdlib suite performs actual UDS/TLS/file-transfer operations, SAN/pin and
-certificate/token scope rejection, expiration, permissions, invalid framing,
-timeouts and a disconnect **after a real file mutation** with no replay. Offline
-tests validate generated certificates/bundles and patch transaction, idempotence,
-rollback conflicts, symlinks and source-only behavior. They do not simulate KVM
-success. Physical acceptance creates/discovers a real Acer VM via Fossil, runs
-the unchanged MCP GUI/PTY/browser smoke, checks exact artifact bytes/hashes,
-tests Fossil network isolation, rebinds that same runtime, and verifies cleanup.
-The Lite acceptance additionally materializes real scoped template artifacts and
-boots a separate evaluator with only `lo`, no browser RPC and matching immutable
-backing/source hashes. Native grading/SFT validity are checked by the actual
-benchmark plus the original export tests.
-
-For the required outage test, record manual VM identity and broker inventory,
-interrupt only the broker LAN connection at a controlled network point, and run
-`fossil-status-kali`/`fossil-resume`. They must report unavailability/error without
-false destruction or journal clearing. Restore the link and verify the same
-identity/overlay/fingerprint before issuing new commands. Repeat after killing
-only the Acer broker process, restarting the controller/gateway, and crashing
-the runner during a persisted candidate checkpoint. Check source/evaluator
-provenance, preserved candidate hash, recovered native evaluation, and final
-authenticated absence. Never kill the QEMU guest to simulate a transport failure.
-
-Compare PostgreSQL row counts, teacher fingerprint, runner journals/candidates,
-source hashes and completed Parquet/SFT outputs against the cold backup. Treat
-any known failure as a failed acceptance gate, not a successful migration.
-
-## Return to single-host operation
-
-Pause and stop distributed work, prove remote absence and preserve another cold
-backup. Keep the original volumes and immutable image generations. Move only
-offline data to the chosen single host, verifying backup hashes and restoring
-the exact teacher identity/state. Restore the original broker/App tokens from
-the protected backup and use the original volume names. Disable the distributed
-systemd unit explicitly. Remove `COMPOSE_FILE` and distributed transport variables
-from the shell environment. The historical Make targets are still present:
-
-```bash
-python3 patch_distributed.py --rollback
+sudo make requirements
 sudo make build
 make up
 make doctor
+make tunnels
+make register_apps
+make auth
+make superbench-fetch ADAPTER=gaia
+make run ADAPTER=gaia LIMIT=3
+make pause
+make status
+make resume
+make export-parquet
 ```
 
-Source rollback does not move or delete persistent data, certificates, units,
-volumes or VM images. It refuses later source edits. If the source rollback has
-already occurred, both the cold backups and the explicitly installed unit must
-still be managed by the operator; no source patch silently undoes a deployment.
+Use the same operator/root identity that owns the configured private bundles and storage. GAIA still uses the pinned 2023 validation Level-3 source and native answer grading. An available tool is not a mandatory invocation. `make start_kali`, `make status_kali` and `make stop_kali` preserve the existing durable manual identity and mutual exclusion with Superbench/registration. `make tunnels` itself creates no Kali.
+
+For Lite, fetch the pinned source on Fossil and select the adapter normally:
+
+```bash
+make superbench-fetch ADAPTER=swe-gym-lite
+make run ADAPTER=swe-gym-lite LIMIT=1
+make status
+```
+
+Selected source/template fingerprints are checked before teacher interaction. During a Lite attempt the teacher Kali stays active through capture and grading; a separate new isolated evaluator receives only the recorded candidate and evaluator-only hidden tests. Native grading order, parser pins, 230 task sources, 11 repository templates and 25 environments remain unchanged.
+
+## Recovery and global shutdown
+
+Keep runner journals, capture/candidate checkpoints and PostgreSQL rows. On transport loss, resource outcome is unknown until an authenticated inventory/discovery proves it. A response timeout never means that create/destroy did not happen, and mutations are never retried blindly. Teacher/evaluator identities, generation/source/backing hashes and task scopes remain frozen. Candidate resume allocates a new evaluator and grades the same persisted patch without new ChatGPT generation.
+
+On Fossil:
+
+```bash
+make status
+make status_kali
+make resume
+# Explicit abandonment, only when the operator chooses it:
+make reset-recovery TASK=the_exact_run_task_id
+```
+
+Administrative read-only reconciliation remains available through `python3 scripts/distributed.py reconcile`; the runtime itself reconciles before creation/recovery. It never becomes a new Make target. An infrastructure error preserves state and stops the campaign. Native fail is a normal evaluated completed trajectory.
+
+Run `make down` on Fossil for the whole project. It stops runner producers, sets a broker mutation barrier, verifies ownership, destroys all temporary teacher/evaluator domains, overlays/reservations, networks, firewalls and attempt artifact stores on Acer, proves authenticated absence, and acknowledges native broker shutdown. Fossil removes only project-labelled containers/networks and verifies that pre-existing volumes remain. It never clears recovery markers, terminalizes PostgreSQL rows, removes permanent golden/templates, prunes images or deletes data. Even expired remote credentials or unreachable Acer stop local Fossil services and return a nonzero cleanup-uncertainty error. No offline receipt is treated as a current absence proof. Acer refuses a local-only shutdown that could leave Fossil running. Before a later restart, start Acer's broker with `make up`, then start Fossil.
+
+`make throw_volumes` retains its explicit THROW confirmation for the intentionally destructive historical reset. Its remote cleanup must succeed before it removes the selected mutable generation data. This is a distinct operator choice and is never part of source patch application or ordinary shutdown.
+
+## Cold migration and verification
+
+Cold migration helpers remain administrative Python operations, with no additional Make target. On the old stopped control deployment, `python3 scripts/distributed.py backup --directory NEW_BACKUP_DIRECTORY` hashes every volume archive and retains original secrets/config in a mode-protected archive. On Fossil, `python3 scripts/distributed.py restore --directory VERIFIED_BACKUP_DIRECTORY` validates every hash/size/member before extracting to new empty, nonoverlapping configured storage. It preserves archives and does not automatically replace deployment credentials, start services or overwrite a nonempty volume. Verify the backup manifest through your trusted transfer channel.
+
+Source verification uses `python3 patch_distributed.py --check`, `--verify` and `--self-test`; patch application itself runs no deployment operation. Repository offline tests exercise real source transactions, real SHA/gzip file transfers, publication eligibility/provenance gates, role dispatch, failure-safe shutdown planning, normalized export rows and the actual TLS engine over in-memory records. Full application pytest suites require their declared package dependencies; controller/guest CloakBrowser 0.4.8 and runner CloakBrowser >=0.5 belong in separate environments. Do not combine incompatible package pins.
+
+Physical acceptance is an explicit test: `python3 scripts/distributed.py acceptance` on Fossil, optionally `--adapter swe-gym-lite`. It exercises the actual private transport, VM identity/discovery, MCP shell/browser/display, multi-MiB verified transfer, Fossil-port isolation, cleanup and the separate evaluator. It cannot be replaced by a mocked VM or an offline source test. Also exercise real private-link loss, process crashes, checkpoint resume, bad certificates and artifact mutation on the intended hosts before a benchmark campaign. No source-only script claims hardware/TLS-socket/ChatGPT success or publishes artifacts by applying a patch.

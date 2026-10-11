@@ -31,6 +31,9 @@ def parse_env(path: Path) -> dict[str, str]:
 
 
 def compose_env() -> dict[str, str]:
+    import distributed
+    cfg = distributed.config("fossil")
+    distributed.environment(cfg)
     subprocess.run(
         ["python3", "scripts/project_state.py", "tunnels"],
         cwd=ROOT,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit two-host operations. Applying the source patch never invokes this file."""
+"""Historical operations dispatched exclusively by config/distributed.toml."""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tarfile
 import time
 import tomllib
@@ -47,7 +48,7 @@ def path_from_config(value):
     return path
 
 
-def config(role, *, credentials=True):
+def config(role=None, *, credentials=True):
     source = ROOT / "config/distributed.toml"
     if source.is_symlink(): raise ValueError("unsafe distributed configuration")
     cfg = tomllib.loads(source.read_text())
@@ -59,8 +60,12 @@ def config(role, *, credentials=True):
     }
     if set(cfg) != set(required) or any(set(cfg[section]) != keys for section, keys in required.items()):
         raise ValueError("distributed.toml has missing or unknown fields")
-    if cfg["deployment"]["role"] != role:
-        raise ValueError("this checkout has another physical-host role")
+    configured_role = cfg["deployment"]["role"]
+    if configured_role not in {"acer", "fossil"}:
+        raise ValueError("distributed.toml must explicitly identify the physical host role")
+    if role is not None and configured_role != role:
+        raise ValueError("this command belongs to another physical host role")
+    role = configured_role
     network, deployment = cfg["network"], cfg["deployment"]
     for name in ("acer_address", "fossil_address"):
         network[name] = private_address(network[name])
@@ -88,7 +93,7 @@ def config(role, *, credentials=True):
     return cfg
 
 
-def host(role, cfg, *, docker=True):
+def host(role, cfg, *, docker=True, build_tools=False):
     if platform.system() != "Linux" or sys.version_info < (3, 12): raise RuntimeError("Linux/Python >=3.12 required")
     release = Path("/etc/os-release").read_text()
     if not re.search(r'^ID=\"?ubuntu\"?$', release, re.M) or not re.search(r'^VERSION_ID=\"?26\.04\"?$', release, re.M):
@@ -98,7 +103,9 @@ def host(role, cfg, *, docker=True):
     if cfg["network"][role + "_address"] not in addresses:
         raise RuntimeError("the configured role LAN address is not assigned to this host")
     if docker:
-        for command in (["docker", "info", "--format", "{{.ServerVersion}}"], ["docker", "compose", "version"], ["docker", "buildx", "version"]):
+        commands = [["docker", "info", "--format", "{{.ServerVersion}}"]]
+        if build_tools: commands += [["docker", "compose", "version"], ["docker", "buildx", "version"]]
+        for command in commands:
             run(command, capture=True, timeout=30)
     if role == "acer":
         if os.geteuid() != 0: raise RuntimeError("Acer broker operations require root")
@@ -106,6 +113,7 @@ def host(role, cfg, *, docker=True):
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
         parent = cfg["paths"]["base_image"].parent
+        while not parent.exists() and parent != parent.parent: parent = parent.parent
         device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
         if not device.startswith("/dev/") or run(["lsblk", "-dn", "-o", "ROTA", device], capture=True, timeout=10) != "0":
             raise RuntimeError("Kali base/templates/overlays must reside on Acer's local SSD")
@@ -263,120 +271,228 @@ def restore(cfg, directory):
     print("Cold volumes restored. Original archives and local-secrets.tar are retained; no service was started.")
 
 
-def fossil(cfg, action, args):
-    environment(cfg)
+
+def install_templates(cfg):
+    # Pure host file installation plus qemu-img inspection; never VM creation.
+    sys.path.insert(0, str(ROOT / "apps/workstation-broker/src"))
+    from workstation_broker.templates import TemplateRegistry
+    from gpt_trace_transport.template_release import UnpublishedRelease, install
+    base = cfg["paths"]["base_image"]
+    def image_info(path):
+        value = json_command(["qemu-img", "info", "--output=json", path])
+        run(["qemu-img", "check", path], capture=True, timeout=3600)
+        return value
+    def registry(root, golden):
+        return TemplateRegistry(root, golden, image_info)
+    try:
+        return install(base, base.parent / "templates", registry)
+    except UnpublishedRelease as exc:
+        # Only a genuinely absent release is optional for GAIA. Corruption,
+        # incompatibility, mutable drafts and authentication/network errors fail.
+        # Lite selection still fails before allocating its teacher or attempt.
+        print("SWE-Gym Lite unavailable: " + str(exc) + "; GAIA golden remains usable", file=sys.stderr)
+        return None
+
+
+def install_unit(cfg):
+    if not re.fullmatch(r"[a-zA-Z0-9_./-]+", str(ROOT)):
+        raise ValueError("systemd unit requires an unambiguous repository path")
+    source = ROOT / "infra/workstation/systemd/gpt-trace-distributed-broker.service.in"
+    output = Path("/etc/systemd/system/gpt-trace-distributed-broker.service")
+    content = source.read_text().replace("@REPOSITORY@", str(ROOT)).encode()
+    for path in (output, *output.parents):
+        if path.is_symlink(): raise ValueError("unsafe systemd unit destination")
+    if output.exists():
+        if output.read_bytes() == content: return
+        # Do not replace an unrelated service or a previous checkout identity.
+        if (b"WorkingDirectory=" + str(ROOT).encode() + b"\n") not in output.read_bytes():
+            raise RuntimeError("existing distributed service belongs to another checkout")
+    fd, name = tempfile.mkstemp(prefix=".gpt-trace-broker-", dir=output.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o644)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, output)
+        run(["systemctl", "daemon-reload"])
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def global_down(cfg):
+    """Fossil coordinates cleanup; local producers stop even on credential failure."""
+    if cfg["deployment"]["role"] != "fossil":
+        raise RuntimeError("global shutdown must run on Fossil: make down; no local-only cleanup was performed")
     host("fossil", cfg)
+    project_filter = "label=com.docker.compose.project=" + PROJECT
+    before_volumes = set(run(["docker", "volume", "ls", "--format", "{{.Name}}"], capture=True).splitlines())
+    running = run(["docker", "ps", "-q", "--filter", project_filter,
+                   "--filter", "label=com.docker.compose.service=runner"], capture=True).splitlines()
+    if running: run(["docker", "stop", "--time", "30", *running])
+    try:
+        full = config("fossil")
+        environment(full)
+        draining = broker(full, "begin_shutdown")
+        if draining.get("draining") is not True or draining.get("project") != PROJECT:
+            raise RuntimeError("Acer did not acknowledge the shutdown mutation barrier")
+        before = broker(full, "inventory")
+        if before.get("project") != PROJECT: raise RuntimeError("remote project identity differs")
+        broker(full, "destroy_all")
+        proof = broker(full, "inventory")
+        if proof.get("absent") is not True or proof.get("project") != PROJECT:
+            raise RuntimeError("Acer cleanup has no authenticated absence proof")
+        directory = ROOT / "state/distributed"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        from gpt_trace_transport.template_release import atomic_json
+        atomic_json(directory / "last-cleanup.json", {"control_id": cfg["deployment"]["control_id"],
+            "execution_id": cfg["deployment"]["execution_id"], "observed_at": time.time(), "inventory": proof}, 0o600)
+        reply = broker(full, "shutdown")
+        if reply.get("absent") is not True or reply.get("shutdown") is not True:
+            raise RuntimeError("Acer broker did not acknowledge clean shutdown")
+    finally:
+        # Label-scoped Docker teardown does not depend on Compose interpolation,
+        # valid remote certificates, a running database, or a secret generator.
+        ids = run(["docker", "ps", "-aq", "--filter", project_filter], capture=True).splitlines()
+        if ids:
+            run(["docker", "stop", "--time", "30", *ids])
+            run(["docker", "rm", *ids])  # Deliberately no -v/--volumes.
+        networks = run(["docker", "network", "ls", "-q", "--filter", project_filter], capture=True).splitlines()
+        if networks: run(["docker", "network", "rm", *networks])
+        if run(["docker", "ps", "-aq", "--filter", project_filter], capture=True):
+            raise RuntimeError("Fossil project containers remain after shutdown")
+        after_volumes = set(run(["docker", "volume", "ls", "--format", "{{.Name}}"], capture=True).splitlines())
+        if before_volumes - after_volumes:
+            raise RuntimeError("pre-existing Docker volumes disappeared during shutdown")
+    print("Global shutdown acknowledged; temporary Acer resources absent; Fossil services stopped; data and permanent images retained.")
+
+
+def control_up(cfg, *, minimal=False):
+    verify_storage(cfg)
+    run([sys.executable, "scripts/project_state.py", "core"])
+    broker(cfg, "probe")
+    services = ("kali-workstation-controller", "workstation-gateway") if minimal else CORE
+    compose("up", "-d", "--wait", "--wait-timeout", "300", *services)
+
+
+def fossil(cfg, action, args):
+    if action == "down": return global_down(cfg)
+    host("fossil", cfg, build_tools=action in {"build", "requirements"})
     if action == "init-storage": return init_storage(cfg)
     if action == "restore": return restore(cfg, args.directory)
+    if action == "requirements":
+        from host_requirements import verify_host_requirements
+        if not verify_host_requirements(role="fossil"): raise RuntimeError("Fossil prerequisites failed")
+        return
+    environment(cfg)
     if action == "build":
+        # Only empty/new persistent directories may be initialized. Existing
+        # data outside the declared storage root is never migrated implicitly.
+        init_storage(cfg)
         import build
         build.ensure_builder(ROOT)
-        compose("build", "--builder", build.BUILDER_NAME, "storage", "teacher-browser", "kali-workstation-controller", "workstation-gateway", "runner", "benchmark-fetch")
+        compose("build", "--builder", build.BUILDER_NAME, "storage", "teacher-browser",
+                "kali-workstation-controller", "workstation-gateway", "runner", "benchmark-fetch")
         build.verify_manifests(ROOT)
         return
+    if action == "publish-kali-golden":
+        raise RuntimeError("golden publication belongs to Acer's KVM publication host")
+    if action in {"up", "kali_control"}:
+        return control_up(cfg, minimal=action == "kali_control")
+    if action == "throw_volumes":
+        # The historical explicit THROW confirmation and source/cache retention
+        # remain in this script. Its shutdown is the same global coordinator.
+        return run([sys.executable, "scripts/throw_volumes.py"])
     verify_storage(cfg)
-    if action == "up":
-        run([sys.executable, "scripts/project_state.py", "core"])
-        broker(cfg, "probe")
-        compose("up", "-d", "--wait", "--wait-timeout", "300", *CORE)
-        return
-    if action == "down":
-        # Stop sources of mutations before remote cleanup; retain every journal.
-        ids = run(["docker", "ps", "-q", "--filter", "label=com.docker.compose.project=" + PROJECT,
-                   "--filter", "label=com.docker.compose.service=runner"], capture=True).splitlines()
-        if ids: run(["docker", "stop", "--time", "30", *ids])
-        try:
-            broker(cfg, "inventory")
-            broker(cfg, "destroy_all")
-            if broker(cfg, "inventory").get("absent") is not True: raise RuntimeError("Acer cleanup has no verified absence")
-        finally:
-            compose("down", "--remove-orphans", "--timeout", "30")
-        verify_storage(cfg)
-        print("Control services stopped; authenticated Acer inventory proves project resources absent; volumes retained.")
-        return
     if action == "reconcile":
         print(json.dumps(broker(cfg, "inventory"), indent=2))
         return
-    if action == "doctor":
+    if action in {"doctor", "acceptance"}:
+        control_up(cfg)
         broker(cfg, "probe")
+        if action == "acceptance":
+            values = ["--adapter", args.adapter] if args.adapter else []
+            return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner",
+                           "/app/tools/distributed_acceptance.py", *values)
         driver = Path("/sys/class/drm/renderD128/device/driver")
-        if not driver.exists() or driver.resolve().name != "nouveau": raise RuntimeError("Fossil render node is not driven by Nouveau")
+        if not driver.exists() or driver.resolve().name != "nouveau":
+            raise RuntimeError("Fossil render node is not driven by Nouveau")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
         compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/teacher_gpu_doctor.py")
-        compose("run", "--rm", "--no-deps", "runner", "doctor")
-        return
-    if action == "acceptance":
-        values = ["--adapter", args.adapter] if args.adapter else []
-        compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/distributed_acceptance.py", *values)
-        return
+        return compose("run", "--rm", "--no-deps", "runner", "doctor")
     if action == "tunnels":
-        broker(cfg, "probe")
+        control_up(cfg)
+        return run([sys.executable, "scripts/tunnels.py"])
+    if action in {"auth", "run", "resume", "start_kali", "register_apps"}:
+        control_up(cfg)
         run([sys.executable, "scripts/tunnels.py"])
-        return
-    mapping = {"auth": "superbench-auth", "run": "superbench-run", "pause": "superbench-pause",
-        "resume": "superbench-resume-active", "status": "superbench-active-status", "start-kali": "manual-kali-start",
-        "stop-kali": "manual-kali-stop", "status-kali": "manual-kali-status", "register-apps": "register-apps",
-        "reset-recovery": "superbench-reset-recovery", "template-doctor": "superbench-template-doctor",
-        "export-parquet": "export-parquet", "export-sft": "export-sft"}
-    if action in {"auth", "run", "resume", "start-kali", "register-apps"}:
-        broker(cfg, "probe")
-        run([sys.executable, "scripts/tunnels.py"])
-    if action == "fetch":
-        if not args.adapter: raise ValueError("--adapter is required")
+    if action in {"status_kali", "stop_kali"}:
+        control_up(cfg, minimal=True)
+    if action == "superbench-fetch":
+        if not args.adapter: raise ValueError("ADAPTER is required")
+        run([sys.executable, "scripts/project_state.py", "core"])
         return compose("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter)
+    mapping = {"auth": "superbench-auth", "run": "superbench-run", "pause": "superbench-pause",
+        "resume": "superbench-resume-active", "status": "superbench-active-status",
+        "start_kali": "manual-kali-start", "stop_kali": "manual-kali-stop",
+        "status_kali": "manual-kali-status", "register_apps": "register-apps",
+        "reset-recovery": "superbench-reset-recovery", "export-parquet": "export-parquet"}
+    if action not in mapping: raise ValueError("operation does not belong to Fossil")
     arguments = []
-    if action in {"run", "template-doctor"}:
-        if action == "template-doctor" and not args.adapter: raise ValueError("--adapter is required")
+    if action == "run":
         if args.adapter: arguments += ["--adapter", args.adapter]
-        if action == "run" and args.limit: arguments += ["--limit", str(args.limit)]
+        if args.limit is not None: arguments += ["--limit", str(args.limit)]
     if action == "reset-recovery":
-        if not args.task: raise ValueError("--task is required")
+        if not args.task: raise ValueError("TASK is required")
         arguments = [args.task, "--yes"]
+    run([sys.executable, "scripts/project_state.py", "core"])
     if action == "export-parquet":
         (ROOT / "exports").mkdir(exist_ok=True)
+        # Export needs PostgreSQL/storage, never a Kali or teacher browser.
+        compose("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "storage")
         arguments = ["/data/exports/corpus.parquet"]
-    if action == "export-sft":
-        compose("run", "--rm", "--no-deps", "runner", "export-parquet", "/data/exports/corpus.parquet")
-        arguments = ["/data/exports/corpus.parquet", "/data/exports/sft.parquet"]
-    if action not in mapping: raise ValueError("unknown Fossil operation")
-    os.environ["GPT_TRACE_RUNNER_BUILD_ID"] = run(["git", "rev-parse", "HEAD"], capture=True)
-    run([sys.executable, "scripts/project_state.py", "core"])
+    if action in {"run", "resume"}:
+        os.environ["GPT_TRACE_RUNNER_BUILD_ID"] = run(["git", "rev-parse", "HEAD"], capture=True)
     compose("run", "--rm", "--no-deps", "-e", "GPT_TRACE_RUNNER_BUILD_ID", "runner", mapping[action], *arguments)
 
 
 def acer(cfg, action, args):
-    host("acer", cfg, docker=action == "build")
+    allowed = {"requirements", "build", "up", "doctor", "status", "kali_control", "serve", "publish-kali-golden"}
+    if action not in allowed:
+        if action == "down":
+            raise RuntimeError("global shutdown is coordinated on Fossil: make down; no local-only cleanup was performed")
+        raise RuntimeError("this operation belongs to Fossil; Acer never runs control-plane services")
+    host("acer", cfg, docker=action in {"requirements", "build", "publish-kali-golden"}, build_tools=action in {"requirements", "build", "publish-kali-golden"})
     paths, network = cfg["paths"], cfg["network"]
-    if action == "unit":
-        if not re.fullmatch(r"[a-zA-Z0-9_./-]+", str(ROOT)): raise ValueError("systemd unit requires an unambiguous repository path")
-        template = (ROOT / "infra/workstation/systemd/gpt-trace-distributed-broker.service.in").read_text()
-        output = ROOT / "state/distributed/gpt-trace-distributed-broker.service"
-        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        output.write_text(template.replace("@REPOSITORY@", str(ROOT)))
-        print(output)
+    if action == "requirements":
+        from host_requirements import verify_host_requirements
+        if not verify_host_requirements(require_root=True, role="acer"): raise RuntimeError("Acer prerequisites failed")
         return
     if action == "build":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True): raise RuntimeError("Acer runtime prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="acer"): raise RuntimeError("Acer prerequisites failed")
         domains = run(["virsh", "-c", "qemu:///system", "list", "--all", "--name"], capture=True).splitlines()
-        if any(x.startswith("gpt-trace-ws-") for x in domains): raise RuntimeError("preserve existing attempts before rebuilding the broker/golden")
+        if any(x.startswith("gpt-trace-ws-") for x in domains):
+            raise RuntimeError("preserve existing attempts before installing broker/images")
         import build
         build.build_host_broker(ROOT)
-        # Never discard an existing image on a failed verification.
         if paths["base_image"] != Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"):
-            raise RuntimeError("the current verified golden installer uses the fixed libvirt SSD root")
-        if paths["base_image"].exists():
-            build.verify_workstation_image(ROOT)
+            raise RuntimeError("verified golden installer requires the fixed libvirt SSD root")
+        if paths["base_image"].exists(): build.verify_workstation_image(ROOT)
         else:
             build.build_workstation_base_image(ROOT)
             build.verify_workstation_image(ROOT)
+        install_templates(cfg)
+        install_unit(cfg)
         return
+    if action == "publish-kali-golden":
+        return run([sys.executable, "infra/workstation/image/build.py", "--publish"])
     if action == "serve":
         runtime = paths["broker_runtime_directory"]
         runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
         runtime.chmod(0o700)
-        cfg_limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
-        if cfg_limits["provider"] != "libvirt": raise ValueError("libvirt provider required")
+        limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
+        if limits["provider"] != "libvirt": raise ValueError("libvirt provider required")
         os.environ.update({"WORKSTATION_CONFIG": str(ROOT / "config/runner.toml"),
             "WORKSTATION_BROKER_SOCKET": str(runtime / "broker.sock"),
             "WORKSTATION_BROKER_STATE": str(paths["base_image"].parent / "attempts"),
@@ -391,66 +507,59 @@ def acer(cfg, action, args):
             "WORKSTATION_CONTROL_PLANE_CIDRS": json.dumps([network["fossil_address"] + "/32"]),
             "WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_admin_token"),
             "WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE": str(paths["tls_directory"] / "workstation_broker_controller_token")})
-        os.execv(str(ROOT / ".venv-workstation-broker/bin/python"),
-                 [str(ROOT / ".venv-workstation-broker/bin/python"), "-m", "workstation_broker.server"])
-    if action == "up":
+        python = ROOT / ".venv-workstation-broker/bin/python"
+        os.execv(str(python), [str(python), "-m", "workstation_broker.server"])
+    if action in {"up", "kali_control", "doctor"}:
+        install_templates(cfg)
+        install_unit(cfg)
         run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
         deadline = time.monotonic() + 130
-        while time.monotonic() < deadline:
+        while True:
             try:
                 broker(cfg, "probe", local=True)
-                return
-            except RuntimeError:
-                if run(["systemctl", "is-active", "gpt-trace-distributed-broker.service"], capture=True) != "active":
-                    raise RuntimeError("distributed broker service is not active")
+                break
+            except (OSError, RuntimeError):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Acer broker startup deadline exceeded")
                 time.sleep(0.5)
-        raise RuntimeError("Acer broker startup deadline exceeded")
-    if action == "down":
-        broker(cfg, "inventory", local=True)
-        broker(cfg, "destroy_all", local=True)
-        if broker(cfg, "inventory", local=True).get("absent") is not True: raise RuntimeError("local resource audit did not prove absence")
-        run(["systemctl", "stop", "gpt-trace-distributed-broker.service"])
-        return
+        if action != "doctor": return
     if action in {"status", "doctor"}:
         print(json.dumps(broker(cfg, "inventory", local=True), indent=2))
         if action == "doctor":
             run([sys.executable, "infra/workstation/image/build.py", "--verify"])
             limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
-            if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024**3:
+            if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024 ** 3:
                 raise RuntimeError("SSD cannot reserve one complete configured overlay")
-        return
-    if action == "templates":
-        python = ROOT / ".venv-workstation-broker/bin/python"
-        run([python, "scripts/build_swe_gym_lite_templates.py", *args.template_args])
-        return
-    raise ValueError("unknown Acer operation")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("role", choices=("fossil", "acer", "backup"))
-    parser.add_argument("action", nargs="?")
+HISTORICAL = ("requirements", "build", "publish-kali-golden", "up", "doctor", "tunnels",
+    "register_apps", "start_kali", "status_kali", "stop_kali", "auth", "run", "pause", "resume",
+    "status", "reset-recovery", "superbench-fetch", "export-parquet", "down", "throw_volumes", "kali_control")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=(*HISTORICAL, "serve", "backup", "restore", "init-storage", "reconcile", "acceptance"))
     parser.add_argument("--adapter")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--task")
     parser.add_argument("--directory")
-    args, extra = parser.parse_known_args()
-    if args.role == "backup":
-        if not args.directory or args.action or extra: parser.error("backup --directory NEW_DIRECTORY")
-        return backup(args.directory)
-    if not args.action: parser.error("a host operation is required")
-    args.template_args = extra
-    if extra and not (args.role == "acer" and args.action == "templates"): parser.error("unknown arguments")
-    cfg = config(args.role, credentials=not (args.role == "fossil" and args.action in {"init-storage", "restore"}))
-    if args.role == "fossil" and args.action in {"init-storage", "restore"}:
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1: parser.error("LIMIT must be positive")
+    if args.action == "superbench-fetch" and not args.adapter: parser.error("ADAPTER is required")
+    if args.action == "reset-recovery" and not args.task: parser.error("TASK is required")
+    if args.action in {"backup", "restore"} and not args.directory: parser.error("--directory is required")
+    cfg = config(credentials=args.action not in {"requirements", "backup", "restore", "init-storage", "down"})
+    role = cfg["deployment"]["role"]
+    if args.action == "backup":
+        if role != "fossil": raise RuntimeError("cold backup belongs to Fossil")
         host("fossil", cfg)
-        return init_storage(cfg) if args.action == "init-storage" else restore(cfg, args.directory)
-    return (fossil if args.role == "fossil" else acer)(cfg, args.action, args)
+        return backup(args.directory)
+    return (fossil if role == "fossil" else acer)(cfg, args.action, args)
 
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyError) as exc:
         print("distributed operation failed: " + str(exc), file=sys.stderr)
         raise SystemExit(1)

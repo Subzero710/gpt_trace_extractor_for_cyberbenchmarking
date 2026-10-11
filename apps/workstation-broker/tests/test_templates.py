@@ -61,7 +61,7 @@ def files(tmp_path):
     registry_path.write_text(json.dumps({"schema_version": 2, "generation": generation}))
     infos = {base: {"format": "qcow2"}, common: {"format": "qcow2", "backing-filename": str(base)},
              repo: {"format": "qcow2", "backing-filename": "../common.qcow2"}}
-    registry = TemplateRegistry(root, base, lambda path: infos[path])
+    registry = TemplateRegistry(root, base, lambda path: infos[path], publication_build=True)
     return SimpleNamespace(root=root, folder=folder, base=base, common=common, repo=repo,
         manifest=manifest, registry_path=registry_path, registry=registry, infos=infos,generation=generation,
         artifacts=artifacts,task_artifacts=task_artifacts)
@@ -273,3 +273,9 @@ def test_old_or_incomplete_security_generation_is_rejected(files, attack):
         path.write_text(json.dumps(manifest))
         path.chmod(0o444)
     with pytest.raises(ValueError): files.registry.select(ID)
+
+
+def test_runtime_refuses_a_generation_without_permanent_release_provenance(files):
+    registry = TemplateRegistry(files.root, files.base, lambda path: files.infos[path])
+    with pytest.raises((ValueError, FileNotFoundError)):
+        registry.select(ID)

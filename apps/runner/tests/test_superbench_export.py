@@ -1,7 +1,7 @@
 import pyarrow.parquet as pq
 import pytest
 
-from gpt_trace_runner.superbench.exporter import SCHEMA, derive_sft, write_corpus_stream
+from gpt_trace_runner.superbench.exporter import SCHEMA, write_corpus_stream, _row
 
 
 def raw_row(task_id, verdict):
@@ -49,7 +49,7 @@ async def rows():
 
 
 @pytest.mark.asyncio
-async def test_corpus_keeps_all_rows_and_sft_defaults_to_pass(tmp_path):
+async def test_corpus_keeps_pass_fail_and_unevaluated_rows(tmp_path):
     corpus = tmp_path / "corpus.parquet"
     assert await write_corpus_stream(rows(), corpus, row_group_size=1) == 3
     table = pq.read_table(corpus)
@@ -64,21 +64,58 @@ async def test_corpus_keeps_all_rows_and_sft_defaults_to_pass(tmp_path):
     assert first_messages[1]["content"] == "Useful reasoning summary."
     assert first_messages[2]["reasoning_title"] == "Answering"
 
-    sft = tmp_path / "sft.parquet"
-    assert derive_sft(corpus, sft) == 1
-    sft_table = pq.read_table(sft)
-    assert sft_table.num_rows == 1
-    assert sft_table.column("evaluation")[0].as_py()["verdict"] == "pass"
+
+    assert [row["evaluation"]["verdict"] if row["evaluation"] else None for row in table.to_pylist()] == ["pass", "fail", None]
+    assert all("raw_messages_json" in row and "validation_json" in row for row in table.to_pylist())
 
 
-def test_sft_can_explicitly_select_failed_rows(tmp_path):
-    # Build synchronously from a tiny valid corpus table for filter behavior.
-    import pyarrow as pa
-    from gpt_trace_runner.superbench.exporter import _row
+@pytest.mark.asyncio
+async def test_corpus_preserves_failed_and_running_captures(tmp_path):
+    async def source():
+        for status in ("failed", "running", "completed"):
+            raw = raw_row(status, None)
+            raw["status"] = status
+            raw["error_type"] = "CaptureInterrupted" if status == "failed" else None
+            yield raw
+    output = tmp_path / "all.parquet"
+    assert await write_corpus_stream(source(), output) == 3
+    data = pq.read_table(output).to_pylist()
+    assert [row["execution_status"] for row in data] == ["failed", "running", "completed"]
+    assert all(row["evaluation"] is None for row in data)
 
-    corpus = tmp_path / "corpus.parquet"
-    table = pa.Table.from_pylist([_row(raw_row("p", "pass")), _row(raw_row("f", "fail"))], schema=SCHEMA)
-    pq.write_table(table, corpus)
-    output = tmp_path / "failed.parquet"
-    assert derive_sft(corpus, output, verdicts=["fail"]) == 1
-    assert pq.read_table(output).column("evaluation")[0].as_py()["verdict"] == "fail"
+
+@pytest.mark.asyncio
+async def test_invalid_or_duplicate_capture_preserves_previous_corpus(tmp_path):
+    output = tmp_path / "corpus.parquet"
+    assert await write_corpus_stream(rows(), output) == 3
+    before = output.read_bytes()
+    async def bad():
+        yield raw_row("same", "pass")
+        yield raw_row("same", "fail")
+    with pytest.raises(ValueError, match="duplicate"):
+        await write_corpus_stream(bad(), output)
+    assert output.read_bytes() == before
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_empty_export_has_the_canonical_schema(tmp_path):
+    async def empty():
+        if False: yield {}
+    output = tmp_path / "empty.parquet"
+    assert await write_corpus_stream(empty(), output) == 0
+    table = pq.read_table(output)
+    assert table.num_rows == 0 and table.schema == SCHEMA
+
+
+def test_partial_tool_trajectory_is_kept_with_diagnostics():
+    import json
+    raw = raw_row("partial", None)
+    raw["status"] = "failed"
+    raw["messages"].append({"author": {"role": "assistant"}, "tool_calls": [
+        {"id": "pending", "name": "unknown", "arguments": {"command": "true"}}]})
+    row = _row(raw)
+    assert row["execution_status"] == "failed" and row["evaluation"] is None
+    assert row["messages"][-1]["tool_calls"][0]["id"] == "pending"
+    assert json.loads(row["raw_messages_json"]) == raw["messages"]
+    assert {x["kind"] for x in json.loads(row["validation_json"])["issues"]} >= {"undeclared_tool", "missing_result"}

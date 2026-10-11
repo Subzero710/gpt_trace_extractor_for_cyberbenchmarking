@@ -220,7 +220,7 @@ def invoked_tool_calls(
     Each logical call retains the assistant recipient and the canonical App/tool
     identity learned from task contracts or the corresponding tool-result metadata.
     This makes the runtime provenance usable as a deterministic alias table during
-    SFT normalization.
+    canonical trajectory normalization.
     """
     calls: list[dict[str, str | None]] = []
     pending: list[dict[str, str | None]] = []

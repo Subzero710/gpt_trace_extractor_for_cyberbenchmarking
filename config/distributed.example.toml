@@ -1,4 +1,7 @@
-# Use distributed PKI provisioning to create a complete identity-pinned config.
+# Use offline PKI provisioning to create a complete identity-pinned local config.
+# Every historical Make command reads this role. Empty values are invalid.
+# Permanent Lite publication identity is derived from actual pins/golden bytes;
+# no release URL or artifact checksum is fabricated here.
 [deployment]
 role = "fossil"
 control_id = "fossil"

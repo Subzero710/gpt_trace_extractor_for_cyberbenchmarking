@@ -1,6 +1,6 @@
 # Kali Workstation runtime
 
-The trusted runner and teacher browser stay in Docker on Ubuntu. Each attempt runs a disposable KVM Kali domain with one qcow2 overlay, libvirt NAT network, vsock CID, desktop, shell, PTYs, and CloakBrowser. The `kali-workstation` MCP controller and gateway persist outside the guest. The runner has neither the Docker nor libvirt socket.
+The trusted runner, ChatGPT teacher browser, PostgreSQL, MCP controller and gateway stay in Docker on Fossil. The native broker and every Kali/evaluator VM run only on Acer. Each attempt runs a disposable KVM Kali domain with one qcow2 overlay, libvirt NAT network, vsock CID, desktop, shell, PTYs, and CloakBrowser. The `kali-workstation` MCP controller and gateway persist outside the guest. The runner has neither the Docker nor libvirt socket.
 
 The broker authenticates control requests with two independent generated credentials: an admin token used by the runner/host lifecycle and a controller token restricted to data-plane operations on an existing attempt. The App gateway uses a third independent App-control token. The broker records the exact task/attempt/environment/fingerprint identity in libvirt metadata, and places a per-attempt secret in a read-only ISO. It verifies the domain, network, overlay backing file, base digest, and guest agent before recovery. The agent accepts only host CID 2 over vsock and verifies every RPC. Guest root is untrusted.
 
@@ -16,13 +16,13 @@ Initial workspace and attachments are seeded through a streamed tar archive. `ex
 
 ## Ubuntu host
 
-Host-only Debian/Ubuntu packages are versioned in root `requirements.txt` and verified by `scripts/host_requirements.py`; the file is a system-package manifest, not a pip file. Docker Engine, Compose and Buildx are checked as host capabilities because their package names vary by installation source. Runtime hosts pull the prebuilt Kali golden from `aad7xppz4fd4r8emr/gpt-trace-kali-golden`; only the separate publishing machine needs the extra packages in `requirements-golden-build.txt`. `make build` performs the runtime preflight before creating the broker venv or Docker images. The broker process requires root for loop mounts and firewall rules, a libvirt system connection, a libvirt QEMU service user, and `/dev/kvm`. For VMware development, expose nested VT-x/AMD-V to Ubuntu; production uses bare metal KVM. Preserve the dedicated `/var/lib/libvirt/images/gpt-trace` storage root and the project state when recovering a running attempt.
+Acer host-only Debian/Ubuntu packages are versioned in root `requirements.txt`; Fossil uses `requirements-control.txt` without KVM packages. Both are verified by `scripts/host_requirements.py`; the file is a system-package manifest, not a pip file. Docker Engine, Compose and Buildx are checked as host capabilities because their package names vary by installation source. Runtime hosts pull the prebuilt Kali golden from `aad7xppz4fd4r8emr/gpt-trace-kali-golden`; only the separate publishing machine needs the extra packages in `requirements-golden-build.txt`. `make build` performs the runtime preflight before creating the broker venv or Docker images. The broker process requires root for loop mounts and firewall rules, a libvirt system connection, a libvirt QEMU service user, and `/dev/kvm`. For VMware development, expose nested VT-x/AMD-V to Ubuntu; production uses bare metal KVM. Preserve the dedicated `/var/lib/libvirt/images/gpt-trace` storage root and the project state when recovering a running attempt.
 
 Run `make build`, then `make up`, then `make doctor` on the configured host. `make doctor` first inspects host prerequisites and then runs the real PTY, Browser↔shell, screenshot, network, isolation and lifecycle smoke through the runner; it creates and destroys dedicated probe attempts. `make down` verifies ownership before removing project domains and networks. The broker is a privileged host process; use an appropriate root-managed service or invoke the project lifecycle with root privileges on a dedicated machine.
 
 The Kali 2026.2 QEMU archive SHA-256 is pinned in the image builder. CloakBrowser wrapper `0.4.8` and free binary `146.0.7680.177.5` are pinned; the upstream binary download is signature-verified by the wrapper. Python dependencies are versioned with wheel hashes in `infra/workstation/image/requirements.lock` and installed with `--require-hashes`. `make publish-kali-golden` performs the existing real-KVM build once, verifies it, and publishes the four golden artifacts to Docker Hub under a tag derived from the full semantic build-input SHA-256. Runtime installation verifies that input fingerprint, the resulting qcow2 digest, the lock digest, and exact APT/Python package manifests before replacing the installed base. The APT `kali-last-snapshot` alias is still mutable: republishing after repository changes may produce a different qcow2 even for unchanged source code, so preserve the published image used by an experiment and review new provenance before replacing it.
 
-The default attempt quota is 16 GiB, output buffer 1 MiB, screenshot 8 MiB, staged artifact 64 MiB, and seed archive 640 MiB. Limits are versioned in `config/runner.toml` and supplied to the broker, controller, and guest at creation. Image build and KVM/GUI/network isolation need validation on the actual Ubuntu host before SFT collection; unit tests in a non-KVM workspace cannot substitute for that gate.
+The configured attempt quota is 64 GiB, output buffer 1 MiB, screenshot 8 MiB, staged artifact 64 MiB, and seed archive 640 MiB. Limits are versioned in `config/runner.toml` and supplied to the broker, controller, and guest at creation. KVM/GUI/network isolation and real ChatGPT/MCP operation need validation on both actual Ubuntu hosts before corpus collection; unit tests in a non-KVM workspace cannot substitute for that gate.
 
 ## Manual ephemeral workstation
 
@@ -53,11 +53,13 @@ The broker records evaluator ownership before allocation, exposes diagnostic
 inspect metadata, and preserves partial/stopped evaluators after technical
 failure. Native pass/fail destroys the evaluator normally. Explicit resume may
 abandon an old evaluator and must create a new one; reset-recovery abandons both
-runtimes. A new registry publication never changes an existing attempt's
-backing generation or selected artifact scope. The guest streaming addition
-changes the golden semantic build-input hash; old golden artifacts must be
-rebuilt/installed before using schema-2 Lite templates.
+runtimes. A new verified registry activation never changes an existing attempt's
+backing generation or selected artifact scope. Golden source inputs and guest RPC contracts are unchanged by this interface migration. Install the exact verified permanent golden matching the checkout.
 
 ## Separate physical hosts
 
 [Distributed operations](distributed.md) put all App/control services on Fossil and every VM, immutable template, artifact stage and evaluator on Acer. Broker absence requires an authenticated resource audit; transport errors retain journals and never imply destruction. The MCP manifest and vsock guest contracts are unchanged.
+
+The private broker transport uses role-bound mTLS certificates, certificate SHA-256 pinning, separate admin/controller tokens and an explicit Fossil peer address. Fossil's Compose file is `compose.control.yaml`; neither runner nor controller mounts a host broker socket. Network failure preserves journals and does not prove absence. Runtime template selection verifies the permanent Release receipt and every installed artifact; see [template publication and installation](swe-gym-lite.md).
+
+Global `make down` is coordinated on Fossil. It first stops runner producers, drains new broker mutations, audits project ownership, destroys and proves absence of temporary Acer resources, acknowledges broker shutdown, and stops/removes only Fossil project containers/networks. It retains all persistent volumes, journals/checkpoints, native base/template images, source caches and unrelated resources. Invalid remote credentials or unreachable Acer still stop Fossil services and return an error for unconfirmed remote cleanup. Acer refuses a local-only shutdown.

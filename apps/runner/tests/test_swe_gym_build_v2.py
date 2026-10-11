@@ -14,7 +14,7 @@ import pytest
 from gpt_trace_runner.superbench.adapters.swe_gym import guest_runtime, os_packages
 
 ROOT = Path(__file__).resolve().parents[3]
-spec = importlib.util.spec_from_file_location("lite_template_builder", ROOT / "scripts/build_swe_gym_lite_templates.py")
+spec = importlib.util.spec_from_file_location("lite_template_builder", ROOT / "scripts/template_publication_build.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
@@ -115,7 +115,7 @@ def test_any_resolved_dependency_change_changes_final_generation(component):
     assert builder.generation_identity(resolved) != builder.generation_identity(changed)
 
 
-def test_publication_validates_immutable_generation_before_atomic_registry_replace(tmp_path):
+def test_publication_build_validates_without_activating_runtime_registry(tmp_path):
     target = tmp_path / "templates"
     target.mkdir()
     registry = target / "registry.json"
@@ -136,8 +136,7 @@ def test_publication_validates_immutable_generation_before_atomic_registry_repla
     second.mkdir()
     (second / "disk.qcow2").write_bytes(b"new disk")
     builder.publish(second, target, {"generation":"b"*64}, lambda *args: None)
-    assert json.loads(registry.read_text()) == {"schema_version":2,"generation":"b"*64}
-    assert not registry.stat().st_mode & 0o222
+    assert registry.read_bytes() == old
 
 
 @pytest.mark.parametrize("payload", ["builder-mirrors", "repos", "task-sources", "dependency.git"])

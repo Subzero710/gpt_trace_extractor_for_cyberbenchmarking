@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Iterable
+import math
+import os
+import tempfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pyarrow as pa
@@ -47,6 +50,9 @@ SCHEMA = pa.schema([
     ("execution_status", pa.string()),
     ("evaluation", EVALUATION),
     ("metadata_json", pa.string()),
+    ("raw_messages_json", pa.string()),
+    ("app_provenance_json", pa.string()),
+    ("validation_json", pa.string()),
 ])
 
 
@@ -56,6 +62,7 @@ def _json(value) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -70,7 +77,7 @@ def _evaluation(raw: dict):
         raise ValueError(f"invalid evaluation verdict: {verdict!r}")
     score = value.get("score")
     if score is not None and (
-        not isinstance(score, (int, float)) or isinstance(score, bool)
+        not isinstance(score, (int, float)) or isinstance(score, bool) or not math.isfinite(score)
     ):
         raise ValueError("evaluation score must be numeric or null")
     details = value.get("details", {})
@@ -86,186 +93,119 @@ def _evaluation(raw: dict):
 
 
 def _row(raw: dict) -> dict:
-    runtime = raw.get("runtime_metadata") or {}
-    apps = raw.get("app_provenance") or []
-    logical_task_id = raw.get("logical_task_id")
-    if not isinstance(logical_task_id, str) or not logical_task_id:
-        raise ValueError("storage row is missing logical_task_id")
-    dataset_metadata = raw.get("dataset_metadata")
-    if not isinstance(dataset_metadata, dict):
+    if not isinstance(raw, dict):
+        raise ValueError("storage row must be an object")
+    for key in ("task_id", "logical_task_id", "status"):
+        if not isinstance(raw.get(key), str) or not raw[key]:
+            raise ValueError("storage row is missing " + key)
+    messages_raw = raw.get("messages")
+    runtime = raw.get("runtime_metadata")
+    apps = raw.get("app_provenance")
+    dataset = raw.get("dataset_metadata")
+    if not isinstance(messages_raw, list) or any(not isinstance(x, dict) for x in messages_raw):
+        raise ValueError("storage row messages must be an array of objects")
+    if not isinstance(runtime, dict) or not isinstance(apps, list) or any(not isinstance(x, dict) for x in apps):
+        raise ValueError("storage row runtime/App provenance has the wrong type")
+    if not isinstance(dataset, dict):
         raise ValueError("storage row dataset_metadata must be an object")
-
-    messages = normalize_messages(
-        raw.get("messages") or [],
-        used_tool_calls=runtime.get("used_tool_calls") or [],
-        app_provenance=apps,
-    )
+    used = runtime.get("used_tool_calls", [])
+    if not isinstance(used, list) or any(not isinstance(x, dict) for x in used):
+        raise ValueError("storage row used_tool_calls must be an array of objects")
+    messages = normalize_messages(messages_raw, used_tool_calls=used, app_provenance=apps)
     tools = tools_from_provenance(apps)
-
-    metadata = dict(dataset_metadata)
+    metadata = dict(dataset)
     metadata["runtime"] = runtime
     metadata["captured_at"] = raw.get("captured_at")
+    metadata["storage"] = {key: raw.get(key) for key in (
+        "conversation_id", "attempt", "runner_id", "task_fingerprint", "error_type",
+        "error_message", "started_at", "created_at", "updated_at")}
+    row = {"trajectory_id": raw["task_id"], "task_id": raw["logical_task_id"],
+        "messages": messages, "tools": tools, "execution_status": raw["status"],
+        "evaluation": _evaluation(raw), "metadata_json": _json(metadata),
+        # Normalization never destroys the captured source or its provenance.
+        "raw_messages_json": _json(messages_raw), "app_provenance_json": _json(apps)}
+    row["validation_json"] = _json(_validate_tool_structure(row))
+    return row
 
-    return {
-        "trajectory_id": str(raw.get("task_id") or ""),
-        "task_id": logical_task_id,
-        "messages": messages,
-        "tools": tools,
-        "execution_status": str(raw.get("status") or ""),
-        "evaluation": _evaluation(raw),
-        "metadata_json": _json(metadata),
-    }
 
-
-async def write_corpus_stream(
-    rows: AsyncIterator[dict],
-    output: Path,
-    *,
-    row_group_size: int = 512,
-) -> int:
-    """Write the single canonical ML corpus from storage rows."""
+async def write_corpus_stream(rows: AsyncIterator[dict], output: Path, *, row_group_size: int = 512) -> int:
+    """Atomic, unfiltered export; an invalid row aborts instead of being skipped."""
+    if type(row_group_size) is not int or row_group_size < 1:
+        raise ValueError("row_group_size must be positive")
+    output = Path(output).absolute()
+    for parent in (output, *output.parents):
+        if parent.is_symlink():
+            raise ValueError("symlink in export destination")
     output.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output.with_suffix(output.suffix + ".tmp")
-    writer = None
-    batch: list[dict] = []
-    count = 0
+    fd, name = tempfile.mkstemp(prefix="." + output.name + ".", suffix=".tmp", dir=output.parent)
+    os.close(fd)
+    tmp, writer, batch, count, seen = Path(name), None, [], 0, set()
     try:
+        writer = pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
         async for raw in rows:
-            batch.append(_row(raw))
+            row = _row(raw)
+            if row["trajectory_id"] in seen:
+                raise ValueError("duplicate trajectory_id: " + row["trajectory_id"])
+            seen.add(row["trajectory_id"])
+            batch.append(row)
             if len(batch) >= row_group_size:
-                table = pa.Table.from_pylist(batch, schema=SCHEMA)
-                writer = writer or pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-                writer.write_table(table)
+                writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
                 count += len(batch)
                 batch.clear()
         if batch:
-            table = pa.Table.from_pylist(batch, schema=SCHEMA)
-            writer = writer or pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-            writer.write_table(table)
+            writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
             count += len(batch)
-        if writer is None:
-            writer = pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
         writer.close()
         writer = None
-        tmp.replace(output)
+        actual = pq.ParquetFile(tmp)
+        if actual.schema_arrow != SCHEMA or actual.metadata.num_rows != count:
+            raise ValueError("written corpus schema/row count mismatch")
+        del actual
+        with tmp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, output)
+        fd = os.open(output.parent, os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
         return count
     finally:
         if writer is not None:
             writer.close()
-        if tmp.exists():
-            tmp.unlink()
+        tmp.unlink(missing_ok=True)
 
 
-def _selected(row: dict, verdicts: set[str]) -> bool:
-    if not verdicts:
-        verdicts = {"pass"}
-    evaluation = row.get("evaluation")
-    verdict = evaluation.get("verdict") if isinstance(evaluation, dict) else None
-    key = verdict if verdict in {"pass", "fail"} else "unevaluated"
-    return key in verdicts
 
 
-def _validate_tool_structure(row: dict) -> None:
-    trajectory = row.get("trajectory_id")
-    declared = [tool.get("name") for tool in row.get("tools") or []]
+def _validate_tool_structure(row: dict) -> dict:
+    """Report partial/ambiguous tool traces without discarding their trajectory."""
+    declared = [tool.get("name") for tool in row.get("tools", [])]
+    issues = []
     if any(not isinstance(name, str) or not name for name in declared):
-        raise ValueError(f"{trajectory}: declared tool has an empty name")
+        issues.append({"kind": "empty_declared_tool"})
     if len(set(declared)) != len(declared):
-        raise ValueError(f"{trajectory}: duplicate declared tool names")
-    declared_set = set(declared)
-
-    calls: dict[str, tuple[str, int]] = {}
-    consumed: set[str] = set()
-    for index, message in enumerate(row.get("messages") or []):
-        for call in message.get("tool_calls") or []:
-            call_id = str(call.get("id") or "")
-            name = str(call.get("name") or "")
-            if not call_id:
-                raise ValueError(f"{trajectory}: tool call without id at message {index}")
-            if call_id in calls:
-                raise ValueError(f"{trajectory}: duplicate tool call id {call_id!r}")
-            if name not in declared_set:
-                raise ValueError(
-                    f"{trajectory}: tool call {call_id!r} references undeclared tool {name!r}"
-                )
-            calls[call_id] = (name, index)
-
+        issues.append({"kind": "duplicate_declared_tool"})
+    calls, consumed = {}, set()
+    for index, message in enumerate(row.get("messages", [])):
+        for call in message.get("tool_calls", []):
+            cid, name = call.get("id"), call.get("name")
+            if not cid or cid in calls:
+                issues.append({"kind": "missing_or_duplicate_call_id", "call_id": cid, "message": index})
+                continue
+            if name not in declared:
+                issues.append({"kind": "undeclared_tool", "call_id": cid, "name": name})
+            calls[cid] = (name, index)
         if message.get("role") == "tool":
-            call_id = message.get("tool_call_id")
-            if not isinstance(call_id, str) or not call_id:
-                raise ValueError(
-                    f"{trajectory}: tool result without tool_call_id at message {index}"
-                )
-            if call_id not in calls:
-                raise ValueError(
-                    f"{trajectory}: tool result references unknown/non-prior call {call_id!r}"
-                )
-            if call_id in consumed:
-                raise ValueError(f"{trajectory}: duplicate result for tool call {call_id!r}")
-            expected_name, call_index = calls[call_id]
-            if call_index >= index:
-                raise ValueError(f"{trajectory}: tool result precedes its call {call_id!r}")
-            result_name = message.get("name")
-            if result_name and result_name != expected_name:
-                raise ValueError(
-                    f"{trajectory}: tool result name {result_name!r} does not match "
-                    f"call {expected_name!r}"
-                )
-            consumed.add(call_id)
-
-    missing = set(calls) - consumed
-    if missing:
-        raise ValueError(f"{trajectory}: tool calls without results: {sorted(missing)!r}")
+            cid = message.get("tool_call_id")
+            if not cid or cid not in calls or calls[cid][1] >= index:
+                issues.append({"kind": "unmatched_result", "call_id": cid, "message": index})
+            elif cid in consumed:
+                issues.append({"kind": "duplicate_result", "call_id": cid, "message": index})
+            else:
+                if message.get("name") and message["name"] != calls[cid][0]:
+                    issues.append({"kind": "result_name_mismatch", "call_id": cid, "message": index})
+                consumed.add(cid)
+    for cid in sorted(set(calls) - consumed):
+        issues.append({"kind": "missing_result", "call_id": cid})
+    return {"complete_tool_pairs": not issues, "issues": issues}
 
 
-def derive_sft(
-    corpus: Path,
-    output: Path,
-    *,
-    verdicts: Iterable[str] = (),
-    row_group_size: int = 512,
-) -> int:
-    """Derive a training view from corpus.parquet; never read storage directly."""
-    selected_verdicts = {str(value) for value in verdicts}
-    invalid = selected_verdicts - {"pass", "fail", "unevaluated"}
-    if invalid:
-        raise ValueError(f"unknown verdict filter(s): {sorted(invalid)!r}")
-
-    source = pq.ParquetFile(corpus)
-    if source.schema_arrow != SCHEMA:
-        raise ValueError("input Parquet is not a Superbench corpus schema")
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output.with_suffix(output.suffix + ".tmp")
-    writer = None
-    batch: list[dict] = []
-    count = 0
-    try:
-        for record_batch in source.iter_batches(batch_size=row_group_size):
-            for row in pa.Table.from_batches([record_batch], schema=SCHEMA).to_pylist():
-                if not _selected(row, selected_verdicts):
-                    continue
-                _validate_tool_structure(row)
-                batch.append(row)
-                if len(batch) >= row_group_size:
-                    table = pa.Table.from_pylist(batch, schema=SCHEMA)
-                    writer = writer or pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-                    writer.write_table(table)
-                    count += len(batch)
-                    batch.clear()
-        if batch:
-            table = pa.Table.from_pylist(batch, schema=SCHEMA)
-            writer = writer or pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-            writer.write_table(table)
-            count += len(batch)
-        if writer is None:
-            writer = pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-        writer.close()
-        writer = None
-        tmp.replace(output)
-        return count
-    finally:
-        if writer is not None:
-            writer.close()
-        if tmp.exists():
-            tmp.unlink()

@@ -1,4 +1,3 @@
-\
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -243,6 +242,10 @@ def verify_attempts_empty() -> None:
 
 
 def main() -> int:
+    import distributed
+    cfg = distributed.config("fossil")
+    distributed.environment(cfg)
+    distributed.host("fossil", cfg)
     config = compose_config()
     project = config.get("name")
     if not isinstance(project, str) or not project:
@@ -267,10 +270,10 @@ def main() -> int:
     if answer != "THROW":
         raise SystemExit("aborted")
 
-    # Reuse the canonical shutdown path: it terminalizes running DB rows,
-    # clears recovery markers, destroys all project-owned libvirt/nft attempts,
-    # and removes Compose containers/networks without touching persistent volumes.
+    # Reuse global shutdown and its acknowledged remote ownership audit.
+    # Recovery markers/data are only removed after the explicit THROW choice.
     run([sys.executable, "scripts/down.py"])
+    cleanup_proof = json.loads((ROOT / "state/distributed/last-cleanup.json").read_bytes())
 
     for logical in DELETE_VOLUMES:
         actual = volumes[logical]
@@ -309,7 +312,8 @@ def main() -> int:
         raise ThrowError("host runtime state directory survived wipe")
     if (ROOT / ".venv-workstation-broker").exists():
         raise ThrowError("host broker venv survived wipe")
-    verify_attempts_empty()
+    if cleanup_proof.get("inventory", {}).get("absent") is not True:
+        raise ThrowError("global shutdown did not acknowledge Acer resource absence")
 
     images = project_image_ids()
     if images:
