@@ -1,5 +1,5 @@
 # Versioned deployment roles and paths. No hostname, hardware identifier, IP, or secret.
-# Local fields (DIST_ROLE, Access credentials, Tunnel token) belong to .env.
+# Local fields (DIST_ROLE, broker URL, Tunnel token) belong to .env.
 [deployment]
 role = ""
 control_id = "control"

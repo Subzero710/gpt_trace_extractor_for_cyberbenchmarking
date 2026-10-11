@@ -193,6 +193,16 @@ class Broker:
         table = "gt_" + suffix(ident)
         exception_rules = "\n".join(f'add rule inet {table} forward iifname "{bridge}" ip daddr {cidr} accept'
                                     for cidr in self.egress_allow_cidrs)
+        # With a tunnel transport, the control host has no stable or configured IP.
+        # Disallow private egress exceptions entirely in this deployment: guests
+        # must not reach the control LAN even when no physical address is known.
+        if os.environ.get("WORKSTATION_BROKER_EXECUTION_ID") and any(
+                ipaddress.ip_network(cidr, strict=False).overlaps(private)
+                for cidr in self.egress_allow_cidrs
+                for private in (ipaddress.ip_network("10.0.0.0/8"),
+                                ipaddress.ip_network("172.16.0.0/12"),
+                                ipaddress.ip_network("192.168.0.0/16"))):
+            raise ValueError("private egress exceptions are forbidden in two-host tunnel mode")
         control_cidrs = json.loads(os.environ.get("WORKSTATION_CONTROL_PLANE_CIDRS", "[]"))
         if not isinstance(control_cidrs, list):
             raise ValueError("invalid control-plane firewall configuration")
@@ -202,8 +212,6 @@ class Broker:
             if network.version != 4 or str(network) != cidr:
                 raise ValueError("control-plane deny routes must be canonical IPv4 CIDRs")
             control_rules.append(f'add rule inet {table} forward iifname "{bridge}" ip daddr {cidr} drop')
-        if os.environ.get("WORKSTATION_BROKER_LISTENER") == "mtls" and not control_rules:
-            raise ValueError("distributed broker requires explicit control-plane deny routes")
         control_rules = "\n".join(control_rules)
         # DNS is accepted only to dnsmasq on this attempt's bridge. DHCP discover
         # is necessarily broadcast before the guest owns an address, while renewals
@@ -878,7 +886,11 @@ def create_app(broker: Broker) -> Starlette:
     # in-flight transfer/create/input operation before absence can be proved.
     operation_lock = asyncio.Lock()
 
-    async def health(_: Request):
+    async def health(request: Request):
+        authorization = request.headers.get("authorization", "")
+        if not (hmac.compare_digest(authorization, f"Bearer {broker.admin_token}") or
+                hmac.compare_digest(authorization, f"Bearer {broker.controller_token}")):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
         return JSONResponse({"status": "ok", "project": PROJECT})
 
     async def dispatch(request: Request):

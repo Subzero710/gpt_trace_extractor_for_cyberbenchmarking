@@ -25,7 +25,6 @@ from gpt_trace_transport.wire import Endpoint, WireClient, token, TransportFailu
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
 CORE = ("postgres", "storage", "teacher-browser", "teacher-browser-tunnel", "kali-workstation-controller", "workstation-gateway")
-_VERIFIED_ACCESS_ORIGINS = set()
 
 
 def run(arguments, *, capture=False, timeout=None):
@@ -50,11 +49,10 @@ def path_from_config(value):
 
 
 
-# Host identities stay outside versioned TOML. Neither LAN IP nor certificates
-# are needed to reach the execution broker through Cloudflare Access.
+# Host identities stay outside versioned TOML. Broker traffic uses Cloudflare Tunnel HTTPS;
+# no LAN IP, Cloudflare Access policy, or private CA is required.
 DISTRIBUTED_ENV_FIELDS = {('deployment', 'role'): 'DIST_ROLE'}
-OPTIONAL_ENV_FIELDS = {'DIST_BROKER_URL', 'DIST_ACCESS_CLIENT_ID',
-    'DIST_ACCESS_CLIENT_SECRET', 'DIST_BROKER_TUNNEL_TOKEN', 'DIST_CONTROL_ADDRESS'}
+OPTIONAL_ENV_FIELDS = {'DIST_BROKER_URL', 'DIST_BROKER_TUNNEL_TOKEN'}
 
 
 def local_deployment_env():
@@ -95,10 +93,10 @@ def broker_origin(value):
         or parsed.port not in (None, 443)
         or not re.fullmatch(r'[a-zA-Z0-9.-]{1,253}', parsed.hostname)
         or '.' not in parsed.hostname):
-        raise ValueError('DIST_BROKER_URL must be a dedicated public https://hostname origin')
+        raise ValueError('DIST_BROKER_URL must be an https://hostname origin')
     try: ipaddress.ip_address(parsed.hostname)
     except ValueError: pass
-    else: raise ValueError('broker Access URL must be a DNS hostname, not an IP')
+    else: raise ValueError('broker URL must be a DNS hostname, not an IP')
     return 'https://' + parsed.hostname.lower()
 
 
@@ -142,30 +140,10 @@ def config(role=None, *, credentials=True):
             raise ValueError('broker scopes must have different tokens')
         if host_role == 'control':
             broker_origin(local.get('DIST_BROKER_URL',''))
-            for field in ('DIST_ACCESS_CLIENT_ID','DIST_ACCESS_CLIENT_SECRET'):
-                value = local.get(field, '')
-                if not 10 <= len(value) <= 512 or not re.fullmatch(r'[A-Za-z0-9._-]+', value):
-                    raise ValueError('missing/invalid Cloudflare Access service credential: ' + field)
         elif not local.get('DIST_BROKER_TUNNEL_TOKEN'):
             raise ValueError('missing DIST_BROKER_TUNNEL_TOKEN on execution host')
     return cfg
 
-
-def write_private(path, value):
-    directory = path.parent
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory.is_symlink() or directory.stat().st_mode & 0o077:
-        raise ValueError('unsafe private credential directory')
-    if path.is_symlink(): raise ValueError('unsafe credential file')
-    if path.exists() and path.stat().st_mode & 0o077:
-        raise ValueError('credential file must have mode 0600')
-    fd, temp = tempfile.mkstemp(prefix='.access-', dir=directory)
-    try:
-        with os.fdopen(fd, 'w') as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(value + '\n'); output.flush(); os.fsync(output.fileno())
-        os.replace(temp, path)
-    finally: Path(temp).unlink(missing_ok=True)
 
 
 def host(role, cfg, *, docker=True, build_tools=False):
@@ -194,17 +172,12 @@ def environment(cfg):
     paths, local = cfg['paths'], cfg['local']
     directory = paths['credentials_directory']
     origin = broker_origin(local['DIST_BROKER_URL'])
-    write_private(directory / 'access_client_id', local['DIST_ACCESS_CLIENT_ID'])
-    write_private(directory / 'access_client_secret', local['DIST_ACCESS_CLIENT_SECRET'])
     values = {
         'COMPOSE_FILE': str(ROOT / 'compose.control.yaml'),
         'DIST_CREDENTIALS_DIRECTORY': str(directory),
         'DIST_BROKER_URL': origin,
-        'DIST_CONTROL_ADDRESS': local.get('DIST_CONTROL_ADDRESS',''),
-        'WORKSTATION_BROKER_TRANSPORT': 'access',
+        'WORKSTATION_BROKER_TRANSPORT': 'https',
         'WORKSTATION_BROKER_URL': origin,
-        'WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE': str(directory / 'access_client_id'),
-        'WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE': str(directory / 'access_client_secret'),
         'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(directory / 'workstation_broker_admin_token'),
         'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(directory / 'workstation_broker_controller_token'),
     }
@@ -218,9 +191,6 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
     else:
         endpoint = Endpoint.from_env(Path("/unused-private-broker.sock"))
     client = WireClient(endpoint)
-    if not local and endpoint.url not in _VERIFIED_ACCESS_ORIGINS:
-        client.check_access_policy()
-        _VERIFIED_ACCESS_ORIGINS.add(endpoint.url)
     result = client.request("deployment_probe" if action == "probe" and not local else action,
         payload if payload is not None else {}, token(cfg["paths"]["credentials_directory"] / "workstation_broker_admin_token"), timeout=timeout)
     if action == "probe" and not local:
@@ -436,12 +406,6 @@ def confirm_remote_shutdown(cfg, shutdown_id):
 
 def execution_environment(cfg):
     paths, local = cfg['paths'], cfg['local']
-    control_address = local.get('DIST_CONTROL_ADDRESS')
-    if control_address:
-        import ipaddress
-        address = ipaddress.ip_address(control_address)
-        if address.version != 4 or not address.is_private:
-            raise ValueError('DIST_CONTROL_ADDRESS must be a private IPv4 for guest isolation')
     os.environ.update({
         'WORKSTATION_CONFIG': str(ROOT / 'config/runner.toml'),
         'WORKSTATION_BROKER_SOCKET': str(paths['broker_runtime_directory'] / 'broker.sock'),
@@ -451,7 +415,6 @@ def execution_environment(cfg):
         'WORKSTATION_BROKER_LISTENER': 'unix',
         'WORKSTATION_BROKER_CONTROL_ID': cfg['deployment']['control_id'],
         'WORKSTATION_BROKER_EXECUTION_ID': cfg['deployment']['execution_id'],
-        'WORKSTATION_CONTROL_PLANE_CIDRS': json.dumps([control_address + '/32'] if control_address else []),
         'WORKSTATION_BROKER_ADMIN_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_admin_token'),
         'WORKSTATION_BROKER_CONTROLLER_TOKEN_FILE': str(paths['credentials_directory'] / 'workstation_broker_controller_token'),
     })

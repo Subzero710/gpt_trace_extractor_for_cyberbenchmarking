@@ -1,4 +1,4 @@
-"""Versioned role/config contract; Cloudflare-specific cases live in test_cloudflare_access."""
+"""Versioned role/config contract; Cloudflare-specific cases live in test_cloudflare_tunnel."""
 from __future__ import annotations
 import unittest
 from pathlib import Path

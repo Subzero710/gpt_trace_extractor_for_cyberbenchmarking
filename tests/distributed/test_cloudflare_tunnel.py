@@ -1,4 +1,4 @@
-"""Cloudflare Access transport, generic roles and post-exit UDS handoff tests.
+"""Cloudflare Tunnel HTTPS transport, generic roles and UDS handoff tests.
 
 No Cloudflare account, Docker or KVM deployment is simulated as a live success.
 """
@@ -27,7 +27,7 @@ from create_broker_tokens import provision
 
 
 def dispatcher():
-    spec=importlib.util.spec_from_file_location('access_dispatch_test', ROOT/'scripts/distributed.py')
+    spec=importlib.util.spec_from_file_location('tunnel_dispatch_test', ROOT/'scripts/distributed.py')
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -111,61 +111,38 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):provision(root)
         assert all('PRIVATE KEY' not in name.read_text() for name in names)
 
-    def test_control_materialization_and_execution_local(self):
+    def test_control_and_execution_need_no_address_or_access_service_token(self):
         directory=self.root/'.secrets/distributed'
         provision(directory)
-        self.env(extra='DIST_BROKER_URL=https://broker.example.net\n'
-                       'DIST_ACCESS_CLIENT_ID=id_123456789.access\n'
-                       'DIST_ACCESS_CLIENT_SECRET=cfast_123456789123456789\n')
+        self.env(extra='DIST_BROKER_URL=https://broker.example.net\n')
         cfg=self.module.config()
         self.module.environment(cfg)
-        self.assertEqual((directory/'access_client_id').read_text().strip(),'id_123456789.access')
-        self.assertEqual(stat.S_IMODE((directory/'access_client_secret').stat().st_mode),0o600)
-        self.assertEqual(os.environ['WORKSTATION_BROKER_TRANSPORT'],'access')
+        self.assertEqual(os.environ['WORKSTATION_BROKER_TRANSPORT'],'https')
+        self.assertEqual(os.environ['WORKSTATION_BROKER_URL'],'https://broker.example.net')
+        self.assertNotIn('WORKSTATION_CONTROL_PLANE_ADDRESS',
+                         {k: v for k,v in os.environ.items() if k.startswith('DIST_')})
+        self.assertFalse((directory/'access_client_id').exists())
         self.env('execution','DIST_BROKER_TUNNEL_TOKEN=eyJ1234567890abcdefghijabcdefghijabcdefghij\n')
         self.assertEqual(self.module.config()['deployment']['role'],'execution')
 
 
-class AccessWireTests(unittest.TestCase):
+class TunnelWireTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
-        for name,value in [('id','sample-identifier.access'),('secret','cfast_12345678912345678912345')]:
-            path=self.root/name
-            path.write_text(value+'\n');path.chmod(0o600)
-        self.endpoint=Endpoint('access',Path('/unused'),'https://broker.example.org',
-            access_client_id_file=self.root/'id', access_client_secret_file=self.root/'secret')
+        self.endpoint=Endpoint('https',Path('/unused'),'https://broker.example.org')
 
-    def test_access_env_and_verified_tls(self):
-        with patch.dict(os.environ, {'WORKSTATION_BROKER_TRANSPORT':'access',
-             'WORKSTATION_BROKER_URL':'https://broker.example.org',
-             'WORKSTATION_BROKER_ACCESS_CLIENT_ID_FILE':str(self.root/'id'),
-             'WORKSTATION_BROKER_ACCESS_CLIENT_SECRET_FILE':str(self.root/'secret')}):
+    def test_https_from_env_with_system_tls(self):
+        with patch.dict(os.environ, {'WORKSTATION_BROKER_TRANSPORT':'https',
+             'WORKSTATION_BROKER_URL':'https://broker.example.org'}):
             endpoint=Endpoint.from_env(Path('/unused'))
         ctx=endpoint.client_context()
         self.assertTrue(ctx.check_hostname)
         self.assertEqual(ctx.verify_mode,ssl.CERT_REQUIRED)
-        headers=endpoint.access_headers()
-        self.assertEqual(headers['CF-Access-Client-Id'],'sample-identifier.access')
-        self.assertEqual(headers['CF-Access-Client-Secret'],'cfast_12345678912345678912345')
-        (self.root/'secret').chmod(0o644)
-        with self.assertRaises(IdentityFailure):endpoint.client_context()
+        self.assertIsNone(endpoint.access_client_id_file if hasattr(endpoint,'access_client_id_file') else None)
 
-    def test_unauthenticated_edge_must_deny_health(self):
-        from unittest.mock import MagicMock
-        endpoint=self.endpoint
-        with patch('http.client.HTTPSConnection') as fake:
-            fake.return_value.getresponse.return_value.status=200
-            with self.assertRaisesRegex(IdentityFailure,'not enforced'):
-                WireClient(endpoint).check_access_policy()
-            self.assertEqual(fake.return_value.request.call_args.args[:2],('GET','/healthz'))
-            for status in (302,401,403):
-                fake.return_value.getresponse.return_value.status=status
-                WireClient(endpoint).check_access_policy()
-
-    def test_real_tls_http_transport_sends_both_independent_credentials(self):
-        # Test real TLS, certificate-name validation and HTTP bytes over loopback.
+    def test_real_tls_http_sends_only_scoped_broker_authorization(self):
         certificate=self.root/'cert.pem';key=self.root/'key.pem'
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
             '-keyout',str(key),'-out',str(certificate),'-subj','/CN=broker.example.org',
@@ -199,9 +176,10 @@ class AccessWireTests(unittest.TestCase):
             self.assertEqual(reply, {'status':'ok'})
             self.assertEqual(json.loads(requests[0][1]),{'number':1})
             headers=requests[0][0]
-            self.assertEqual(headers['CF-Access-Client-Secret'],'cfast_12345678912345678912345')
             self.assertEqual(headers['Authorization'],'Bearer admin-scoped-token')
             self.assertEqual(headers['Host'],'broker.example.org')
+            self.assertIsNone(headers.get('CF-Access-Client-Id'))
+            self.assertIsNone(headers.get('CF-Access-Client-Secret'))
         finally:
             server.shutdown();server.server_close()
 

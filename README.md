@@ -26,9 +26,9 @@ make export-parquet
 make down
 ```
 
-Every Make operation reads the committed `config/distributed.toml` plus host-local `.env` role and Cloudflare routing credentials. The execution host runs the native KVM broker and a dedicated Cloudflare Tunnel proxying its Unix socket. The control host connects over HTTPS using a Cloudflare Access Service Token and distinct broker admin/controller tokens; no LAN broker address or private PKI is needed. See [the deployment guide](docs/distributed.md).
+Every Make operation reads the committed `config/distributed.toml` plus host-local `.env` role and Cloudflare routing credentials. The execution host runs the native KVM broker and a dedicated Cloudflare Tunnel proxying its Unix socket. The control host connects over HTTPS using distinct role-scoped broker admin/controller bearer tokens; no LAN broker address or private PKI is needed. See [the deployment guide](docs/distributed.md).
 
-Provision Cloudflare Access and the independent broker bearer tokens using [the distributed guide](docs/distributed.md), then run the execution host's `build`/`up` before the control host's `build`/`up`. The control host owns `run`, `resume`, App registration, manual Kali orchestration and export. Its `doctor` also runs the real runtime smoke against execution host. `make down` runs on the control host and coordinates authenticated, owned-resource cleanup on the execution host before stopping control host services. It preserves database/profile/source volumes, journals, checkpoints and permanent images; uncertain remote cleanup is an error. The execution host rejects control-plane operations. Its `make down` performs local cleanup and broker shutdown, explicitly reports `scope=execution-local; global=false`, and leaves control host campaign/services outside its scope.
+Configure the Cloudflare Tunnel and the independent broker bearer tokens using [the distributed guide](docs/distributed.md), then run the execution host's `build`/`up` before the control host's `build`/`up`. The control host owns `run`, `resume`, App registration, manual Kali orchestration and export. Its `doctor` also runs the real runtime smoke against execution host. `make down` runs on the control host and coordinates authenticated, owned-resource cleanup on the execution host before stopping control host services. It preserves database/profile/source volumes, journals, checkpoints and permanent images; uncertain remote cleanup is an error. The execution host rejects control-plane operations. Its `make down` performs local cleanup and broker shutdown, explicitly reports `scope=execution-local; global=false`, and leaves control host campaign/services outside its scope.
 
 Put deployment-local values in `.env` using `.env.example`: PostgreSQL password, the independent teacher-browser KasmVNC password, `TEACHER_BROWSER_TUNNEL_TOKEN`, the non-secret `TEACHER_BROWSER_PUBLIC_URL` for the Cloudflare Kasm hostname, control plane API key, optional benchmark source token, and `APP_KALI_WORKSTATION_TUNNEL_ID`. Other non-secret runner/workstation settings remain versioned in `config/runner.toml`. Docker Compose injects `TEACHER_BROWSER_PUBLIC_URL` into runner containers, so `make auth` uses the deployment hostname without hardcoding it in TOML. The App registry and manifest live in `apps/registry/` and `apps/kali-workstation/`.
 
@@ -45,7 +45,7 @@ make superbench-fetch ADAPTER=swe-gym-lite
 make run ADAPTER=swe-gym-lite LIMIT=1
 ```
 
-Fetch verifies the official pinned 230-task dataset on the control host, identifies an administrative local preparation on the execution host over the Cloudflare Access channel, starts or rediscovers its finite worker and waits for validated activation. The execution host builds the 25 environments, 11 repository images and 230 scoped source/setup archives once. All image bytes remain on the execution host. Repeated fetch reuses verified permanent bytes; lost responses are rediscovered without blindly repeating mutations. `run` and `resume` cannot construct templates and fail with this fetch command when local artifacts are absent or incompatible.
+Fetch verifies the official pinned 230-task dataset on the control host, identifies an administrative local preparation on the execution host over the Cloudflare Tunnel HTTPS channel, starts or rediscovers its finite worker and waits for validated activation. The execution host builds the 25 environments, 11 repository images and 230 scoped source/setup archives once. All image bytes remain on the execution host. Repeated fetch reuses verified permanent bytes; lost responses are rediscovered without blindly repeating mutations. `run` and `resume` cannot construct templates and fail with this fetch command when local artifacts are absent or incompatible.
 
 ## Manual Kali lifecycle
 
@@ -66,7 +66,7 @@ make stop_kali
 
 ## Deployment on the control host and execution host
 
-The single historical Make interface dispatches automatically from the local role configuration. See [distributed operations](docs/distributed.md) for Cloudflare Access, migration, local preparation and physical acceptance. No host-prefixed Make targets exist.
+The single historical Make interface dispatches automatically from the local role configuration. See [distributed operations](docs/distributed.md) for Cloudflare Tunnel, migration, local preparation and physical acceptance. No host-prefixed Make targets exist.
 
 `make export-parquet` exports every captured, exportable PostgreSQL trajectory regardless of execution status or native verdict, including failed and unevaluated captures. It retains normalized messages/tool calls/results, original messages, App provenance, metadata, evaluations and tool-coherence diagnostics. Invalid data aborts the atomic export; no trajectory is silently dropped by a verdict filter.
 

@@ -25,7 +25,7 @@ async def exercise(adapter_name=None):
     from gpt_trace_runner.workstation_provider import InternalRuntime
     from rich.console import Console
 
-    if os.environ.get("WORKSTATION_BROKER_TRANSPORT") != "mtls":
+    if os.environ.get("WORKSTATION_BROKER_TRANSPORT") != "https":
         raise RuntimeError("this acceptance command requires the real distributed deployment")
     settings = Settings()
     require_manual_kali_stopped(settings)
@@ -69,13 +69,9 @@ async def exercise(adapter_name=None):
             from pathlib import Path
             if Path(exported["local_path"]).read_bytes() != data or imported["sha256"] != hashlib.sha256(data).hexdigest():
                 raise RuntimeError("remote bounded import/export did not preserve exact bytes")
-            control_address = os.environ.get("WORKSTATION_CONTROL_PLANE_ADDRESS", "")
-            if not control_address:
-                raise RuntimeError("set DIST_CONTROL_ADDRESS on control host for physical isolation acceptance")
-            program = "import socket\naddress=" + repr(control_address) + "\n"
-            program += "for port in (22,8080,9222,9443):\n"
-            program += " s=socket.socket(); s.settimeout(2)\n"
-            program += " try:\n  s.connect((address,port))\n except OSError:\n  pass\n else:\n  raise SystemExit('Control Plane reachable from Kali')\n finally:\n  s.close()\n"
+            # Test representative RFC1918 destinations, not a specific physical host.
+            # The broker also rejects all private network egress exceptions.
+            program = "import socket\ntargets=('10.0.0.1','172.16.0.1','192.168.1.1')\nfor address in targets:\n for port in (22,443,8080,9443):\n  s=socket.socket(); s.settimeout(0.6)\n  try:\n   s.connect((address,port))\n  except OSError:\n   pass\n  else:\n   raise SystemExit('Private address reachable from Kali: '+address)\n  finally:\n   s.close()\n"
             isolation = await runtime.call("exec_command", {"command": "python3 -c 'import sys; exec(sys.stdin.read())'",
                 "stdin": program, "cwd": "/tmp", "timeout_seconds": 20})
             if isolation["exit_code"] != 0: raise RuntimeError("Kali reached control host: " + isolation["stderr"])
@@ -113,7 +109,7 @@ async def exercise(adapter_name=None):
             await lifecycle.assert_clean(task, environments, fingerprint, attempt=1)
             completed = True
             print(json.dumps({"status": "passed", "task_id": task.task_id,
-                "transport": "real mTLS", "runtime": first, "template_evaluator_tested": logical_task is not None}, indent=2))
+                "transport": "real Cloudflare Tunnel HTTPS", "runtime": first, "template_evaluator_tested": logical_task is not None}, indent=2))
     finally:
         # Technical failures remain diagnosable; do not invent cleanup success or destroy an uncertain attempt.
         await lifecycle.close()
