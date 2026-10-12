@@ -31,7 +31,7 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
     argv = ["/bin/bash", "-c", script]
     if offline:
         argv = ["unshare", "--net", "/bin/bash", "-c", "ip link set lo up\n" + script]
-    with Path(log).open("wb") if log else tempfile.TemporaryFile() as output:
+    with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
         result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
         if result.returncode:
             output.seek(0, os.SEEK_END)

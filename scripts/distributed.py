@@ -346,7 +346,10 @@ def preparation_fetch(cfg):
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
             if phase != last_phase:
-                print("preparation " + operation_id + ": " + str(phase), flush=True)
+                print("preparation " + operation_id + ": attempt=" +
+                      str(status.get("attempt", "?")) + ", phase=" + str(phase), flush=True)
+                if phase in {"failed", "interrupted", "canceled"} and status.get("error"):
+                    print("preparation previous error: " + str(status["error"]), flush=True)
                 last_phase = phase
             if phase == "ready":
                 result = status.get("result")

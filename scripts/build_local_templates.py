@@ -8,9 +8,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -27,6 +29,50 @@ MINICONDA_SHA256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d
 VIRTUAL_GIB = 512
 FREE_SPACE_GIB = 64
 BUILD_TIMEOUT_HOURS = 96
+
+
+# Fixed Acer SWE-Gym Lite build guest: exactly 6 GiB of RAM and 6 vCPUs.
+# The builder runs sequentially; resources do not depend on current free RAM.
+GUEST_MEMORY_MIB = 6144
+GUEST_VCPUS = 6
+
+
+def guest_resources():
+    return GUEST_MEMORY_MIB, GUEST_VCPUS
+
+
+def guest_failure_diagnostics(image):
+    """Read-only recovery of the guest's firstboot failure, including kernel OOM."""
+    messages = []
+    for path in ("/etc/gpt-trace-image-build-failed", "/var/log/swe-gym-lite-builder.log"):
+        try:
+            result = subprocess.run(
+                ["virt-cat", "-a", str(image), path], capture_output=True,
+                timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            messages.append(f"{path}: diagnostic unavailable: {exc}")
+            continue
+        if result.returncode == 0:
+            messages.append(f"{path}:\n" + result.stdout.decode(errors="replace")[-6000:])
+    try:
+        with tempfile.TemporaryDirectory(prefix="gpt-trace-guest-journal-") as directory:
+            extracted = subprocess.run(
+                ["virt-copy-out", "-a", str(image), "/var/log/journal", directory],
+                capture_output=True, timeout=180, check=False)
+            if extracted.returncode == 0:
+                journal = subprocess.run(
+                    ["journalctl", "--directory", str(Path(directory) / "journal"),
+                     "--no-pager", "-o", "short-iso", "-n", "2000"],
+                    capture_output=True, timeout=60, check=False)
+                if journal.returncode == 0:
+                    lines = journal.stdout.decode(errors="replace").splitlines()
+                    relevant = [line for line in lines if re.search(
+                        r"oom|out of memory|killed process|failed with result|guestfs-firstboot", line, re.I)]
+                    if relevant:
+                        messages.append("guest system journal:\n" + "\n".join(relevant[-60:]))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        messages.append(f"guest journal unavailable: {exc}")
+    return "\n".join(messages)[-12000:] or "no readable guest diagnostics"
 
 
 def digest(path):
@@ -290,13 +336,21 @@ def build(args):
             if payload is not None:
                 argv += ["--copy-in", str(payload) + ":/opt"]
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
-            argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host", "-m", "4096", "-smp", "4",
+            memory_mb, vcpus = guest_resources()
+            print(f"Acer local preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
+            argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
+                    "-m", str(memory_mb), "-smp", str(vcpus),
                     "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
             argv += ["-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0"] if network else ["-nic", "none"]
             cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot",
                 timeout=args.build_timeout_hours * 3600)
-            if capture("virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete").strip() != b"ok":
-                raise RuntimeError("guest build completion proof is missing")
+            # A clean QEMU exit does not imply a successful guest firstboot.
+            proof = subprocess.run(
+                ["virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete"],
+                capture_output=True, timeout=180, check=False)
+            if proof.returncode != 0 or proof.stdout.strip() != b"ok":
+                raise RuntimeError("guest build completion proof is missing; "
+                                   "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
 
         def mirror_for(url, name):
             from urllib.parse import urlparse
@@ -313,8 +367,20 @@ def build(args):
             return path
 
         def submodule_mirror(url, commit):
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
+                raise RuntimeError("unsupported trusted public Git submodule URL")
             key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
-            path = mirror_for(url, key)
+            path = cache_root / key
+            # Exact pinned commit already present: no need to re-fetch the entire
+            # upstream mirror for each of the 230 task source archives.
+            if path.is_dir() and not path.is_symlink() and path.stat().st_uid == 0:
+                probe = subprocess.run(
+                    ["git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}"],
+                    capture_output=True, timeout=60, check=False)
+                if probe.returncode == 0:
+                    return path
+            path = mirror_for(url, key)  # Missing object: fetch then validate.
             cmd("git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}")
             return path
 
