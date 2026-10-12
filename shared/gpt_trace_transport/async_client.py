@@ -11,9 +11,9 @@ from .wire import Endpoint, WireClient, TransportFailure
 
 def distributed() -> bool:
     mode = os.environ.get("WORKSTATION_BROKER_TRANSPORT", "unix")
-    if mode not in {"unix", "mtls"}:
+    if mode not in {"unix", "mtls", "https"}:
         raise RuntimeError("unknown explicit broker transport")
-    return mode == "mtls"
+    return mode != "unix"
 
 
 class BrokerHTTPTransport(httpx.AsyncBaseTransport):
