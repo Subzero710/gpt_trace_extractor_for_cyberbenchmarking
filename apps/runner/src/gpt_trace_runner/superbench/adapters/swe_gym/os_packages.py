@@ -8,8 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
-PACKAGES = ("build-essential", "cmake", "libpq-dev", "locales", "locales-all", "openjdk-17-jdk",
-            "openjdk-17-jre", "pipx", "nodejs", "npm", "libffi-dev", "libtiff-dev", "jq", "cloud-guest-utils")
+PACKAGES = ("build-essential", "cmake", "libpq-dev", "locales", "locales-all", "openjdk-21-jdk",
+            "openjdk-21-jre", "pipx", "nodejs", "npm", "libffi-dev", "libtiff-dev", "jq", "cloud-guest-utils")
 
 
 def digest(path):
