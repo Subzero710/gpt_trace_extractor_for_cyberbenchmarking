@@ -449,15 +449,36 @@ def local_down(cfg):
     if record is not None and record.get("deployment") != expected:
         raise RuntimeError("local broker identity belongs to another deployment")
     if record is None or not same_process(record["broker_identity"]):
-        # An explicitly verified inactive lifecycle, not a network-error path.
-        python = ROOT / ".venv-workstation-broker/bin/python"
-        result = json.loads(run([python, "-B", "-m", "workstation_broker.local_shutdown"], capture=True, timeout=150))
-        if (result.get("scope") != "execution-local" or result.get("global") is not False
-                or result.get("deployment") != expected or result.get("broker_stopped") is not True
-                or result.get("inventory", {}).get("absent") is not True):
-            raise RuntimeError("local offline cleanup lacks verified absence")
-        print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
-        return result
+        # The durable record can be absent/stale during a native broker restart.
+        # An ACTIVE service must use the authenticated Unix-socket shutdown path,
+        # never the offline helper. That helper checks inactive systemd itself.
+        status = run(["systemctl", "show", "--property=ActiveState", "--value",
+                      "gpt-trace-distributed-broker.service"], capture=True, timeout=30)
+        pid = run(["systemctl", "show", "--property=MainPID", "--value",
+                   "gpt-trace-distributed-broker.service"], capture=True, timeout=30)
+        if status not in {"inactive", "failed"} or pid != "0":
+            # Admin token and deployment identity bind this socket to this Acer.
+            # A stale recorded PID is not a reason to touch unrelated processes.
+            current = broker(cfg, "deployment_probe", local=True, timeout=15)
+            if (current.get("status") != "ok" or current.get("project") != PROJECT
+                    or current.get("execution_id") != expected["execution_id"]):
+                raise RuntimeError("active execution broker did not prove its deployment identity")
+        else:
+            python = ROOT / ".venv-workstation-broker/bin/python"
+            try:
+                raw = run([python, "-B", "-m", "workstation_broker.local_shutdown"],
+                          capture=True, timeout=150)
+            except subprocess.CalledProcessError as exc:
+                details = (exc.stderr or "").strip()
+                raise RuntimeError("execution-local offline cleanup failed: " +
+                                   (details[-8000:] if details else str(exc))) from exc
+            result = json.loads(raw)
+            if (result.get("scope") != "execution-local" or result.get("global") is not False
+                    or result.get("deployment") != expected or result.get("broker_stopped") is not True
+                    or result.get("inventory", {}).get("absent") is not True):
+                raise RuntimeError("local offline cleanup lacks verified absence")
+            print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
+            return result
     barrier = broker(cfg, "begin_shutdown", local=True, timeout=90)
     if barrier.get("draining") is not True or barrier.get("project") != PROJECT:
         raise RuntimeError("local mutation barrier unconfirmed")
