@@ -23,7 +23,11 @@ def stable(value):
 
 
 def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    value = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1048576), b""):
+            value.update(chunk)
+    return value.hexdigest()
 
 
 def contract():

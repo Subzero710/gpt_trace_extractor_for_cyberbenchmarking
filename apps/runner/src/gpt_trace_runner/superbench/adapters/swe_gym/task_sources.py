@@ -164,7 +164,7 @@ def validate_checkout(folder, base_commit):
             submodules[name] = validate_checkout(folder / name, sha)
         else:
             expected_files.add(name)
-    actual = {p.relative_to(folder).as_posix() for p in folder.rglob("*") if not p.is_dir() and
+    actual = {p.relative_to(folder).as_posix() for p in folder.rglob("*") if (p.is_symlink() or not p.is_dir()) and
               ".git" not in p.relative_to(folder).parts and not any(p.is_relative_to(folder / sub) for sub in submodules)}
     if actual != expected_files:
         raise ValueError("task source contains extra/missing ignored working-tree files")

@@ -175,18 +175,48 @@ def verify_sources(inputs, mirrors):
 
 
 def firstboot(body):
+    # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM
+    # while QEMU itself always stays at 6144 MiB RAM / 6 vCPUs. A successfully
+    # published template has no swap file and has been trimmed.
     return """#!/bin/bash
 set -eo pipefail
 exec >> /var/log/swe-gym-lite-builder.log 2>&1
 rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
+# Builder only: no persistent systemd disable or mask.
+systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
+SWAP_FILE=/root/.gpt-trace-swe-gym-build.swap
 finish() {
     rc=$?
-    if [ "$rc" -ne 0 ]; then echo "$rc" > /etc/gpt-trace-image-build-failed; fi
+    trap - EXIT
+    if [ "$rc" -eq 0 ]; then
+        if ! swapoff "$SWAP_FILE"; then
+            echo 'failed to disable temporary guest swap'
+            rc=1
+        elif ! rm -f "$SWAP_FILE"; then
+            echo 'failed to remove temporary guest swap'
+            rc=1
+        elif ! fstrim -av; then
+            echo 'failed to reclaim temporary guest swap blocks'
+            rc=1
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        echo ok > /etc/gpt-trace-image-build-complete
+    else
+        echo "$rc" > /etc/gpt-trace-image-build-failed
+    fi
     sync
     systemctl poweroff --no-block
 }
 trap finish EXIT
-""" + body + "\nfstrim -av\necho ok > /etc/gpt-trace-image-build-complete\n"
+test ! -e "$SWAP_FILE" && test ! -L "$SWAP_FILE"
+# Fixed disk-backed swap for Conda solves, not host or guest RAM.
+fallocate -l 8G "$SWAP_FILE"
+chmod 600 "$SWAP_FILE"
+mkswap "$SWAP_FILE"
+swapon "$SWAP_FILE"
+echo 'temporary guest build swap enabled: 8 GiB'
+""" + body + "\n"
 
 
 def root_growth():
