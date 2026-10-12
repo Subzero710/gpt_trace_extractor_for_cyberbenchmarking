@@ -322,6 +322,7 @@ add rule inet {table} input iifname "{bridge}" drop
         if not selection and self.templates.immutable_sha256(selected) != digest:
             raise ValueError("Kali base image mutated")
         directory.mkdir(mode=0o711)
+        os.chmod(directory, 0o711)
         secret = secrets.token_hex(32)
         cid = 4096 + int(suffix(ident), 16) % 2147480000
         overlay, iso = directory / "disk/overlay.qcow2", directory / "disk/identity.iso"
