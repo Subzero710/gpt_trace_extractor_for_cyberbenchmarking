@@ -1,4 +1,4 @@
-# Acer: local pinned Kali provisioning and benchmark preparation.
+# Execution host: local pinned Kali provisioning and benchmark preparation.
 libguestfs-tools
 p7zip-full
 dpkg

@@ -54,7 +54,7 @@ class JobScope:
         # Existing unit only: no independent service, slice, supervisor or daemon.
         _directory(MOUNT)
         if not (MOUNT / 'cgroup.controllers').is_file():
-            raise RuntimeError('Acer preparation requires the existing broker unit on cgroup v2')
+            raise RuntimeError('execution-host preparation requires the existing broker unit on cgroup v2')
         _directory(UNIT)
         name = cls.name(operation_id, attempt)
         path = UNIT / name

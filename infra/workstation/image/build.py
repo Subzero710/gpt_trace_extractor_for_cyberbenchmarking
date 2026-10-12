@@ -441,7 +441,7 @@ def _commit_prepared(journal):
 def build() -> None:
     """Build locally only when absent; existing permanent bytes are never replaced."""
     global BUILD_LOG
-    if os.geteuid() != 0: raise RuntimeError("local golden construction requires Acer root")
+    if os.geteuid() != 0: raise RuntimeError("local golden construction requires execution-host root")
     _safe_parent()
     descriptor = os.open(DEST.parent / "golden-build.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
@@ -570,7 +570,7 @@ def verify(base: Path | None = None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build locally or verify the permanent Kali golden on Acer.")
+    parser = argparse.ArgumentParser(description="Build locally or verify the permanent Kali golden on the execution host.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--local", action="store_true", help="build locally when absent; otherwise verify")
     mode.add_argument("--verify", action="store_true", help="verify without any image mutation")

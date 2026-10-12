@@ -1,5 +1,5 @@
 [Unit]
-Description=Cyber Dataset private Acer KVM broker
+Description=Cyber Dataset private execution-host KVM broker
 After=network-online.target libvirtd.service
 Wants=network-online.target
 
