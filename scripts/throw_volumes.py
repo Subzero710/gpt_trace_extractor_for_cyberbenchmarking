@@ -243,9 +243,9 @@ def verify_attempts_empty() -> None:
 
 def main() -> int:
     import distributed
-    cfg = distributed.config("control")
+    cfg = distributed.config("fossil")
     distributed.environment(cfg)
-    distributed.host("control", cfg)
+    distributed.host("fossil", cfg)
     config = compose_config()
     project = config.get("name")
     if not isinstance(project, str) or not project:
@@ -313,7 +313,7 @@ def main() -> int:
     if (ROOT / ".venv-workstation-broker").exists():
         raise ThrowError("host broker venv survived wipe")
     if cleanup_proof.get("inventory", {}).get("absent") is not True:
-        raise ThrowError("global shutdown did not acknowledge Execution resource absence")
+        raise ThrowError("global shutdown did not acknowledge Acer resource absence")
 
     images = project_image_ids()
     if images:
