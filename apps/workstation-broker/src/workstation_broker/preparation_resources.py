@@ -84,6 +84,14 @@ class JobScope:
         if value['closed']:
             if path.exists(): raise RuntimeError('closed preparation cgroup unexpectedly exists')
             return []
+        if not path.exists():
+            stamp = state.get('worker')
+            if stamp is not None:
+                if _jobs().same_process(stamp):
+                    raise RuntimeError('preparation cgroup disappeared while worker is still alive; preserved')
+                if _jobs().group_members(stamp, state['operation_id']):
+                    raise RuntimeError('preparation cgroup disappeared while owned process group remains; preserved')
+            return []
         _directory(path)
         directories = [path, *sorted(p for p in path.rglob('*') if p.is_dir())]
         members = {}
@@ -137,7 +145,7 @@ class JobScope:
         path = cls.path(state)
         if cls.members(state): raise RuntimeError('owned preparation descendants remain')
         if state['scope']['closed']: return state
-        if state['scope']['boot_id'] == _jobs().boot_id():
+        if state['scope']['boot_id'] == _jobs().boot_id() and path.exists():
             for child in sorted((p for p in path.rglob('*') if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
                 _directory(child).rmdir()
             path.rmdir()
