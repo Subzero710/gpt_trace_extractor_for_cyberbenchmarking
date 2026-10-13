@@ -31,10 +31,10 @@ FREE_SPACE_GIB = 64
 BUILD_TIMEOUT_HOURS = 96
 
 
-# Fixed Acer SWE-Gym Lite build guest: exactly 6 GiB of RAM and 6 vCPUs.
-# The builder runs sequentially; resources do not depend on current free RAM.
-GUEST_MEMORY_MIB = 6144
-GUEST_VCPUS = 6
+# Fossil SWE-Gym Lite build guest: 12 GiB RAM, 4 vCPUs, sequential jobs.
+# The host has 15 GiB of usable RAM; do not launch a second concurrent VM.
+GUEST_MEMORY_MIB = 12288
+GUEST_VCPUS = 4
 
 
 def guest_resources():
@@ -176,7 +176,7 @@ def verify_sources(inputs, mirrors):
 
 def firstboot(body):
     # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM
-    # while QEMU itself always stays at 6144 MiB RAM / 6 vCPUs. A successfully
+    # while QEMU itself stays at 12288 MiB RAM / 4 vCPUs. A successfully
     # published template has no swap file and has been trimmed.
     return """#!/bin/bash
 set -eo pipefail
@@ -367,7 +367,7 @@ def build(args):
                 argv += ["--copy-in", str(payload) + ":/opt"]
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
             memory_mb, vcpus = guest_resources()
-            print(f"Acer local preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
+            print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
             argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
                     "-m", str(memory_mb), "-smp", str(vcpus),
                     "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap"]

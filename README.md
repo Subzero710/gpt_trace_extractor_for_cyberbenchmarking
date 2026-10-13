@@ -36,7 +36,7 @@ On the execution host, root `requirements.txt` is deliberately a Debian/Ubuntu *
 
 ## Kali golden image
 
-The execution host builds the golden locally from the official Kali archive pinned by URL and SHA-256 in `infra/workstation/image/build.py`. Guest dependencies, browser and provisioning recipes retain their existing pins. The installed base and three provenance/package files become root-owned and read-only, with the base activated last from a durable verified installation journal. Interrupted activation resumes only from the exact prepared bytes; an invalid existing permanent image is preserved and rejected. Golden images remain on the execution host's SSD and are excluded from Git.
+The execution host builds the golden locally from the official Kali archive pinned by URL and SHA-256 in `infra/workstation/image/build.py`. Guest dependencies, browser and provisioning recipes retain their existing pins. The installed base and three provenance/package files become root-owned and read-only, with the base activated last from a durable verified installation journal. Interrupted activation resumes only from the exact prepared bytes; an invalid existing permanent image is preserved and rejected. Golden images remain on the execution host's local ext4/xfs disk (HDD supported) and are excluded from Git. On Fossil, the 512-GiB QCOW2 virtual disk is sparse: the physical backing filesystem must still have adequate real free space.
 
 `sudo make build` on the execution host prepares the broker and this golden. `make up` starts the broker without constructing or downloading templates. On the control host, the only Lite preparation entry point is:
 

@@ -25,6 +25,7 @@ DEST = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
 PROVISION_TIMEOUT_SECONDS = 7200
+VIRTUAL_DISK_GIB = 512
 BUILD_LOG = None
 
 GUEST_PACKAGES = (
@@ -47,6 +48,7 @@ GUEST_PACKAGES = (
     "tcpdump",
     "nmap",
     "util-linux",
+    "cloud-guest-utils",  # growpart for the 512-GiB ext4 root volume
 )
 
 
@@ -90,6 +92,7 @@ def golden_build_input_sha256() -> str:
     hasher = hashlib.sha256()
     _hash_component(hasher, "source", (SOURCE + ARCHIVE).encode("utf-8"))
     _hash_component(hasher, "archive_sha256", ARCHIVE_SHA256.encode("ascii"))
+    _hash_component(hasher, "virtual_disk_gib", str(VIRTUAL_DISK_GIB).encode("ascii"))
     _hash_component(hasher, "firstboot_script", firstboot_script().encode("utf-8"))
     _hash_component(
         hasher,
@@ -254,6 +257,17 @@ rm -f /etc/apt/sources.list.d/kali.sources
 apt-get -o Acquire::Retries=5 update
 DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 -y install {packages}
 
+# Grow the actual Kali partition and ext4 filesystem, not just the QCOW2
+# container.  This runs only while constructing the new immutable golden.
+root_device="$(findmnt -n -o SOURCE /)"
+test "$(findmnt -n -o FSTYPE /)" = ext4
+parent_device="$(lsblk -n -o PKNAME "$root_device")"
+partition_number="$(lsblk -n -o PARTN "$root_device")"
+test -n "$parent_device" && test -n "$partition_number"
+growpart "/dev/$parent_device" "$partition_number"
+resize2fs "$root_device"
+test "$(df -B1 --output=size / | tail -n 1)" -ge $((480 * 1024 * 1024 * 1024))
+
 python3 -m venv /opt/gpt-trace/venv
 /opt/gpt-trace/venv/bin/pip install \
     --no-cache-dir \
@@ -342,7 +356,7 @@ def provision_in_real_guest(image: Path) -> None:
         "-cpu",
         "host",
         "-m",
-        "4096",
+        "12288",
         "-smp",
         "4",
         "-drive",
@@ -477,6 +491,7 @@ def build() -> None:
                     raise RuntimeError(f"expected one official QEMU image; found {len(images)}")
                 image = stage / DEST.name
                 run("qemu-img", "convert", "-O", "qcow2", str(images[0]), str(image))
+                run("qemu-img", "resize", "-f", "qcow2", str(image), f"{VIRTUAL_DISK_GIB}G")
                 prepare_offline(image, stage)
                 provision_in_real_guest(image)
                 packages = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-packages.txt"])
@@ -556,6 +571,8 @@ def verify(base: Path | None = None) -> None:
     )
     if info.get("format") != "qcow2" or info.get("backing-filename"):
         raise RuntimeError("base is not an independent qcow2")
+    if info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3:
+        raise RuntimeError("Kali base does not provide the configured 512-GiB virtual disk")
     physical = base.stat().st_blocks * 512
     print(
         "Kali image:", base,

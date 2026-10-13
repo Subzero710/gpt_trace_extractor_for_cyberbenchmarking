@@ -3,7 +3,10 @@
 This checkout is hardware/hostname-agnostic. `control` runs the Docker control plane,
 PostgreSQL, runner, and teacher browser. `execution` runs the native root-owned
 broker, KVM guests, and immutable images. The shared `config/distributed.toml` is
-committed. Each host chooses its role using its private `.env`.
+committed. Each host chooses its role using its private `.env`. For this installation,
+Fossil is `execution` (Intel VT-x, 4 vCPU, 12 GiB Kali RAM, 512 GiB sparse
+QCOW2 on its second HDD); Acer is `control` (PostgreSQL, runner, KasmVNC).
+The roles are NOT hard-coded to hostnames in the tracked repository.
 
 ## Cloudflare Tunnel (without Cloudflare Access)
 
@@ -33,14 +36,14 @@ private network IP, or TLS server name to configure.
 
 ## Local `.env` fields
 
-On **control** (besides existing environment settings):
+On **control** (Acer, besides existing environment settings):
 
 ```dotenv
 DIST_ROLE=control
 DIST_BROKER_URL=https://broker.YOUR-CLOUDFLARE-DOMAIN
 ```
 
-On **execution**:
+On **execution** (Fossil):
 
 ```dotenv
 DIST_ROLE=execution

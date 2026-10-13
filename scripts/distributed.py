@@ -158,11 +158,18 @@ def host(role, cfg, *, docker=True, build_tools=False):
         if not os.access("/dev/kvm", os.R_OK | os.W_OK): raise RuntimeError("execution host KVM is unavailable")
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
-        parent = cfg["paths"]["base_image"].parent
+        image_directory = cfg["paths"]["base_image"].parent
+        # Fossil binds HDD2 here. Do not fill Ubuntu's root disk if the mount is absent.
+        if image_directory == Path("/var/lib/libvirt/images/gpt-trace") and not image_directory.is_mount():
+            raise RuntimeError("the dedicated HDD2 libvirt image mount is missing")
+        parent = image_directory
         while not parent.exists() and parent != parent.parent: parent = parent.parent
         device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
-        if not device.startswith("/dev/") or run(["lsblk", "-dn", "-o", "ROTA", device], capture=True, timeout=10) != "0":
-            raise RuntimeError("Kali base/templates/overlays must reside on execution host's local SSD")
+        filesystem = run(["findmnt", "-n", "-o", "FSTYPE", "-T", parent], capture=True, timeout=10)
+        # An HDD is supported: the images must be backed by a local filesystem,
+        # not mergerfs/FUSE, NFS, overlayfs or an ephemeral RAM filesystem.
+        if not device.startswith("/dev/") or filesystem not in {"ext4", "xfs"}:
+            raise RuntimeError("Kali images require a directly mounted local ext4/xfs filesystem")
 
 
 def environment(cfg):
@@ -457,7 +464,7 @@ def local_down(cfg):
         pid = run(["systemctl", "show", "--property=MainPID", "--value",
                    "gpt-trace-distributed-broker.service"], capture=True, timeout=30)
         if status not in {"inactive", "failed"} or pid != "0":
-            # Admin token and deployment identity bind this socket to this Acer.
+            # Admin token and deployment identity bind this socket to this execution host.
             # A stale recorded PID is not a reason to touch unrelated processes.
             current = broker(cfg, "deployment_probe", local=True, timeout=15)
             if (current.get("status") != "ok" or current.get("project") != PROJECT
@@ -628,9 +635,12 @@ def control(cfg, action, args):
             values = ["--adapter", args.adapter] if args.adapter else []
             return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner",
                            "/app/tools/distributed_acceptance.py", *values)
+        node = Path("/dev/dri/renderD128")
         driver = Path("/sys/class/drm/renderD128/device/driver")
-        if not driver.exists() or driver.resolve().name != "nouveau":
-            raise RuntimeError("control host render node is not driven by Nouveau")
+        # Acer can use Intel i915/xe; AMD/Nouveau are also acceptable.  The
+        # real Chromium renderer is verified by teacher_gpu_doctor.py below.
+        if not node.is_char_device() or not driver.exists():
+            raise RuntimeError("control host needs a working GPU DRM render node")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
         compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/teacher_gpu_doctor.py")
         return compose("run", "--rm", "--no-deps", "runner", "doctor")
@@ -695,7 +705,7 @@ def execution(cfg, action, args):
         import build
         build.build_host_broker(ROOT)
         if paths["base_image"] != Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"):
-            raise RuntimeError("verified golden installer requires the fixed libvirt SSD root")
+            raise RuntimeError("verified golden installer requires the configured fixed libvirt image path")
         if paths["base_image"].exists(): build.verify_workstation_image(ROOT)
         else:
             build.build_workstation_base_image(ROOT)
@@ -735,7 +745,7 @@ def execution(cfg, action, args):
             run([sys.executable, "infra/workstation/image/build.py", "--verify"])
             limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
             if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024 ** 3:
-                raise RuntimeError("SSD cannot reserve one complete configured overlay")
+                raise RuntimeError("execution disk cannot reserve one complete configured overlay")
 
 
 HISTORICAL = ("requirements", "build", "up", "doctor", "tunnels",
