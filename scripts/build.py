@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BUILDER_NAME = "gpt-trace-extractor-builder"
+BUILDER_NAME = "default"
 PROJECT_IMAGE_LABEL = "io.gpttrace.project=gpt-trace-extractor"
 PROFILES = ("runner",)
 
@@ -163,58 +163,12 @@ def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subpro
     )
 
 
-def builder_exists() -> bool:
-    proc = subprocess.run(
-        ["docker", "buildx", "inspect", BUILDER_NAME],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return proc.returncode == 0
-
-
 def ensure_builder(root: Path) -> None:
-    if not builder_exists():
-        config = root / "infra" / "buildkit" / "buildkitd.toml"
-        run(
-            [
-                "docker",
-                "buildx",
-                "create",
-                "--name",
-                BUILDER_NAME,
-                "--driver",
-                "docker-container",
-                "--buildkitd-config",
-                str(config),
-            ]
-        )
-
-    # The docker-container driver has to obtain the BuildKit image on first use.
-    # Bootstrap separately so transient registry/auth timeouts are retried here,
-    # rather than causing the whole Compose build to fail immediately.
-    delays = (0, 3, 8, 15)
-    last_rc = 1
-    for attempt, delay in enumerate(delays, 1):
-        if delay:
-            import time
-            time.sleep(delay)
-        print(
-            f"+ bootstrap builder {BUILDER_NAME} "
-            f"(attempt {attempt}/{len(delays)})",
-            flush=True,
-        )
-        proc = subprocess.run(
-            ["docker", "buildx", "inspect", BUILDER_NAME, "--bootstrap"],
-            text=True,
-        )
-        last_rc = proc.returncode
-        if last_rc == 0:
-            return
-
-    raise subprocess.CalledProcessError(
-        last_rc,
-        ["docker", "buildx", "inspect", BUILDER_NAME, "--bootstrap"],
-    )
+    """Require Docker Engine's built-in builder with isolated RUN networking."""
+    inspected = run(["docker", "buildx", "inspect", BUILDER_NAME], capture=True).stdout
+    driver = next((line for line in inspected.splitlines() if line.startswith("Driver:")), "")
+    if driver.split(":", 1)[-1].strip() != "docker":
+        raise RuntimeError("the default Buildx builder must use the Docker Engine driver")
 
 
 def prune_project_dangling_images() -> None:
@@ -242,68 +196,19 @@ def build(root: Path) -> None:
     # Safe after a successful build: old labeled project images become dangling.
     prune_project_dangling_images()
 
-    # GC is already configured on the dedicated builder. Trigger a sweep too.
-    # Prefer size-based pruning when supported by the installed buildx.
-    help_proc = subprocess.run(
-        ["docker", "buildx", "prune", "--help"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    if "--max-used-space" in help_proc.stdout:
-        run(
-            [
-                "docker",
-                "buildx",
-                "--builder",
-                BUILDER_NAME,
-                "prune",
-                "--force",
-                "--max-used-space",
-                "4GB",
-            ]
-        )
-    else:
-        # Compatibility fallback: still project-isolated because this is a
-        # dedicated builder, but age-based instead of strict size-based.
-        run(
-            [
-                "docker",
-                "buildx",
-                "--builder",
-                BUILDER_NAME,
-                "prune",
-                "--force",
-                "--filter",
-                "until=24h",
-            ]
-        )
+    # Docker Engine's BuildKit cache is shared across projects.
+    # Pruning it from this project could delete unrelated cached layers.
 
 
 def clean(root: Path) -> None:
     prune_project_dangling_images()
-    if builder_exists():
-        run(
-            [
-                "docker",
-                "buildx",
-                "--builder",
-                BUILDER_NAME,
-                "prune",
-                "--all",
-                "--force",
-            ]
-        )
-    else:
-        print(f"builder {BUILDER_NAME!r} does not exist; no project build cache to prune")
+    print("Docker Engine build cache is shared and was not pruned.")
 
 
 def status(root: Path) -> None:
-    print(f"builder={BUILDER_NAME}")
-    if builder_exists():
-        run(["docker", "buildx", "--builder", BUILDER_NAME, "du"])
-    else:
-        print("dedicated builder: not created yet")
+    ensure_builder(root)
+    print(f"builder={BUILDER_NAME} (Docker Engine driver)")
+    print("BuildKit cache is shared with other projects; no project-only cache usage is available.")
 
     print()
     print("labeled project images:")
