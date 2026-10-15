@@ -12,6 +12,10 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
+    # The bridge is dedicated to cloudflared; addresses remain Docker-managed.
     networks: [tunnel_egress]
 networks:
-  tunnel_egress: {}
+  tunnel_egress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-gpt-exec
