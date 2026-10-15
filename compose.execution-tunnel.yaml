@@ -12,17 +12,6 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
-    # Stable identity for Fossil's narrowly scoped Cloudflare/Mullvad bypass.
-    mac_address: "02:42:ac:1e:fb:02"
-    networks:
-      tunnel_egress:
-        ipv4_address: 172.30.251.2
+    networks: [tunnel_egress]
 networks:
-  tunnel_egress:
-    driver: bridge
-    driver_opts:
-      com.docker.network.bridge.name: br-gpt-exec
-    ipam:
-      config:
-        - subnet: 172.30.251.0/29
-          gateway: 172.30.251.1
+  tunnel_egress: {}

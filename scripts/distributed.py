@@ -474,7 +474,7 @@ def local_down(cfg):
             python = ROOT / ".venv-workstation-broker/bin/python"
             try:
                 raw = run([python, "-B", "-m", "workstation_broker.local_shutdown"],
-                          capture=True, timeout=900)
+                          capture=True, timeout=150)
             except subprocess.CalledProcessError as exc:
                 details = (exc.stderr or "").strip()
                 raise RuntimeError("execution-local offline cleanup failed: " +
@@ -725,9 +725,9 @@ def execution(cfg, action, args):
         install_unit(cfg)
         execution_environment(cfg)
         if (paths["base_image"].parent / "broker-drain.json").exists():
-            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=900)
+            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=150)
         run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + 130
         while True:
             try:
                 broker(cfg, "probe", local=True)
