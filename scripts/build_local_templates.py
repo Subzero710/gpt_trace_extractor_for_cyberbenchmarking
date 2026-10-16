@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,7 @@ def _migrate_known_legacy_stage(target_root, staged, identity):
         return False
     if not old.exists() or not (old / "common.qcow2").is_file():
         return False
+    _purge_apt_partial(old)
     _owned_tree(old)
     common = old / "common.qcow2"
     chain = json.loads(subprocess.check_output(["qemu-img", "info", "--backing-chain", "--output=json", str(common)], timeout=180))
@@ -143,6 +145,41 @@ def _migrate_known_legacy_stage(target_root, staged, identity):
     (staged / "FAILED.txt").unlink(missing_ok=True)
     print("adopted historical failed common disk; verified Conda work retained", flush=True)
     return True
+
+
+def _purge_apt_partial(stage):
+    """Remove ONLY the untrusted APT download scratch from a trusted stage.
+
+    libguestfs copies this guest-created directory with its original _apt UID;
+    unlike completed artifacts it is not a trusted build input. Never follow
+    symlinks, cross mounts, or relax the ownership rules for anything else.
+    """
+    stage = Path(stage)
+    package_dir = stage / "os" / "swe-gym-os"
+    for ancestor in (stage, stage / "os", package_dir):
+        if ancestor.is_symlink():
+            raise RuntimeError("unsafe APT scratch ancestor: " + str(ancestor))
+        if not ancestor.exists():
+            return
+        info = ancestor.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or
+                info.st_mode & 0o022 or ancestor.is_mount()):
+            raise RuntimeError("unsafe APT scratch ancestor: " + str(ancestor))
+    partial = package_dir / "partial"
+    if partial.is_symlink():
+        raise RuntimeError("unsafe APT scratch symlink: " + str(partial))
+    if not partial.exists():
+        return
+    if not partial.is_dir() or partial.is_mount():
+        raise RuntimeError("unsafe APT scratch directory: " + str(partial))
+    for item in partial.rglob("*"):
+        mode = item.lstat().st_mode
+        if (item.is_symlink() or item.is_mount() or
+                not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
+            raise RuntimeError("unsafe APT scratch entry: " + str(item))
+    # _apt ownership inside this specific disposable scratch directory is
+    # expected. No .deb, manifest, QCOW2, git mirror, or checkpoint is removed.
+    shutil.rmtree(partial)
 
 
 def guest_resources():
@@ -668,6 +705,7 @@ def build(args):
                 os_tools.verify_artifacts(os_folder, os_manifest)
                 print("reused verified OS package closure", flush=True)
             else:
+                _purge_apt_partial(staged)
                 _discard(resolver)
                 _discard(os_parent)
                 overlay(resolver, BASE)
@@ -684,6 +722,9 @@ def build(args):
                 resolver.unlink()
                 shutil.rmtree(os_payload)
 
+            # The OS closure is checked; APT's _apt-owned partial download
+            # directory is neither a dependency nor a reusable checkpoint.
+            _purge_apt_partial(staged)
             payload = staged / "swe-gym-build"
             _discard(payload)
             payload.mkdir()
@@ -996,8 +1037,15 @@ PY_GUEST
             # Unrecoverable failure: delete this exact private stage, not caches,
             # immutable generations or any unrelated running operation.
             if staged.exists():
-                _discard(staged)
-            print("unrecoverable build failed; disposable stage removed", file=sys.stderr)
+                try:
+                    _purge_apt_partial(staged)
+                    _discard(staged)
+                except Exception as cleanup_exc:
+                    # Cleanup must never conceal the actual build failure.
+                    print("unrecoverable build cleanup refused; original error retained: "
+                          + str(cleanup_exc), file=sys.stderr)
+                else:
+                    print("unrecoverable build failed; disposable stage removed", file=sys.stderr)
             raise
 
 
