@@ -151,7 +151,18 @@ test "$(findmnt -n -o FSTYPE /)" = ext4
 parent=$(lsblk -n -o PKNAME "$root_device")
 partition=$(lsblk -n -o PARTN "$root_device")
 test -n "$parent" && test -n "$partition"
-growpart "/dev/$parent" "$partition"
+if growth_output=$(growpart "/dev/$parent" "$partition" 2>&1); then
+    printf '%s\n' "$growth_output"
+else
+    growth_rc=$?
+    printf '%s\n' "$growth_output"
+    # growpart returns 1 for an already full-size partition (NOCHANGE).
+    # Any other error, including exit 1 without NOCHANGE, must still fail.
+    if [ "$growth_rc" -ne 1 ] || [[ "$growth_output" != NOCHANGE:* ]]; then
+        echo "growpart failed with exit status $growth_rc" >&2
+        exit "$growth_rc"
+    fi
+fi
 resize2fs "$root_device"
 '''
 
