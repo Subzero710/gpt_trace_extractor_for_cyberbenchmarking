@@ -37,6 +37,114 @@ GUEST_MEMORY_MIB = 12288
 GUEST_VCPUS = 4
 
 
+class RecoverableBuildError(RuntimeError):
+    """A transient failure with a verified, pinned build checkpoint on disk."""
+
+
+def _owned_tree(path):
+    """Reject links and non-root-owned files before recursively deleting a stage."""
+    path = Path(path)
+    for item in (path, *path.rglob("*")):
+        stat = item.lstat()
+        if item.is_symlink() or stat.st_uid != 0 or stat.st_mode & 0o022:
+            raise RuntimeError("unsafe build cleanup target, preserving: " + str(item))
+    return path
+
+
+def _discard(path):
+    if path.is_symlink():
+        raise RuntimeError("unsafe disposable path: " + str(path))
+    if path.is_dir():
+        shutil.rmtree(_owned_tree(path))
+    elif path.exists():
+        from gpt_trace_transport.local_templates import safe
+        safe(path)
+        path.unlink()
+
+
+def _transient_failure(exc):
+    value = str(exc)
+    return re.search(r"IncompleteRead|Connection broken|Connection reset|"
+                     r"ReadTimeout|ConnectTimeout|RemoteDisconnected|"
+                     r"Temporary failure in name resolution|HTTP (?:429|50[0234])|"
+                     r"ChunkedEncodingError|Max retries exceeded|timed out|"
+                     r"host free-space safety margin reached|No space left on device|"
+                     r"Resource temporarily unavailable",
+                     value, re.I) is not None
+
+
+# Exactly one historical operation can be migrated from the old UUID staging
+# layout. This is deliberately NOT a generic cross-recipe reuse mechanism.
+LEGACY_CONDA_OPERATION = "118a837a3c3684ab23303fe71e2926df5745862403131eda46e06bfe42a8f34b"
+LEGACY_BUILDER_SHA256 = "f1022ba1eaa2c67f8973ccd5440a2b0d7d5dd96967a8feec3b790e8c2a674be8"
+LEGACY_GUEST_SHA256 = "0d09722e1b14212ad5588b3d230d1658be8a54f456bf5aeb8c4dcca7b3935e1f"
+
+
+def _migrate_known_legacy_stage(target_root, staged, identity):
+    """Adopt only the proven failed Conda common disk from the reported incident."""
+    from gpt_trace_transport.local_templates import safe, canonical
+    old_root = BASE.parent / "preparations" / LEGACY_CONDA_OPERATION
+    state_path = old_root / "state.json"
+    log_path = old_root / "attempt-0001.log"
+    if not state_path.exists() or not log_path.exists():
+        return False
+    state = json.loads(safe(state_path).read_bytes())
+    prior = state.get("compatibility", {})
+    if (state.get("phase") != "failed" or state.get("operation_id") != LEGACY_CONDA_OPERATION
+            or "IncompleteRead" not in str(state.get("error"))
+            or hashlib.sha256(canonical(prior)).hexdigest() != LEGACY_CONDA_OPERATION
+            or prior.get("builder_sha256") != LEGACY_BUILDER_SHA256
+            or prior.get("runtime_sources", {}).get("guest_runtime.py") != LEGACY_GUEST_SHA256):
+        return False
+    expected = identity["compatibility"]
+    if ({k: v for k, v in prior.items() if k not in {"builder_sha256", "runtime_sources"}}
+            != {k: v for k, v in expected.items() if k not in {"builder_sha256", "runtime_sources"}}):
+        return False
+    if ({k: v for k, v in prior["runtime_sources"].items() if k != "guest_runtime.py"}
+            != {k: v for k, v in expected["runtime_sources"].items() if k != "guest_runtime.py"}):
+        return False
+    log = safe(log_path).read_text(errors="replace")
+    markers = re.findall(r"build stopped; preserved state:\s+([^\n\r]+)", log)
+    if not markers:
+        return False
+    old = Path(markers[-1].strip())
+    if old.parent != target_root or not re.fullmatch(r"\.build-[0-9a-f]{32}", old.name):
+        return False
+    if not old.exists() or not (old / "common.qcow2").is_file():
+        return False
+    _owned_tree(old)
+    common = old / "common.qcow2"
+    chain = json.loads(subprocess.check_output(["qemu-img", "info", "--backing-chain", "--output=json", str(common)], timeout=180))
+    if (len(chain) != 2 or chain[0].get("format") != "qcow2" or
+            Path(chain[0]["filename"]).resolve() != common.resolve() or
+            Path(chain[1]["filename"]).resolve() != BASE.resolve()):
+        return False
+    subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
+    def old_guest(path):
+        return subprocess.check_output(["virt-cat", "-a", str(common), path], timeout=180)
+    if hashlib.sha256(old_guest("/opt/swe-gym-lite/runtime.py")).hexdigest() != LEGACY_GUEST_SHA256:
+        return False
+    if old_guest("/etc/gpt-trace-image-build-failed").strip() != b"1":
+        return False
+    if not old_guest("/opt/miniconda3/bin/conda"):
+        return False
+    inputs = json.loads(safe(old / "build-inputs/inputs.json").read_bytes())
+    if (inputs.get("pins") != expected["pins"] or
+            json.loads(old_guest("/opt/swe-gym-lite/build-environments.json")) != inputs.get("environments")):
+        return False
+    # One atomic move: old failed stage no longer wastes space, and all verified
+    # successful Conda environments remain inside the same QCOW2 overlay.
+    os.rename(old, staged)
+    atomic_json(staged / "build-identity.json", identity)
+    marker = staged / ".checkpoints"
+    marker.mkdir(mode=0o700, exist_ok=True)
+    atomic_json(marker / "legacy-adopted.json", {"operation_id": LEGACY_CONDA_OPERATION,
+        "guest_sha256": LEGACY_GUEST_SHA256})
+    (staged / "FAILED.txt").unlink(missing_ok=True)
+    print("adopted historical failed common disk; verified Conda work retained", flush=True)
+    return True
+
+
 def guest_resources():
     return GUEST_MEMORY_MIB, GUEST_VCPUS
 
@@ -209,11 +317,18 @@ finish() {
     systemctl poweroff --no-block
 }
 trap finish EXIT
-test ! -e "$SWAP_FILE" && test ! -L "$SWAP_FILE"
-# Fixed disk-backed swap for Conda solves, not host or guest RAM.
-fallocate -l 8G "$SWAP_FILE"
-chmod 600 "$SWAP_FILE"
-mkswap "$SWAP_FILE"
+test ! -L "$SWAP_FILE"
+# A failed boot leaves this exact private swap file. Reuse it on a verified
+# checkpoint reboot without allocating a second 8-GiB file.
+if test -e "$SWAP_FILE"; then
+    test -f "$SWAP_FILE"
+    test "$(stat -c %u:%a "$SWAP_FILE")" = "0:600"
+    test "$(stat -c %s "$SWAP_FILE")" = "8589934592"
+else
+    fallocate -l 8G "$SWAP_FILE"
+    chmod 600 "$SWAP_FILE"
+    mkswap "$SWAP_FILE"
+fi
 swapon "$SWAP_FILE"
 echo 'temporary guest build swap enabled: 8 GiB'
 """ + body + "\n"
@@ -353,8 +468,55 @@ def build(args):
         raise RuntimeError("untrusted full-mirror host cache")
     with (target_root / "build.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        staged = target_root / (".build-" + uuid.uuid4().hex)
-        staged.mkdir(mode=0o755)
+        staged = target_root / (".build-" + args.operation_id)
+        identity = {"schema": 1, "operation_id": args.operation_id,
+                    "compatibility": job["compatibility"]}
+        if staged.exists():
+            from gpt_trace_transport.local_templates import safe
+            safe(staged, directory=True)
+            previous = staged / "build-identity.json"
+            if json.loads(safe(previous, immutable=True).read_text()) != identity:
+                raise RuntimeError("staged build identity does not match this exact operation")
+            if (staged / "local-validation.json").exists():
+                # An interrupted seal/atomic rename is recoverable without any
+                # rebuild. Validate every immutable byte before publication.
+                from gpt_trace_transport.local_templates import (verify_manifest,
+                    verify_local_validation, activate)
+                manifest = verify_manifest(staged, job["compatibility"], source_root=ROOT)
+                verify_local_validation(staged, manifest, expected=job["compatibility"])
+                generation = manifest["generation"]
+                generations = target_root / "generations"
+                generations.mkdir(mode=0o755, exist_ok=True)
+                final = generations / generation
+                if final.exists():
+                    raise RuntimeError("sealed generation already exists; refusing replacement")
+                os.rename(staged, final)
+                from workstation_broker.preparation import record_built_generation
+                from workstation_broker.templates import TemplateRegistry
+                record_built_generation(args.operation_id, generation)
+                def factory(root, base):
+                    return TemplateRegistry(root, base, lambda p: json.loads(
+                        subprocess.check_output(["qemu-img", "info", "--output=json", str(p)], timeout=60)),
+                        source_root=ROOT)
+                activate(TEMPLATES, BASE, generation, factory, ROOT)
+                return final
+            print("resuming verified host preparation " + args.operation_id, flush=True)
+        else:
+            if not _migrate_known_legacy_stage(target_root, staged, identity):
+                staged.mkdir(mode=0o755)
+                atomic_json(staged / "build-identity.json", identity)
+        checkpoints = staged / ".checkpoints"
+        checkpoints.mkdir(mode=0o700, exist_ok=True)
+        from gpt_trace_transport.local_templates import safe
+        safe(checkpoints, directory=True)
+
+        def read_checkpoint(name):
+            path = checkpoints / name
+            return json.loads(safe(path, immutable=True).read_text()) if path.exists() else None
+
+        def write_checkpoint(name, data):
+            atomic_json(checkpoints / name, data)
+
         log = staged / "host-build.log"
         margin = args.free_space_gib * 1024**3
         free_space(staged, margin)
@@ -444,76 +606,120 @@ def build(args):
 
         try:
             inputs_root = staged / "build-inputs"
-            inputs_root.mkdir()
+            inputs_root.mkdir(exist_ok=True)
             # execution host has no control-plane deployment,
             # credentials, Compose services or persistent campaign volumes.
             # Build only a source-fetch image and bind its private build cache.
             image = "gpt-trace-lite-local-source:" + digest(PINS)[:32]
-            cmd("docker", "build", "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
-                "-f", "apps/runner/Dockerfile", ".", cwd=ROOT, timeout=14400)
-            source_cache = cache_root / "dataset"
-            source_cache.mkdir(mode=0o700, exist_ok=True)
-            cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", "bridge", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
-                "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
-                "--mount", "type=bind,source=" + str(source_cache) + ",target=/source-cache",
-                image, "-m", "gpt_trace_runner.superbench.adapters.swe_gym.source",
-                "--export", "/build-inputs", "--source-root", "/source-cache", cwd=ROOT)
+            if not (inputs_root / "inputs.json").is_file():
+                cmd("docker", "build", "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
+                    "-f", "apps/runner/Dockerfile", ".", cwd=ROOT, timeout=14400)
+                source_cache = cache_root / "dataset"
+                source_cache.mkdir(mode=0o700, exist_ok=True)
+                cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", "bridge", "--cap-drop", "ALL",
+                    "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
+                    "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
+                    "--mount", "type=bind,source=" + str(source_cache) + ",target=/source-cache",
+                    image, "-m", "gpt_trace_runner.superbench.adapters.swe_gym.source",
+                    "--export", "/build-inputs", "--source-root", "/source-cache", cwd=ROOT)
             inputs = json.loads((inputs_root / "inputs.json").read_text())
             pins = json.loads(PINS.read_text())
             if inputs["pins"] != pins or pins["recipe_version"] != 2 or pins["schema_version"] != 2:
                 raise RuntimeError("host/fetch container recipe differs; rebuild the runner image")
             repos_set = sorted({item["repo"] for item in inputs["tasks"].values()})
             for repo in repos_set:
+                mirror = cache_root / (repo.replace("/", "_") + ".git")
+                bases = [row["base_commit"] for row in inputs["tasks"].values() if row["repo"] == repo]
+                if mirror.is_dir() and not mirror.is_symlink() and mirror.stat().st_uid == 0 and all(
+                        subprocess.run(["git", "--git-dir", str(mirror), "cat-file", "-e", sha + "^{commit}"],
+                            capture_output=True, timeout=60).returncode == 0 for sha in bases):
+                    continue
                 mirror_for("https://github.com/" + repo + ".git", repo.replace("/", "_") + ".git")
             verify_sources(inputs, cache_root)
             source_folder, cache_folder, audit = staged / "sources", staged / "setup-caches", staged / "audit"
-            for folder in (source_folder, cache_folder, audit): folder.mkdir()
+            for folder in (source_folder, cache_folder, audit): folder.mkdir(exist_ok=True)
             artifacts, mapping = {}, {}
             for logical, item in sorted(inputs["tasks"].items()):
                 free_space(staged, margin)
                 key = tools.artifact_id("task_source", logical)
                 output = source_folder / (key + ".tar.gz")
-                record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
-                                              submodule_mirror=submodule_mirror)
+                record = read_checkpoint("source-" + key + ".json")
+                if record is not None:
+                    tools.validate_artifact(item, output, record)
+                    print("reused verified source: " + logical, flush=True)
+                else:
+                    _discard(output)
+                    record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
+                                                  submodule_mirror=submodule_mirror)
+                    output.chmod(0o444)
+                    tools.validate_artifact(item, output, record)
+                    write_checkpoint("source-" + key + ".json", record)
                 artifacts[key] = {**record, "path": output.relative_to(staged).as_posix()}
-                output.chmod(0o444)
                 mapping[logical] = {"template_id": item["template_id"], "task_source": key,
                                     "setup_cache": tools.artifact_id("setup_cache", logical)}
 
             # Golden provenance exposes kali-last-snapshot, a mutable alias,
             # not an immutable snapshot ID. Resolve in an expendable VM instead.
             resolver = staged / "os-resolver.qcow2"
-            overlay(resolver, BASE)
-            os_payload = staged / "swe-gym-os-helper"
-            os_payload.mkdir()
-            shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
-            provision(resolver, "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy\n"
-                "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve']('/opt/swe-gym-os')\nPY_GUEST\n", os_payload, network=True)
             os_parent = staged / "os"
-            os_parent.mkdir()
-            cmd("virt-copy-out", "-a", str(resolver), "/opt/swe-gym-os", str(os_parent))
             os_folder = os_parent / "swe-gym-os"
-            os_manifest = json.loads((os_folder / "manifest.json").read_text())
-            os_tools.verify_artifacts(os_folder, os_manifest)
-            resolver.unlink()  # The local generation contains exact debs, never resolver mutations.
-            shutil.rmtree(os_payload)
+            if (os_folder / "manifest.json").is_file():
+                os_manifest = json.loads((os_folder / "manifest.json").read_text())
+                os_tools.verify_artifacts(os_folder, os_manifest)
+                print("reused verified OS package closure", flush=True)
+            else:
+                _discard(resolver)
+                _discard(os_parent)
+                overlay(resolver, BASE)
+                os_payload = staged / "swe-gym-os-helper"
+                _discard(os_payload)
+                os_payload.mkdir()
+                shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
+                provision(resolver, "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy\n"
+                    "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve']('/opt/swe-gym-os')\nPY_GUEST\n", os_payload, network=True)
+                os_parent.mkdir()
+                cmd("virt-copy-out", "-a", str(resolver), "/opt/swe-gym-os", str(os_parent))
+                os_manifest = json.loads((os_folder / "manifest.json").read_text())
+                os_tools.verify_artifacts(os_folder, os_manifest)
+                resolver.unlink()
+                shutil.rmtree(os_payload)
 
             payload = staged / "swe-gym-build"
+            _discard(payload)
             payload.mkdir()
             for name in ("runtime.py", "task_sources.py", "os_packages.py"):
                 shutil.copyfile(GUEST if name == "runtime.py" else GUEST.with_name(name), payload / name)
             (payload / "environments.json").write_text(json.dumps({"environments": inputs["environments"]}, sort_keys=True))
             shutil.copytree(os_folder, payload / "os-artifacts")
             installer = payload / "miniconda.sh"
-            with urllib.request.urlopen("https://repo.anaconda.com/miniconda/" + MINICONDA, timeout=120) as response, installer.open("wb") as output:
-                while chunk := response.read(1048576):
-                    output.write(chunk)
-                    free_space(staged, margin)
-            if digest(installer) != MINICONDA_SHA256:
-                raise RuntimeError("pinned Miniconda installer digest mismatch")
+            cache_installer = cache_root / ("miniconda-" + MINICONDA_SHA256 + ".sh")
+            if cache_installer.exists():
+                from gpt_trace_transport.local_templates import safe
+                safe(cache_installer)
+                if digest(cache_installer) != MINICONDA_SHA256:
+                    raise RuntimeError("cached Miniconda digest mismatch")
+            else:
+                for attempt in range(1, 11):
+                    partial = cache_installer.with_suffix(".part")
+                    _discard(partial)
+                    try:
+                        with urllib.request.urlopen("https://repo.anaconda.com/miniconda/" + MINICONDA, timeout=180) as response, partial.open("wb") as output:
+                            while chunk := response.read(1048576):
+                                output.write(chunk)
+                                free_space(staged, margin)
+                        if digest(partial) != MINICONDA_SHA256:
+                            raise RuntimeError("pinned Miniconda installer digest mismatch")
+                        partial.chmod(0o444)
+                        os.replace(partial, cache_installer)
+                        break
+                    except (OSError, TimeoutError) as exc:
+                        if attempt == 10: raise RecoverableBuildError("Miniconda download interrupted") from exc
+                        time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
+            shutil.copyfile(cache_installer, installer)
             common = staged / "common.qcow2"
-            overlay(common, BASE)
+            initial_common = not common.exists()
+            if initial_common:
+                overlay(common, BASE)
             boot = r'''
 mkdir -p /opt/swe-gym-lite
 cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym-build/os_packages.py /opt/swe-gym-lite/
@@ -535,7 +741,53 @@ module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json
 json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
 PY_GUEST
 '''
-            provision(common, boot, payload, network=True)
+            boot_resume = r'''
+/usr/bin/python3 - <<'PY_GUEST'
+import runpy,json
+module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
+module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
+json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
+PY_GUEST
+'''
+            proof = subprocess.run(["virt-cat", "-a", str(common), "/etc/gpt-trace-image-build-complete"],
+                                   capture_output=True, timeout=180, check=False)
+            if proof.returncode == 0 and proof.stdout.strip() == b"ok":
+                print("reused verified complete common QCOW2", flush=True)
+            else:
+                if not initial_common:
+                    # Only a previously installed Miniconda can be resumed safely.
+                    has_conda = subprocess.run(["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                              timeout=180).returncode == 0
+                    if has_conda:
+                        source = subprocess.check_output(["virt-cat", "-a", str(common),
+                            "/opt/swe-gym-lite/runtime.py"], timeout=180)
+                        installed = hashlib.sha256(source).hexdigest()
+                        current = digest(GUEST)
+                        if installed != current:
+                            marker = read_checkpoint("legacy-adopted.json")
+                            if (installed != LEGACY_GUEST_SHA256 or marker != {
+                                    "operation_id": LEGACY_CONDA_OPERATION,
+                                    "guest_sha256": LEGACY_GUEST_SHA256}):
+                                raise RuntimeError("unknown guest runtime in unfinished common disk")
+                            cmd("virt-customize", "--no-network", "-a", str(common),
+                                "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
+                            updated = subprocess.check_output(["virt-cat", "-a", str(common),
+                                "/opt/swe-gym-lite/runtime.py"], timeout=180)
+                            if hashlib.sha256(updated).hexdigest() != current:
+                                raise RuntimeError("legacy guest runtime migration did not verify")
+                    if not has_conda:
+                        _discard(common)
+                        overlay(common, BASE)
+                else:
+                    has_conda = False
+                try:
+                    provision(common, boot_resume if has_conda else boot,
+                              None if has_conda else payload, network=True)
+                except RuntimeError as exc:
+                    if _transient_failure(exc):
+                        raise RecoverableBuildError("transient guest download; common checkpoint retained: " + str(exc)) from exc
+                    raise
             shutil.rmtree(payload)
             common.chmod(0o444)
             environments = {key: guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json") for key in inputs["environments"]}
@@ -550,7 +802,30 @@ PY_GUEST
             for logical, item in sorted(inputs["tasks"].items()):
                 free_space(staged, margin)
                 source_record = artifacts[mapping[logical]["task_source"]]
+                ckpt_name = "task-" + tools.artifact_id("task_source", logical) + ".json"
+                done = read_checkpoint(ckpt_name)
+                if done is not None:
+                    cache_record = done["cache_record"]
+                    archive = staged / cache_record["path"]
+                    if (done.get("logical_task_id") != logical or
+                            cache_record["kind"] != "setup_cache" or
+                            cache_record["source_identity"] != source_record["source_identity"] or
+                            archive.is_symlink() or not archive.is_file() or
+                            digest(archive) != cache_record["sha256"] or
+                            archive.stat().st_size != cache_record["size"] or
+                            done["offline"] != {"base_commit": item["base_commit"],
+                                                "env_hash": item["env_hash"], "offline": True}):
+                        raise RuntimeError("verified task checkpoint changed; refusing unsafe reuse")
+                    artifacts[mapping[logical]["setup_cache"]] = cache_record
+                    vcs_provenance[logical] = done["vcs"]
+                    task_inventories[logical] = done["inventories"]
+                    offline_proofs[logical] = done["offline"]
+                    print("reused verified task: " + logical, flush=True)
+                    continue
                 incoming = staged / "swe-gym-task"
+                _discard(incoming)
+                _discard(staged / "task-warm.qcow2")
+                _discard(staged / "task-replay.qcow2")
                 incoming.mkdir()
                 (incoming / "item.json").write_text(json.dumps(item))
                 shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
@@ -584,6 +859,9 @@ PY_GUEST
                 offline_proofs[logical] = guest_json(replay, "/opt/swe-gym-task/offline-proof.json")
                 if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
                     raise RuntimeError("fresh task replay proof differs from exact base/environment")
+                write_checkpoint(ckpt_name, {"logical_task_id": logical,
+                    "cache_record": cache_record, "vcs": vcs_provenance[logical],
+                    "inventories": task_inventories[logical], "offline": offline_proofs[logical]})
                 # Only after successful fresh replay may expendable disks go away.
                 warm.unlink()
                 replay.unlink()
@@ -593,17 +871,27 @@ PY_GUEST
             atomic_json(audit / "offline-setups.json", offline_proofs)
 
             repos = staged / "repos"
-            repos.mkdir()
+            repos.mkdir(exist_ok=True)
             templates, isolations = {}, {"common": common_validation}
             base_record = {"path": str(BASE), "sha256": digest(BASE)}
             common_record = {"path": "common.qcow2", "sha256": digest(common)}
             for repo in repos_set:
                 image = repos / (repo.replace("/", "_") + ".qcow2")
-                overlay(image, common)
-                boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
-                boot += "module['build_repo']({}," + repr(repo) + ")\n"
-                boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\nPY_GUEST\n"
-                provision(image, boot, network=False)
+                ready = False
+                if image.exists():
+                    proof = subprocess.run(["virt-cat", "-a", str(image),
+                        "/etc/gpt-trace-image-build-complete"], capture_output=True, timeout=180)
+                    ready = proof.returncode == 0 and proof.stdout.strip() == b"ok"
+                if ready:
+                    subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=3600)
+                    print("reused verified repository image " + repo, flush=True)
+                else:
+                    _discard(image)
+                    overlay(image, common)
+                    boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
+                    boot += "module['build_repo']({}," + repr(repo) + ")\n"
+                    boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\nPY_GUEST\n"
+                    provision(image, boot, network=False)
                 image.chmod(0o444)
                 isolations[repo] = guest_json(image, "/opt/swe-gym-lite/isolation-validation.json")
                 if isolations[repo] != common_validation:
@@ -646,6 +934,7 @@ PY_GUEST
             atomic_json(staged / "resolved-inputs.json", resolved)
             shutil.rmtree(inputs_root)
             (staged / 'firstboot.sh').unlink(missing_ok=True)
+            shutil.rmtree(checkpoints)
             summary = {"common_physical_bytes": common.stat().st_blocks * 512,
                        "repo_templates_physical_bytes": physical_bytes(repos.glob('*.qcow2')),
                        "task_sources_physical_bytes": physical_bytes(source_folder.glob('*.tar.gz')),
@@ -697,13 +986,18 @@ PY_GUEST
             print(json.dumps({"generation": generation, "invariants": manifest['invariants'], "allocation": summary}, indent=2))
             return final
         except BaseException as exc:
-            # Preserve failed stages, images, exact debs and logs. Never activate
-            # a new registry, reuse an unsafe v1 build, or clean diagnostics here.
-            if staged.exists() and staged.stat().st_mode & 0o200:
-                (staged / 'FAILED.txt').write_text(type(exc).__name__ + ': ' + str(exc) + '\n')
-            else:
-                (target_root / (staged.name + '.failed.txt')).write_text(str(exc) + '\n')
-            print('build stopped; preserved state:', staged, file=sys.stderr)
+            if isinstance(exc, RecoverableBuildError) or _transient_failure(exc):
+                # The worker records an interrupted/retryable state. Preserve only
+                # this operation's pinned checkpoint, never publish a partial image.
+                print("recoverable interruption; staged checkpoints retained: " + str(staged), file=sys.stderr)
+                if isinstance(exc, RecoverableBuildError):
+                    raise
+                raise RecoverableBuildError(str(exc)) from exc
+            # Unrecoverable failure: delete this exact private stage, not caches,
+            # immutable generations or any unrelated running operation.
+            if staged.exists():
+                _discard(staged)
+            print("unrecoverable build failed; disposable stage removed", file=sys.stderr)
             raise
 
 

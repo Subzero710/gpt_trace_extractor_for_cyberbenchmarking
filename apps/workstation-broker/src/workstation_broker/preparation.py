@@ -272,7 +272,7 @@ class PreparationManager:
                 previous = self._reconcile(previous)
                 if previous["phase"] == "ready":
                     previous = self._verify_ready(previous)
-                if previous["phase"] == "ready" or previous["phase"] not in TERMINAL:
+                if previous["phase"] in {"ready", "failed"} or previous["phase"] not in TERMINAL:
                     return self._public(previous)
                 if not payload["retry"]:
                     return self._public(previous)
@@ -548,7 +548,10 @@ def worker(operation_id, slot_fd):
             "verified_signature": signature, "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25}}, "error": None})
     except BaseException as exc:
         state = manager._read(operation_id)
-        manager._write({**state, "phase": "failed", "result": None,
+        # Only a recoverable build keeps its owned staging checkpoint; a
+        # permanent failure has already removed its disposable stage.
+        recoverable = type(exc).__name__ == "RecoverableBuildError"
+        manager._write({**state, "phase": "interrupted" if recoverable else "failed", "result": None,
             "error": type(exc).__name__ + ": " + str(exc)[:3000]})
         raise
     finally: os.close(slot_fd)

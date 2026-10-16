@@ -322,11 +322,37 @@ def restore(cfg, directory):
 
 
 
+def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=3600):
+    """Retry read-only requests across tunnel outages; never replay mutations."""
+    started = time.monotonic()
+    retry = 0
+    while True:
+        try:
+            result = broker(cfg, action, payload, timeout=120)
+        except (TransportFailure, RemoteFailure) as exc:
+            if isinstance(exc, IdentityFailure):
+                raise
+            if isinstance(exc, RemoteFailure) and getattr(exc, "status", None) not in {
+                    502, 503, 504, 520, 521, 522, 523, 524}:
+                raise
+            if time.monotonic() - started >= outage_seconds:
+                raise RuntimeError("broker link unavailable for one hour; remote build outcome unconfirmed; "
+                                   "rerun fetch to rediscover the durable operation") from exc
+            if retry == 0:
+                print("broker connection interrupted; reconnecting without restarting any VM", flush=True)
+            time.sleep(min(30, 2 ** min(retry, 5)))
+            retry += 1
+        else:
+            if retry:
+                print("broker reconnected; resumed preparation monitoring", flush=True)
+            return result
+
+
 def preparation_fetch(cfg):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
     from gpt_trace_transport.local_templates import source_contract, atomic_json
-    broker(cfg, "probe", timeout=60)
-    identified = broker(cfg, "template_preparation_probe", {"source_contract": source_contract(ROOT)}, timeout=120)
+    broker_read_resilient(cfg, "probe")
+    identified = broker_read_resilient(cfg, "template_preparation_probe", {"source_contract": source_contract(ROOT)})
     operation_id = identified.get("operation_id")
     deployment = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
     if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
@@ -348,7 +374,7 @@ def preparation_fetch(cfg):
     last_phase = None
     try:
         while True:
-            status = broker(cfg, "template_preparation_status", {"operation_id": operation_id}, timeout=60)
+            status = broker_read_resilient(cfg, "template_preparation_status", {"operation_id": operation_id})
             if status.get("operation_id") != operation_id or status.get("deployment") != deployment:
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
@@ -367,14 +393,26 @@ def preparation_fetch(cfg):
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
                 print("SWE-Gym Lite ready on execution host: " + result["generation"], flush=True)
                 return result
-            if phase in {"not_started", "failed", "interrupted", "canceled"}:
+            if phase == "failed":
+                raise RuntimeError("permanent preparation failure: " + str(status.get("error")))
+            if phase in {"not_started", "interrupted", "canceled"}:
                 if started:
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
                 # A new explicit fetch may retry a previously proved-dead job.
                 # This command NEVER repeats a start after a lost response.
                 started = True
-                broker(cfg, "prepare_templates", {"operation_id": operation_id,
-                    "compatibility": identified["compatibility"], "retry": phase != "not_started"}, timeout=60)
+                # Start exactly once. A lost response triggers read-only
+                # reconciliation instead of a duplicate start request.
+                try:
+                    broker(cfg, "prepare_templates", {"operation_id": operation_id,
+                        "compatibility": identified["compatibility"], "retry": phase != "not_started"}, timeout=60)
+                except (TransportFailure, RemoteFailure) as exc:
+                    if isinstance(exc, IdentityFailure):
+                        raise
+                    if isinstance(exc, RemoteFailure) and getattr(exc, "status", None) not in {
+                            502, 503, 504, 520, 521, 522, 523, 524}:
+                        raise
+                    print("preparation start outcome unconfirmed; rediscovering without duplicate start", flush=True)
             elif phase not in {"starting", "running", "validating"}:
                 raise RuntimeError("unknown preparation phase: " + str(phase))
             time.sleep(2)

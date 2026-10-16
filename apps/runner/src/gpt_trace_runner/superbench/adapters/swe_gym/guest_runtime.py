@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import runpy
 import types
 from pathlib import Path
@@ -118,6 +119,9 @@ def build_limits(env=None):
     # The pinned Miniconda already ships libmamba. Strict channel priority
     # avoids exploring conflicting defaults/conda-forge variants.
     result.update(CONDA_SOLVER="libmamba", CONDA_CHANNEL_PRIORITY="strict",
+                  CONDA_REMOTE_MAX_RETRIES="10", CONDA_REMOTE_BACKOFF_FACTOR="2",
+                  CONDA_REMOTE_CONNECT_TIMEOUT_SECS="30", CONDA_REMOTE_READ_TIMEOUT_SECS="180",
+                  PIP_RETRIES="10", PIP_TIMEOUT="180",
                   MAKEFLAGS="-j2", CMAKE_BUILD_PARALLEL_LEVEL="2",
                   MAX_JOBS="2", npm_config_jobs="2")
     return result
@@ -477,16 +481,61 @@ def build_common(inputs):
         raise RuntimeError("pinned Miniconda installer did not complete")
     for env_hash, record in sorted(inputs["environments"].items()):
         commands, recipe_proof = optimized_build_script(env_hash, record)
+        prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
+        inventory_file = ROOT / "environments" / (env_hash + ".json")
+        recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
+        expected_proof = json.dumps(recipe_proof, sort_keys=True)
+        # A successful environment is a durable checkpoint inside common.qcow2.
+        # Never trust the mere existence of its directory as proof of completion.
+        if inventory_file.exists() and recipe_file.exists() and prefix.is_dir():
+            if (recipe_file.read_text() == expected_proof and
+                    json.loads(inventory_file.read_text()) == env_inventory(prefix)):
+                print("SWE-Gym verified environment checkpoint: " + env_hash, flush=True)
+                continue
+        # Incomplete or unverifiable environments are discarded individually.
+        # Valid environments and the verified Conda package download cache survive.
+        if prefix.is_symlink() or inventory_file.is_symlink() or recipe_file.is_symlink():
+            raise RuntimeError("untrusted Conda checkpoint path")
+        inventory_file.unlink(missing_ok=True)
+        recipe_file.unlink(missing_ok=True)
+        if prefix.exists():
+            shutil.rmtree(prefix)
         print("SWE-Gym environment " + env_hash + ": python=" +
               str(recipe_proof["single_solve_python"] or "upstream") +
               ", solver=libmamba, channels=strict", flush=True)
-        (ROOT / "environments" / (env_hash + ".recipe.json")).write_text(
-            json.dumps(recipe_proof, sort_keys=True))
-        shell(commands, cwd=ROOT, env=build_limits({**os.environ,
-              "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]}),
-              log=ROOT / "logs" / (env_hash + ".build.log"))
-        prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
-        (ROOT / "environments" / (env_hash + ".json")).write_text(json.dumps(env_inventory(prefix), sort_keys=True))
+        env = build_limits({**os.environ, "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]})
+        log = ROOT / "logs" / (env_hash + ".build.log")
+        for attempt in range(1, 11):
+            try:
+                shell(commands, cwd=ROOT, env=env, log=log)
+                break
+            except RuntimeError as exc:
+                # Retry only explicitly recognized transient transport failures;
+                # do not hide missing packages, bad hashes or solver conflicts.
+                transient = re.search(
+                    r"IncompleteRead|Connection broken|Connection reset|ReadTimeout|"
+                    r"ConnectTimeout|Timed out|ConnectionError|RemoteDisconnected|"
+                    r"Temporary failure in name resolution|HTTP (?:429|50[0234])|"
+                    r"SSLZeroReturnError|ChunkedEncodingError|Max retries exceeded",
+                    str(exc), re.I)
+                if not transient or attempt == 10:
+                    raise
+                print(f"SWE-Gym transient download error for {env_hash}; "
+                      f"retry {attempt}/9 after backoff", flush=True)
+                if prefix.is_symlink():
+                    raise RuntimeError("untrusted partial Conda prefix") from exc
+                if prefix.exists():
+                    shutil.rmtree(prefix)
+                time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
+        # Persist proof only after all official commands and the exact installed
+        # package inventory succeeded. Atomic rename avoids torn JSON checkpoints.
+        data = json.dumps(env_inventory(prefix), sort_keys=True)
+        temporary = inventory_file.with_suffix(".json.tmp")
+        temporary.write_text(data)
+        os.replace(temporary, inventory_file)
+        temporary = recipe_file.with_suffix(".json.tmp")
+        temporary.write_text(expected_proof)
+        os.replace(temporary, recipe_file)
     # Task setup is performed only in disposable builder overlays. The common
     # image has never contained benchmark checkouts or source archives.
     caches = {"conda": file_inventory(Path("/opt/miniconda3/pkgs")),
