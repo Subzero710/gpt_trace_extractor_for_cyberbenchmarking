@@ -8,9 +8,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -27,6 +29,50 @@ MINICONDA_SHA256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d
 VIRTUAL_GIB = 512
 FREE_SPACE_GIB = 64
 BUILD_TIMEOUT_HOURS = 96
+
+
+# Fossil SWE-Gym Lite build guest: 12 GiB RAM, 4 vCPUs, sequential jobs.
+# The host has 15 GiB of usable RAM; do not launch a second concurrent VM.
+GUEST_MEMORY_MIB = 12288
+GUEST_VCPUS = 4
+
+
+def guest_resources():
+    return GUEST_MEMORY_MIB, GUEST_VCPUS
+
+
+def guest_failure_diagnostics(image):
+    """Read-only recovery of the guest's firstboot failure, including kernel OOM."""
+    messages = []
+    for path in ("/etc/gpt-trace-image-build-failed", "/var/log/swe-gym-lite-builder.log"):
+        try:
+            result = subprocess.run(
+                ["virt-cat", "-a", str(image), path], capture_output=True,
+                timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            messages.append(f"{path}: diagnostic unavailable: {exc}")
+            continue
+        if result.returncode == 0:
+            messages.append(f"{path}:\n" + result.stdout.decode(errors="replace")[-6000:])
+    try:
+        with tempfile.TemporaryDirectory(prefix="gpt-trace-guest-journal-") as directory:
+            extracted = subprocess.run(
+                ["virt-copy-out", "-a", str(image), "/var/log/journal", directory],
+                capture_output=True, timeout=180, check=False)
+            if extracted.returncode == 0:
+                journal = subprocess.run(
+                    ["journalctl", "--directory", str(Path(directory) / "journal"),
+                     "--no-pager", "-o", "short-iso", "-n", "2000"],
+                    capture_output=True, timeout=60, check=False)
+                if journal.returncode == 0:
+                    lines = journal.stdout.decode(errors="replace").splitlines()
+                    relevant = [line for line in lines if re.search(
+                        r"oom|out of memory|killed process|failed with result|guestfs-firstboot", line, re.I)]
+                    if relevant:
+                        messages.append("guest system journal:\n" + "\n".join(relevant[-60:]))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        messages.append(f"guest journal unavailable: {exc}")
+    return "\n".join(messages)[-12000:] or "no readable guest diagnostics"
 
 
 def digest(path):
@@ -129,18 +175,48 @@ def verify_sources(inputs, mirrors):
 
 
 def firstboot(body):
+    # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM
+    # while QEMU itself stays at 12288 MiB RAM / 4 vCPUs. A successfully
+    # published template has no swap file and has been trimmed.
     return """#!/bin/bash
 set -eo pipefail
 exec >> /var/log/swe-gym-lite-builder.log 2>&1
 rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
+# Builder only: no persistent systemd disable or mask.
+systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
+SWAP_FILE=/root/.gpt-trace-swe-gym-build.swap
 finish() {
     rc=$?
-    if [ "$rc" -ne 0 ]; then echo "$rc" > /etc/gpt-trace-image-build-failed; fi
+    trap - EXIT
+    if [ "$rc" -eq 0 ]; then
+        if ! swapoff "$SWAP_FILE"; then
+            echo 'failed to disable temporary guest swap'
+            rc=1
+        elif ! rm -f "$SWAP_FILE"; then
+            echo 'failed to remove temporary guest swap'
+            rc=1
+        elif ! fstrim -av; then
+            echo 'failed to reclaim temporary guest swap blocks'
+            rc=1
+        fi
+    fi
+    if [ "$rc" -eq 0 ]; then
+        echo ok > /etc/gpt-trace-image-build-complete
+    else
+        echo "$rc" > /etc/gpt-trace-image-build-failed
+    fi
     sync
     systemctl poweroff --no-block
 }
 trap finish EXIT
-""" + body + "\nfstrim -av\necho ok > /etc/gpt-trace-image-build-complete\n"
+test ! -e "$SWAP_FILE" && test ! -L "$SWAP_FILE"
+# Fixed disk-backed swap for Conda solves, not host or guest RAM.
+fallocate -l 8G "$SWAP_FILE"
+chmod 600 "$SWAP_FILE"
+mkswap "$SWAP_FILE"
+swapon "$SWAP_FILE"
+echo 'temporary guest build swap enabled: 8 GiB'
+""" + body + "\n"
 
 
 def root_growth():
@@ -301,13 +377,21 @@ def build(args):
             if payload is not None:
                 argv += ["--copy-in", str(payload) + ":/opt"]
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
-            argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host", "-m", "4096", "-smp", "4",
+            memory_mb, vcpus = guest_resources()
+            print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
+            argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
+                    "-m", str(memory_mb), "-smp", str(vcpus),
                     "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
             argv += ["-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0"] if network else ["-nic", "none"]
             cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot",
                 timeout=args.build_timeout_hours * 3600)
-            if capture("virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete").strip() != b"ok":
-                raise RuntimeError("guest build completion proof is missing")
+            # A clean QEMU exit does not imply a successful guest firstboot.
+            proof = subprocess.run(
+                ["virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete"],
+                capture_output=True, timeout=180, check=False)
+            if proof.returncode != 0 or proof.stdout.strip() != b"ok":
+                raise RuntimeError("guest build completion proof is missing; "
+                                   "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
 
         def mirror_for(url, name):
             from urllib.parse import urlparse
@@ -324,8 +408,20 @@ def build(args):
             return path
 
         def submodule_mirror(url, commit):
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
+                raise RuntimeError("unsupported trusted public Git submodule URL")
             key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
-            path = mirror_for(url, key)
+            path = cache_root / key
+            # Exact pinned commit already present: no need to re-fetch the entire
+            # upstream mirror for each of the 230 task source archives.
+            if path.is_dir() and not path.is_symlink() and path.stat().st_uid == 0:
+                probe = subprocess.run(
+                    ["git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}"],
+                    capture_output=True, timeout=60, check=False)
+                if probe.returncode == 0:
+                    return path
+            path = mirror_for(url, key)  # Missing object: fetch then validate.
             cmd("git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}")
             return path
 

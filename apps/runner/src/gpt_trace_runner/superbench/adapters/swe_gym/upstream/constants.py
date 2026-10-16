@@ -1785,7 +1785,7 @@ SPECS_MONAI = {
         #     # remove these lines and delay dask installation later
         #     "sed -i '/^git+https:\/\/github.com\/Project-MONAI\//d' ~/requirements.txt"
         # ],
-        "install": "sed -i '/^git+https:\/\/github.com\/Project-MONAI\//d' requirements-dev.txt; python -m pip install types-pkg-resources==0.1.3 pytest; pip install -r requirements-dev.txt;python setup.py develop;",
+        "install": "sed -i '/^git+https:\\/\\/github.com\\/Project-MONAI\\//d' requirements-dev.txt; python -m pip install types-pkg-resources==0.1.3 pytest; pip install -r requirements-dev.txt;python setup.py develop;",
         "test_cmd": TEST_MONAI,
     }
     for k in ['0.1', '0.2', '0.3', '0.4', '0.5', '0.6', '0.7', '0.8', '0.9', '0.11', '0.105', '1.0', '1.1', '1.2', '1.3']
@@ -1800,7 +1800,7 @@ SPECS_DVC = {
         "pre_install": [
             "apt-get -y update && apt-get -y upgrade && apt-get install -y cmake",
             # fix moto dev version missing issue
-            "[ -f setup.py ] && sed -E -i 's/moto==([0-9]+\.[0-9]+\.[0-9]+)\.dev[0-9]+/moto==\\1/' setup.py",
+            "[ -f setup.py ] && sed -E -i 's/moto==([0-9]+\\.[0-9]+\\.[0-9]+)\\.dev[0-9]+/moto==\\1/' setup.py",
             # fix pyarrow version issue
             "[ -f setup.py ] && sed -i 's/pyarrow==0.15.1/pyarrow==0.16/' setup.py"
             # fix boto version conflict

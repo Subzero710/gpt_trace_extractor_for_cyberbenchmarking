@@ -108,7 +108,7 @@ class TemplateRegistry:
     def select(self, template_id, generation=None):
         try: return self._select(template_id, generation)
         except (OSError, ValueError) as exc:
-            raise ValueError(str(exc) + "; run make superbench-fetch ADAPTER=swe-gym-lite on Fossil") from exc
+            raise ValueError(str(exc) + "; run make superbench-fetch ADAPTER=swe-gym-lite on the control host") from exc
 
     def _select(self, template_id: str, generation: str | None = None) -> dict:
         if not isinstance(template_id, str) or ID.fullmatch(template_id) is None:

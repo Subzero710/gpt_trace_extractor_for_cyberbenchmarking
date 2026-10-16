@@ -31,12 +31,96 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
     argv = ["/bin/bash", "-c", script]
     if offline:
         argv = ["unshare", "--net", "/bin/bash", "-c", "ip link set lo up\n" + script]
-    with Path(log).open("wb") if log else tempfile.TemporaryFile() as output:
+    with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
         result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
         if result.returncode:
             output.seek(0, os.SEEK_END)
             output.seek(max(0, output.tell()-4000))
             raise RuntimeError(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}")
+
+
+def stream_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1048576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Build-only environment transformation: pinned official inputs stay byte-for-byte
+# unchanged, while Python's final version is constrained before the first solve.
+# Reproducibility records BOTH scripts and the solver policy in the guest image.
+def optimized_build_script(env_hash, record):
+    original = record["stored_script"]
+    if not isinstance(original, list) or any(not isinstance(x, str) for x in original):
+        raise RuntimeError("invalid pinned SWE-Gym environment recipe")
+    name = record["stored_name"]
+    if name != "swegym_" + env_hash:
+        raise RuntimeError("environment recipe identity changed")
+    commands = list(original)
+    migration = []
+    for i, command in enumerate(commands):
+        if "conda install python=" not in command:
+            continue
+        match = re.fullmatch(
+            r"conda activate (swegym_[0-9a-f]{22}) && conda install python=(\d+\.\d+) -y",
+            command)
+        if match is None or match.group(1) != name:
+            raise RuntimeError("unknown post-create Python downgrade; refusing unsafe optimization")
+        migration.append((i, match.group(2)))
+    if len(migration) > 1:
+        raise RuntimeError("multiple post-create Python downgrades")
+    python_version = None
+    if migration:
+        command_i, python_version = migration[0]
+        create = [i for i, text in enumerate(commands) if text == "conda env create --file environment.yml"]
+        yaml_indices = [i for i, text in enumerate(commands) if text.startswith("cat <<'") and " > environment.yml\n" in text]
+        if len(create) != 1 or len(yaml_indices) != 1 or not yaml_indices[0] < create[0] < command_i:
+            raise RuntimeError("unexpected upstream YAML/create/downgrade structure")
+        yaml_i = yaml_indices[0]
+        first, sep, rest = commands[yaml_i].partition("\n")
+        header = re.fullmatch(r"cat <<'([A-Za-z0-9_]+)' > environment\.yml", first)
+        if not sep or header is None:
+            raise RuntimeError("unrecognized upstream environment YAML heredoc")
+        delimiter = "\n" + header.group(1)
+        body, sep, tail = rest.rpartition(delimiter)
+        if not sep or tail.strip():
+            raise RuntimeError("unexpected upstream environment YAML termination")
+        if len(re.findall(r"^name: ", body, re.M)) != 1 or "name: " + name + "\n" not in body + "\n":
+            raise RuntimeError("official stored environment name differs")
+        py_specs = re.findall(r"^\s*-\s*python(?=[=<>!~\s])([^\n]*)$", body, re.M)
+        if len(py_specs) > 1:
+            raise RuntimeError("multiple upstream Python constraints")
+        if py_specs:
+            # E.g. Bokeh already specifies the target Python=3.10: no YAML edit.
+            if re.fullmatch(r"=\s*" + re.escape(python_version) + r"\s*(?:#.*)?", py_specs[0]) is None:
+                raise RuntimeError("upstream Python constraint conflicts with final version")
+        else:
+            if body.count("\ndependencies:\n") != 1:
+                raise RuntimeError("unexpected upstream YAML dependencies field")
+            body = body.replace("\ndependencies:\n", "\ndependencies:\n  - python=" + python_version + "\n", 1)
+        commands[yaml_i] = first + "\n" + body + delimiter + tail
+        # The official last command also activates the newly prepared env.
+        commands[command_i] = "conda activate " + name
+    if any("conda install python=" in text for text in commands):
+        raise RuntimeError("late Python version change remains in optimized recipe")
+    fingerprint = lambda values: hashlib.sha256(json.dumps(
+        values, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    return commands, {"official_script_sha256": fingerprint(original),
+                      "effective_script_sha256": fingerprint(commands),
+                      "single_solve_python": python_version,
+                      "solver": "libmamba", "channel_priority": "strict"}
+
+
+def build_limits(env=None):
+    """Bound compile workers, not guest vCPU count or the frozen package set."""
+    result = dict(os.environ if env is None else env)
+    # The pinned Miniconda already ships libmamba. Strict channel priority
+    # avoids exploring conflicting defaults/conda-forge variants.
+    result.update(CONDA_SOLVER="libmamba", CONDA_CHANNEL_PRIORITY="strict",
+                  MAKEFLAGS="-j2", CMAKE_BUILD_PARALLEL_LEVEL="2",
+                  MAX_JOBS="2", npm_config_jobs="2")
+    return result
 
 
 def env_inventory(prefix):
@@ -116,7 +200,7 @@ def setup_commands(item, destination, prefix):
 
 
 def runtime_environment(item, *, offline):
-    env = os.environ.copy()
+    env = build_limits()
     env.update(HOME="/root", PIP_CACHE_DIR=str(ROOT / "caches/pip"),
                npm_config_cache=str(ROOT / "caches/npm"), PDM_CACHE_DIR=str(ROOT / "caches/pdm"),
                PIPX_HOME=str(ROOT / "caches/pipx"), PIPX_BIN_DIR="/root/.local/bin",
@@ -296,10 +380,10 @@ print(json.dumps(result))
     for path in wheelhouse.iterdir():
         if not path.is_file() or path.is_symlink():
             raise RuntimeError("unexpected wheelhouse entry")
-        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        sha = stream_digest(path)
         stored = pool / sha
         if stored.exists():
-            if hashlib.sha256(stored.read_bytes()).hexdigest() != sha:
+            if stream_digest(stored) != sha:
                 raise RuntimeError("shared wheel cache changed")
             path.unlink()
             os.link(stored, path)
@@ -381,7 +465,7 @@ def freeze_downloads():
     records = {}
     for path in sorted((ROOT / "wheelhouse").rglob("*")):
         if path.is_file():
-            records[str(path.relative_to(ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            records[str(path.relative_to(ROOT))] = stream_digest(path)
     (ROOT / "download-provenance.json").write_text(json.dumps(records, sort_keys=True))
 
 
@@ -392,7 +476,14 @@ def build_common(inputs):
     if not CONDA.is_file():
         raise RuntimeError("pinned Miniconda installer did not complete")
     for env_hash, record in sorted(inputs["environments"].items()):
-        shell(record["stored_script"], cwd=ROOT, env={**os.environ, "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]},
+        commands, recipe_proof = optimized_build_script(env_hash, record)
+        print("SWE-Gym environment " + env_hash + ": python=" +
+              str(recipe_proof["single_solve_python"] or "upstream") +
+              ", solver=libmamba, channels=strict", flush=True)
+        (ROOT / "environments" / (env_hash + ".recipe.json")).write_text(
+            json.dumps(recipe_proof, sort_keys=True))
+        shell(commands, cwd=ROOT, env=build_limits({**os.environ,
+              "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]}),
               log=ROOT / "logs" / (env_hash + ".build.log"))
         prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
         (ROOT / "environments" / (env_hash + ".json")).write_text(json.dumps(env_inventory(prefix), sort_keys=True))
@@ -435,7 +526,7 @@ def file_inventory(folder):
         if path.is_symlink():
             records[path.relative_to(folder).as_posix()] = {"link": os.readlink(path)}
         elif path.is_file():
-            records[path.relative_to(folder).as_posix()] = {"sha256": source_tools().digest(path), "size": path.stat().st_size}
+            records[path.relative_to(folder).as_posix()] = {"sha256": stream_digest(path), "size": path.stat().st_size}
     return records
 
 

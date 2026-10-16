@@ -173,7 +173,8 @@
       ],
       "networks": [
         "core_internal",
-        "ui_egress"
+        "ui_egress",
+        "teacher_tunnel_origin"
       ],
       "ports": [
         "127.0.0.1:9222:9222"
@@ -215,7 +216,8 @@
         }
       },
       "networks": [
-        "ui_egress"
+        "teacher_tunnel_origin",
+        "teacher_tunnel_egress"
       ],
       "mem_limit": "256m",
       "mem_reservation": "64m",
@@ -410,6 +412,15 @@
     "ui_egress": null,
     "broker_private_egress": {
       "driver": "bridge"
+    },
+    "teacher_tunnel_origin": {
+      "internal": true
+    },
+    "teacher_tunnel_egress": {
+      "driver": "bridge",
+      "driver_opts": {
+        "com.docker.network.bridge.name": "br-gpt-teacher"
+      }
     }
   },
   "secrets": {

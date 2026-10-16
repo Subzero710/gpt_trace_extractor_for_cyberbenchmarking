@@ -92,6 +92,36 @@ class LibvirtWorkstationProvider:
         if not isinstance(data, dict): raise AppInfrastructureError("invalid broker response")
         return data
 
+    async def _await_async_create(self, operation: str, payload: dict) -> dict:
+        """Keep long VM startup off the Cloudflare HTTP request lifetime."""
+        import asyncio
+        import uuid
+        ident = {key: payload[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
+        operation_id = uuid.uuid4().hex
+        args = {**payload, "operation": operation, "operation_id": operation_id}
+        acknowledgement = await self._request("begin_async", args)
+        if (acknowledgement.get("state") != "accepted" or
+                acknowledgement.get("identity") != ident or acknowledgement.get("operation") != operation):
+            raise AppInfrastructureError("invalid remote creation acknowledgement; outcome unconfirmed")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 1900
+        while loop.time() < deadline:
+            status = await self._request("poll_async", {**ident, "operation": operation, "operation_id": operation_id})
+            if status.get("identity") != ident or status.get("operation") != operation:
+                raise AppInfrastructureError("broker asynchronous operation identity mismatch")
+            state = status.get("state")
+            if state == "complete":
+                result = status.get("result")
+                if not isinstance(result, dict):
+                    raise AppInfrastructureError("broker async result is not an object")
+                return result
+            if state == "failed":
+                raise AppInfrastructureError(f"broker {operation} failed: {status.get('detail', '')[:600]}")
+            if state != "pending":
+                raise AppInfrastructureError("broker creation outcome unknown; reconcile explicitly, never retry blindly")
+            await asyncio.sleep(2)
+        raise AppInfrastructureError("broker creation exceeded operation deadline; outcome unconfirmed, reconcile explicitly")
+
     async def _resource(self, name, task, environments, fingerprint, attempt, control_token):
         identity = self._identity(task, environments, fingerprint, attempt)
         if identity is None: return AttemptRuntime({})
@@ -104,8 +134,11 @@ class LibvirtWorkstationProvider:
             if reconciliation.get("identity") != identity or reconciliation.get("state") not in {"present", "absent"}:
                 raise AppInfrastructureError("broker reconciliation identity/outcome mismatch")
             if reconciliation["state"] == "present":
-                name = "inspect_attempt"
-        details = await self._request(name, payload)
+                details = await self._request("inspect_attempt", payload)
+            else:
+                details = await self._await_async_create("create_attempt", payload)
+        else:
+            details = await self._request(name, payload)
         if details.get("identity") != identity or details.get("provider") != "libvirt":
             raise AppInfrastructureError("broker attempt identity mismatch")
         if task.workstation_template is not None:
@@ -235,7 +268,9 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None or task.workstation_template is None:
             raise AppInfrastructureError("isolated evaluation requires an immutable workstation template")
-        result = await self._request("create_evaluator", {**ident, "abandon_stale": abandon_stale})
+        payload = {**ident, "abandon_stale": abandon_stale}
+        result = (await self._await_async_create("create_evaluator", payload) if self.remote
+                  else await self._request("create_evaluator", payload))
         evaluator = result.get("identity", {})
         if any(evaluator.get(key) != value for key, value in ident.items()) or evaluator.get("purpose") != "evaluator" or result.get("template_id") != task.workstation_template or result.get("network") is not None:
             raise AppInfrastructureError("isolated evaluator identity/template/network mismatch")

@@ -158,11 +158,18 @@ def host(role, cfg, *, docker=True, build_tools=False):
         if not os.access("/dev/kvm", os.R_OK | os.W_OK): raise RuntimeError("execution host KVM is unavailable")
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
-        parent = cfg["paths"]["base_image"].parent
+        image_directory = cfg["paths"]["base_image"].parent
+        # Fossil binds HDD2 here. Do not fill Ubuntu's root disk if the mount is absent.
+        if image_directory == Path("/var/lib/libvirt/images/gpt-trace") and not image_directory.is_mount():
+            raise RuntimeError("the dedicated HDD2 libvirt image mount is missing")
+        parent = image_directory
         while not parent.exists() and parent != parent.parent: parent = parent.parent
         device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
-        if not device.startswith("/dev/") or run(["lsblk", "-dn", "-o", "ROTA", device], capture=True, timeout=10) != "0":
-            raise RuntimeError("Kali base/templates/overlays must reside on execution host's local SSD")
+        filesystem = run(["findmnt", "-n", "-o", "FSTYPE", "-T", parent], capture=True, timeout=10)
+        # An HDD is supported: the images must be backed by a local filesystem,
+        # not mergerfs/FUSE, NFS, overlayfs or an ephemeral RAM filesystem.
+        if not device.startswith("/dev/") or filesystem not in {"ext4", "xfs"}:
+            raise RuntimeError("Kali images require a directly mounted local ext4/xfs filesystem")
 
 
 def environment(cfg):
@@ -346,7 +353,10 @@ def preparation_fetch(cfg):
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
             if phase != last_phase:
-                print("preparation " + operation_id + ": " + str(phase), flush=True)
+                print("preparation " + operation_id + ": attempt=" +
+                      str(status.get("attempt", "?")) + ", phase=" + str(phase), flush=True)
+                if phase in {"failed", "interrupted", "canceled"} and status.get("error"):
+                    print("preparation previous error: " + str(status["error"]), flush=True)
                 last_phase = phase
             if phase == "ready":
                 result = status.get("result")
@@ -446,15 +456,36 @@ def local_down(cfg):
     if record is not None and record.get("deployment") != expected:
         raise RuntimeError("local broker identity belongs to another deployment")
     if record is None or not same_process(record["broker_identity"]):
-        # An explicitly verified inactive lifecycle, not a network-error path.
-        python = ROOT / ".venv-workstation-broker/bin/python"
-        result = json.loads(run([python, "-B", "-m", "workstation_broker.local_shutdown"], capture=True, timeout=150))
-        if (result.get("scope") != "execution-local" or result.get("global") is not False
-                or result.get("deployment") != expected or result.get("broker_stopped") is not True
-                or result.get("inventory", {}).get("absent") is not True):
-            raise RuntimeError("local offline cleanup lacks verified absence")
-        print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
-        return result
+        # The durable record can be absent/stale during a native broker restart.
+        # An ACTIVE service must use the authenticated Unix-socket shutdown path,
+        # never the offline helper. That helper checks inactive systemd itself.
+        status = run(["systemctl", "show", "--property=ActiveState", "--value",
+                      "gpt-trace-distributed-broker.service"], capture=True, timeout=30)
+        pid = run(["systemctl", "show", "--property=MainPID", "--value",
+                   "gpt-trace-distributed-broker.service"], capture=True, timeout=30)
+        if status not in {"inactive", "failed"} or pid != "0":
+            # Admin token and deployment identity bind this socket to this execution host.
+            # A stale recorded PID is not a reason to touch unrelated processes.
+            current = broker(cfg, "deployment_probe", local=True, timeout=15)
+            if (current.get("status") != "ok" or current.get("project") != PROJECT
+                    or current.get("execution_id") != expected["execution_id"]):
+                raise RuntimeError("active execution broker did not prove its deployment identity")
+        else:
+            python = ROOT / ".venv-workstation-broker/bin/python"
+            try:
+                raw = run([python, "-B", "-m", "workstation_broker.local_shutdown"],
+                          capture=True, timeout=900)
+            except subprocess.CalledProcessError as exc:
+                details = (exc.stderr or "").strip()
+                raise RuntimeError("execution-local offline cleanup failed: " +
+                                   (details[-8000:] if details else str(exc))) from exc
+            result = json.loads(raw)
+            if (result.get("scope") != "execution-local" or result.get("global") is not False
+                    or result.get("deployment") != expected or result.get("broker_stopped") is not True
+                    or result.get("inventory", {}).get("absent") is not True):
+                raise RuntimeError("local offline cleanup lacks verified absence")
+            print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
+            return result
     barrier = broker(cfg, "begin_shutdown", local=True, timeout=90)
     if barrier.get("draining") is not True or barrier.get("project") != PROJECT:
         raise RuntimeError("local mutation barrier unconfirmed")
@@ -604,9 +635,12 @@ def control(cfg, action, args):
             values = ["--adapter", args.adapter] if args.adapter else []
             return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner",
                            "/app/tools/distributed_acceptance.py", *values)
+        node = Path("/dev/dri/renderD128")
         driver = Path("/sys/class/drm/renderD128/device/driver")
-        if not driver.exists() or driver.resolve().name != "nouveau":
-            raise RuntimeError("control host render node is not driven by Nouveau")
+        # Acer can use Intel i915/xe; AMD/Nouveau are also acceptable.  The
+        # real Chromium renderer is verified by teacher_gpu_doctor.py below.
+        if not node.is_char_device() or not driver.exists():
+            raise RuntimeError("control host needs a working GPU DRM render node")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
         compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/teacher_gpu_doctor.py")
         return compose("run", "--rm", "--no-deps", "runner", "doctor")
@@ -671,7 +705,7 @@ def execution(cfg, action, args):
         import build
         build.build_host_broker(ROOT)
         if paths["base_image"] != Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"):
-            raise RuntimeError("verified golden installer requires the fixed libvirt SSD root")
+            raise RuntimeError("verified golden installer requires the configured fixed libvirt image path")
         if paths["base_image"].exists(): build.verify_workstation_image(ROOT)
         else:
             build.build_workstation_base_image(ROOT)
@@ -691,9 +725,9 @@ def execution(cfg, action, args):
         install_unit(cfg)
         execution_environment(cfg)
         if (paths["base_image"].parent / "broker-drain.json").exists():
-            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=150)
+            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=900)
         run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
-        deadline = time.monotonic() + 130
+        deadline = time.monotonic() + 900
         while True:
             try:
                 broker(cfg, "probe", local=True)
@@ -711,7 +745,7 @@ def execution(cfg, action, args):
             run([sys.executable, "infra/workstation/image/build.py", "--verify"])
             limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
             if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024 ** 3:
-                raise RuntimeError("SSD cannot reserve one complete configured overlay")
+                raise RuntimeError("execution disk cannot reserve one complete configured overlay")
 
 
 HISTORICAL = ("requirements", "build", "up", "doctor", "tunnels",

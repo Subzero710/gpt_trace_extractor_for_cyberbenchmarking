@@ -369,9 +369,7 @@ class PreparationManager:
         return active
 
     def cancel_all(self):
-        """Only down calls this, after the broker mutation barrier is established."""
-        # A newly spawned child needs the manager lock briefly to claim its
-        # identity. Let it observe the durable drain and exit without building.
+        """Drain only verified preparation cgroups and labelled source containers."""
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             with self.lock():
@@ -379,29 +377,59 @@ class PreparationManager:
                 unclaimed = any(s and s["phase"] == "starting" and s.get("worker") is None for s in waiting)
             if not unclaimed: break
             time.sleep(0.05)
+
+        # No process is treated as absent when cgroup.events still says populated.
+        # The exceptional value permits force-killing this exact validated scope
+        # only during the authenticated shutdown barrier, not status/retry.
+        def busy(state):
+            try:
+                return bool(JobScope.members(state))
+            except RuntimeError as exc:
+                if str(exc) == 'cgroup still populated; absence unconfirmed':
+                    return True
+                raise
+
         with self.lock():
             states = [self._read(identifier(p.name)) for p in self.root.iterdir() if p.is_dir()]
             for state in states:
                 if state is None: raise RuntimeError("unowned preparation state")
-                state = self._reconcile(state)
+                forced_drain = False
+                try:
+                    state = self._reconcile(state)
+                except RuntimeError as exc:
+                    if str(exc) != 'cgroup still populated; absence unconfirmed':
+                        raise
+                    forced_drain = True
+
                 if state.get('worker') is None and state['phase'] not in TERMINAL:
                     raise RuntimeError('unclaimed spawning job; outcome unconfirmed')
-                members = JobScope.members(state)
+                try:
+                    members = JobScope.members(state)
+                except RuntimeError as exc:
+                    if str(exc) != 'cgroup still populated; absence unconfirmed':
+                        raise
+                    members = []
+                    forced_drain = True
                 if members:
                     JobScope.terminate(state)
                     deadline = time.monotonic() + 30
-                    while JobScope.members(state) and time.monotonic() < deadline:
+                    while busy(state) and time.monotonic() < deadline:
                         self._reap()
                         time.sleep(0.1)
-                    if JobScope.members(state):
-                        JobScope.kill(state)
-                        deadline = time.monotonic() + 10
-                        while JobScope.members(state) and time.monotonic() < deadline:
-                            self._reap()
-                            time.sleep(0.1)
-                    if JobScope.members(state): raise RuntimeError('owned preparation descendants remain')
+                if busy(state):
+                    # The cgroup path comes only from the durable operation ID,
+                    # attempt and current boot and is checked before signalling.
+                    forced_drain = True
+                    JobScope.kill(state)
+                    deadline = time.monotonic() + 10
+                    while busy(state) and time.monotonic() < deadline:
+                        self._reap()
+                        time.sleep(0.1)
+                if busy(state):
+                    raise RuntimeError('owned preparation cgroup remained populated after kill')
+                state = self._reconcile(self._read(state['operation_id']))
                 containers = self._containers(state)
-                if members or containers or state['phase'] not in TERMINAL:
+                if forced_drain or members or containers or state['phase'] not in TERMINAL:
                     state = {**self._read(state['operation_id']), 'phase': 'canceled',
                         'error': 'canceled by make down; stages and diagnostics preserved', 'result': None}
                 self._write(JobScope.close(state))

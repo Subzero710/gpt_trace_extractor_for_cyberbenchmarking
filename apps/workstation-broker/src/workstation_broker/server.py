@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import ipaddress
+import logging
 import pwd
 import re
 import secrets
@@ -164,9 +165,10 @@ class Broker:
                               if name in {entry.pw_name for entry in pwd.getpwall()}), None)
         if self.qemu_uid is None:
             raise RuntimeError("libvirt QEMU service user is missing")
-        self.base_digest = file_sha256(self.base)
         self.templates = TemplateRegistry(self.template_root or self.base.parent / "templates",
                                           self.base, qemu_image_info)
+        # One verified digest per unchanged backing image, even on slow HDDs.
+        self.base_digest = self.templates.immutable_sha256(self.base)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
 
@@ -319,7 +321,7 @@ add rule inet {table} input iifname "{bridge}" drop
         if directory.exists() or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines():
             raise ValueError("attempt already exists; discover or destroy it explicitly")
         digest = selection["backing_sha256"] if selection else self.base_digest
-        if not selection and self.templates.immutable_sha256(selected) != digest:
+        if not selection and await asyncio.to_thread(self.templates.immutable_sha256, selected) != digest:
             raise ValueError("Kali base image mutated")
         directory.mkdir(mode=0o711)
         os.chmod(directory, 0o711)
@@ -331,36 +333,41 @@ add rule inet {table} input iifname "{bridge}" drop
         state = {"identity": ident, "name": name, "network": network, "metadata": meta,
                  "secret": secret, "backend": "vsock", "base": str(selected)}
         try:
-            self._mount(directory)
-            run("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(selected), str(overlay))
+            # Large quota reservation/formatting must not freeze the HTTP event loop.
+            await asyncio.to_thread(self._mount, directory)
+            await asyncio.to_thread(run, "qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(selected), str(overlay))
             os.chown(overlay, self.qemu_uid, -1)
             os.chmod(overlay, 0o600)
             if network is not None:
-                self._create_network(ident, network, directory)
+                await asyncio.to_thread(self._create_network, ident, network, directory)
             (directory / "identity.json").write_text(json.dumps({**ident, "secret": secret,
                 "limits": {"max_terminals": self.max_terminals, "max_output_bytes": self.max_output_bytes,
                            "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes}}))
             os.chmod(directory / "identity.json", 0o600)
-            run("xorriso", "-as", "mkisofs", "-quiet", "-o", str(iso), "-V", "GPTTRACE", str(directory / "identity.json"))
+            await asyncio.to_thread(run, "xorriso", "-as", "mkisofs", "-quiet", "-o", str(iso), "-V", "GPTTRACE", str(directory / "identity.json"))
             os.chown(iso, self.qemu_uid, -1)
             os.chmod(iso, 0o600)
             domain_definition = directory / "domain.xml"
             domain_definition.write_bytes(domain_xml(name, network, overlay, iso, cid, self.memory_mb, self.vcpus, ident, digest, selection))
-            run("virsh", "-c", "qemu:///system", "define", str(domain_definition))
+            await asyncio.to_thread(run, "virsh", "-c", "qemu:///system", "define", str(domain_definition))
             self._write_state(directory / "state.json", state)
-            run("virsh", "-c", "qemu:///system", "start", name)
-            for _ in range(self.boot_timeout_seconds):
+            await asyncio.to_thread(run, "virsh", "-c", "qemu:///system", "start", name)
+            # One real, monotonic deadline; individual VSOCK probes are bounded.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.boot_timeout_seconds
+            while loop.time() < deadline:
                 try:
-                    reply = await self.rpc(ident, "health", {})
+                    remaining = deadline - loop.time()
+                    reply = await asyncio.wait_for(self.rpc(ident, "health", {}), timeout=min(6.0, remaining))
                     if reply.get("identity") == ident:
                         return await self.inspect_verified(ident)
                 except (OSError, TimeoutError, ValueError):
                     pass
-                await asyncio.sleep(1)
-            raise TimeoutError("guest agent did not become ready")
+                await asyncio.sleep(min(1.0, max(0.0, deadline - loop.time())))
+            raise TimeoutError("guest agent did not become ready within configured boot timeout")
         except BaseException:
             if template_id is None:
-                self.destroy(ident, strict=False)
+                await asyncio.to_thread(self.destroy, ident, strict=False)
             # Templated/evaluator failures remain until an explicit operator action.
             raise
 
@@ -417,7 +424,7 @@ add rule inet {table} input iifname "{bridge}" drop
                     "template_source_fingerprint", "logical_task_id")}}
 
     async def inspect_verified(self, ident: dict) -> dict:
-        result = self.inspect(ident)
+        result = await asyncio.to_thread(self.inspect, ident)
         health = await self.rpc(ident, "health", {})
         if health.get("identity") != ident or health.get("guest_agent_version") != "3.0.0":
             raise ValueError("guest agent identity/version mismatch")
@@ -441,8 +448,8 @@ add rule inet {table} input iifname "{bridge}" drop
         return path, rows
 
     async def create_evaluator(self, teacher, *, abandon_stale=False):
-        data = self._read(teacher)
-        selection = self.templates.verify_record(data["metadata"])
+        data = await asyncio.to_thread(self._read, teacher)
+        selection = await asyncio.to_thread(self.templates.verify_record, data["metadata"])
         path, previous = self._evaluator_index(teacher)
         if previous:
             if not abandon_stale:
@@ -664,7 +671,7 @@ add rule inet {table} input iifname "{bridge}" drop
         return {"removed": removed, "orphaned": sorted(set(orphaned))}
 
     async def rpc(self, ident: dict, method: str, args: dict) -> dict:
-        data = self._read(ident)
+        data = await asyncio.to_thread(self._read, ident)
         if not isinstance(method, str) or not re.fullmatch(r"[a-z_]{1,40}", method):
             raise ValueError("invalid guest RPC method")
         body = json.dumps({"identity": ident, "secret": data["secret"], "method": method, "args": args}).encode()
@@ -672,9 +679,11 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError("guest RPC too large")
         def exchange() -> dict:
             with socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM) as connection:
-                connection.settimeout(self.guest_agent_timeout_seconds)
+                # Probing health never needs a 30-minute RPC timeout.
+                is_probe = method == "health"
+                connection.settimeout(min(5.0, self.guest_agent_timeout_seconds) if is_probe else self.guest_agent_timeout_seconds)
                 connection.connect((data["metadata"]["cid"], PORT))
-                connection.settimeout(1850)
+                connection.settimeout(5.0 if is_probe else 1850)
                 connection.sendall(struct.pack("!I", len(body)) + body)
                 size = struct.unpack("!I", recv_exact(connection, 4))[0]
                 if size > MAX_BODY:
@@ -886,6 +895,29 @@ def create_app(broker: Broker) -> Starlette:
     # Serializing native actions makes the shutdown barrier wait for every
     # in-flight transfer/create/input operation before absence can be proved.
     operation_lock = asyncio.Lock()
+    """Cloudflare-safe async broker operation admission"""
+    # Results remain available to repeated authenticated polls for this broker
+    # process lifetime; a restarted process will refuse to infer any VM outcome.
+    operations: dict[tuple[str, str], dict] = {}
+
+    async def execute_background(record: dict, operation: str, ident: dict, payload: dict) -> None:
+        try:
+            async with operation_lock:
+                if getattr(broker, "draining", False):
+                    raise RuntimeError("broker draining; async creation rejected")
+                if operation == "create_attempt":
+                    result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
+                else:
+                    result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
+            record["result"] = result
+            record["state"] = "complete"
+        except asyncio.CancelledError:
+            record["state"] = "unknown"
+            raise
+        except Exception as exc:
+            logging.getLogger(__name__).exception("broker background %s failed", operation)
+            record["error"] = f"{type(exc).__name__}: {str(exc)[:600]}"
+            record["state"] = "failed"
 
     async def health(request: Request):
         authorization = request.headers.get("authorization", "")
@@ -910,6 +942,64 @@ def create_app(broker: Broker) -> Starlette:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("broker request must be an object")
+            # Status is deliberately lock-free. Long VM preparation is serialized
+            # by operation_lock, but may outlive Cloudflare's request deadline.
+            if action == "poll_async":
+                ident = identity(payload)
+                operation = payload.get("operation")
+                if operation not in {"create_attempt", "create_evaluator"}:
+                    raise ValueError("invalid asynchronous operation")
+                operation_id = payload.get("operation_id")
+                if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+                    raise ValueError("invalid asynchronous operation ID")
+                record = operations.get((operation, operation_id))
+                if record is None:
+                    return JSONResponse({"state": "unknown", "identity": ident, "operation": operation})
+                if record["identity"] != ident:
+                    raise ValueError("asynchronous operation identity mismatch")
+                response = {"state": record["state"], "identity": ident, "operation": operation}
+                if record["state"] == "complete":
+                    response["result"] = record["result"]
+                if record["state"] == "failed":
+                    response["detail"] = record["error"]
+                return JSONResponse(response)
+            if action == "begin_async":
+                if getattr(broker, "draining", False):
+                    raise RuntimeError("broker is draining; creation blocked")
+                ident = identity(payload)
+                operation = payload.get("operation")
+                if operation not in {"create_attempt", "create_evaluator"} or payload.get("purpose") is not None:
+                    raise ValueError("invalid asynchronous operation or identity")
+                operation_id = payload.get("operation_id")
+                if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+                    raise ValueError("invalid asynchronous operation ID")
+                allowed = {"operation", "operation_id", "task_id", "attempt", "environment_id", "fingerprint"}
+                if operation == "create_attempt":
+                    allowed |= {"template_id", "logical_task_id"}
+                else:
+                    allowed |= {"abandon_stale"}
+                    if type(payload.get("abandon_stale", False)) is not bool:
+                        raise ValueError("invalid evaluator recovery flag")
+                if set(payload) - allowed:
+                    raise ValueError("unknown asynchronous creation argument")
+                key = (operation, operation_id)
+                previous = operations.get(key)
+                if previous is not None:
+                    if previous["payload"] != payload:
+                        raise ValueError("attempt creation parameters changed; preserve existing operation")
+                    return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
+                if len(operations) >= 10000:
+                    raise RuntimeError("broker operation registry capacity reached; preserve history")
+                if any(op == operation and item["identity"] == ident and item["state"] == "pending"
+                       for (op, _), item in operations.items()):
+                    raise ValueError("creation already in progress for this identity; reconcile before retry")
+                # In particular, never retry blindly after a broker restart.
+                if operation == "create_attempt" and broker._paths(ident)[2].exists():
+                    raise ValueError("attempt resources already exist; reconcile existing VM explicitly")
+                record = {"state": "pending", "payload": dict(payload), "identity": ident}
+                operations[key] = record
+                record["task"] = asyncio.create_task(execute_background(record, operation, ident, payload))
+                return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
             async with operation_lock:
                 if action == "begin_shutdown":
                     if payload: raise ValueError("shutdown barrier takes no parameters")

@@ -54,7 +54,7 @@ class JobScope:
         # Existing unit only: no independent service, slice, supervisor or daemon.
         _directory(MOUNT)
         if not (MOUNT / 'cgroup.controllers').is_file():
-            raise RuntimeError('Acer preparation requires the existing broker unit on cgroup v2')
+            raise RuntimeError('execution-host preparation requires the existing broker unit on cgroup v2')
         _directory(UNIT)
         name = cls.name(operation_id, attempt)
         path = UNIT / name
@@ -138,7 +138,20 @@ class JobScope:
 
     @classmethod
     def kill(cls, state):
-        if cls.members(state): _write(cls.path(state) / 'cgroup.kill', '1')
+        # During a shutdown barrier, the cgroup may report populated=1 while
+        # /proc racing with process exit exposes no non-zombie PID.  members()
+        # deliberately refuses to certify absence in that case, but must not
+        # prevent killing *only the already-validated owned cgroup*.
+        path = cls.path(state)
+        scope = state['scope']
+        if scope['closed'] or scope['boot_id'] != _jobs().boot_id() or not path.exists():
+            return
+        _directory(path)
+        events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
+        if events.get('populated') not in {'0', '1'}:
+            raise RuntimeError('invalid cgroup population proof')
+        if events['populated'] == '1':
+            _write(path / 'cgroup.kill', '1')
 
     @classmethod
     def close(cls, state):

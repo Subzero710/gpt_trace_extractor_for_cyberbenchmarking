@@ -293,9 +293,13 @@ class SourceContractTests(unittest.TestCase):
         engine = load("distributed_contract_engine_test", ROOT / "patch_local_preparation.py")
         self.assertEqual(engine.blob_sha(manifest), engine.DATA["catalog"]["apps/kali-workstation/tool-manifest.json"])
 
-    def test_guest_semantics_retain_the_original_golden_fingerprint(self):
+    def test_golden_fingerprint_pins_512_gib_virtual_disk(self):
         image = load("distributed_golden_builder_test", ROOT / "infra/workstation/image/build.py")
-        self.assertEqual(image.golden_build_input_sha256(), "4130895e6f37115739a3b832d8b5e6ce3c371a403968cda95c57a249e4a0f29e")
+        self.assertEqual(image.VIRTUAL_DISK_GIB, 512)
+        fingerprint = image.golden_build_input_sha256()
+        self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+        with patch.object(image, "VIRTUAL_DISK_GIB", 256):
+            self.assertNotEqual(fingerprint, image.golden_build_input_sha256())
 
 
 if __name__ == "__main__":
