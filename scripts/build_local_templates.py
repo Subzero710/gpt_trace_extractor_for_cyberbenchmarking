@@ -168,18 +168,43 @@ def _purge_apt_partial(stage):
     partial = package_dir / "partial"
     if partial.is_symlink():
         raise RuntimeError("unsafe APT scratch symlink: " + str(partial))
-    if not partial.exists():
+    if partial.exists():
+        if not partial.is_dir() or partial.is_mount():
+            raise RuntimeError("unsafe APT scratch directory: " + str(partial))
+        for item in partial.rglob("*"):
+            mode = item.lstat().st_mode
+            if (item.is_symlink() or item.is_mount() or
+                    not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
+                raise RuntimeError("unsafe APT scratch entry: " + str(item))
+        # No resolved .deb, manifest, QCOW2 or checkpoint lives in partial.
+        shutil.rmtree(partial)
+
+    # APT_AUXFILES_CLEANUP_V1: libguestfs copies this EMPTY runtime directory
+    # with the original _apt UID. Remove only this exact path after validating
+    # all its ancestors, its owner, and its emptiness. Never relax _owned_tree.
+    empty_lists = package_dir / "empty-lists"
+    if empty_lists.is_symlink():
+        raise RuntimeError("unsafe APT empty-lists symlink: " + str(empty_lists))
+    if not empty_lists.exists():
         return
-    if not partial.is_dir() or partial.is_mount():
-        raise RuntimeError("unsafe APT scratch directory: " + str(partial))
-    for item in partial.rglob("*"):
-        mode = item.lstat().st_mode
-        if (item.is_symlink() or item.is_mount() or
-                not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))):
-            raise RuntimeError("unsafe APT scratch entry: " + str(item))
-    # _apt ownership inside this specific disposable scratch directory is
-    # expected. No .deb, manifest, QCOW2, git mirror, or checkpoint is removed.
-    shutil.rmtree(partial)
+    lists_info = empty_lists.lstat()
+    if (not stat.S_ISDIR(lists_info.st_mode) or lists_info.st_uid != 0 or
+            lists_info.st_mode & 0o022 or empty_lists.is_mount()):
+        raise RuntimeError("unsafe APT empty-lists parent: " + str(empty_lists))
+    auxfiles = empty_lists / "auxfiles"
+    if auxfiles.is_symlink():
+        raise RuntimeError("unsafe APT auxfiles symlink: " + str(auxfiles))
+    if not auxfiles.exists():
+        return
+    import pwd
+    apt_uid = pwd.getpwnam("_apt").pw_uid
+    info = auxfiles.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, apt_uid) or
+            info.st_mode & 0o022 or auxfiles.is_mount()):
+        raise RuntimeError("unsafe APT auxfiles directory: " + str(auxfiles))
+    if any(auxfiles.iterdir()):
+        raise RuntimeError("nonempty APT auxfiles, preserving: " + str(auxfiles))
+    auxfiles.rmdir()
 
 
 def guest_resources():
