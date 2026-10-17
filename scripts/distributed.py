@@ -396,6 +396,12 @@ def preparation_fetch(cfg):
                 return result
             if phase in {"not_started", "failed", "interrupted", "canceled"}:
                 if started:
+                    if phase == "not_started":
+                        raise RuntimeError(
+                            "preparation " + operation_id +
+                            " start remains unconfirmed; rerun make superbench-fetch "
+                            "ADAPTER=swe-gym-lite to rediscover it; "
+                            "no mutation was blindly retried")
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
                 # A new explicit fetch may retry a previously proved-dead job.
                 # This command NEVER repeats a start after a lost response.
