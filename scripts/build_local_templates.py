@@ -817,7 +817,7 @@ PY_GUEST
 '''
             proof = subprocess.run(["virt-cat", "-a", str(common), "/etc/gpt-trace-image-build-complete"],
                                    capture_output=True, timeout=180, check=False)
-            if proof.returncode == 0 and proof.stdout.strip() == b"ok":
+            if not initial_common and proof.returncode == 0 and proof.stdout.strip() == b"ok":
                 print("reused verified complete common QCOW2", flush=True)
             else:
                 if not initial_common:
