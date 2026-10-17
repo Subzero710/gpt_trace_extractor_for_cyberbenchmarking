@@ -20,6 +20,9 @@ def test_domain_contains_exact_metadata_and_no_host_mount():
     assert metadata['base_sha256']=='b'*64
     assert xml.find('./devices/vsock/cid').get('address')=='7000'
     assert xml.find('./devices/filesystem') is None
+    seclabel = xml.find('./seclabel')
+    assert seclabel is not None
+    assert seclabel.attrib == {'type':'none','model':'dac'}
 
 
 @pytest.mark.asyncio

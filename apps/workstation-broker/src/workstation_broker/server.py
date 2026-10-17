@@ -126,6 +126,10 @@ def domain_xml(name: str, network: str | None, overlay: Path, config_iso: Path, 
         ET.SubElement(devices, "graphics", type="spice", autoport="yes", listen="127.0.0.1")
     vsock = ET.SubElement(devices, "vsock", model="virtio")
     ET.SubElement(vsock, "cid", auto="no", address=str(cid))
+    # The immutable base/repository/template QCOW2 files are deliberately
+    # root-owned and read-only. Disable only libvirt's DAC relabeling for this
+    # domain so starting/stopping a guest cannot chown shared backing images.
+    ET.SubElement(domain, "seclabel", type="none", model="dac")
     return ET.tostring(domain, encoding="utf-8")
 
 
