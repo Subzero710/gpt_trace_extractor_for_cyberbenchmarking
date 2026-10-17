@@ -168,8 +168,10 @@ class Broker:
             raise RuntimeError("libvirt QEMU service user is missing")
         self.templates = TemplateRegistry(self.template_root or self.base.parent / "templates",
                                           self.base, qemu_image_info)
-        # One verified digest per unchanged backing image, even on slow HDDs.
-        self.base_digest = self.templates.immutable_sha256(self.base)
+        # Verify the immutable golden exactly once. TemplateRegistry.expected()
+        # validates provenance/package manifests and hashes the base through the
+        # registry digest cache, so later backing checks reuse the same digest.
+        self.base_digest = self.templates.expected()["golden_sha256"]
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
 
@@ -1126,10 +1128,6 @@ def main():
     controller_token = token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"])
     if hmac.compare_digest(admin_token, controller_token):
         raise RuntimeError("broker admin and controller tokens must be distinct")
-    from gpt_trace_transport.local_templates import compatibility
-    # Self-verify the installed immutable base.  Checkout implementation changes
-    # do not invalidate already-built persistent templates/base bytes.
-    compatibility(Path(os.environ["WORKSTATION_BASE_IMAGE"]))
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
     broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), Path(os.environ["WORKSTATION_BASE_IMAGE"]),
                     admin_token, controller_token,
