@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 """Sequential local execution host builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
@@ -205,6 +206,52 @@ def _purge_apt_partial(stage):
     if any(auxfiles.iterdir()):
         raise RuntimeError("nonempty APT auxfiles, preserving: " + str(auxfiles))
     auxfiles.rmdir()
+
+
+def _compatibility_matches(left, right):
+    from gpt_trace_transport.local_templates import compatible_template_identity
+    try:
+        return compatible_template_identity(left, right)
+    except (ValueError, TypeError):
+        return False
+
+
+def _stage_score(path):
+    common = path / "common.qcow2"
+    common_bytes = common.stat().st_blocks * 512 if common.is_file() else 0
+    checkpoints = path / ".checkpoints"
+    task_count = len(list(checkpoints.glob("task-*.json"))) if checkpoints.is_dir() else 0
+    source_count = len(list(checkpoints.glob("source-*.json"))) if checkpoints.is_dir() else 0
+    return (common_bytes, task_count, source_count, path.stat().st_mtime_ns)
+
+
+def _adopt_resumable_stage(target_root, staged, identity):
+    candidates = []
+    for old in target_root.glob(".build-*"):
+        if old == staged or old.is_symlink() or not old.is_dir():
+            continue
+        record = old / "build-identity.json"
+        if not record.is_file() or record.is_symlink():
+            continue
+        try:
+            previous = json.loads(record.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if not _compatibility_matches(previous.get("compatibility"), identity["compatibility"]):
+            continue
+        candidates.append(old)
+    if not candidates:
+        return False
+    # Prefer the stage containing the most expensive retained work.  Other old
+    # stages are deliberately preserved; only make throw_volumes may erase them.
+    old = max(candidates, key=_stage_score)
+    _purge_apt_partial(old)
+    os.rename(old, staged)
+    atomic_json(staged / "build-identity.json", identity)
+    print("adopted persistent resumable template stage: " + str(old) + " -> " + str(staged), flush=True)
+    if len(candidates) > 1:
+        print("additional historical template stages preserved for explicit make throw_volumes", flush=True)
+    return True
 
 
 def guest_resources():
@@ -517,7 +564,10 @@ def build(args):
             raise RuntimeError("missing host build executable: " + executable)
     golden = load_module("swe_gym_kali_builder", ROOT / "infra/workstation/image/build.py")
     golden.require_host_build_runtime()
-    golden.verify(BASE)
+    from gpt_trace_transport.local_templates import compatibility, compatible_template_identity
+    installed = compatibility(BASE, ROOT)
+    if not compatible_template_identity(installed, job["compatibility"]):
+        raise RuntimeError("installed Kali/template compatibility changed; persistent template storage preserved")
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
     os_tools = load_module("swe_gym_os_packages", GUEST.with_name("os_packages.py"))
     target_root = TEMPLATES / "swe-gym-lite"
@@ -530,15 +580,18 @@ def build(args):
         raise RuntimeError("untrusted full-mirror host cache")
     with (target_root / "build.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        staged = target_root / (".build-" + args.operation_id)
-        identity = {"schema": 1, "operation_id": args.operation_id,
-                    "compatibility": job["compatibility"]}
+        staged = target_root / ".build-resumable-v2"
+        identity = {"schema": 2, "compatibility": job["compatibility"]}
         if staged.exists():
             from gpt_trace_transport.local_templates import safe
             safe(staged, directory=True)
             previous = staged / "build-identity.json"
-            if json.loads(safe(previous, immutable=True).read_text()) != identity:
-                raise RuntimeError("staged build identity does not match this exact operation")
+            prior_identity = json.loads(safe(previous, immutable=True).read_text())
+            if not _compatibility_matches(prior_identity.get("compatibility"), identity["compatibility"]):
+                raise RuntimeError("persistent template stage belongs to another template contract; "
+                                   "preserved; only make throw_volumes may remove it")
+            if prior_identity != identity:
+                atomic_json(previous, identity)
             if (staged / "local-validation.json").exists():
                 # An interrupted seal/atomic rename is recoverable without any
                 # rebuild. Validate every immutable byte before publication.
@@ -564,7 +617,7 @@ def build(args):
                 return final
             print("resuming verified host preparation " + args.operation_id, flush=True)
         else:
-            if not _migrate_known_legacy_stage(target_root, staged, identity):
+            if not _adopt_resumable_stage(target_root, staged, identity):
                 staged.mkdir(mode=0o755)
                 atomic_json(staged / "build-identity.json", identity)
         checkpoints = staged / ".checkpoints"
@@ -710,19 +763,35 @@ def build(args):
                     tools.validate_artifact(item, output, record)
                     print("reused verified source: " + logical, flush=True)
                 else:
-                    _discard(output)
-                    record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
-                                                  submodule_mirror=submodule_mirror)
-                    output.chmod(0o444)
-                    tools.validate_artifact(item, output, record)
-                    write_checkpoint("source-" + key + ".json", record)
+                    if output.exists():
+                        if output.is_symlink() or not output.is_file():
+                            raise RuntimeError("unsafe orphan task source archive; preserved")
+                        with tempfile.TemporaryDirectory(dir=output.parent, prefix=".recover-source-") as temporary:
+                            checkout = Path(temporary) / "checkout"
+                            integrity = {"sha256": digest(output), "size": output.stat().st_size}
+                            tools.extract(output, checkout, **integrity)
+                            proof = tools.validate_checkout(checkout, item["base_commit"])
+                        record = {**integrity, "kind": "task_source", "logical_task_id": item["instance_id"],
+                            "allowed_template_id": item["template_id"],
+                            "source_identity": {name: item[name] for name in ("instance_id", "repo", "base_commit")},
+                            "validation": proof}
+                        tools.validate_artifact(item, output, record)
+                        output.chmod(0o444)
+                        write_checkpoint("source-" + key + ".json", record)
+                        print("recovered orphan verified source: " + logical, flush=True)
+                    else:
+                        record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
+                                                      submodule_mirror=submodule_mirror)
+                        output.chmod(0o444)
+                        tools.validate_artifact(item, output, record)
+                        write_checkpoint("source-" + key + ".json", record)
                 artifacts[key] = {**record, "path": output.relative_to(staged).as_posix()}
                 mapping[logical] = {"template_id": item["template_id"], "task_source": key,
                                     "setup_cache": tools.artifact_id("setup_cache", logical)}
 
             # Golden provenance exposes kali-last-snapshot, a mutable alias,
             # not an immutable snapshot ID. Resolve in an expendable VM instead.
-            resolver = staged / "os-resolver.qcow2"
+            resolver = cache_root / "os-resolver.qcow2"
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
             if (os_folder / "manifest.json").is_file():
@@ -731,11 +800,17 @@ def build(args):
                 print("reused verified OS package closure", flush=True)
             else:
                 _purge_apt_partial(staged)
-                _discard(resolver)
-                _discard(os_parent)
-                overlay(resolver, BASE)
+                if not resolver.exists():
+                    overlay(resolver, BASE)
+                elif resolver.is_symlink() or not resolver.is_file():
+                    raise RuntimeError("unsafe persistent OS resolver volume; preserved")
+                if os_parent.exists() and not (os_folder / "manifest.json").is_file():
+                    # Partial copied-out metadata is not a VM volume.  Preserve the
+                    # expensive resolver disk and refresh only this import scratch.
+                    shutil.rmtree(os_parent)
                 os_payload = staged / "swe-gym-os-helper"
-                _discard(os_payload)
+                if os_payload.exists():
+                    shutil.rmtree(os_payload)
                 os_payload.mkdir()
                 shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
                 provision(resolver, "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy\n"
@@ -744,7 +819,7 @@ def build(args):
                 cmd("virt-copy-out", "-a", str(resolver), "/opt/swe-gym-os", str(os_parent))
                 os_manifest = json.loads((os_folder / "manifest.json").read_text())
                 os_tools.verify_artifacts(os_folder, os_manifest)
-                resolver.unlink()
+                # Keep the resolver QCOW2 as a stable resumable build volume.
                 shutil.rmtree(os_payload)
 
             # The OS closure is checked; APT's _apt-owned partial download
@@ -831,20 +906,22 @@ PY_GUEST
                         installed = hashlib.sha256(source).hexdigest()
                         current = digest(GUEST)
                         if installed != current:
-                            marker = read_checkpoint("legacy-adopted.json")
-                            if (installed != LEGACY_GUEST_SHA256 or marker != {
-                                    "operation_id": LEGACY_CONDA_OPERATION,
-                                    "guest_sha256": LEGACY_GUEST_SHA256}):
-                                raise RuntimeError("unknown guest runtime in unfinished common disk")
+                            # The stable template ABI is unchanged.  Update only the
+                            # build-time helper inside this unfinished volume and keep
+                            # every verified Conda environment already checkpointed.
                             cmd("virt-customize", "--no-network", "-a", str(common),
                                 "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
                             updated = subprocess.check_output(["virt-cat", "-a", str(common),
                                 "/opt/swe-gym-lite/runtime.py"], timeout=180)
                             if hashlib.sha256(updated).hexdigest() != current:
-                                raise RuntimeError("legacy guest runtime migration did not verify")
-                    if not has_conda:
-                        _discard(common)
-                        overlay(common, BASE)
+                                raise RuntimeError("unfinished common runtime update did not verify")
+                    else:
+                        partial_conda = subprocess.run(["virt-cat", "-a", str(common), "/opt/miniconda3/conda-meta/history"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0
+                        if partial_conda:
+                            cmd("virt-customize", "--no-network", "-a", str(common),
+                                "--run-command", "rm -rf /opt/miniconda3", timeout=14400)
+                        print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
                 else:
                     has_conda = False
                 try:
@@ -952,8 +1029,16 @@ PY_GUEST
                     subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=3600)
                     print("reused verified repository image " + repo, flush=True)
                 else:
-                    _discard(image)
-                    overlay(image, common)
+                    if not image.exists():
+                        overlay(image, common)
+                    elif image.is_symlink() or not image.is_file():
+                        raise RuntimeError("unsafe persistent repository image; preserved")
+                    else:
+                        info = json.loads(capture("qemu-img", "info", "--output=json", str(image)))
+                        backing_name = info.get("full-backing-filename") or info.get("backing-filename")
+                        backing_path = Path(backing_name) if backing_name and Path(backing_name).is_absolute() else image.parent / str(backing_name)
+                        if info.get("format") != "qcow2" or not backing_name or backing_path.resolve() != common.resolve():
+                            raise RuntimeError("existing repository volume has another backing; preserved; use make throw_volumes")
                     boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
                     boot += "module['build_repo']({}," + repr(repo) + ")\n"
                     boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\nPY_GUEST\n"
@@ -1000,7 +1085,7 @@ PY_GUEST
             atomic_json(staged / "resolved-inputs.json", resolved)
             shutil.rmtree(inputs_root)
             (staged / 'firstboot.sh').unlink(missing_ok=True)
-            shutil.rmtree(checkpoints)
+            # Keep verified checkpoints; normal commands never erase persistent template progress.
             summary = {"common_physical_bytes": common.stat().st_blocks * 512,
                        "repo_templates_physical_bytes": physical_bytes(repos.glob('*.qcow2')),
                        "task_sources_physical_bytes": physical_bytes(source_folder.glob('*.tar.gz')),
@@ -1052,26 +1137,13 @@ PY_GUEST
             print(json.dumps({"generation": generation, "invariants": manifest['invariants'], "allocation": summary}, indent=2))
             return final
         except BaseException as exc:
-            if isinstance(exc, RecoverableBuildError) or _transient_failure(exc):
-                # The worker records an interrupted/retryable state. Preserve only
-                # this operation's pinned checkpoint, never publish a partial image.
-                print("recoverable interruption; staged checkpoints retained: " + str(staged), file=sys.stderr)
-                if isinstance(exc, RecoverableBuildError):
-                    raise
-                raise RecoverableBuildError(str(exc)) from exc
-            # Unrecoverable failure: delete this exact private stage, not caches,
-            # immutable generations or any unrelated running operation.
-            if staged.exists():
-                try:
-                    _purge_apt_partial(staged)
-                    _discard(staged)
-                except Exception as cleanup_exc:
-                    # Cleanup must never conceal the actual build failure.
-                    print("unrecoverable build cleanup refused; original error retained: "
-                          + str(cleanup_exc), file=sys.stderr)
-                else:
-                    print("unrecoverable build failed; disposable stage removed", file=sys.stderr)
-            raise
+            # No normal failure is authorized to erase template volumes/checkpoints.
+            # Preserve the single stable stage so a later explicit fetch continues
+            # after a code/network/operator fix.  Only make throw_volumes can wipe it.
+            print("build stopped; persistent resumable state retained: " + str(staged), file=sys.stderr)
+            if isinstance(exc, RecoverableBuildError):
+                raise
+            raise RecoverableBuildError(str(exc)) from exc
 
 
 def main():

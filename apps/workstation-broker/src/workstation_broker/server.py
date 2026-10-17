@@ -1,3 +1,4 @@
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 from __future__ import annotations
 
 import asyncio
@@ -1013,7 +1014,8 @@ def create_app(broker: Broker) -> Starlette:
                     return JSONResponse({"draining": True, "project": PROJECT})
                 if getattr(broker, "draining", False) and action not in {
                         "probe", "inventory", "deployment_probe", "destroy_all", "destroy_attempt",
-                        "abandon_attempt", "assert_absent", "shutdown", "shutdown_status", "template_preparation_status"}:
+                        "abandon_attempt", "assert_absent", "shutdown", "shutdown_status", "template_preparation_status",
+                        "throw_template_storage"}:
                     raise RuntimeError("broker is draining for global shutdown; attempt mutations are blocked")
                 if action == "shutdown":
                     proof = inventory(broker)
@@ -1030,9 +1032,16 @@ def create_app(broker: Broker) -> Starlette:
                 if action == "shutdown_status":
                     from workstation_broker.shutdown_observer import pending_status
                     return JSONResponse(pending_status(payload))
-                if action in {"template_preparation_probe", "prepare_templates", "template_preparation_status"}:
+                if action in {"template_preparation_probe", "prepare_templates", "template_preparation_status", "throw_template_storage"}:
                     manager = getattr(broker, "preparations", None)
                     if manager is None: raise RuntimeError("native administrative preparation manager is unavailable")
+                    if action == "throw_template_storage":
+                        if not getattr(broker, "draining", False):
+                            raise RuntimeError("persistent template deletion requires an established shutdown barrier")
+                        proof = inventory(broker)
+                        if proof.get("absent") is not True:
+                            raise RuntimeError("temporary execution resources remain; refusing persistent THROW")
+                        return JSONResponse(await asyncio.to_thread(manager.throw_persistent_storage, payload))
                     handler = {"template_preparation_probe": manager.probe,
                         "prepare_templates": manager.start, "template_preparation_status": manager.status}[action]
                     return JSONResponse(await asyncio.to_thread(handler, payload))
@@ -1117,8 +1126,10 @@ def main():
     controller_token = token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"])
     if hmac.compare_digest(admin_token, controller_token):
         raise RuntimeError("broker admin and controller tokens must be distinct")
-    from gpt_trace_transport.local_templates import golden_builder
-    golden_builder().verify(Path(os.environ["WORKSTATION_BASE_IMAGE"]))
+    from gpt_trace_transport.local_templates import compatibility
+    # Self-verify the installed immutable base.  Checkout implementation changes
+    # do not invalidate already-built persistent templates/base bytes.
+    compatibility(Path(os.environ["WORKSTATION_BASE_IMAGE"]))
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
     broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), Path(os.environ["WORKSTATION_BASE_IMAGE"]),
                     admin_token, controller_token,

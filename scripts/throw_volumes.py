@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 from __future__ import annotations
 
 import json
@@ -260,8 +261,8 @@ def main() -> int:
     print(
         "WARNING: destructive inter-generation reset.\n"
         "Deletes: active project containers/VM attempts, postgres_data, runner_state, "
-        "browser_profile, exports, host runtime state, host broker venv, and final "
-        "project Docker images.\n"
+        "browser_profile, exports, host runtime state, host broker venv, final "
+        "project Docker images, and Fossil SWE-Gym template/checkpoint storage.\n"
         "Preserves: benchmark_sources, Kali download/golden image, BuildKit cache, "
         ".env, .secrets and App/tunnel registration.",
         flush=True,
@@ -269,6 +270,19 @@ def main() -> int:
     answer = input("Type THROW to continue: ")
     if answer != "THROW":
         raise SystemExit("aborted")
+
+    # Establish the authenticated mutation barrier first, destroy temporary VM
+    # attempts, then perform the one explicitly authorized persistent-template wipe.
+    barrier = distributed.broker(cfg, "begin_shutdown", timeout=90)
+    if barrier.get("draining") is not True:
+        raise ThrowError("execution host did not acknowledge THROW shutdown barrier")
+    distributed.broker(cfg, "destroy_all", timeout=300)
+    proof = distributed.broker(cfg, "inventory", timeout=60)
+    if proof.get("absent") is not True:
+        raise ThrowError("temporary execution-host resources remain before THROW")
+    thrown = distributed.broker(cfg, "throw_template_storage", {"confirmation": "THROW"}, timeout=1800)
+    if thrown.get("thrown") is not True:
+        raise ThrowError("execution host did not confirm persistent template wipe")
 
     # Reuse global shutdown and its acknowledged remote ownership audit.
     # Recovery markers/data are only removed after the explicit THROW choice.
@@ -322,8 +336,8 @@ def main() -> int:
         )
 
     print(
-        "throw complete: mutable generation state removed; pinned benchmark sources, "
-        "Kali image/cache and BuildKit cache preserved.",
+        "throw complete: mutable generation state and persistent SWE-Gym templates removed; "
+        "pinned benchmark sources, Kali image/cache and BuildKit cache preserved.",
         flush=True,
     )
     return 0

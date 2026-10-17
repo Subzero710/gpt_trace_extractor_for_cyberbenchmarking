@@ -1,3 +1,4 @@
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 """Finite admin-only local preparation jobs. Durable identity, no command RPC.
 
 One inherited flock protects the whole build across broker restarts. The child
@@ -10,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -272,8 +274,9 @@ class PreparationManager:
                 previous = self._reconcile(previous)
                 if previous["phase"] == "ready":
                     previous = self._verify_ready(previous)
-                if previous["phase"] in {"ready", "failed"} or previous["phase"] not in TERMINAL:
+                if previous["phase"] == "ready" or previous["phase"] not in TERMINAL:
                     return self._public(previous)
+                # failed/interrupted/canceled are resumable only after a new explicit fetch.
                 if not payload["retry"]:
                     return self._public(previous)
                 if JobScope.members(previous) or self._containers(previous):
@@ -438,11 +441,40 @@ class PreparationManager:
         if self.inventory(): raise RuntimeError("preparation absence unconfirmed")
 
 
+    def throw_persistent_storage(self, payload):
+        """Explicit THROW-only destruction of persistent SWE-Gym template state."""
+        if payload != {"confirmation": "THROW"}:
+            raise ValueError("persistent template deletion requires explicit THROW confirmation")
+        if self.slot_busy():
+            raise RuntimeError("template build slot is active; drain/cancel before THROW")
+        if self.inventory():
+            raise RuntimeError("active template preparation remains; drain before THROW")
+        namespace = self.template_root / "swe-gym-lite"
+        if namespace.exists() or namespace.is_symlink():
+            if namespace.is_symlink() or not namespace.is_dir():
+                raise RuntimeError("unsafe SWE-Gym template namespace")
+            for item in (namespace, *namespace.rglob("*")):
+                if item.is_symlink() or item.is_mount():
+                    raise RuntimeError("unsafe persistent template entry; refusing THROW")
+            # This is intentionally the sole persistent-template tree deletion.
+            for directory in sorted((p for p in namespace.rglob("*") if p.is_dir()),
+                                    key=lambda p: len(p.parts), reverse=True):
+                directory.chmod(0o700)
+            namespace.chmod(0o700)
+            shutil.rmtree(namespace)
+        with self.lock():
+            for directory in list(self.root.iterdir()):
+                if not directory.is_dir():
+                    continue
+                state = self._read(identifier(directory.name))
+                if state is None or JobScope.members(state) or self._containers(state):
+                    raise RuntimeError("preparation history is still active; refusing THROW")
+                shutil.rmtree(directory)
+        return {"thrown": True, "template_namespace": str(namespace)}
+
+
 def _prepare(manager, state):
     from workstation_broker.templates import TemplateRegistry
-    from gpt_trace_transport.local_templates import golden_builder
-    golden = golden_builder(manager.source_root)
-    golden.verify(manager.base)
     expected = compatibility(manager.base, manager.source_root)
     if expected != state["compatibility"]: raise RuntimeError("golden/recipe changed since preparation was identified")
     root = manager.template_root
@@ -478,7 +510,8 @@ def _prepare(manager, state):
         # recipe is now requested. Corruption never authorizes replacement.
         verify_manifest(folder, validation["compatibility"], source_root=manager.source_root)
         verify_local_validation(folder, manifest, expected=validation["compatibility"])
-        if validation["compatibility"] == expected: candidates.append(current["generation"])
+        from gpt_trace_transport.local_templates import compatible_template_identity
+        if compatible_template_identity(validation["compatibility"], expected): candidates.append(current["generation"])
     generations = namespace / "generations"
     if generations.exists():
         safe(generations, directory=True)
@@ -488,7 +521,8 @@ def _prepare(manager, state):
             validation_path = folder / "local-validation.json"
             if not validation_path.exists(): raise RuntimeError("unvalidated permanent generation; preserved")
             validation = json.loads(safe(validation_path, immutable=True).read_bytes())
-            if validation.get("compatibility") == expected and folder.name not in candidates:
+            from gpt_trace_transport.local_templates import compatible_template_identity
+            if compatible_template_identity(validation.get("compatibility"), expected) and folder.name not in candidates:
                 candidates.append(folder.name)
     if candidates:
         selected = candidates[0]
@@ -548,10 +582,9 @@ def worker(operation_id, slot_fd):
             "verified_signature": signature, "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25}}, "error": None})
     except BaseException as exc:
         state = manager._read(operation_id)
-        # Only a recoverable build keeps its owned staging checkpoint; a
-        # permanent failure has already removed its disposable stage.
-        recoverable = type(exc).__name__ == "RecoverableBuildError"
-        manager._write({**state, "phase": "interrupted" if recoverable else "failed", "result": None,
+        # Every template-build failure preserves durable bytes/checkpoints.  A later
+        # explicit fetch may continue after code/network/operator repair.
+        manager._write({**state, "phase": "interrupted", "result": None,
             "error": type(exc).__name__ + ": " + str(exc)[:3000]})
         raise
     finally: os.close(slot_fd)

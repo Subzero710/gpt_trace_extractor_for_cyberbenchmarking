@@ -1,3 +1,4 @@
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 """Host-owned, immutable template generations. No task-supplied paths."""
 from __future__ import annotations
 
@@ -51,15 +52,20 @@ class TemplateRegistry:
         self._expected = None
         self._generation_checks = {}
         self._golden_signature = None
+        self._template_contract_signature = None
 
     def expected(self):
-        from gpt_trace_transport.local_templates import compatibility, file_signature
+        from gpt_trace_transport.local_templates import (compatibility, file_signature,
+            template_contract, canonical)
         signature = tuple(file_signature(p) for p in (self.base,
             self.base.with_suffix(".provenance.json"), self.base.parent / "kali-packages.txt",
             self.base.parent / "kali-python-packages.txt"))
-        if self._expected is None or self._golden_signature != signature:
+        contract_signature = hashlib.sha256(canonical(template_contract(self.source_root))).hexdigest()
+        if (self._expected is None or self._golden_signature != signature or
+                self._template_contract_signature != contract_signature):
             self._expected = compatibility(self.base, self.source_root, hasher=self.immutable_sha256)
             self._golden_signature = signature
+            self._template_contract_signature = contract_signature
         return self._expected
 
     def validate_generation(self, generation, *, complete=False, check_images=False):

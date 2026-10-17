@@ -1,3 +1,4 @@
+# GPT_TRACE_PERSISTENT_TEMPLATE_RESUME_V1
 """Root-owned local generations: recipes, complete byte inventory and activation.
 
 No network client and no guest construction lives in this module. Integrity is
@@ -22,6 +23,7 @@ PINS = Path("apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.j
 RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
+TEMPLATE_ABI = 1
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -122,32 +124,62 @@ def golden_builder(source_root=ROOT):
     return module
 
 
-def source_contract(source_root=ROOT):
+def template_contract(source_root=ROOT):
+    """Stable identity of the expensive SWE-Gym template payload.
+
+    Repository implementation hashes deliberately do not belong here.  Bump
+    TEMPLATE_ABI only when the bytes required by an already-built template are
+    intentionally made incompatible.
+    """
     source_root = Path(source_root)
     pins = json.loads((source_root / PINS).read_bytes())
     if pins.get("schema_version") != 2 or pins.get("recipe_version") != 2:
         raise ValueError("unsupported pinned Lite recipe")
     if digest(source_root / RUNTIME / "contract.json") != pins["contract_sha256"]:
         raise ValueError("pinned Lite source contract differs")
-    return {"schema_version": 2, "recipe_version": 2, "pins": pins,
-        "source_fingerprint": hashlib.sha256(canonical(pins)).hexdigest(),
-        "security": SECURITY, "builder_sha256": digest(source_root / BUILDER),
+    return {"schema_version": 2, "recipe_version": 2, "template_abi": TEMPLATE_ABI,
+        "pins": pins, "source_fingerprint": hashlib.sha256(canonical(pins)).hexdigest(),
+        "security": SECURITY}
+
+
+def source_contract(source_root=ROOT):
+    """Exact control/execution code contract used only to authorize a build."""
+    source_root = Path(source_root)
+    stable = template_contract(source_root)
+    return {**stable, "builder_sha256": digest(source_root / BUILDER),
         "golden_build_input_sha256": golden_builder(source_root).golden_build_input_sha256(),
         "runtime_sources": {name: digest(source_root / RUNTIME / name)
             for name in ("guest_runtime.py", "task_sources.py", "os_packages.py")}}
 
 
+def normalized_template_compatibility(value):
+    if not isinstance(value, dict):
+        raise ValueError("invalid template compatibility record")
+    abi = value.get("template_abi", 1 if value.get("recipe_version") == 2 else None)
+    keys = ("schema_version", "recipe_version", "pins", "source_fingerprint", "security",
+            "architecture", "golden_sha256", "golden_provenance_sha256", "golden_provenance")
+    result = {key: value.get(key) for key in keys}
+    result["template_abi"] = abi
+    if abi is None or any(result[key] is None for key in keys):
+        raise ValueError("incomplete template compatibility record")
+    return result
+
+
+def compatible_template_identity(recorded, expected):
+    return normalized_template_compatibility(recorded) == normalized_template_compatibility(expected)
+
+
 def compatibility(base, source_root=ROOT, *, hasher=digest):
+    """Bind templates to immutable inputs on disk, not to the current checkout."""
     base, source_root = Path(base), Path(source_root)
-    recipe = source_contract(source_root)
+    recipe = template_contract(source_root)
     provenance_path = safe(base.with_suffix(".provenance.json"), immutable=True)
     provenance = json.loads(provenance_path.read_bytes())
-    golden = golden_builder(source_root)
-    if (provenance.get("source") != golden.SOURCE + golden.ARCHIVE or
-            provenance.get("source_sha256") != golden.ARCHIVE_SHA256 or
-            provenance.get("build_input_sha256") != recipe["golden_build_input_sha256"] or
-            provenance.get("python_lock_sha256") != digest(source_root / "infra/workstation/image/requirements.lock")):
-        raise ValueError("installed Kali golden recipe/source provenance differs")
+    required = {"source", "source_sha256", "base_sha256", "build_input_sha256",
+                "python_lock_sha256", "apt_package_manifest_sha256",
+                "python_package_manifest_sha256"}
+    if not isinstance(provenance, dict) or not required <= set(provenance):
+        raise ValueError("installed Kali golden provenance is incomplete")
     for name, key in (("kali-packages.txt", "apt_package_manifest_sha256"),
                       ("kali-python-packages.txt", "python_package_manifest_sha256")):
         if hasher(safe(base.parent / name, immutable=True)) != provenance.get(key):
@@ -187,7 +219,7 @@ def verify_local_validation(folder, manifest, *, expected, hasher=digest, comple
     validation = json.loads(safe(folder / "local-validation.json", immutable=True).read_bytes())
     if (not isinstance(validation, dict) or set(validation) != {"schema", "generation", "compatibility", "files"}
             or validation["schema"] != 1 or validation["generation"] != manifest.get("generation")
-            or validation["compatibility"] != expected):
+            or not compatible_template_identity(validation["compatibility"], expected)):
         raise ValueError("locally validated generation identity/compatibility differs")
     files = validation["files"]
     if not isinstance(files, dict) or not {"manifest.json", "resolved-inputs.json", "common.qcow2", "audit/offline-setups.json"} <= set(files):
@@ -265,10 +297,6 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
         if manifest.get(key) != expected[key]: raise ValueError("template recipe/security compatibility mismatch: " + key)
     if resolved.get("golden", {}).get("sha256") != expected["golden_sha256"]:
         raise ValueError("template uses another Kali golden")
-    for name, sha in expected["runtime_sources"].items():
-        source_path = (RUNTIME / name).as_posix()
-        if resolved.get("builder_sources", {}).get(source_path) != sha:
-            raise ValueError("template guest source differs from installed native harness")
     if manifest.get("invariants") != {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0} or len(manifest.get("templates", {})) != 11 or len(manifest.get("task_artifacts", {})) != 230 or len(manifest.get("env_mapping", {})) != 25:
         raise ValueError("local Lite coverage changed")
     proof = json.loads((folder / "audit/offline-setups.json").read_bytes())
@@ -344,8 +372,6 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
             expected_artifacts.add(key)
     if set(manifest["artifacts"]) != expected_artifacts:
         raise ValueError("local artifacts contain missing or cross-task entries")
-    if resolved.get("builder_sources", {}).get(BUILDER.as_posix()) != expected["builder_sha256"]:
-        raise ValueError("local template builder recipe differs")
     if resolved.get("golden", {}).get("provenance") != expected["golden_provenance"]:
         raise ValueError("local golden provenance differs")
     for template_id, row in manifest["templates"].items():
