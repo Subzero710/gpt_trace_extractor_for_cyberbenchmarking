@@ -143,8 +143,12 @@ class TemplateRegistry:
             raise ValueError("resolved template inputs digest mismatch")
         resolved = json.loads(resolved_path.read_text())
         encoded = json.dumps(resolved, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        if hashlib.sha256(encoded).hexdigest() != generation or any(manifest.get(key) != resolved.get(key) for key in
-                ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation")):
+        manifest_abi = manifest.get("template_abi", 1 if manifest.get("recipe_version") == 2 else None)
+        resolved_abi = resolved.get("template_abi", 1 if resolved.get("recipe_version") == 2 else None)
+        if (hashlib.sha256(encoded).hexdigest() != generation or manifest_abi != resolved_abi or
+                any(manifest.get(key) != resolved.get(key) for key in
+                    ("schema_version", "recipe_version", "pins", "source_fingerprint", "security",
+                     "templates", "artifacts", "task_artifacts", "isolation_validation"))):
             raise ValueError("template generation content identity mismatch")
         self.validate_generation(generation)
         source = manifest.get("source_fingerprint")

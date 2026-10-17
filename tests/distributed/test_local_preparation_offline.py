@@ -70,6 +70,21 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertEqual(self.builder.TASK_COMPLETION, "/opt/swe-gym-task/build-complete.json")
         self.assertEqual(self.builder.RESOLVER_COMPLETION, "/opt/swe-gym-os-resolver-complete.json")
 
+    def test_final_manifest_propagates_template_abi(self):
+        tree = ast.parse((ROOT / "scripts/build_local_templates.py").read_bytes())
+        candidates = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "manifest" for target in node.targets):
+                continue
+            keys = {key.value for key in node.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+            if "generation" in keys and "resolved_inputs_sha256" in keys:
+                candidates.append(keys)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("template_abi", candidates[0])
+
 
 class LocalGenerationTests(unittest.TestCase):
     def setUp(self):
@@ -543,6 +558,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
             recipe = local.template_contract(ROOT)
+            source_recipe = local.source_contract(ROOT)
             expected = {**recipe, "architecture": "x86_64",
                 "golden_sha256": hashlib.sha256(b"actual fixture golden bytes").hexdigest(),
                 "golden_provenance_sha256": hashlib.sha256(b"fixture provenance").hexdigest(),
@@ -560,7 +576,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": phase,
                     "result": {"generation": hashlib.sha256(b"fixture generation").hexdigest(),
                         "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25}, "verified_signature": {"actual_fixture": [1]}}}
-            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=local.source_contract(ROOT)), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=source_recipe), patch.object(local, "template_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
                 self.dispatch.preparation_fetch(cfg)
             self.assertEqual(calls.count("prepare_templates"), 1)
             self.assertEqual(calls.count("template_preparation_status"), 3)
@@ -571,7 +587,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 if action == "template_preparation_probe": return identified
                 if action == "template_preparation_status": return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": "not_started"}
                 raise TransportFailure("lost reply after remote start")
-            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=local.source_contract(ROOT)), patch.object(self.dispatch, "broker", side_effect=lost), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=source_recipe), patch.object(local, "template_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=lost), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "rediscover"):
                     self.dispatch.preparation_fetch(cfg)
             self.assertEqual(calls.count("prepare_templates"), 1)

@@ -245,6 +245,17 @@ def test_old_or_incomplete_security_generation_is_rejected(files, attack):
     with pytest.raises(ValueError): files.registry.select(ID)
 
 
+def test_registry_rejects_manifest_resolved_template_abi_mismatch(files):
+    path = files.folder / "manifest.json"
+    manifest = json.loads(path.read_bytes())
+    path.chmod(0o644)
+    manifest["template_abi"] = manifest["template_abi"] + 1
+    path.write_text(json.dumps(manifest))
+    path.chmod(0o444)
+    with pytest.raises(ValueError, match="content identity mismatch"):
+        files.registry.select(ID)
+
+
 def test_runtime_refuses_a_generation_without_local_validation(files):
     path = files.folder / "local-validation.json"
     files.folder.chmod(0o755)

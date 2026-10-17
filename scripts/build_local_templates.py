@@ -1343,8 +1343,9 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                        "task_sources_logical_bytes": sum(p.stat().st_size for p in source_folder.glob('*.tar.gz')),
                        "setup_caches_physical_bytes": physical_bytes(cache_folder.glob('*.tar.gz')),
                        "setup_caches_logical_bytes": sum(p.stat().st_size for p in cache_folder.glob('*.tar.gz'))}
-            manifest = {"schema_version": 2, "recipe_version": 2, "generation": generation,
-                "source_fingerprint": inputs["source_fingerprint"], "pins": pins, "security": SECURITY_CONTRACT,
+            manifest = {"schema_version": 2, "recipe_version": 2, "template_abi": job["compatibility"]["template_abi"],
+                "generation": generation, "source_fingerprint": inputs["source_fingerprint"],
+                "pins": pins, "security": SECURITY_CONTRACT,
                 "resolved_inputs_sha256": digest(staged / 'resolved-inputs.json'),
                 "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0},
                 "env_mapping": {key: value['stored_name'] for key, value in inputs['environments'].items()},
