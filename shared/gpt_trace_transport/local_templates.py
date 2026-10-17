@@ -24,6 +24,13 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
+# Stable trust anchors for already-installed immutable Kali goldens. New
+# upstream goldens append a tuple here; old tuples stay forever so unrelated
+# checkout changes never invalidate bytes that were already built and sealed.
+GOLDEN_SOURCE_PINS = frozenset({
+    ("https://cdimage.kali.org/kali-2026.2/kali-linux-2026.2-qemu-amd64.7z",
+     "c7c35588d05277c482c908bf7a136d348f76ffa68700b04ff53c0b217e6bd071"),
+})
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -180,6 +187,12 @@ def compatibility(base, source_root=ROOT, *, hasher=digest):
                 "python_package_manifest_sha256"}
     if not isinstance(provenance, dict) or not required <= set(provenance):
         raise ValueError("installed Kali golden provenance is incomplete")
+    if (provenance.get("source"), provenance.get("source_sha256")) not in GOLDEN_SOURCE_PINS:
+        raise ValueError("installed Kali golden source provenance is not a trusted immutable pin")
+    for key in ("source_sha256", "base_sha256", "build_input_sha256", "python_lock_sha256",
+                "apt_package_manifest_sha256", "python_package_manifest_sha256"):
+        if SHA.fullmatch(str(provenance.get(key))) is None:
+            raise ValueError("installed Kali golden provenance contains an invalid SHA-256: " + key)
     for name, key in (("kali-packages.txt", "apt_package_manifest_sha256"),
                       ("kali-python-packages.txt", "python_package_manifest_sha256")):
         if hasher(safe(base.parent / name, immutable=True)) != provenance.get(key):
@@ -293,6 +306,10 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
         raise ValueError("resolved template generation/input SHA-256 mismatch")
     for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation"):
         if manifest.get(key) != resolved.get(key): raise ValueError("manifest/resolved input mismatch: " + key)
+    manifest_abi = manifest.get("template_abi", 1 if manifest.get("recipe_version") == 2 else None)
+    resolved_abi = resolved.get("template_abi", 1 if resolved.get("recipe_version") == 2 else None)
+    if manifest_abi != resolved_abi or manifest_abi != expected["template_abi"]:
+        raise ValueError("template ABI compatibility mismatch")
     for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security"):
         if manifest.get(key) != expected[key]: raise ValueError("template recipe/security compatibility mismatch: " + key)
     if resolved.get("golden", {}).get("sha256") != expected["golden_sha256"]:

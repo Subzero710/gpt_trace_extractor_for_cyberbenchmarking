@@ -125,6 +125,7 @@ def fixture(parent, *, activate=True, label="repo"):
         local.atomic_json(base.with_suffix(".provenance.json"), provenance)
         for path in (base, parent / "kali-packages.txt", parent / "kali-python-packages.txt"): path.chmod(0o444)
     expected = local.compatibility(base, ROOT)
+    build_contract = local.source_contract(ROOT)
     contract = json.loads((ROOT / local.RUNTIME / "contract.json").read_bytes())
     tools = load("fixture_task_sources", ROOT / local.RUNTIME / "task_sources.py")
     common = folder / "common.qcow2"
@@ -172,13 +173,13 @@ def fixture(parent, *, activate=True, label="repo"):
         "installed_before": {}, "installed_after": {}}
     local.atomic_json(deb.parent / "manifest.json", os_manifest)
     clean = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
-    resolved = {"schema_version": 2, "recipe_version": 2, "pins": expected["pins"],
-        "source_fingerprint": expected["source_fingerprint"], "security": local.SECURITY,
+    resolved = {"schema_version": 2, "recipe_version": 2, "template_abi": expected["template_abi"],
+        "pins": expected["pins"], "source_fingerprint": expected["source_fingerprint"], "security": local.SECURITY,
         "templates": templates, "artifacts": artifacts, "task_artifacts": mapping,
         "isolation_validation": {name: clean for name in repos | {"common"}},
         "golden": {"sha256": expected["golden_sha256"], "provenance": expected["golden_provenance"]},
-        "builder_sources": {**{(local.RUNTIME / name).as_posix(): sha for name, sha in expected["runtime_sources"].items()},
-            local.BUILDER.as_posix(): expected["builder_sha256"]}, "environments": environments, "resolved_os": os_manifest,
+        "builder_sources": {**{(local.RUNTIME / name).as_posix(): sha for name, sha in build_contract["runtime_sources"].items()},
+            local.BUILDER.as_posix(): build_contract["builder_sha256"]}, "environments": environments, "resolved_os": os_manifest,
         "cache_provenance": caches, "offline_setups_sha256": local.digest(folder / "audit/offline-setups.json"),
         **{key: local.digest(folder / "audit" / name) for name, key in (
             ("environment-downloads.json", "environment_downloads_sha256"),

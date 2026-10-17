@@ -38,6 +38,39 @@ def temporary_tree(parent):
         if path.is_dir() and not path.is_symlink(): path.chmod(0o700)
 
 
+class PersistentBuilderPolicyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.builder = load("persistent_builder_policy", ROOT / "scripts/build_local_templates.py")
+
+    def test_qcow2_volumes_are_never_deleted_by_normal_builder_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "retained.qcow2"
+            image.write_bytes(b"persistent-volume")
+            with self.assertRaisesRegex(RuntimeError, "outside make throw_volumes"):
+                self.builder._discard(image)
+            self.assertEqual(image.read_bytes(), b"persistent-volume")
+
+    def test_stage_selection_preserves_common_work_then_imports_other_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            common_heavy = root / ".build-heavy-common"
+            task_heavy = root / ".build-many-tasks"
+            for stage in (common_heavy, task_heavy):
+                (stage / ".checkpoints").mkdir(parents=True)
+            (common_heavy / "common.qcow2").write_bytes(b"x" * (2 * 1024 * 1024))
+            (task_heavy / "common.qcow2").write_bytes(b"x" * (1024 * 1024))
+            for index in range(20):
+                (task_heavy / ".checkpoints" / f"task-{index}.json").write_text("{}")
+            self.assertGreater(self.builder._stage_score(common_heavy), self.builder._stage_score(task_heavy))
+
+    def test_stage_specific_completion_proofs_exist_for_every_persistent_qcow2_kind(self):
+        self.assertEqual(self.builder.COMMON_COMPLETION, "/opt/swe-gym-lite/common-template-complete.json")
+        self.assertEqual(self.builder.REPO_COMPLETION, "/opt/swe-gym-lite/repository-template-complete.json")
+        self.assertEqual(self.builder.TASK_COMPLETION, "/opt/swe-gym-task/build-complete.json")
+        self.assertEqual(self.builder.RESOLVER_COMPLETION, "/opt/swe-gym-os-resolver-complete.json")
+
+
 class LocalGenerationTests(unittest.TestCase):
     def setUp(self):
         if os.geteuid() != 0: self.skipTest("real root-ownership fixture required")
@@ -110,7 +143,7 @@ class LocalGenerationTests(unittest.TestCase):
             elif attack == "mutable": validation.chmod(0o644)
             elif attack in {"compatibility", "sha"}:
                 changed = json.loads(original)
-                if attack == "compatibility": changed["compatibility"]["builder_sha256"] = "0" * 64
+                if attack == "compatibility": changed["compatibility"]["source_fingerprint"] = "0" * 64
                 else: changed["files"]["manifest.json"]["sha256"] = "0" * 64
                 local.atomic_json(validation, changed)
             else:
@@ -321,10 +354,10 @@ finally:
         before = self.files.registry_path.read_bytes()
         self.mode = "error"
         self.start()
-        failed = self.wait_phase({"failed"})
+        failed = self.wait_phase({"interrupted"})
         self.assertIn("synthetic build boundary failure", failed["error"])
         for process in self.children: process.wait(timeout=5)
-        self.assertEqual(self.start()["phase"], "failed")
+        self.assertEqual(self.start()["phase"], "interrupted")
         self.assertEqual(len(self.children), 1)
         self.assertEqual(self.files.registry_path.read_bytes(), before)
         self.assertTrue(list(self.manager.root.rglob("*.log")))
@@ -509,7 +542,11 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
     def test_single_explicit_fetch_polls_and_never_repeats_a_lost_start(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
-            expected = {**local.source_contract(ROOT), "golden_sha256": hashlib.sha256(b"actual fixture golden bytes").hexdigest()}
+            recipe = local.template_contract(ROOT)
+            expected = {**recipe, "architecture": "x86_64",
+                "golden_sha256": hashlib.sha256(b"actual fixture golden bytes").hexdigest(),
+                "golden_provenance_sha256": hashlib.sha256(b"fixture provenance").hexdigest(),
+                "golden_provenance": {"fixture": True}}
             operation_id = hashlib.sha256(local.canonical(expected)).hexdigest()
             identified = {"operation_id": operation_id, "compatibility": expected, "deployment": cfg["deployment"]}
             calls = []

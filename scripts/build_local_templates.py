@@ -37,6 +37,10 @@ BUILD_TIMEOUT_HOURS = 96
 # The host has 15 GiB of usable RAM; do not launch a second concurrent VM.
 GUEST_MEMORY_MIB = 12288
 GUEST_VCPUS = 4
+COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
+REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
+TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
+RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
 
 
 class RecoverableBuildError(RuntimeError):
@@ -54,6 +58,9 @@ def _owned_tree(path):
 
 
 def _discard(path):
+    path = Path(path)
+    if path.suffix == ".qcow2":
+        raise RuntimeError("QCOW2 volume deletion is forbidden outside make throw_volumes: " + str(path))
     if path.is_symlink():
         raise RuntimeError("unsafe disposable path: " + str(path))
     if path.is_dir():
@@ -217,15 +224,21 @@ def _compatibility_matches(left, right):
 
 
 def _stage_score(path):
+    """Prefer the stage containing the most already-validated expensive work."""
     common = path / "common.qcow2"
     common_bytes = common.stat().st_blocks * 512 if common.is_file() else 0
     checkpoints = path / ".checkpoints"
     task_count = len(list(checkpoints.glob("task-*.json"))) if checkpoints.is_dir() else 0
     source_count = len(list(checkpoints.glob("source-*.json"))) if checkpoints.is_dir() else 0
-    return (common_bytes, task_count, source_count, path.stat().st_mtime_ns)
+    repo_count = len(list((path / "repos").glob("*.qcow2"))) if (path / "repos").is_dir() else 0
+    sealed = int((path / "local-validation.json").is_file())
+    # Any repo image implies a completed common.  Otherwise preserve the stage
+    # with the most common-QCOW2 work, because task/source checkpoints can be
+    # imported independently from every other compatible donor below.
+    return (sealed, repo_count, common_bytes, task_count, source_count, path.stat().st_mtime_ns)
 
 
-def _adopt_resumable_stage(target_root, staged, identity):
+def _compatible_stage_candidates(target_root, staged, identity):
     candidates = []
     for old in target_root.glob(".build-*"):
         if old == staged or old.is_symlink() or not old.is_dir():
@@ -237,20 +250,28 @@ def _adopt_resumable_stage(target_root, staged, identity):
             previous = json.loads(record.read_bytes())
         except (OSError, ValueError):
             continue
-        if not _compatibility_matches(previous.get("compatibility"), identity["compatibility"]):
-            continue
-        candidates.append(old)
+        if _compatibility_matches(previous.get("compatibility"), identity["compatibility"]):
+            candidates.append(old)
+    return candidates
+
+
+def _adopt_resumable_stage(target_root, staged, identity):
+    candidates = _compatible_stage_candidates(target_root, staged, identity)
     if not candidates:
         return False
-    # Prefer the stage containing the most expensive retained work.  Other old
-    # stages are deliberately preserved; only make throw_volumes may erase them.
+    # Keep one canonical stage.  Completed source/task artifacts from every
+    # other compatible historical stage are imported lazily and validated below.
     old = max(candidates, key=_stage_score)
     _purge_apt_partial(old)
     os.rename(old, staged)
-    atomic_json(staged / "build-identity.json", identity)
+    # A sealed stage's build-identity is part of local-validation.json and must
+    # never be rewritten before verification/publication. Mutable partial stages
+    # may update this administrative record to the current schema.
+    if not (staged / "local-validation.json").exists():
+        atomic_json(staged / "build-identity.json", identity)
     print("adopted persistent resumable template stage: " + str(old) + " -> " + str(staged), flush=True)
     if len(candidates) > 1:
-        print("additional historical template stages preserved for explicit make throw_volumes", flush=True)
+        print("compatible historical stages retained as resumable artifact donors", flush=True)
     return True
 
 
@@ -580,8 +601,11 @@ def build(args):
         raise RuntimeError("untrusted full-mirror host cache")
     with (target_root / "build.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        staged = target_root / ".build-resumable-v2"
-        identity = {"schema": 2, "compatibility": job["compatibility"]}
+        # One deterministic resumable stage per *template identity*, not per
+        # checkout/build implementation.  The operation ID is the hash of the
+        # stable compatibility record, so code-only changes reuse this path.
+        staged = target_root / (".build-resumable-v3-" + args.operation_id)
+        identity = {"schema": 3, "compatibility": job["compatibility"]}
         if staged.exists():
             from gpt_trace_transport.local_templates import safe
             safe(staged, directory=True)
@@ -590,9 +614,10 @@ def build(args):
             if not _compatibility_matches(prior_identity.get("compatibility"), identity["compatibility"]):
                 raise RuntimeError("persistent template stage belongs to another template contract; "
                                    "preserved; only make throw_volumes may remove it")
-            if prior_identity != identity:
+            sealed_stage = (staged / "local-validation.json").exists()
+            if prior_identity != identity and not sealed_stage:
                 atomic_json(previous, identity)
-            if (staged / "local-validation.json").exists():
+            if sealed_stage:
                 # An interrupted seal/atomic rename is recoverable without any
                 # rebuild. Validate every immutable byte before publication.
                 from gpt_trace_transport.local_templates import (verify_manifest,
@@ -624,6 +649,10 @@ def build(args):
         checkpoints.mkdir(mode=0o700, exist_ok=True)
         from gpt_trace_transport.local_templates import safe
         safe(checkpoints, directory=True)
+        historical_stages = _compatible_stage_candidates(target_root, staged, identity)
+        scratch_root = target_root / ".scratch"
+        scratch_root.mkdir(mode=0o700, exist_ok=True)
+        safe(scratch_root, directory=True)
 
         def read_checkpoint(name):
             path = checkpoints / name
@@ -642,12 +671,46 @@ def build(args):
         def guest_json(image, path):
             return json.loads(capture("virt-cat", "-a", str(image), path))
 
+        def guest_json_optional(image, path):
+            result = subprocess.run(["virt-cat", "-a", str(image), path], capture_output=True,
+                                    timeout=180, check=False)
+            if result.returncode != 0:
+                return None
+            try:
+                return json.loads(result.stdout)
+            except (ValueError, UnicodeError):
+                return None
+
+        def generic_guest_complete(image):
+            proof = subprocess.run(["virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete"],
+                                   capture_output=True, timeout=180, check=False)
+            return proof.returncode == 0 and proof.stdout.strip() == b"ok"
+
+        def completion_matches(image, path, expected):
+            # The generic marker is inherited by every QCOW2 overlay, so it is
+            # never sufficient on its own.  A stage-specific proof must also be
+            # present and exactly match this build step.
+            return generic_guest_complete(image) and guest_json_optional(image, path) == expected
+
         def overlay(image, backing):
             relative = os.path.relpath(backing, image.parent) if backing != BASE else str(BASE)
             cmd("qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", relative, image.name,
                 str(args.virtual_gib) + "G", cwd=image.parent)
 
-        def provision(image, boot, payload=None, *, network):
+        def reset_scratch_overlay(image, backing):
+            """Reuse one fixed scratch volume path; never unlink a QCOW2."""
+            if image.is_symlink() or (image.exists() and not image.is_file()):
+                raise RuntimeError("unsafe scratch QCOW2 volume: " + str(image))
+            image.parent.mkdir(mode=0o700, exist_ok=True)
+            if image.exists():
+                image.chmod(0o600)
+                with image.open("r+b") as handle:
+                    handle.truncate(0)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            overlay(image, backing)
+
+        def provision(image, boot, payload=None, *, network, completion=None):
             boot_file = staged / "firstboot.sh"
             boot_file.write_text(firstboot(boot))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
@@ -663,12 +726,23 @@ def build(args):
             cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot",
                 timeout=args.build_timeout_hours * 3600)
             # A clean QEMU exit does not imply a successful guest firstboot.
-            proof = subprocess.run(
-                ["virt-cat", "-a", str(image), "/etc/gpt-trace-image-build-complete"],
-                capture_output=True, timeout=180, check=False)
-            if proof.returncode != 0 or proof.stdout.strip() != b"ok":
+            if not generic_guest_complete(image):
                 raise RuntimeError("guest build completion proof is missing; "
                                    "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
+            if completion is not None:
+                path, expected = completion
+                if guest_json_optional(image, path) != expected:
+                    raise RuntimeError("guest stage-specific completion proof is missing or differs: " + path)
+
+        def historical_files(relative):
+            for old in historical_stages:
+                source = old / relative
+                if not source.exists():
+                    continue
+                try:
+                    yield safe(source, immutable=True)
+                except (OSError, ValueError):
+                    continue
 
         def mirror_for(url, name):
             from urllib.parse import urlparse
@@ -703,7 +777,7 @@ def build(args):
             return path
 
         def task_boot(item, artifact, *, warm, cache=None):
-            # Only this item/source/cache ever enters this disposable disk.
+            # Only this item/source/cache ever enters this scratch disk.
             body = "import runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
             body += "item=json.load(open('/opt/swe-gym-task/item.json'))\n"
             body += "artifact=" + repr({**artifact, "path": "/opt/swe-gym-task/source.tar.gz"}) + "\n"
@@ -711,13 +785,16 @@ def build(args):
                 body += "module['warm_task'](item,artifact)\n"
                 body += "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')\n"
                 body += "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)\n"
+                completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"]}
             else:
                 body += "cache=" + repr({**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}) + "\n"
                 body += "module['install_setup_cache'](item,cache)\n"
                 body += "prefix=module['prepare'](item,artifact=artifact,log=module['ROOT']/'logs/offline.log')\n"
                 body += "module['evaluation_setup'](item,prefix,item['eval_setup_commands'],module['ROOT']/'logs')\n"
                 body += "json.dump({'base_commit':item['base_commit'],'env_hash':item['env_hash'],'offline':True},open('/opt/swe-gym-task/offline-proof.json','w'))\n"
-            return "/usr/bin/python3 - <<'PY_GUEST'\n" + body + "PY_GUEST\n"
+                completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"]}
+            body += "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)\n"
+            return "/usr/bin/python3 - <<'PY_GUEST'\n" + body + "PY_GUEST\n", completion
 
         try:
             inputs_root = staged / "build-inputs"
@@ -763,7 +840,30 @@ def build(args):
                     tools.validate_artifact(item, output, record)
                     print("reused verified source: " + logical, flush=True)
                 else:
-                    if output.exists():
+                    if not output.exists():
+                        relative_source = Path("sources") / (key + ".tar.gz")
+                        for donor in historical_files(relative_source):
+                            os.link(donor, output)
+                            try:
+                                with tempfile.TemporaryDirectory(dir=output.parent, prefix=".recover-source-") as temporary:
+                                    checkout = Path(temporary) / "checkout"
+                                    integrity = {"sha256": digest(output), "size": output.stat().st_size}
+                                    tools.extract(output, checkout, **integrity)
+                                    proof = tools.validate_checkout(checkout, item["base_commit"])
+                                record = {**integrity, "kind": "task_source", "logical_task_id": item["instance_id"],
+                                    "allowed_template_id": item["template_id"],
+                                    "source_identity": {name: item[name] for name in ("instance_id", "repo", "base_commit")},
+                                    "validation": proof}
+                                tools.validate_artifact(item, output, record)
+                            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                                output.unlink(missing_ok=True)
+                                record = None
+                                continue
+                            output.chmod(0o444)
+                            write_checkpoint("source-" + key + ".json", record)
+                            print("reused compatible historical source: " + logical, flush=True)
+                            break
+                    if record is None and output.exists():
                         if output.is_symlink() or not output.is_file():
                             raise RuntimeError("unsafe orphan task source archive; preserved")
                         with tempfile.TemporaryDirectory(dir=output.parent, prefix=".recover-source-") as temporary:
@@ -779,7 +879,7 @@ def build(args):
                         output.chmod(0o444)
                         write_checkpoint("source-" + key + ".json", record)
                         print("recovered orphan verified source: " + logical, flush=True)
-                    else:
+                    if record is None:
                         record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
                                                       submodule_mirror=submodule_mirror)
                         output.chmod(0o444)
@@ -790,10 +890,14 @@ def build(args):
                                     "setup_cache": tools.artifact_id("setup_cache", logical)}
 
             # Golden provenance exposes kali-last-snapshot, a mutable alias,
-            # not an immutable snapshot ID. Resolve in an expendable VM instead.
+            # not an immutable snapshot ID. Resolve in one persistent resumable
+            # resolver volume; never recreate it merely because a host copy-out
+            # was interrupted.
             resolver = cache_root / "os-resolver.qcow2"
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
+            resolver_completion = {"schema": 1, "kind": "os-resolver",
+                "source_fingerprint": inputs["source_fingerprint"]}
             if (os_folder / "manifest.json").is_file():
                 os_manifest = json.loads((os_folder / "manifest.json").read_text())
                 os_tools.verify_artifacts(os_folder, os_manifest)
@@ -804,23 +908,35 @@ def build(args):
                     overlay(resolver, BASE)
                 elif resolver.is_symlink() or not resolver.is_file():
                     raise RuntimeError("unsafe persistent OS resolver volume; preserved")
-                if os_parent.exists() and not (os_folder / "manifest.json").is_file():
-                    # Partial copied-out metadata is not a VM volume.  Preserve the
-                    # expensive resolver disk and refresh only this import scratch.
-                    shutil.rmtree(os_parent)
-                os_payload = staged / "swe-gym-os-helper"
-                if os_payload.exists():
+                legacy_resolver_complete = (generic_guest_complete(resolver) and
+                    isinstance(guest_json_optional(resolver, "/opt/swe-gym-os/manifest.json"), dict))
+                resolver_ready = completion_matches(resolver, RESOLVER_COMPLETION, resolver_completion) or legacy_resolver_complete
+                if not resolver_ready:
+                    # resolve() is intentionally not idempotent.  Keep the QCOW2
+                    # volume itself and clear only its incomplete guest scratch.
+                    cmd("virt-customize", "--no-network", "-a", str(resolver),
+                        "--run-command", "rm -rf /opt/swe-gym-os /opt/swe-gym-os-helper " + RESOLVER_COMPLETION,
+                        timeout=14400)
+                    os_payload = staged / "swe-gym-os-helper"
+                    if os_payload.exists():
+                        shutil.rmtree(os_payload)
+                    os_payload.mkdir()
+                    shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
+                    resolver_boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\n"
+                    resolver_boot += "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve']('/opt/swe-gym-os')\n"
+                    resolver_boot += "json.dump(" + repr(resolver_completion) + ",open('" + RESOLVER_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
+                    provision(resolver, resolver_boot, os_payload, network=True,
+                        completion=(RESOLVER_COMPLETION, resolver_completion))
                     shutil.rmtree(os_payload)
-                os_payload.mkdir()
-                shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
-                provision(resolver, "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy\n"
-                    "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve']('/opt/swe-gym-os')\nPY_GUEST\n", os_payload, network=True)
+                else:
+                    print("reused verified persistent OS resolver volume", flush=True)
+                if os_parent.exists():
+                    # Host-side copy-out scratch only; the resolver QCOW2 is kept.
+                    shutil.rmtree(os_parent)
                 os_parent.mkdir()
                 cmd("virt-copy-out", "-a", str(resolver), "/opt/swe-gym-os", str(os_parent))
                 os_manifest = json.loads((os_folder / "manifest.json").read_text())
                 os_tools.verify_artifacts(os_folder, os_manifest)
-                # Keep the resolver QCOW2 as a stable resumable build volume.
-                shutil.rmtree(os_payload)
 
             # The OS closure is checked; APT's _apt-owned partial download
             # directory is neither a dependency nor a reusable checkpoint.
@@ -861,6 +977,10 @@ def build(args):
             initial_common = not common.exists()
             if initial_common:
                 overlay(common, BASE)
+            common_completion = {"schema": 1, "kind": "common",
+                "template_abi": job["compatibility"]["template_abi"],
+                "source_fingerprint": inputs["source_fingerprint"]}
+            marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
             boot = r'''
 mkdir -p /opt/swe-gym-lite
 cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym-build/os_packages.py /opt/swe-gym-lite/
@@ -880,7 +1000,7 @@ import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
 module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
 json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
-PY_GUEST
+''' + marker_line + r'''PY_GUEST
 '''
             boot_resume = r'''
 /usr/bin/python3 - <<'PY_GUEST'
@@ -888,45 +1008,53 @@ import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
 module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
 json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
-PY_GUEST
+''' + marker_line + r'''PY_GUEST
 '''
-            proof = subprocess.run(["virt-cat", "-a", str(common), "/etc/gpt-trace-image-build-complete"],
-                                   capture_output=True, timeout=180, check=False)
-            if not initial_common and proof.returncode == 0 and proof.stdout.strip() == b"ok":
+            clean_isolation = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
+            legacy_common_complete = False
+            if not initial_common and generic_guest_complete(common):
+                try:
+                    legacy_common_complete = (
+                        guest_json(common, "/opt/swe-gym-lite/build-environments.json") ==
+                            {"environments": inputs["environments"]}
+                        and guest_json(common, "/opt/swe-gym-lite/isolation-validation.json") == clean_isolation
+                        and isinstance(guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json"), dict)
+                        and all(isinstance(guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json"), dict)
+                                for key in inputs["environments"]))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    legacy_common_complete = False
+            common_ready = completion_matches(common, COMMON_COMPLETION, common_completion) or legacy_common_complete
+            if common_ready:
+                subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
                 print("reused verified complete common QCOW2", flush=True)
             else:
-                if not initial_common:
-                    # Only a previously installed Miniconda can be resumed safely.
-                    has_conda = subprocess.run(["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
-                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                              timeout=180).returncode == 0
-                    if has_conda:
-                        source = subprocess.check_output(["virt-cat", "-a", str(common),
+                # A generic base-image marker is never accepted as common proof.
+                # Resume verified Conda checkpoints in-place; otherwise reset only
+                # incomplete guest directories, never the QCOW2 volume itself.
+                has_conda = (not initial_common and subprocess.run(
+                    ["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0)
+                if has_conda:
+                    source = subprocess.run(["virt-cat", "-a", str(common), "/opt/swe-gym-lite/runtime.py"],
+                        capture_output=True, timeout=180, check=False)
+                    current = digest(GUEST)
+                    if source.returncode != 0 or hashlib.sha256(source.stdout).hexdigest() != current:
+                        cmd("virt-customize", "--no-network", "-a", str(common),
+                            "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
+                        updated = subprocess.check_output(["virt-cat", "-a", str(common),
                             "/opt/swe-gym-lite/runtime.py"], timeout=180)
-                        installed = hashlib.sha256(source).hexdigest()
-                        current = digest(GUEST)
-                        if installed != current:
-                            # The stable template ABI is unchanged.  Update only the
-                            # build-time helper inside this unfinished volume and keep
-                            # every verified Conda environment already checkpointed.
-                            cmd("virt-customize", "--no-network", "-a", str(common),
-                                "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
-                            updated = subprocess.check_output(["virt-cat", "-a", str(common),
-                                "/opt/swe-gym-lite/runtime.py"], timeout=180)
-                            if hashlib.sha256(updated).hexdigest() != current:
-                                raise RuntimeError("unfinished common runtime update did not verify")
-                    else:
-                        partial_conda = subprocess.run(["virt-cat", "-a", str(common), "/opt/miniconda3/conda-meta/history"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0
-                        if partial_conda:
-                            cmd("virt-customize", "--no-network", "-a", str(common),
-                                "--run-command", "rm -rf /opt/miniconda3", timeout=14400)
-                        print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
+                        if hashlib.sha256(updated).hexdigest() != current:
+                            raise RuntimeError("unfinished common runtime update did not verify")
                 else:
-                    has_conda = False
+                    if not initial_common:
+                        cmd("virt-customize", "--no-network", "-a", str(common),
+                            "--run-command", "rm -rf /opt/miniconda3 /opt/swe-gym-lite /opt/swe-gym-build",
+                            timeout=14400)
+                    print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
                 try:
                     provision(common, boot_resume if has_conda else boot,
-                              None if has_conda else payload, network=True)
+                              None if has_conda else payload, network=True,
+                              completion=(COMMON_COMPLETION, common_completion))
                 except RuntimeError as exc:
                     if _transient_failure(exc):
                         raise RecoverableBuildError("transient guest download; common checkpoint retained: " + str(exc)) from exc
@@ -941,11 +1069,98 @@ PY_GUEST
             if common_validation != {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}:
                 raise RuntimeError("common image leaked source state")
 
+            # One pair of scratch QCOW2s is reused across all 230 tasks and across
+            # retries.  They live outside the staged generation, so a successful
+            # publication never needs to delete a volume.  Migrate the historical
+            # in-stage scratch pair once if an interrupted old builder left it there.
+            for scratch_name in ("task-warm.qcow2", "task-replay.qcow2"):
+                legacy = staged / scratch_name
+                current_scratch = scratch_root / scratch_name
+                if legacy.exists() or legacy.is_symlink():
+                    if legacy.is_symlink() or not legacy.is_file():
+                        raise RuntimeError("unsafe legacy scratch volume; preserved")
+                    if current_scratch.exists() or current_scratch.is_symlink():
+                        raise RuntimeError("duplicate scratch QCOW2 volumes exist; preserved; only make throw_volumes may erase them")
+                    legacy.chmod(0o600)
+                    os.rename(legacy, current_scratch)
+                    relative = os.path.relpath(common, current_scratch.parent)
+                    cmd("qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2",
+                        "-b", relative, str(current_scratch), timeout=3600)
+                    print("migrated persistent task scratch volume: " + scratch_name, flush=True)
+
+            def scratch_uses_common(image):
+                if image.is_symlink() or not image.is_file():
+                    return False
+                try:
+                    info = json.loads(capture("qemu-img", "info", "--output=json", str(image)))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    return False
+                backing_name = info.get("full-backing-filename") or info.get("backing-filename")
+                if not backing_name:
+                    return False
+                backing_path = Path(backing_name) if Path(backing_name).is_absolute() else image.parent / backing_name
+                return info.get("format") == "qcow2" and backing_path.resolve() == common.resolve()
+
+            def recover_historical_task(logical, item, source_record, ckpt_name):
+                if (checkpoints / ckpt_name).exists():
+                    return False
+                key = mapping[logical]["setup_cache"]
+                expected_relative = Path("setup-caches") / (key + ".tar.gz")
+                for old in historical_stages:
+                    old_checkpoint = old / ".checkpoints" / ckpt_name
+                    if not old_checkpoint.exists():
+                        continue
+                    try:
+                        done = json.loads(safe(old_checkpoint, immutable=True).read_bytes())
+                        cache_record = done["cache_record"]
+                        if (done.get("logical_task_id") != logical or
+                                cache_record.get("kind") != "setup_cache" or
+                                cache_record.get("logical_task_id") != logical or
+                                cache_record.get("allowed_template_id") != item["template_id"] or
+                                cache_record.get("source_identity") != source_record["source_identity"] or
+                                Path(cache_record.get("path", "")) != expected_relative or
+                                done.get("offline") != {"base_commit": item["base_commit"],
+                                                        "env_hash": item["env_hash"], "offline": True} or
+                                not isinstance(done.get("inventories"), dict) or
+                                not isinstance(done.get("vcs"), list)):
+                            continue
+                        old_archive = safe(old / expected_relative, immutable=True)
+                        if (old_archive.stat().st_size != cache_record.get("size") or
+                                digest(old_archive) != cache_record.get("sha256")):
+                            continue
+                        old_downloads = safe(old / "audit" / (key + ".downloads.json"), immutable=True)
+                        if not isinstance(json.loads(old_downloads.read_bytes()), dict):
+                            continue
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+                    archive = staged / expected_relative
+                    if archive.exists():
+                        if (archive.is_symlink() or not archive.is_file() or
+                                archive.stat().st_size != cache_record["size"] or
+                                digest(archive) != cache_record["sha256"]):
+                            raise RuntimeError("current setup-cache artifact conflicts with a verified historical checkpoint; preserved")
+                    else:
+                        os.link(old_archive, archive)
+                    downloads = audit / (key + ".downloads.json")
+                    if downloads.exists():
+                        if downloads.is_symlink() or digest(downloads) != digest(old_downloads):
+                            raise RuntimeError("current setup-cache provenance conflicts with a verified historical checkpoint; preserved")
+                    else:
+                        os.link(old_downloads, downloads)
+                    write_checkpoint(ckpt_name, done)
+                    print("reused verified task from compatible historical stage: " + logical, flush=True)
+                    return True
+                return False
+
             offline_proofs, vcs_provenance, task_inventories = {}, {}, {}
+            warm = scratch_root / "task-warm.qcow2"
+            replay = scratch_root / "task-replay.qcow2"
+            incoming = scratch_root / "swe-gym-task"
             for logical, item in sorted(inputs["tasks"].items()):
                 free_space(staged, margin)
                 source_record = artifacts[mapping[logical]["task_source"]]
                 ckpt_name = "task-" + tools.artifact_id("task_source", logical) + ".json"
+                recover_historical_task(logical, item, source_record, ckpt_name)
                 done = read_checkpoint(ckpt_name)
                 if done is not None:
                     cache_record = done["cache_record"]
@@ -965,24 +1180,39 @@ PY_GUEST
                     offline_proofs[logical] = done["offline"]
                     print("reused verified task: " + logical, flush=True)
                     continue
-                incoming = staged / "swe-gym-task"
+
                 _discard(incoming)
-                _discard(staged / "task-warm.qcow2")
-                _discard(staged / "task-replay.qcow2")
-                incoming.mkdir()
+                incoming.mkdir(mode=0o700)
                 (incoming / "item.json").write_text(json.dumps(item))
                 shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
-                warm = staged / "task-warm.qcow2"
-                overlay(warm, common)
-                provision(warm, task_boot(item, source_record, warm=True), incoming, network=True)
+
+                warm_boot, warm_completion = task_boot(item, source_record, warm=True)
+                legacy_warm_ready = False
+                if scratch_uses_common(warm) and generic_guest_complete(warm):
+                    legacy_warm_ready = (guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item and
+                        isinstance(guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json"), dict))
+                warm_ready = (scratch_uses_common(warm) and
+                              completion_matches(warm, TASK_COMPLETION, warm_completion)) or legacy_warm_ready
+                if warm_ready:
+                    print("reused completed task warm scratch: " + logical, flush=True)
+                else:
+                    reset_scratch_overlay(warm, common)
+                    provision(warm, warm_boot, incoming, network=True,
+                              completion=(TASK_COMPLETION, warm_completion))
                 proof = guest_json(warm, "/opt/swe-gym-task/cache-proof.json")
                 key = mapping[logical]["setup_cache"]
-                exported = cache_folder / (".export-" + key)
-                exported.mkdir()
-                cmd("virt-copy-out", "-a", str(warm), "/opt/swe-gym-task/setup-cache.tar.gz", str(exported))
                 archive = cache_folder / (key + ".tar.gz")
-                (exported / "setup-cache.tar.gz").rename(archive)
-                exported.rmdir()
+                if not (archive.is_file() and not archive.is_symlink() and
+                        archive.stat().st_size == proof.get("size") and digest(archive) == proof.get("sha256")):
+                    if archive.exists() or archive.is_symlink():
+                        _discard(archive)
+                    exported = cache_folder / (".export-" + key)
+                    if exported.exists():
+                        shutil.rmtree(exported)
+                    exported.mkdir()
+                    cmd("virt-copy-out", "-a", str(warm), "/opt/swe-gym-task/setup-cache.tar.gz", str(exported))
+                    (exported / "setup-cache.tar.gz").rename(archive)
+                    exported.rmdir()
                 if digest(archive) != proof["sha256"] or archive.stat().st_size != proof["size"]:
                     raise RuntimeError("task setup cache changed during export")
                 cache_record = {"kind": "setup_cache", "logical_task_id": logical, "allowed_template_id": item["template_id"],
@@ -996,18 +1226,28 @@ PY_GUEST
                     "eval_setup": guest_json(warm, "/opt/swe-gym-lite/task-provenance/" + logical + ".json")}
                 archive.chmod(0o444)
                 shutil.copyfile(archive, incoming / "setup-cache.tar.gz")
-                replay = staged / "task-replay.qcow2"
-                overlay(replay, common)
-                provision(replay, task_boot(item, source_record, warm=False, cache=cache_record), incoming, network=False)
+
+                replay_boot, replay_completion = task_boot(item, source_record, warm=False, cache=cache_record)
+                expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
+                legacy_replay_ready = (scratch_uses_common(replay) and generic_guest_complete(replay) and
+                    guest_json_optional(replay, "/opt/swe-gym-task/item.json") == item and
+                    guest_json_optional(replay, "/opt/swe-gym-task/offline-proof.json") == expected_offline)
+                replay_ready = (scratch_uses_common(replay) and
+                                completion_matches(replay, TASK_COMPLETION, replay_completion)) or legacy_replay_ready
+                if replay_ready:
+                    print("reused completed task replay scratch: " + logical, flush=True)
+                else:
+                    reset_scratch_overlay(replay, common)
+                    provision(replay, replay_boot, incoming, network=False,
+                              completion=(TASK_COMPLETION, replay_completion))
                 offline_proofs[logical] = guest_json(replay, "/opt/swe-gym-task/offline-proof.json")
                 if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
                     raise RuntimeError("fresh task replay proof differs from exact base/environment")
                 write_checkpoint(ckpt_name, {"logical_task_id": logical,
                     "cache_record": cache_record, "vcs": vcs_provenance[logical],
                     "inventories": task_inventories[logical], "offline": offline_proofs[logical]})
-                # Only after successful fresh replay may expendable disks go away.
-                warm.unlink()
-                replay.unlink()
+                # Scratch disks remain at two fixed paths and are reset in-place for
+                # the next task; no QCOW2 volume is ever unlinked here.
                 shutil.rmtree(incoming)
             atomic_json(audit / "task-inventories.json", task_inventories)
             atomic_json(audit / "vcs-provenance.json", vcs_provenance)
@@ -1020,29 +1260,39 @@ PY_GUEST
             common_record = {"path": "common.qcow2", "sha256": digest(common)}
             for repo in repos_set:
                 image = repos / (repo.replace("/", "_") + ".qcow2")
+                repo_completion = {"schema": 1, "kind": "repository", "repo": repo,
+                    "template_abi": job["compatibility"]["template_abi"],
+                    "source_fingerprint": inputs["source_fingerprint"]}
                 ready = False
                 if image.exists():
-                    proof = subprocess.run(["virt-cat", "-a", str(image),
-                        "/etc/gpt-trace-image-build-complete"], capture_output=True, timeout=180)
-                    ready = proof.returncode == 0 and proof.stdout.strip() == b"ok"
+                    if image.is_symlink() or not image.is_file():
+                        raise RuntimeError("unsafe persistent repository image; preserved")
+                    info = json.loads(capture("qemu-img", "info", "--output=json", str(image)))
+                    backing_name = info.get("full-backing-filename") or info.get("backing-filename")
+                    backing_path = Path(backing_name) if backing_name and Path(backing_name).is_absolute() else image.parent / str(backing_name)
+                    if info.get("format") != "qcow2" or not backing_name or backing_path.resolve() != common.resolve():
+                        raise RuntimeError("existing repository volume has another backing; preserved; use make throw_volumes")
+                    legacy_repo_complete = False
+                    if generic_guest_complete(image):
+                        try:
+                            legacy_repo_complete = (
+                                guest_json(image, "/opt/swe-gym-lite/repo.json") ==
+                                    {"repo": repo, "template_id": "swe-gym-lite/" + repo.replace("/", "_")}
+                                and guest_json(image, "/opt/swe-gym-lite/isolation-validation.json") == common_validation)
+                        except (OSError, ValueError, subprocess.SubprocessError):
+                            legacy_repo_complete = False
+                    ready = completion_matches(image, REPO_COMPLETION, repo_completion) or legacy_repo_complete
                 if ready:
                     subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=3600)
                     print("reused verified repository image " + repo, flush=True)
                 else:
                     if not image.exists():
                         overlay(image, common)
-                    elif image.is_symlink() or not image.is_file():
-                        raise RuntimeError("unsafe persistent repository image; preserved")
-                    else:
-                        info = json.loads(capture("qemu-img", "info", "--output=json", str(image)))
-                        backing_name = info.get("full-backing-filename") or info.get("backing-filename")
-                        backing_path = Path(backing_name) if backing_name and Path(backing_name).is_absolute() else image.parent / str(backing_name)
-                        if info.get("format") != "qcow2" or not backing_name or backing_path.resolve() != common.resolve():
-                            raise RuntimeError("existing repository volume has another backing; preserved; use make throw_volumes")
                     boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
                     boot += "module['build_repo']({}," + repr(repo) + ")\n"
-                    boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\nPY_GUEST\n"
-                    provision(image, boot, network=False)
+                    boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\n"
+                    boot += "json.dump(" + repr(repo_completion) + ",open('" + REPO_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
+                    provision(image, boot, network=False, completion=(REPO_COMPLETION, repo_completion))
                 image.chmod(0o444)
                 isolations[repo] = guest_json(image, "/opt/swe-gym-lite/isolation-validation.json")
                 if isolations[repo] != common_validation:
@@ -1064,7 +1314,8 @@ PY_GUEST
             if len(mapping) != 230 or len(templates) != 11 or len(environments) != 25 or len(offline_proofs) != 230:
                 raise RuntimeError("final task/template/environment/replay coverage changed")
             from workstation_broker.templates import SECURITY_CONTRACT, TemplateRegistry
-            resolved = {"schema_version": 2, "recipe_version": 2, "pins": pins,
+            resolved = {"schema_version": 2, "recipe_version": 2,
+                "template_abi": job["compatibility"]["template_abi"], "pins": pins,
                 "source_fingerprint": inputs["source_fingerprint"], "security": SECURITY_CONTRACT,
                 "golden": {"sha256": base_record["sha256"], "provenance": json.loads(BASE.with_suffix('.provenance.json').read_text())},
                 "builder_sources": {path.relative_to(ROOT).as_posix(): digest(path) for path in
