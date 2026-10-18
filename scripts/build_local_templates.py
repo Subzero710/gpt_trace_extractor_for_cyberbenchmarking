@@ -16,13 +16,26 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.request
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
+
+
+def configured_base_image():
+    config_path = ROOT / "config/distributed.toml"
+    with config_path.open("rb") as stream:
+        config = tomllib.load(stream)
+    value = config.get("paths", {}).get("base_image")
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise RuntimeError("config/distributed.toml paths.base_image must be an absolute path")
+    return Path(value)
+
+
+BASE = configured_base_image()
 TEMPLATES = BASE.parent / "templates"
 GUEST = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py"
 PINS = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json"
@@ -33,11 +46,6 @@ FREE_SPACE_GIB = 64
 BUILD_TIMEOUT_HOURS = 96
 
 
-# Fossil SWE-Gym Lite build guest: 12 GiB RAM, 4 vCPUs, sequential jobs.
-# The host has 15 GiB of usable RAM; do not launch a second concurrent VM.
-GUEST_MEMORY_MIB = 12288
-GUEST_VCPUS = 4
-WARM_CACHE_GIB = 128
 COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
@@ -81,79 +89,6 @@ def _transient_failure(exc):
                      r"host free-space safety margin reached|No space left on device|"
                      r"Resource temporarily unavailable",
                      value, re.I) is not None
-
-
-# Exactly one historical operation can be migrated from the old UUID staging
-# layout. This is deliberately NOT a generic cross-recipe reuse mechanism.
-LEGACY_CONDA_OPERATION = "118a837a3c3684ab23303fe71e2926df5745862403131eda46e06bfe42a8f34b"
-LEGACY_BUILDER_SHA256 = "f1022ba1eaa2c67f8973ccd5440a2b0d7d5dd96967a8feec3b790e8c2a674be8"
-LEGACY_GUEST_SHA256 = "0d09722e1b14212ad5588b3d230d1658be8a54f456bf5aeb8c4dcca7b3935e1f"
-
-
-def _migrate_known_legacy_stage(target_root, staged, identity):
-    """Adopt only the proven failed Conda common disk from the reported incident."""
-    from gpt_trace_transport.local_templates import safe, canonical
-    old_root = BASE.parent / "preparations" / LEGACY_CONDA_OPERATION
-    state_path = old_root / "state.json"
-    log_path = old_root / "attempt-0001.log"
-    if not state_path.exists() or not log_path.exists():
-        return False
-    state = json.loads(safe(state_path).read_bytes())
-    prior = state.get("compatibility", {})
-    if (state.get("phase") != "failed" or state.get("operation_id") != LEGACY_CONDA_OPERATION
-            or "IncompleteRead" not in str(state.get("error"))
-            or hashlib.sha256(canonical(prior)).hexdigest() != LEGACY_CONDA_OPERATION
-            or prior.get("builder_sha256") != LEGACY_BUILDER_SHA256
-            or prior.get("runtime_sources", {}).get("guest_runtime.py") != LEGACY_GUEST_SHA256):
-        return False
-    expected = identity["compatibility"]
-    if ({k: v for k, v in prior.items() if k not in {"builder_sha256", "runtime_sources"}}
-            != {k: v for k, v in expected.items() if k not in {"builder_sha256", "runtime_sources"}}):
-        return False
-    if ({k: v for k, v in prior["runtime_sources"].items() if k != "guest_runtime.py"}
-            != {k: v for k, v in expected["runtime_sources"].items() if k != "guest_runtime.py"}):
-        return False
-    log = safe(log_path).read_text(errors="replace")
-    markers = re.findall(r"build stopped; preserved state:\s+([^\n\r]+)", log)
-    if not markers:
-        return False
-    old = Path(markers[-1].strip())
-    if old.parent != target_root or not re.fullmatch(r"\.build-[0-9a-f]{32}", old.name):
-        return False
-    if not old.exists() or not (old / "common.qcow2").is_file():
-        return False
-    _purge_apt_partial(old)
-    _owned_tree(old)
-    common = old / "common.qcow2"
-    chain = json.loads(subprocess.check_output(["qemu-img", "info", "--backing-chain", "--output=json", str(common)], timeout=180))
-    if (len(chain) != 2 or chain[0].get("format") != "qcow2" or
-            Path(chain[0]["filename"]).resolve() != common.resolve() or
-            Path(chain[1]["filename"]).resolve() != BASE.resolve()):
-        return False
-    subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
-    def old_guest(path):
-        return subprocess.check_output(["virt-cat", "-a", str(common), path], timeout=180)
-    if hashlib.sha256(old_guest("/opt/swe-gym-lite/runtime.py")).hexdigest() != LEGACY_GUEST_SHA256:
-        return False
-    if old_guest("/etc/gpt-trace-image-build-failed").strip() != b"1":
-        return False
-    if not old_guest("/opt/miniconda3/bin/conda"):
-        return False
-    inputs = json.loads(safe(old / "build-inputs/inputs.json").read_bytes())
-    if (inputs.get("pins") != expected["pins"] or
-            json.loads(old_guest("/opt/swe-gym-lite/build-environments.json")) != inputs.get("environments")):
-        return False
-    # One atomic move: old failed stage no longer wastes space, and all verified
-    # successful Conda environments remain inside the same QCOW2 overlay.
-    os.rename(old, staged)
-    atomic_json(staged / "build-identity.json", identity)
-    marker = staged / ".checkpoints"
-    marker.mkdir(mode=0o700, exist_ok=True)
-    atomic_json(marker / "legacy-adopted.json", {"operation_id": LEGACY_CONDA_OPERATION,
-        "guest_sha256": LEGACY_GUEST_SHA256})
-    (staged / "FAILED.txt").unlink(missing_ok=True)
-    print("adopted historical failed common disk; verified Conda work retained", flush=True)
-    return True
 
 
 def _purge_apt_partial(stage):
@@ -277,7 +212,18 @@ def _adopt_resumable_stage(target_root, staged, identity):
 
 
 def guest_resources():
-    return GUEST_MEMORY_MIB, GUEST_VCPUS
+    total_mib = (os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")) // (1024 * 1024)
+    reserve_mib = max(2048, total_mib // 5)
+    memory_mib = ((total_mib - reserve_mib) // 256) * 256
+    if memory_mib < 4096:
+        raise RuntimeError("execution host needs at least 6 GiB RAM for local SWE-Gym preparation")
+    cpus = os.cpu_count() or 1
+    vcpus = max(1, min(8, cpus - 1 if cpus > 1 else 1))
+    return memory_mib, vcpus
+
+
+def warm_cache_gib(virtual_gib):
+    return max(16, virtual_gib // 4)
 
 
 def guest_failure_diagnostics(image):
@@ -740,12 +686,15 @@ def build(args):
             overlay(image, backing)
 
         def provision(image, boot, payload=None, *, network, completion=None,
-                      cache_disk=None, trim=True, serial_log=None):
+                      cache_disk=None, trim=True, serial_log=None, refresh_runtime=False):
             boot_file = staged / "firstboot.sh"
             boot_file.write_text(firstboot(boot, trim=trim, shared_warm_cache=cache_disk is not None))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
             if payload is not None:
                 argv += ["--copy-in", str(payload) + ":/opt"]
+            if refresh_runtime:
+                for runtime_source in (GUEST, GUEST.with_name("task_sources.py"), GUEST.with_name("os_packages.py")):
+                    argv += ["--copy-in", str(runtime_source) + ":/opt/swe-gym-lite"]
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
@@ -771,6 +720,17 @@ def build(args):
                 path, expected = completion
                 if guest_json_optional(image, path) != expected:
                     raise RuntimeError("guest stage-specific completion proof is missing or differs: " + path)
+
+        def refresh_overlay_runtime(image):
+            original_mode = stat.S_IMODE(image.stat().st_mode)
+            image.chmod(0o600)
+            try:
+                argv = ["virt-customize", "--no-network", "-a", str(image)]
+                for runtime_source in (GUEST, GUEST.with_name("task_sources.py"), GUEST.with_name("os_packages.py")):
+                    argv += ["--copy-in", str(runtime_source) + ":/opt/swe-gym-lite"]
+                cmd(*argv, timeout=14400)
+            finally:
+                image.chmod(original_mode)
 
         def historical_files(relative):
             for old in historical_stages:
@@ -814,28 +774,61 @@ def build(args):
             cmd("git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}")
             return path
 
-        def task_boot(item, artifact, *, warm, cache=None):
+        def task_boot(item, artifact, *, mode, cache=None):
             # Only this item/source/cache ever enters this scratch disk.
-            body = "import runpy,json\nmodule=runpy.run_path('/opt/swe-gym-lite/runtime.py')\n"
-            body += "item=json.load(open('/opt/swe-gym-task/item.json'))\n"
-            body += "artifact=" + repr({**artifact, "path": "/opt/swe-gym-task/source.tar.gz"}) + "\n"
-            if warm:
-                body += "module['resume_warm_task'](item,artifact)\n"
-                body += "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')\n"
-                body += "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)\n"
+            lines = [
+                "import runpy,json",
+                "module=runpy.run_path('/opt/swe-gym-lite/runtime.py')",
+                "item=json.load(open('/opt/swe-gym-task/item.json'))",
+                "artifact=" + repr({**artifact, "path": "/opt/swe-gym-task/source.tar.gz"}),
+            ]
+            if mode in {"warm", "warm-recover"}:
                 completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"],
                               "cache_format": 2}
-            else:
+                if mode == "warm":
+                    lines += [
+                        "module['warm_task'](item,artifact)",
+                        "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')",
+                        "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)",
+                        "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
+                    ]
+                else:
+                    lines += [
+                        "module['prime_shared_pip_cache'](item)",
+                        "reusable=module['warm_task_ready'](item)",
+                        "json.dump({'reusable':bool(reusable)},open('/opt/swe-gym-task/recovery.json','w'),sort_keys=True)",
+                        "if reusable:",
+                        "    proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')",
+                        "    json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)",
+                        "    json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
+                    ]
+            elif mode in {"replay", "replay-recover"}:
                 delivered = {**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}
                 if cache.get("cache_format") == 2:
                     delivered["wheel_store"] = "/opt/swe-gym-task/wheel-cas"
-                body += "cache=" + repr(delivered) + "\n"
-                body += "module['resume_replay_task'](item,artifact,cache)\n"
                 completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"],
                               "cache_format": cache.get("cache_format", 1), "cache_sha256": cache["sha256"]}
-            body += "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)\n"
-            return "/usr/bin/python3 - <<'PY_GUEST'\ntry:\n" + "".join("    "+line+"\n" for line in body.splitlines()) + \
-                   "except BaseException as exc:\n    raise RuntimeError(type(exc).__name__ + ': ' + str(exc)[:3000]) from None\nPY_GUEST\n", completion
+                lines.append("cache=" + repr(delivered))
+                if mode == "replay":
+                    lines += [
+                        "module['replay_task'](item,artifact,cache)",
+                        "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
+                    ]
+                else:
+                    lines += [
+                        "reusable=module['replay_task_ready'](item)",
+                        "json.dump({'reusable':bool(reusable)},open('/opt/swe-gym-task/recovery.json','w'),sort_keys=True)",
+                        "if reusable:",
+                        "    json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
+                    ]
+            else:
+                raise ValueError("unknown task boot mode: " + str(mode))
+            body = "\n".join(lines) + "\n"
+            wrapped = "/usr/bin/python3 - <<'PY_GUEST'\ntry:\n"
+            wrapped += "".join("    " + line + "\n" for line in body.splitlines())
+            wrapped += "except BaseException as exc:\n    raise RuntimeError(type(exc).__name__ + ': ' + str(exc)[:3000]) from None\nPY_GUEST\n"
+            return wrapped, completion
+
 
         try:
             inputs_root = staged / "build-inputs"
@@ -954,7 +947,7 @@ def build(args):
                     if not verify_wheel_object(source, sha, size):
                         raise RuntimeError("persisted wheel CAS object changed")
                     os.link(source, folder / sha)
-            for logical, item in sorted(inputs["tasks"].items()):
+            for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
                 free_space(staged, margin)
                 key = tools.artifact_id("task_source", logical)
                 output = source_folder / (key + ".tar.gz")
@@ -1148,15 +1141,15 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     legacy_common_complete = False
             common_ready = completion_matches(common, COMMON_COMPLETION, common_completion) or legacy_common_complete
 
-            def refresh_common_runtime():
+            def refresh_incomplete_common_runtime():
                 source = subprocess.run(["virt-cat", "-a", str(common), "/opt/swe-gym-lite/runtime.py"],
                     capture_output=True, timeout=180, check=False)
                 current = digest(GUEST)
                 if source.returncode == 0 and hashlib.sha256(source.stdout).hexdigest() == current:
                     return
-                # Runtime implementation changes do not invalidate the 25 frozen
-                # Conda environment checkpoints. Replace only the trusted helper
-                # bytes and keep the expensive common image contents in place.
+                # This path is only used while common.qcow2 is still incomplete.
+                # A completed common is an immutable backing image and is never
+                # rewritten under existing task/repository overlays.
                 original_mode = stat.S_IMODE(common.stat().st_mode)
                 common.chmod(0o600)
                 try:
@@ -1170,9 +1163,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     common.chmod(original_mode)
 
             if common_ready:
-                refresh_common_runtime()
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
-                print("reused verified complete common QCOW2", flush=True)
+                print("reused verified complete immutable common QCOW2", flush=True)
             else:
                 # A generic base-image marker is never accepted as common proof.
                 # Resume verified Conda checkpoints in-place; otherwise reset only
@@ -1181,7 +1173,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     ["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0)
                 if has_conda:
-                    refresh_common_runtime()
+                    refresh_incomplete_common_runtime()
                 else:
                     if not initial_common:
                         cmd("virt-customize", "--no-network", "-a", str(common),
@@ -1240,14 +1232,15 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
 
             def ensure_warm_cache_volume():
                 path = cache_root / "task-warm-cache.qcow2"
+                size_gib = warm_cache_gib(args.virtual_gib)
                 if path.is_symlink() or (path.exists() and not path.is_file()):
                     raise RuntimeError("unsafe shared task warm-cache volume; preserved")
                 if not path.exists():
-                    cmd("qemu-img", "create", "-f", "qcow2", str(path), str(WARM_CACHE_GIB) + "G")
+                    cmd("qemu-img", "create", "-f", "qcow2", str(path), str(size_gib) + "G")
                 path.chmod(0o600)
                 info = json.loads(capture("qemu-img", "info", "--output=json", str(path)))
                 if (info.get("format") != "qcow2" or
-                        info.get("virtual-size") != WARM_CACHE_GIB * 1024**3):
+                        info.get("virtual-size") != size_gib * 1024**3):
                     raise RuntimeError("shared task warm-cache volume geometry changed; preserved")
                 if path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
                     raise RuntimeError("shared task warm-cache volume ownership/mode changed; preserved")
@@ -1340,7 +1333,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             warm = scratch_root / "task-warm.qcow2"
             replay = scratch_root / "task-replay.qcow2"
             incoming = scratch_root / "swe-gym-task"
-            for logical, item in sorted(inputs["tasks"].items()):
+            for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
                 free_space(staged, margin)
                 source_record = artifacts[mapping[logical]["task_source"]]
                 ckpt_name = "task-" + tools.artifact_id("task_source", logical) + ".json"
@@ -1371,7 +1364,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 (incoming / "item.json").write_text(json.dumps(item))
                 shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
 
-                warm_boot, warm_completion = task_boot(item, source_record, warm=True)
+                warm_boot, warm_completion = task_boot(item, source_record, mode="warm")
                 legacy_warm_ready = False
                 warm_matches_item = False
                 if scratch_uses_common(warm):
@@ -1387,13 +1380,20 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     print("reused completed task warm scratch: " + logical, flush=True)
                 else:
                     if warm_matches_item:
-                        print("resuming preserved task warm scratch after interrupted post-setup/export: " + logical,
-                              flush=True)
-                    else:
+                        recovery_boot, _ = task_boot(item, source_record, mode="warm-recover")
+                        print("recovering completed work from interrupted task warm scratch: " + logical, flush=True)
+                        provision(warm, recovery_boot, incoming, network=False,
+                                  cache_disk=warm_cache, trim=False,
+                                  serial_log=warm_serial, refresh_runtime=True)
+                        recovery = guest_json_optional(warm, "/opt/swe-gym-task/recovery.json")
+                        warm_ready = (recovery == {"reusable": True} and
+                                      completion_matches(warm, TASK_COMPLETION, warm_completion))
+                    if not warm_ready:
                         reset_scratch_overlay(warm, common)
-                    provision(warm, warm_boot, incoming, network=True,
-                              completion=(TASK_COMPLETION, warm_completion),
-                              cache_disk=warm_cache, trim=False, serial_log=warm_serial)
+                        provision(warm, warm_boot, incoming, network=True,
+                                  completion=(TASK_COMPLETION, warm_completion),
+                                  cache_disk=warm_cache, trim=False, serial_log=warm_serial,
+                                  refresh_runtime=True)
                 proof = guest_json(warm, "/opt/swe-gym-task/cache-proof.json")
                 wheels = import_wheel_cas(warm, logical, proof)
                 key = mapping[logical]["setup_cache"]
@@ -1424,7 +1424,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 shutil.copyfile(archive, incoming / "setup-cache.tar.gz")
                 stage_task_wheels(incoming, cache_record)
 
-                replay_boot, replay_completion = task_boot(item, source_record, warm=False, cache=cache_record)
+                replay_boot, replay_completion = task_boot(item, source_record, mode="replay", cache=cache_record)
                 expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
                 replay_ready = (scratch_uses_common(replay) and
                                 completion_matches(replay, TASK_COMPLETION, replay_completion))
@@ -1435,12 +1435,18 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     print("reused completed task replay scratch: " + logical, flush=True)
                 else:
                     if replay_matches_item:
-                        print("resuming preserved task replay scratch: " + logical, flush=True)
-                    else:
+                        recovery_boot, _ = task_boot(item, source_record, mode="replay-recover", cache=cache_record)
+                        print("recovering completed work from interrupted task replay scratch: " + logical, flush=True)
+                        provision(replay, recovery_boot, incoming, network=False, trim=False,
+                                  serial_log=replay_serial, refresh_runtime=True)
+                        recovery = guest_json_optional(replay, "/opt/swe-gym-task/recovery.json")
+                        replay_ready = (recovery == {"reusable": True} and
+                                        completion_matches(replay, TASK_COMPLETION, replay_completion))
+                    if not replay_ready:
                         reset_scratch_overlay(replay, common)
-                    provision(replay, replay_boot, incoming, network=False,
-                              completion=(TASK_COMPLETION, replay_completion),
-                              trim=False, serial_log=replay_serial)
+                        provision(replay, replay_boot, incoming, network=False,
+                                  completion=(TASK_COMPLETION, replay_completion),
+                                  trim=False, serial_log=replay_serial, refresh_runtime=True)
                 offline_proofs[logical] = guest_json(replay, "/opt/swe-gym-task/offline-proof.json")
                 if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
                     raise RuntimeError("fresh task replay proof differs from exact base/environment")
@@ -1484,6 +1490,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                             legacy_repo_complete = False
                     ready = completion_matches(image, REPO_COMPLETION, repo_completion) or legacy_repo_complete
                 if ready:
+                    refresh_overlay_runtime(image)
                     subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=3600)
                     print("reused verified repository image " + repo, flush=True)
                 else:
@@ -1493,7 +1500,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     boot += "module['build_repo']({}," + repr(repo) + ")\n"
                     boot += "json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))\n"
                     boot += "json.dump(" + repr(repo_completion) + ",open('" + REPO_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
-                    provision(image, boot, network=False, completion=(REPO_COMPLETION, repo_completion))
+                    provision(image, boot, network=False, completion=(REPO_COMPLETION, repo_completion),
+                              refresh_runtime=True)
                 image.chmod(0o444)
                 isolations[repo] = guest_json(image, "/opt/swe-gym-lite/isolation-validation.json")
                 if isolations[repo] != common_validation:

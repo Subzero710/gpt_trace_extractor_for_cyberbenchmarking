@@ -79,12 +79,13 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertIn("/dev/vdb", task_script)
         self.assertIn("fstrim -av", permanent_script)
         self.assertNotIn("GPT_TRACE_SHARED_WARM_CACHE", permanent_script)
-        self.assertEqual(self.builder.WARM_CACHE_GIB, 128)
+        self.assertEqual(self.builder.warm_cache_gib(self.builder.VIRTUAL_GIB), 128)
         source = (ROOT / "scripts/build_local_templates.py").read_text()
-        self.assertIn("resuming preserved task warm scratch after interrupted post-setup/export", source)
-        self.assertIn("module['resume_warm_task'](item,artifact)", source)
-        self.assertIn("module['resume_replay_task'](item,artifact,cache)", source)
+        self.assertIn("recovering completed work from interrupted task warm scratch", source)
+        self.assertIn("module['warm_task'](item,artifact)", source)
+        self.assertIn("module['replay_task'](item,artifact,cache)", source)
         self.assertIn("cache_disk=warm_cache, trim=False", source)
+        self.assertIn("refresh_runtime=True", source)
 
     def test_final_manifest_propagates_template_abi(self):
         tree = ast.parse((ROOT / "scripts/build_local_templates.py").read_bytes())

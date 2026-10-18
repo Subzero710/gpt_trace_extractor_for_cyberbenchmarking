@@ -205,25 +205,48 @@ def env_inventory(prefix):
             "pip_freeze": run(str(prefix / "bin/python"), "-m", "pip", "freeze", "--all").decode()}
 
 
-def clone_env(item, *, offline):
-    name = "swegym_" + item["env_hash"]
-    stored = Path("/opt/miniconda3/envs") / name
-    if not stored.is_dir():
+def stored_env_prefix(item):
+    prefix = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"])
+    if not prefix.is_dir() or not (prefix / "bin/python").is_file():
         raise RuntimeError("required frozen environment missing; templates must be rebuilt by the operator")
-    expected = json.loads((ROOT / "environments" / (item["env_hash"] + ".json")).read_text())
-    if env_inventory(stored) != expected:
-        raise RuntimeError("stored environment provenance changed")
-    prefix = Path("/opt/miniconda3/envs/testbed")
-    if prefix.exists():
-        run(str(CONDA), "env", "remove", "--prefix", str(prefix), "-y")
-    args = [str(CONDA), "create", "--name", "testbed", "--clone", str(stored), "--yes"]
-    if offline:
-        args.append("--offline")
-    run(*args)
-    # Conda clone performs prefix relocation; no environment is renamed/moved.
-    if not (prefix / "bin/python").is_file():
-        raise RuntimeError("Conda did not materialize testbed")
     return prefix
+
+
+def pristine_env(item):
+    prefix = stored_env_prefix(item)
+    expected = json.loads((ROOT / "environments" / (item["env_hash"] + ".json")).read_text())
+    if env_inventory(prefix) != expected:
+        raise RuntimeError("stored environment provenance changed")
+    return prefix
+
+
+def recovery_env_prefix(item):
+    legacy = Path("/opt/miniconda3/envs/testbed")
+    if legacy.is_dir() and (legacy / "bin/python").is_file():
+        return legacy
+    return stored_env_prefix(item)
+
+
+def pip_versions(prefix):
+    return {entry["name"].lower().replace("_", "-"): entry["version"]
+            for entry in json.loads(run(str(prefix / "bin/python"), "-m", "pip",
+                                        "list", "--format=json").decode())}
+
+
+def activation_command(prefix):
+    return "conda activate " + shlex.quote(str(prefix)) + "; export CONDA_DEFAULT_ENV=testbed"
+
+
+def adapt_environment_commands(commands, prefix):
+    adapted = []
+    for line in commands:
+        if line.strip() == "conda activate testbed":
+            adapted.append(activation_command(prefix))
+        elif re.search(r"\bconda\s+activate\s+testbed\b", line):
+            raise RuntimeError("unsupported embedded testbed environment activation in pinned recipe")
+        else:
+            adapted.append(line)
+    return adapted
 
 
 def repo_name(repo):
@@ -268,7 +291,7 @@ def setup_commands(item, destination, prefix):
             frozen_python = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"]) / "bin/python"
             line = "test -x /root/.local/bin/pdm || pipx install pdm --python " + shlex.quote(str(frozen_python))
         adapted.append(line)
-    commands = adapted
+    commands = adapt_environment_commands(adapted, prefix)
     commands.append("git remote | xargs -r -n1 git remote remove")
     commands.append("test \"$(git rev-parse HEAD)\" = " + shlex.quote(item["base_commit"]))
     commands.append("test \"$CONDA_PREFIX\" = " + shlex.quote(str(prefix)))
@@ -305,8 +328,8 @@ def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
         if any(line.startswith("pipx install pdm") for line in item["repo_script_list"]) and not Path("/root/.local/bin/pdm").is_file():
             raise RuntimeError("frozen PDM tool is missing; runtime cannot install it")
         configure_vcs_cache(item)
-    prefix = _timed(item, prefix_name + "_clone_env",
-                    lambda: clone_env(item, offline=offline))
+    prefix = _timed(item, prefix_name + "_select_env",
+                    lambda: pristine_env(item))
     commands = setup_commands(item, destination, prefix)
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
@@ -359,6 +382,7 @@ def verify_candidate(item, candidate, artifact, destination):
 
 
 def evaluation_setup(item, prefix, commands, folder, *, destination="/testbed"):
+    commands = adapt_environment_commands(commands, prefix)
     _timed(item, "replay_eval_setup",
            lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=True),
                          offline=True, log=folder / "eval-setup.log"))
@@ -393,7 +417,8 @@ def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
     folder = Path(folder)
     apply_candidate(candidate, destination, sha256=candidate_sha256, size=candidate_size)
     shell(hidden, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "hidden.log")
-    script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate testbed\nset +e\n' + test_command
+    script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate\n' + \
+             activation_command(stored_env_prefix(item)) + '\nset +e\n' + test_command
     script += ' >' + shlex.quote(str(folder / 'tests.log')) + ' 2>&1\nstatus=$?\n'
     script += 'printf "%s\\n" "$status" >' + shlex.quote(str(folder / 'tests.exit')) + '\nexit 0\n'
     shell([script], cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "test-launch.log")
@@ -449,7 +474,7 @@ def _validate_vcs_provenance(item):
 def warm_task_ready(item):
     """Deep proof used to salvage a warm scratch that failed after expensive setup."""
     instance = item["instance_id"]
-    prefix = Path("/opt/miniconda3/envs/testbed")
+    prefix = recovery_env_prefix(item)
     setup_record = ROOT / "task-provenance" / (instance + ".setup.json")
     final_record = ROOT / "task-provenance" / (instance + ".json")
     wheelhouse = ROOT / "wheelhouse" / instance
@@ -502,33 +527,23 @@ def _write_warm_state(item):
         os.fsync(handle.fileno())
 
 
-def resume_warm_task(item, artifact):
-    prime_shared_pip_cache(item)
-    if warm_task_ready(item):
-        _phase(item, "warm_recovery", "reused")
-        _write_warm_state(item)
-        return
-    _phase(item, "warm_recovery", "rebuild")
-    warm_task(item, artifact)
-
-
 def warm_task(item, artifact):
+    prime_shared_pip_cache(item)
     _reset_task_warm_outputs(item)
-    prefix = prepare(item, artifact=artifact, offline=False, log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
+    baseline = pip_versions(pristine_env(item))
+    prefix = prepare(item, artifact=artifact, offline=False,
+                     log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
     (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(
         json.dumps(env_inventory(prefix), sort_keys=True))
+    eval_commands = adapt_environment_commands(item["eval_setup_commands"], prefix)
     _timed(item, "warm_eval_setup",
-           lambda: shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
+           lambda: shell(eval_commands, cwd="/testbed", env=runtime_environment(item, offline=False),
                          log=ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
     (ROOT / "task-provenance" / (item["instance_id"] + ".json")).write_text(json.dumps(inventory, sort_keys=True))
-    requirements = run(str(prefix / "bin/python"), "-m", "pip", "list", "--format=json").decode()
-    packages = json.loads(requirements)
-    stored = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"])
-    baseline = {entry["name"].lower().replace("_", "-"): entry["version"] for entry in json.loads(
-        run(str(stored / "bin/python"), "-m", "pip", "list", "--format=json").decode())}
+    packages = json.loads(run(str(prefix / "bin/python"), "-m", "pip", "list", "--format=json").decode())
     editable = json.loads(run(str(prefix / "bin/python"), "-m", "pip", "list", "--editable", "--format=json").decode())
     excluded = {entry["name"].lower().replace("_", "-") for entry in editable}
     direct = json.loads(run(str(prefix / "bin/python"), "-c", """import importlib.metadata,json
@@ -632,7 +647,7 @@ def configure_vcs_cache(item):
 
 def replay_task_ready(item):
     proof_path = Path("/opt/swe-gym-task/offline-proof.json")
-    prefix = Path("/opt/miniconda3/envs/testbed")
+    prefix = recovery_env_prefix(item)
     try:
         if proof_path.is_symlink() or not proof_path.is_file() or not prefix.is_dir():
             return False
@@ -650,11 +665,7 @@ def replay_task_ready(item):
     return True
 
 
-def resume_replay_task(item, artifact, cache):
-    if replay_task_ready(item):
-        _phase(item, "replay_recovery", "reused")
-        return
-    _phase(item, "replay_recovery", "rebuild")
+def replay_task(item, artifact, cache):
     _timed(item, "replay_install_cache", lambda: install_setup_cache(item, cache))
     prefix = prepare(item, artifact=artifact, log=ROOT / "logs/offline.log")
     evaluation_setup(item, prefix, item["eval_setup_commands"], ROOT / "logs")
@@ -882,7 +893,18 @@ def export_setup_cache(item, output):
             (folder / "identity.json").write_text(json.dumps(
                 {key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}))
             inventory = file_inventory(folder)
-            integrity = source_tools().pack(folder, output, allowed_absolute_links=CACHE_LINK_ROOTS)
+            output_path = Path(output)
+            if output_path.is_symlink():
+                raise RuntimeError("unsafe task setup-cache output")
+            partial = output_path.with_name("." + output_path.name + ".partial")
+            if partial.is_symlink():
+                raise RuntimeError("unsafe task setup-cache partial output")
+            partial.unlink(missing_ok=True)
+            try:
+                integrity = source_tools().pack(folder, partial, allowed_absolute_links=CACHE_LINK_ROOTS)
+                os.replace(partial, output_path)
+            finally:
+                partial.unlink(missing_ok=True)
         return {**integrity, "files": inventory, "cache_format": 2, "wheel_files": wheels}
     return _timed(item, "warm_export_cache", perform)
 
