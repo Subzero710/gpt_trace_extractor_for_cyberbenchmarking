@@ -2,6 +2,7 @@
 from __future__ import annotations
 import ast
 import contextlib
+import errno
 import copy
 import hashlib
 import importlib.util
@@ -70,6 +71,21 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertEqual(self.builder.TASK_COMPLETION, "/opt/swe-gym-task/build-complete.json")
         self.assertEqual(self.builder.RESOLVER_COMPLETION, "/opt/swe-gym-os-resolver-complete.json")
 
+    def test_task_scratches_skip_trim_and_warm_cache_is_persistent_builder_only(self):
+        task_script = self.builder.firstboot("echo fixture", trim=False, shared_warm_cache=True)
+        permanent_script = self.builder.firstboot("echo fixture", trim=True, shared_warm_cache=False)
+        self.assertNotIn("fstrim -av", task_script)
+        self.assertIn("GPTTRACE_SHARED_WARM_CACHE", task_script)
+        self.assertIn("/dev/vdb", task_script)
+        self.assertIn("fstrim -av", permanent_script)
+        self.assertNotIn("GPT_TRACE_SHARED_WARM_CACHE", permanent_script)
+        self.assertEqual(self.builder.WARM_CACHE_GIB, 128)
+        source = (ROOT / "scripts/build_local_templates.py").read_text()
+        self.assertIn("resuming preserved task warm scratch after interrupted post-setup/export", source)
+        self.assertIn("module['resume_warm_task'](item,artifact)", source)
+        self.assertIn("module['resume_replay_task'](item,artifact,cache)", source)
+        self.assertIn("cache_disk=warm_cache, trim=False", source)
+
     def test_final_manifest_propagates_template_abi(self):
         tree = ast.parse((ROOT / "scripts/build_local_templates.py").read_bytes())
         candidates = []
@@ -136,6 +152,50 @@ class WheelCacheFormatTests(unittest.TestCase):
             self.assertEqual(pooled.read_bytes(), wheel_bytes)
             self.assertEqual(installed.stat().st_ino, wheel.stat().st_ino)
             self.assertEqual(pooled.stat().st_ino, wheel.stat().st_ino)
+
+    def test_link_or_copy_falls_back_only_for_cross_device_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = root / "source", root / "target"
+            source.write_bytes(b"cross-device fixture")
+            with patch.object(self.runtime.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
+                self.runtime._link_or_copy(source, target)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            with patch.object(self.runtime.os, "link", side_effect=OSError(errno.EPERM, "denied")):
+                with self.assertRaises(PermissionError):
+                    self.runtime._link_or_copy(source, root / "denied")
+
+    def test_format2_accepts_only_runtime_tree_or_exact_builder_wheel_store(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime_store = root / "runtime" / "artifact" / "wheels"
+            builder_store = root / "builder-wheel-cas"
+            foreign = root / "foreign"
+            for path in (runtime_store, builder_store, foreign):
+                path.mkdir(parents=True)
+            old_runtime, old_builder = self.runtime.TEMPLATE_ARTIFACT_ROOT, self.runtime.BUILDER_WHEEL_STORE
+            try:
+                self.runtime.TEMPLATE_ARTIFACT_ROOT = root / "runtime"
+                self.runtime.BUILDER_WHEEL_STORE = builder_store
+                self.assertTrue(self.runtime._trusted_wheel_store(runtime_store))
+                self.assertTrue(self.runtime._trusted_wheel_store(builder_store))
+                self.assertFalse(self.runtime._trusted_wheel_store(foreign))
+            finally:
+                self.runtime.TEMPLATE_ARTIFACT_ROOT = old_runtime
+                self.runtime.BUILDER_WHEEL_STORE = old_builder
+
+    def test_task_cache_explicitly_excludes_reusable_pip_and_wheel_pools(self):
+        with tempfile.TemporaryDirectory() as temp:
+            old_root = self.runtime.ROOT
+            try:
+                self.runtime.ROOT = Path(temp)
+                ignored = self.runtime._cache_copy_ignore(Path(temp) / "caches",
+                                                          ["pip", "wheels", "git", "npm"])
+                self.assertEqual(ignored, {"pip", "wheels"})
+                self.assertEqual(self.runtime._cache_copy_ignore(Path(temp) / "caches/git",
+                                                                 ["pip", "wheels"]), set())
+            finally:
+                self.runtime.ROOT = old_root
 
     def test_legacy_format1_cache_remains_installable(self):
         with tempfile.TemporaryDirectory() as temp:

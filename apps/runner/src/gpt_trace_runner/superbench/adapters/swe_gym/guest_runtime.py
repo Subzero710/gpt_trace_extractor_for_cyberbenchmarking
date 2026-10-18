@@ -5,6 +5,7 @@ during the host build and a network namespace, so a missing cache fails closed.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -25,6 +26,77 @@ CONDA = Path("/opt/miniconda3/bin/conda")
 def run(*args, cwd=None, env=None, input=None):
     return subprocess.run(args, cwd=cwd, env=env, input=input, check=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+
+SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
+BUILDER_WHEEL_STORE = Path("/opt/swe-gym-task/wheel-cas")
+
+
+def _phase(item, phase, state, elapsed=None):
+    """Persist compact task timings and mirror them to the QEMU serial line."""
+    record = {"instance_id": item.get("instance_id"), "phase": phase, "state": state,
+              "time": time.time()}
+    if elapsed is not None:
+        record["elapsed_seconds"] = round(float(elapsed), 3)
+    line = "GPTTRACE_PHASE " + json.dumps(record, sort_keys=True, separators=(",", ":"))
+    try:
+        (ROOT / "logs").mkdir(parents=True, exist_ok=True)
+        with (ROOT / "logs/task-timings.jsonl").open("a") as output:
+            output.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        with Path("/dev/ttyS0").open("a") as output:
+            output.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _timed(item, phase, callback):
+    started = time.monotonic()
+    _phase(item, phase, "start")
+    try:
+        result = callback()
+    except BaseException:
+        _phase(item, phase, "failed", time.monotonic() - started)
+        raise
+    _phase(item, phase, "done", time.monotonic() - started)
+    return result
+
+
+def _shared_warm_cache():
+    value = os.environ.get("GPT_TRACE_SHARED_WARM_CACHE")
+    if value != str(SHARED_WARM_CACHE_ROOT):
+        return None
+    if SHARED_WARM_CACHE_ROOT.is_symlink() or not SHARED_WARM_CACHE_ROOT.is_dir():
+        raise RuntimeError("shared warm cache mount is unavailable")
+    return SHARED_WARM_CACHE_ROOT
+
+
+def prime_shared_pip_cache(item):
+    """One-time migration of the pre-cache-disk pip cache from a preserved warm scratch."""
+    shared = _shared_warm_cache()
+    if shared is None:
+        return False
+    marker = shared / ".legacy-pip-imported-v1"
+    if marker.exists():
+        if marker.is_symlink() or marker.read_text() != "ok\n":
+            raise RuntimeError("shared warm cache migration marker changed")
+        return False
+    source = ROOT / "caches/pip"
+    target = shared / "pip"
+    def copy():
+        if source.exists():
+            if source.is_symlink() or not source.is_dir():
+                raise RuntimeError("legacy warm pip cache is unsafe")
+            shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+        marker.write_text("ok\n")
+        with marker.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _timed(item, "shared_pip_cache_import", copy)
+    return True
 
 
 def shell(commands, *, cwd, env=None, offline=False, log=None):
@@ -205,7 +277,10 @@ def setup_commands(item, destination, prefix):
 
 def runtime_environment(item, *, offline):
     env = build_limits()
-    env.update(HOME="/root", PIP_CACHE_DIR=str(ROOT / "caches/pip"),
+    shared = None if offline else _shared_warm_cache()
+    pip_cache = (shared / "pip") if shared is not None else (ROOT / "caches/pip")
+    pip_cache.mkdir(parents=True, exist_ok=True)
+    env.update(HOME="/root", PIP_CACHE_DIR=str(pip_cache),
                npm_config_cache=str(ROOT / "caches/npm"), PDM_CACHE_DIR=str(ROOT / "caches/pdm"),
                PIPX_HOME=str(ROOT / "caches/pipx"), PIPX_BIN_DIR="/root/.local/bin",
                npm_config_prefix=str(ROOT / "caches/npm-global"))
@@ -223,25 +298,26 @@ def relocate_checkout(commands, destination):
 
 
 def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
-    clean_checkout(item, artifact, destination)
+    prefix_name = "replay" if offline else "warm"
+    _timed(item, prefix_name + "_clean_checkout",
+           lambda: clean_checkout(item, artifact, destination))
     if offline:
         if any(line.startswith("pipx install pdm") for line in item["repo_script_list"]) and not Path("/root/.local/bin/pdm").is_file():
             raise RuntimeError("frozen PDM tool is missing; runtime cannot install it")
         configure_vcs_cache(item)
-    prefix = clone_env(item, offline=offline)
+    prefix = _timed(item, prefix_name + "_clone_env",
+                    lambda: clone_env(item, offline=offline))
     commands = setup_commands(item, destination, prefix)
-    # Upstream expects /testbed; builder and evaluator use that path too.
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
-    shell(commands, cwd=destination, env=runtime_environment(item, offline=offline), offline=offline, log=log)
+    _timed(item, prefix_name + "_repo_setup",
+           lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=offline),
+                         offline=offline, log=log))
     if offline:
         expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).read_text())
         if env_inventory(prefix) != expected:
             raise RuntimeError("offline official setup differs from the frozen build-time package inventory")
     verify_os_packages()
-    # Official pre-install recipes can edit tracked requirements/setup files.
-    # Preserve installed packages and ignored build products, but restore the
-    # exact tracked base that candidate diffs are defined against.
     run("git", "-C", str(destination), "reset", "--hard", item["base_commit"])
     return prefix
 
@@ -283,7 +359,9 @@ def verify_candidate(item, candidate, artifact, destination):
 
 
 def evaluation_setup(item, prefix, commands, folder, *, destination="/testbed"):
-    shell(commands, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "eval-setup.log")
+    _timed(item, "replay_eval_setup",
+           lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=True),
+                         offline=True, log=folder / "eval-setup.log"))
     expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".json")).read_text())
     if env_inventory(prefix) != expected:
         raise RuntimeError("clean evaluator setup differs from frozen package inventory")
@@ -325,22 +403,127 @@ def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
     return {"test_exit_status": status}
 
 
+def _reset_task_warm_outputs(item):
+    instance = item["instance_id"]
+    wheelhouse = ROOT / "wheelhouse" / instance
+    if wheelhouse.is_symlink():
+        raise RuntimeError("untrusted task wheelhouse")
+    if wheelhouse.exists():
+        shutil.rmtree(wheelhouse)
+    for suffix in (".setup.json", ".json", ".vcs.json"):
+        path = ROOT / "task-provenance" / (instance + suffix)
+        if path.is_symlink():
+            raise RuntimeError("untrusted task provenance path")
+        path.unlink(missing_ok=True)
+    (Path("/opt/swe-gym-task") / "warm-state.json").unlink(missing_ok=True)
+
+
+def _validate_vcs_provenance(item):
+    path = ROOT / "task-provenance" / (item["instance_id"] + ".vcs.json")
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        records = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(records, list):
+        return False
+    for record in records:
+        if (not isinstance(record, dict) or set(record) != {"url", "mirror", "commit"} or
+                not isinstance(record["url"], str) or not record["url"].startswith("https://") or
+                re.fullmatch(r"[0-9a-f]{40}", str(record["commit"])) is None):
+            return False
+        mirror = Path(record["mirror"])
+        expected_root = ROOT / "caches/git"
+        if (not mirror.is_absolute() or not mirror.is_relative_to(expected_root) or
+                mirror.is_symlink() or not mirror.is_dir()):
+            return False
+        try:
+            if run("git", "--git-dir", str(mirror), "rev-parse", "HEAD").decode().strip() != record["commit"]:
+                return False
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return True
+
+
+def warm_task_ready(item):
+    """Deep proof used to salvage a warm scratch that failed after expensive setup."""
+    instance = item["instance_id"]
+    prefix = Path("/opt/miniconda3/envs/testbed")
+    setup_record = ROOT / "task-provenance" / (instance + ".setup.json")
+    final_record = ROOT / "task-provenance" / (instance + ".json")
+    wheelhouse = ROOT / "wheelhouse" / instance
+    try:
+        if (not prefix.is_dir() or setup_record.is_symlink() or final_record.is_symlink() or
+                not setup_record.is_file() or not final_record.is_file() or
+                wheelhouse.is_symlink() or not wheelhouse.is_dir()):
+            return False
+        setup_inventory = json.loads(setup_record.read_text())
+        final_inventory = json.loads(final_record.read_text())
+        if not isinstance(setup_inventory, dict) or not isinstance(final_inventory, dict):
+            return False
+        if env_inventory(prefix) != final_inventory:
+            return False
+        if run("git", "-C", "/testbed", "rev-parse", "HEAD").decode().strip() != item["base_commit"]:
+            return False
+        if not _validate_vcs_provenance(item):
+            return False
+        pool = ROOT / "caches/wheels"
+        if pool.is_symlink() or not pool.is_dir():
+            return False
+        pool_inodes = set()
+        for stored in pool.iterdir():
+            if stored.is_symlink() or not stored.is_file():
+                return False
+            info = stored.stat()
+            pool_inodes.add((info.st_dev, info.st_ino, info.st_size))
+        for path in wheelhouse.iterdir():
+            if path.is_symlink() or not path.is_file():
+                return False
+            # warm_task() hardlinks every captured distribution into caches/wheels.
+            # Inode identity is enough for recovery; export_setup_cache hashes each
+            # object afterwards and the offline replay is the final correctness proof.
+            info = path.stat()
+            if (info.st_dev, info.st_ino, info.st_size) not in pool_inodes:
+                return False
+        verify_os_packages()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _write_warm_state(item):
+    path = Path("/opt/swe-gym-task/warm-state.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema": 1, "instance_id": item["instance_id"],
+                                "repo": item["repo"], "base_commit": item["base_commit"],
+                                "env_hash": item["env_hash"]}, sort_keys=True))
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def resume_warm_task(item, artifact):
+    prime_shared_pip_cache(item)
+    if warm_task_ready(item):
+        _phase(item, "warm_recovery", "reused")
+        _write_warm_state(item)
+        return
+    _phase(item, "warm_recovery", "rebuild")
+    warm_task(item, artifact)
+
+
 def warm_task(item, artifact):
+    _reset_task_warm_outputs(item)
     prefix = prepare(item, artifact=artifact, offline=False, log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
-    # Upstream evaluation may install additional distributions. Keep distinct
-    # inventories so teacher repo setup and clean evaluator setup each verify
-    # against their own build-time phase, without requiring identical outputs.
-    (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(json.dumps(env_inventory(prefix), sort_keys=True))
-    shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
-          log=ROOT / "logs/eval-warm.log")
+    (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(
+        json.dumps(env_inventory(prefix), sort_keys=True))
+    _timed(item, "warm_eval_setup",
+           lambda: shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
+                         log=ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
     (ROOT / "task-provenance" / (item["instance_id"] + ".json")).write_text(json.dumps(inventory, sort_keys=True))
-    # The cloned environment already contains the frozen baseline distributions.
-    # Download only added/changed packages; conda-only baseline distributions
-    # need not exist on PyPI. VCS distributions retain their exact source commit.
-    # A clean offline replay below is the local activation criterion.
     requirements = run(str(prefix / "bin/python"), "-m", "pip", "list", "--format=json").decode()
     packages = json.loads(requirements)
     stored = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"])
@@ -375,10 +558,12 @@ print(json.dumps(result))
     requirements_file = ROOT / "resolved-requirements.txt"
     requirements_file.write_text("\n".join(reqs) + "\n")
     if reqs:
-        run(str(prefix / "bin/python"), "-m", "pip", "download", "--no-deps", "--dest", str(wheelhouse),
-            "--requirement", str(requirements_file), env=runtime_environment(item, offline=False))
+        _timed(item, "warm_capture_wheels",
+               lambda: run(str(prefix / "bin/python"), "-m", "pip", "download", "--no-deps",
+                           "--dest", str(wheelhouse), "--requirement", str(requirements_file),
+                           env=runtime_environment(item, offline=False)))
     requirements_file.unlink()
-    freeze_vcs_dependencies(item, prefix)
+    _timed(item, "warm_freeze_vcs", lambda: freeze_vcs_dependencies(item, prefix))
     pool = ROOT / "caches/wheels"
     pool.mkdir(parents=True, exist_ok=True)
     for path in wheelhouse.iterdir():
@@ -393,7 +578,7 @@ print(json.dumps(result))
             os.link(stored, path)
         else:
             os.link(path, stored)
-
+    _write_warm_state(item)
 
 def freeze_vcs_dependencies(item, prefix):
     script = """import importlib.metadata,json
@@ -443,6 +628,41 @@ def configure_vcs_cache(item):
         run("git", "config", "--file", str(config), "--add", "url.file://" + str(mirror) + ".insteadOf", record["url"])
     os.environ["GIT_CONFIG_GLOBAL"] = str(config)
 
+
+
+def replay_task_ready(item):
+    proof_path = Path("/opt/swe-gym-task/offline-proof.json")
+    prefix = Path("/opt/miniconda3/envs/testbed")
+    try:
+        if proof_path.is_symlink() or not proof_path.is_file() or not prefix.is_dir():
+            return False
+        if json.loads(proof_path.read_text()) != {
+                "base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
+            return False
+        expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".json")).read_text())
+        if env_inventory(prefix) != expected:
+            return False
+        if run("git", "-C", "/testbed", "rev-parse", "HEAD").decode().strip() != item["base_commit"]:
+            return False
+        verify_os_packages()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def resume_replay_task(item, artifact, cache):
+    if replay_task_ready(item):
+        _phase(item, "replay_recovery", "reused")
+        return
+    _phase(item, "replay_recovery", "rebuild")
+    _timed(item, "replay_install_cache", lambda: install_setup_cache(item, cache))
+    prefix = prepare(item, artifact=artifact, log=ROOT / "logs/offline.log")
+    evaluation_setup(item, prefix, item["eval_setup_commands"], ROOT / "logs")
+    proof = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
+    path = Path("/opt/swe-gym-task/offline-proof.json")
+    path.write_text(json.dumps(proof, sort_keys=True))
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
 
 def install_offline_apt_guard():
     """Validate frozen prerequisites; campaigns never upgrade OS packages."""
@@ -599,39 +819,72 @@ def _wheel_files(value):
     return checked
 
 
-def export_setup_cache(item, output):
-    """Export task-only state while keeping Python wheels content-addressed."""
-    verify_os_packages()
-    wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
-    if wheelhouse.is_symlink() or not wheelhouse.is_dir():
-        raise RuntimeError("task wheelhouse is missing")
-    wheels = {}
-    for path in sorted(wheelhouse.iterdir()):
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("unexpected task wheelhouse entry")
-        wheels[path.name] = {"sha256": stream_digest(path), "size": path.stat().st_size}
-    wheels = _wheel_files(wheels)
-    with tempfile.TemporaryDirectory(prefix="swegym-cache-") as temporary:
-        folder = Path(temporary)
-        for name in ("caches", "task-provenance"):
-            shutil.copytree(ROOT / name, folder / name, symlinks=True, copy_function=os.link)
-        # The task wheelhouse and caches/wheels pool contain the same immutable
-        # package bytes. Keep those bytes once in the host generation CAS instead
-        # of serializing them into every task setup-cache archive.
-        wheel_pool = folder / "caches" / "wheels"
-        if wheel_pool.is_symlink():
-            raise RuntimeError("untrusted task wheel pool")
-        if wheel_pool.exists():
-            shutil.rmtree(wheel_pool)
-        (folder / "wheel-files.json").write_text(json.dumps(wheels, sort_keys=True))
-        local = Path("/root/.local")
-        if local.exists():
-            shutil.copytree(local, folder / "root-local", symlinks=True, copy_function=os.link)
-        (folder / "identity.json").write_text(json.dumps({key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}))
-        inventory = file_inventory(folder)
-        integrity = source_tools().pack(folder, output, allowed_absolute_links=CACHE_LINK_ROOTS)
-    return {**integrity, "files": inventory, "cache_format": 2, "wheel_files": wheels}
 
+def _link_or_copy(source, destination):
+    """Prefer same-filesystem hardlinks, but never fail solely on EXDEV."""
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        shutil.copyfile(source, destination)
+
+
+def _cache_copy_ignore(directory, names):
+    if Path(directory) == ROOT / "caches":
+        return {"pip", "wheels"} & set(names)
+    return set()
+
+
+def _trusted_wheel_store(path):
+    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+        return False
+    return path == BUILDER_WHEEL_STORE or path.is_relative_to(TEMPLATE_ARTIFACT_ROOT)
+
+
+def _materialize_cas_object(source, target, sha, size):
+    if target.exists() or target.is_symlink():
+        raise RuntimeError("task wheel destination already exists")
+    _link_or_copy(source, target)
+    if target.is_symlink() or not target.is_file() or target.stat().st_size != size or stream_digest(target) != sha:
+        target.unlink(missing_ok=True)
+        raise RuntimeError("materialized wheel CAS object differs")
+
+
+def export_setup_cache(item, output):
+    """Export task-only state while reusable download bytes stay shared."""
+    def perform():
+        verify_os_packages()
+        wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
+        if wheelhouse.is_symlink() or not wheelhouse.is_dir():
+            raise RuntimeError("task wheelhouse is missing")
+        wheels = {}
+        for path in sorted(wheelhouse.iterdir()):
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("unexpected task wheelhouse entry")
+            wheels[path.name] = {"sha256": stream_digest(path), "size": path.stat().st_size}
+        wheels = _wheel_files(wheels)
+        # Keep export staging on ROOT's filesystem. Hardlinks are cheap here;
+        # _link_or_copy still handles /root/.local or unusual split mounts.
+        with tempfile.TemporaryDirectory(prefix=".swegym-cache-", dir=ROOT) as temporary:
+            folder = Path(temporary)
+            shutil.copytree(ROOT / "caches", folder / "caches", symlinks=True,
+                            copy_function=_link_or_copy, ignore=_cache_copy_ignore)
+            shutil.copytree(ROOT / "task-provenance", folder / "task-provenance",
+                            symlinks=True, copy_function=_link_or_copy)
+            if (folder / "caches/pip").exists() or (folder / "caches/wheels").exists():
+                raise RuntimeError("task setup cache contains excluded reusable download bytes")
+            (folder / "wheel-files.json").write_text(json.dumps(wheels, sort_keys=True))
+            local = Path("/root/.local")
+            if local.exists():
+                shutil.copytree(local, folder / "root-local", symlinks=True,
+                                copy_function=_link_or_copy)
+            (folder / "identity.json").write_text(json.dumps(
+                {key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}))
+            inventory = file_inventory(folder)
+            integrity = source_tools().pack(folder, output, allowed_absolute_links=CACHE_LINK_ROOTS)
+        return {**integrity, "files": inventory, "cache_format": 2, "wheel_files": wheels}
+    return _timed(item, "warm_export_cache", perform)
 
 def install_setup_cache(item, artifact):
     with tempfile.TemporaryDirectory(prefix="swegym-cache-") as temporary:
@@ -662,8 +915,7 @@ def install_setup_cache(item, artifact):
             if json.loads((folder / "wheel-files.json").read_text()) != wheels:
                 raise RuntimeError("task wheel manifest differs from trusted artifact metadata")
             wheel_store = Path(artifact.get("wheel_store", ""))
-            if wheels and (not wheel_store.is_absolute() or not wheel_store.is_relative_to(TEMPLATE_ARTIFACT_ROOT) or
-                           wheel_store.is_symlink() or not wheel_store.is_dir()):
+            if wheels and not _trusted_wheel_store(wheel_store):
                 raise RuntimeError("trusted task wheel store is missing")
             for name in ("caches", "task-provenance"):
                 destination = ROOT / name
@@ -693,10 +945,10 @@ def install_setup_cache(item, artifact):
                 elif verified[sha] != size:
                     raise RuntimeError("wheel CAS size collision")
                 target = task_wheels / filename
-                os.link(source, target)
+                _materialize_cas_object(source, target, sha, size)
                 pooled = pool / sha
                 if not pooled.exists():
-                    os.link(source, pooled)
+                    _materialize_cas_object(source, pooled, sha, size)
                 elif pooled.is_symlink() or not pooled.is_file() or pooled.stat().st_size != size or stream_digest(pooled) != sha:
                     raise RuntimeError("wheel CAS pool changed")
         else:

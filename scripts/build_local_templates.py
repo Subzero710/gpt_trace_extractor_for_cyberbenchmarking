@@ -37,6 +37,7 @@ BUILD_TIMEOUT_HOURS = 96
 # The host has 15 GiB of usable RAM; do not launch a second concurrent VM.
 GUEST_MEMORY_MIB = 12288
 GUEST_VCPUS = 4
+WARM_CACHE_GIB = 128
 COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
@@ -412,17 +413,44 @@ def verify_sources(inputs, mirrors):
     print("source validation: tasks=230 repos=11 env_hashes=25 unmapped=0 missing_base_commits=0", flush=True)
 
 
-def firstboot(body):
-    # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM
-    # while QEMU itself stays at 12288 MiB RAM / 4 vCPUs. A successfully
-    # published template has no swap file and has been trimmed.
+def firstboot(body, *, trim=True, shared_warm_cache=False):
+    # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM.
+    # Task scratch overlays are truncated/recreated between tasks, so fstrim on
+    # every warm/replay only burns HDD time; permanent common/repo images still trim.
+    trim_step = r'''
+        elif ! fstrim -av; then
+            echo 'failed to reclaim temporary guest swap blocks'
+            rc=1
+''' if trim else ""
+    cache_setup = r'''
+test -b /dev/vdb
+cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
+if test -z "$cache_type"; then
+    mkfs.ext4 -F -L GPTTRACE_WARM_CACHE /dev/vdb
+elif test "$cache_type" != ext4; then
+    echo "unexpected shared warm-cache filesystem: $cache_type" >&2
+    exit 1
+fi
+mkdir -p /mnt/gpt-trace-warm-cache
+mount -o noatime,nosuid,nodev /dev/vdb /mnt/gpt-trace-warm-cache
+WARM_CACHE_MOUNT=/mnt/gpt-trace-warm-cache
+marker="$WARM_CACHE_MOUNT/.gpt-trace-warm-cache-v1"
+if test ! -e "$marker"; then
+    extra=$(find "$WARM_CACHE_MOUNT" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)
+    test -z "$extra"
+    printf 'gpt-trace-swe-gym-warm-cache-v1\n' > "$marker"
+    chmod 600 "$marker"
+fi
+test "$(cat "$marker")" = gpt-trace-swe-gym-warm-cache-v1
+export GPT_TRACE_SHARED_WARM_CACHE="$WARM_CACHE_MOUNT"
+''' if shared_warm_cache else ""
     return """#!/bin/bash
 set -eo pipefail
 exec >> /var/log/swe-gym-lite-builder.log 2>&1
 rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
-# Builder only: no persistent systemd disable or mask.
 systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
 SWAP_FILE=/root/.gpt-trace-swe-gym-build.swap
+WARM_CACHE_MOUNT=
 finish() {
     rc=$?
     trap - EXIT
@@ -433,8 +461,12 @@ finish() {
         elif ! rm -f "$SWAP_FILE"; then
             echo 'failed to remove temporary guest swap'
             rc=1
-        elif ! fstrim -av; then
-            echo 'failed to reclaim temporary guest swap blocks'
+""" + trim_step + """        fi
+    fi
+    if test -n "$WARM_CACHE_MOUNT" && mountpoint -q "$WARM_CACHE_MOUNT"; then
+        sync
+        if ! umount "$WARM_CACHE_MOUNT"; then
+            echo 'failed to unmount shared warm cache'
             rc=1
         fi
     fi
@@ -448,8 +480,6 @@ finish() {
 }
 trap finish EXIT
 test ! -L "$SWAP_FILE"
-# A failed boot leaves this exact private swap file. Reuse it on a verified
-# checkpoint reboot without allocating a second 8-GiB file.
 if test -e "$SWAP_FILE"; then
     test -f "$SWAP_FILE"
     test "$(stat -c %u:%a "$SWAP_FILE")" = "0:600"
@@ -461,8 +491,7 @@ else
 fi
 swapon "$SWAP_FILE"
 echo 'temporary guest build swap enabled: 8 GiB'
-""" + body + "\n"
-
+""" + cache_setup + body + "\n"
 
 def root_growth():
     # cloud-guest-utils comes from the verified, locally staged .deb closure.
@@ -710,9 +739,10 @@ def build(args):
                     os.fsync(handle.fileno())
             overlay(image, backing)
 
-        def provision(image, boot, payload=None, *, network, completion=None):
+        def provision(image, boot, payload=None, *, network, completion=None,
+                      cache_disk=None, trim=True, serial_log=None):
             boot_file = staged / "firstboot.sh"
-            boot_file.write_text(firstboot(boot))
+            boot_file.write_text(firstboot(boot, trim=trim, shared_warm_cache=cache_disk is not None))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
             if payload is not None:
                 argv += ["--copy-in", str(payload) + ":/opt"]
@@ -722,10 +752,18 @@ def build(args):
             argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
                     "-m", str(memory_mb), "-smp", str(vcpus),
                     "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
+            if cache_disk is not None:
+                argv += ["-drive", f"file={cache_disk},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
             argv += ["-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0"] if network else ["-nic", "none"]
-            cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot",
-                timeout=args.build_timeout_hours * 3600)
-            # A clean QEMU exit does not imply a successful guest firstboot.
+            if serial_log is None:
+                serial = ["-serial", "none"]
+            else:
+                serial_log.parent.mkdir(parents=True, exist_ok=True)
+                serial_log.unlink(missing_ok=True)
+                print("live task phase log: " + str(serial_log), flush=True)
+                serial = ["-serial", "file:" + str(serial_log)]
+            cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", *serial,
+                "-monitor", "none", "-no-reboot", timeout=args.build_timeout_hours * 3600)
             if not generic_guest_complete(image):
                 raise RuntimeError("guest build completion proof is missing; "
                                    "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
@@ -782,7 +820,7 @@ def build(args):
             body += "item=json.load(open('/opt/swe-gym-task/item.json'))\n"
             body += "artifact=" + repr({**artifact, "path": "/opt/swe-gym-task/source.tar.gz"}) + "\n"
             if warm:
-                body += "module['warm_task'](item,artifact)\n"
+                body += "module['resume_warm_task'](item,artifact)\n"
                 body += "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')\n"
                 body += "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)\n"
                 completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"],
@@ -792,14 +830,12 @@ def build(args):
                 if cache.get("cache_format") == 2:
                     delivered["wheel_store"] = "/opt/swe-gym-task/wheel-cas"
                 body += "cache=" + repr(delivered) + "\n"
-                body += "module['install_setup_cache'](item,cache)\n"
-                body += "prefix=module['prepare'](item,artifact=artifact,log=module['ROOT']/'logs/offline.log')\n"
-                body += "module['evaluation_setup'](item,prefix,item['eval_setup_commands'],module['ROOT']/'logs')\n"
-                body += "json.dump({'base_commit':item['base_commit'],'env_hash':item['env_hash'],'offline':True},open('/opt/swe-gym-task/offline-proof.json','w'))\n"
+                body += "module['resume_replay_task'](item,artifact,cache)\n"
                 completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"],
                               "cache_format": cache.get("cache_format", 1), "cache_sha256": cache["sha256"]}
             body += "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)\n"
-            return "/usr/bin/python3 - <<'PY_GUEST'\n" + body + "PY_GUEST\n", completion
+            return "/usr/bin/python3 - <<'PY_GUEST'\ntry:\n" + "".join("    "+line+"\n" for line in body.splitlines()) + \
+                   "except BaseException as exc:\n    raise RuntimeError(type(exc).__name__ + ': ' + str(exc)[:3000]) from None\nPY_GUEST\n", completion
 
         try:
             inputs_root = staged / "build-inputs"
@@ -1202,6 +1238,23 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 backing_path = Path(backing_name) if Path(backing_name).is_absolute() else image.parent / backing_name
                 return info.get("format") == "qcow2" and backing_path.resolve() == common.resolve()
 
+            def ensure_warm_cache_volume():
+                path = cache_root / "task-warm-cache.qcow2"
+                if path.is_symlink() or (path.exists() and not path.is_file()):
+                    raise RuntimeError("unsafe shared task warm-cache volume; preserved")
+                if not path.exists():
+                    cmd("qemu-img", "create", "-f", "qcow2", str(path), str(WARM_CACHE_GIB) + "G")
+                path.chmod(0o600)
+                info = json.loads(capture("qemu-img", "info", "--output=json", str(path)))
+                if (info.get("format") != "qcow2" or
+                        info.get("virtual-size") != WARM_CACHE_GIB * 1024**3):
+                    raise RuntimeError("shared task warm-cache volume geometry changed; preserved")
+                if path.stat().st_uid != 0 or path.stat().st_mode & 0o077:
+                    raise RuntimeError("shared task warm-cache volume ownership/mode changed; preserved")
+                return path
+
+            warm_cache = ensure_warm_cache_volume()
+
             def ensure_cache_wheels(cache_record, stage):
                 cache_format = cache_record.get("cache_format", 1)
                 if type(cache_format) is not int:
@@ -1320,18 +1373,27 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
 
                 warm_boot, warm_completion = task_boot(item, source_record, warm=True)
                 legacy_warm_ready = False
-                if scratch_uses_common(warm) and generic_guest_complete(warm):
-                    old_proof = guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json")
-                    legacy_warm_ready = (guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item and
-                                         isinstance(old_proof, dict) and old_proof.get("cache_format") == 2)
+                warm_matches_item = False
+                if scratch_uses_common(warm):
+                    warm_matches_item = guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item
+                    if generic_guest_complete(warm):
+                        old_proof = guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json")
+                        legacy_warm_ready = (warm_matches_item and isinstance(old_proof, dict) and
+                                             old_proof.get("cache_format") == 2)
                 warm_ready = (scratch_uses_common(warm) and
                               completion_matches(warm, TASK_COMPLETION, warm_completion)) or legacy_warm_ready
+                warm_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".warm.serial.log")
                 if warm_ready:
                     print("reused completed task warm scratch: " + logical, flush=True)
                 else:
-                    reset_scratch_overlay(warm, common)
+                    if warm_matches_item:
+                        print("resuming preserved task warm scratch after interrupted post-setup/export: " + logical,
+                              flush=True)
+                    else:
+                        reset_scratch_overlay(warm, common)
                     provision(warm, warm_boot, incoming, network=True,
-                              completion=(TASK_COMPLETION, warm_completion))
+                              completion=(TASK_COMPLETION, warm_completion),
+                              cache_disk=warm_cache, trim=False, serial_log=warm_serial)
                 proof = guest_json(warm, "/opt/swe-gym-task/cache-proof.json")
                 wheels = import_wheel_cas(warm, logical, proof)
                 key = mapping[logical]["setup_cache"]
@@ -1366,12 +1428,19 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
                 replay_ready = (scratch_uses_common(replay) and
                                 completion_matches(replay, TASK_COMPLETION, replay_completion))
+                replay_matches_item = (scratch_uses_common(replay) and
+                                       guest_json_optional(replay, "/opt/swe-gym-task/item.json") == item)
+                replay_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".replay.serial.log")
                 if replay_ready:
                     print("reused completed task replay scratch: " + logical, flush=True)
                 else:
-                    reset_scratch_overlay(replay, common)
+                    if replay_matches_item:
+                        print("resuming preserved task replay scratch: " + logical, flush=True)
+                    else:
+                        reset_scratch_overlay(replay, common)
                     provision(replay, replay_boot, incoming, network=False,
-                              completion=(TASK_COMPLETION, replay_completion))
+                              completion=(TASK_COMPLETION, replay_completion),
+                              trim=False, serial_log=replay_serial)
                 offline_proofs[logical] = guest_json(replay, "/opt/swe-gym-task/offline-proof.json")
                 if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
                     raise RuntimeError("fresh task replay proof differs from exact base/environment")
