@@ -580,22 +580,57 @@ def file_inventory(folder):
 
 
 CACHE_LINK_ROOTS = ("/opt/miniconda3", "/opt/swe-gym-lite/caches", "/usr/bin")
+TEMPLATE_ARTIFACT_ROOT = Path("/var/lib/gpt-trace-template-artifacts")
+
+
+def _wheel_files(value):
+    if not isinstance(value, dict) or len(value) > 4096:
+        raise RuntimeError("invalid task wheel manifest")
+    checked = {}
+    for name, record in sorted(value.items()):
+        if (not isinstance(name, str) or not name or name in {".", ".."} or
+                name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
+            raise RuntimeError("invalid task wheel filename")
+        if (not isinstance(record, dict) or set(record) != {"sha256", "size"} or
+                re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256"))) is None or
+                type(record.get("size")) is not int or not 0 <= record["size"] <= 2**43):
+            raise RuntimeError("invalid task wheel integrity record")
+        checked[name] = {"sha256": record["sha256"], "size": record["size"]}
+    return checked
 
 
 def export_setup_cache(item, output):
-    """Only this task's disposable builder has contributed to this cache."""
+    """Export task-only state while keeping Python wheels content-addressed."""
     verify_os_packages()
+    wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
+    if wheelhouse.is_symlink() or not wheelhouse.is_dir():
+        raise RuntimeError("task wheelhouse is missing")
+    wheels = {}
+    for path in sorted(wheelhouse.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("unexpected task wheelhouse entry")
+        wheels[path.name] = {"sha256": stream_digest(path), "size": path.stat().st_size}
+    wheels = _wheel_files(wheels)
     with tempfile.TemporaryDirectory(prefix="swegym-cache-") as temporary:
         folder = Path(temporary)
-        for name in ("caches", "wheelhouse", "task-provenance"):
+        for name in ("caches", "task-provenance"):
             shutil.copytree(ROOT / name, folder / name, symlinks=True, copy_function=os.link)
+        # The task wheelhouse and caches/wheels pool contain the same immutable
+        # package bytes. Keep those bytes once in the host generation CAS instead
+        # of serializing them into every task setup-cache archive.
+        wheel_pool = folder / "caches" / "wheels"
+        if wheel_pool.is_symlink():
+            raise RuntimeError("untrusted task wheel pool")
+        if wheel_pool.exists():
+            shutil.rmtree(wheel_pool)
+        (folder / "wheel-files.json").write_text(json.dumps(wheels, sort_keys=True))
         local = Path("/root/.local")
         if local.exists():
             shutil.copytree(local, folder / "root-local", symlinks=True, copy_function=os.link)
         (folder / "identity.json").write_text(json.dumps({key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}))
         inventory = file_inventory(folder)
         integrity = source_tools().pack(folder, output, allowed_absolute_links=CACHE_LINK_ROOTS)
-    return {**integrity, "files": inventory}
+    return {**integrity, "files": inventory, "cache_format": 2, "wheel_files": wheels}
 
 
 def install_setup_cache(item, artifact):
@@ -606,12 +641,65 @@ def install_setup_cache(item, artifact):
         expected = {key: item[key] for key in ("instance_id", "repo", "base_commit", "env_hash")}
         if json.loads((folder / "identity.json").read_text()) != expected:
             raise RuntimeError("setup cache belongs to another task/base/environment")
-        if set(path.name for path in folder.iterdir()) - {"caches", "wheelhouse", "task-provenance", "root-local", "identity.json"}:
-            raise RuntimeError("unexpected task setup cache payload")
-        for name in ("caches", "wheelhouse", "task-provenance"):
-            destination = ROOT / name
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.move(folder / name, destination)
+        cache_format = artifact.get("cache_format", 1)
+        if type(cache_format) is not int:
+            raise RuntimeError("unsupported task setup cache format")
+        if cache_format == 1:
+            if set(path.name for path in folder.iterdir()) - {"caches", "wheelhouse", "task-provenance", "root-local", "identity.json"}:
+                raise RuntimeError("unexpected legacy task setup cache payload")
+            for name in ("caches", "wheelhouse", "task-provenance"):
+                destination = ROOT / name
+                if destination.exists():
+                    shutil.rmtree(destination)
+                shutil.move(folder / name, destination)
+        elif cache_format == 2:
+            if set(path.name for path in folder.iterdir()) - {"caches", "task-provenance", "root-local", "identity.json", "wheel-files.json"}:
+                raise RuntimeError("unexpected task setup cache payload")
+            wheels = _wheel_files(artifact.get("wheel_files"))
+            embedded_pool = folder / "caches" / "wheels"
+            if embedded_pool.exists() or embedded_pool.is_symlink():
+                raise RuntimeError("content-addressed setup cache embeds duplicate wheel bytes")
+            if json.loads((folder / "wheel-files.json").read_text()) != wheels:
+                raise RuntimeError("task wheel manifest differs from trusted artifact metadata")
+            wheel_store = Path(artifact.get("wheel_store", ""))
+            if wheels and (not wheel_store.is_absolute() or not wheel_store.is_relative_to(TEMPLATE_ARTIFACT_ROOT) or
+                           wheel_store.is_symlink() or not wheel_store.is_dir()):
+                raise RuntimeError("trusted task wheel store is missing")
+            for name in ("caches", "task-provenance"):
+                destination = ROOT / name
+                if destination.exists():
+                    shutil.rmtree(destination)
+                shutil.move(folder / name, destination)
+            wheelhouse = ROOT / "wheelhouse"
+            if wheelhouse.is_symlink():
+                raise RuntimeError("untrusted task wheelhouse")
+            if wheelhouse.exists():
+                shutil.rmtree(wheelhouse)
+            task_wheels = wheelhouse / item["instance_id"]
+            task_wheels.mkdir(parents=True)
+            pool = ROOT / "caches" / "wheels"
+            if pool.is_symlink():
+                raise RuntimeError("untrusted task wheel pool")
+            pool.mkdir(parents=True, exist_ok=True)
+            verified = {}
+            for filename, record in wheels.items():
+                sha, size = record["sha256"], record["size"]
+                source = wheel_store / sha
+                if sha not in verified:
+                    if (source.is_symlink() or not source.is_file() or
+                            source.stat().st_size != size or stream_digest(source) != sha):
+                        raise RuntimeError("trusted wheel CAS object differs")
+                    verified[sha] = size
+                elif verified[sha] != size:
+                    raise RuntimeError("wheel CAS size collision")
+                target = task_wheels / filename
+                os.link(source, target)
+                pooled = pool / sha
+                if not pooled.exists():
+                    os.link(source, pooled)
+                elif pooled.is_symlink() or not pooled.is_file() or pooled.stat().st_size != size or stream_digest(pooled) != sha:
+                    raise RuntimeError("wheel CAS pool changed")
+        else:
+            raise RuntimeError("unsupported task setup cache format")
         if (folder / "root-local").exists():
             shutil.copytree(folder / "root-local", "/root/.local", dirs_exist_ok=True, symlinks=True)

@@ -514,36 +514,49 @@ add rule inet {table} input iifname "{bridge}" drop
     async def materialize_template_artifact(self, ident, artifact_id):
         data = self._read(ident)
         row = self.templates.artifact(data["metadata"], artifact_id)
-        path = "/var/lib/gpt-trace-template-artifacts/" + artifact_id + "/payload"
+        root = "/var/lib/gpt-trace-template-artifacts/" + artifact_id
+        path = root + "/payload"
         health = await self.rpc(ident, "health", {})
         if health.get("trusted_artifacts_version") != 1:
             raise ValueError("golden guest lacks trusted template streaming; rebuild/install the golden")
-        await self.rpc(ident, "template_import_begin", {"path": path, "sha256": row["sha256"],
-                                                        "size": row["size"], "overwrite": True})
-        digest, size = hashlib.sha256(), 0
-        try:
-            # The runner never reads these bytes. Every frame is <= 1 MiB.
-            fd = os.open(row["host_path"], os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb") as stream:
-                before = os.fstat(stream.fileno())
-                if before.st_size != row["size"] or before.st_uid != 0 or before.st_mode & 0o222:
-                    raise ValueError("template artifact changed before streaming")
-                while chunk := stream.read(1048576):
-                    size += len(chunk)
-                    digest.update(chunk)
-                    await self.rpc(ident, "template_import_chunk", {"content_base64": base64.b64encode(chunk).decode()})
-                after = os.fstat(stream.fileno())
-            stat_key = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
-            if size != row["size"] or digest.hexdigest() != row["sha256"] or stat_key(before) != stat_key(after):
-                raise ValueError("template artifact changed while streaming")
-            proof = await self.rpc(ident, "template_import_end", {"size": size})
-            if proof != {"path": path, "sha256": row["sha256"], "size": size}:
-                raise ValueError("guest template artifact integrity mismatch")
-            return {**proof, "artifact_id": artifact_id, "kind": row["kind"],
-                    "logical_task_id": row["logical_task_id"], "source_identity": row["source_identity"]}
-        except BaseException:
-            await self.rpc(ident, "template_import_abort", {})
-            raise
+
+        async def deliver(source, guest_path, sha, expected_size):
+            await self.rpc(ident, "template_import_begin", {"path": guest_path, "sha256": sha,
+                                                            "size": expected_size, "overwrite": True})
+            digest, size = hashlib.sha256(), 0
+            try:
+                # The runner never reads these bytes. Every frame is <= 1 MiB.
+                fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    if before.st_size != expected_size or before.st_uid != 0 or before.st_mode & 0o222:
+                        raise ValueError("template artifact changed before streaming")
+                    while chunk := stream.read(1048576):
+                        size += len(chunk)
+                        digest.update(chunk)
+                        await self.rpc(ident, "template_import_chunk", {"content_base64": base64.b64encode(chunk).decode()})
+                    after = os.fstat(stream.fileno())
+                stat_key = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+                if size != expected_size or digest.hexdigest() != sha or stat_key(before) != stat_key(after):
+                    raise ValueError("template artifact changed while streaming")
+                proof = await self.rpc(ident, "template_import_end", {"size": size})
+                if proof != {"path": guest_path, "sha256": sha, "size": size}:
+                    raise ValueError("guest template artifact integrity mismatch")
+                return proof
+            except BaseException:
+                await self.rpc(ident, "template_import_abort", {})
+                raise
+
+        proof = await deliver(row["host_path"], path, row["sha256"], row["size"])
+        result = {**proof, "artifact_id": artifact_id, "kind": row["kind"],
+                  "logical_task_id": row["logical_task_id"], "source_identity": row["source_identity"]}
+        if row.get("kind") == "setup_cache" and row.get("cache_format") == 2:
+            wheel_store = root + "/wheels"
+            for wheel in row.get("wheel_objects", []):
+                await deliver(wheel["host_path"], wheel_store + "/" + wheel["sha256"],
+                              wheel["sha256"], wheel["size"])
+            result.update(cache_format=2, wheel_files=row["wheel_files"], wheel_store=wheel_store)
+        return result
 
     def destroy(self, ident: dict, *, strict: bool = True) -> None:
         name, network, directory = self._paths(ident)

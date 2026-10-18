@@ -148,7 +148,8 @@ class TemplateRegistry:
         if (hashlib.sha256(encoded).hexdigest() != generation or manifest_abi != resolved_abi or
                 any(manifest.get(key) != resolved.get(key) for key in
                     ("schema_version", "recipe_version", "pins", "source_fingerprint", "security",
-                     "templates", "artifacts", "task_artifacts", "isolation_validation"))):
+                     "templates", "artifacts", "task_artifacts", "isolation_validation")) or
+                manifest.get("wheel_cas", {}) != resolved.get("wheel_cas", {})):
             raise ValueError("template generation content identity mismatch")
         self.validate_generation(generation)
         source = manifest.get("source_fingerprint")
@@ -240,4 +241,28 @@ class TemplateRegistry:
         path = trusted(folder / name, self.root)
         if not path.is_relative_to(folder) or path.stat().st_size != size or self.immutable_sha256(path) != sha:
             raise ValueError("template artifact digest/size mismatch")
-        return {**row, "artifact_id": artifact_id, "host_path": path}
+        result = {**row, "artifact_id": artifact_id, "host_path": path}
+        if row.get("kind") == "setup_cache":
+            cache_format = row.get("cache_format", 1)
+            if type(cache_format) is not int:
+                raise ValueError("unsupported setup cache format")
+            if cache_format == 2:
+                from gpt_trace_transport.local_templates import wheel_files
+                shared = manifest.get("wheel_cas", {})
+                objects = {}
+                for wheel in wheel_files(row.get("wheel_files")).values():
+                    wheel_sha, wheel_size = wheel["sha256"], wheel["size"]
+                    shared_row = shared.get(wheel_sha)
+                    expected_path = "wheel-cas/" + wheel_sha
+                    if (not isinstance(shared_row, dict) or shared_row.get("path") != expected_path or
+                            shared_row.get("sha256") != wheel_sha or shared_row.get("size") != wheel_size):
+                        raise ValueError("setup cache references an unknown shared wheel")
+                    wheel_path = trusted(folder / expected_path, self.root)
+                    if (not wheel_path.is_relative_to(folder) or wheel_path.stat().st_size != wheel_size or
+                            self.immutable_sha256(wheel_path) != wheel_sha):
+                        raise ValueError("shared wheel CAS digest/size mismatch")
+                    objects[wheel_sha] = {"sha256": wheel_sha, "size": wheel_size, "host_path": wheel_path}
+                result["wheel_objects"] = [objects[key] for key in sorted(objects)]
+            elif cache_format != 1:
+                raise ValueError("unsupported setup cache format")
+        return result

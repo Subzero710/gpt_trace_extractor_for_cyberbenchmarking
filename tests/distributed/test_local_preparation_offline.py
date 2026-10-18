@@ -86,6 +86,89 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertIn("template_abi", candidates[0])
 
 
+class WheelCacheFormatTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.runtime = load("wheel_cache_guest_runtime", ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py")
+        cls.sources = load("wheel_cache_task_sources", ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/task_sources.py")
+        cls.runtime._sources = cls.sources
+
+    def item(self):
+        return {"instance_id": "fixture-task", "repo": "owner/repo", "base_commit": "a" * 40,
+                "env_hash": "b" * 22, "template_id": "swe-gym-lite/owner_repo"}
+
+    def pack(self, folder, archive):
+        return self.sources.pack(folder, archive, allowed_absolute_links=self.runtime.CACHE_LINK_ROOTS)
+
+    def test_format2_reconstructs_wheelhouse_from_one_trusted_cas_object(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            guest = root / "guest"
+            trusted = root / "trusted-template-artifacts"
+            payload = root / "payload"
+            wheel_store = trusted / "setup" / "wheels"
+            for path in (guest, payload / "caches", payload / "task-provenance", wheel_store):
+                path.mkdir(parents=True, exist_ok=True)
+            item = self.item()
+            wheel_bytes = b"one immutable shared wheel payload"
+            sha = hashlib.sha256(wheel_bytes).hexdigest()
+            wheel = wheel_store / sha
+            wheel.write_bytes(wheel_bytes)
+            manifest = {"shared-1-py3-none-any.whl": {"sha256": sha, "size": len(wheel_bytes)}}
+            (payload / "identity.json").write_text(json.dumps({key: item[key]
+                for key in ("instance_id", "repo", "base_commit", "env_hash")}))
+            (payload / "wheel-files.json").write_text(json.dumps(manifest, sort_keys=True))
+            archive = root / "cache.tar.gz"
+            integrity = self.pack(payload, archive)
+            artifact = {**integrity, "path": str(archive), "cache_format": 2,
+                        "wheel_files": manifest, "wheel_store": str(wheel_store)}
+            old_root, old_trusted = self.runtime.ROOT, self.runtime.TEMPLATE_ARTIFACT_ROOT
+            try:
+                self.runtime.ROOT = guest
+                self.runtime.TEMPLATE_ARTIFACT_ROOT = trusted
+                self.runtime.install_setup_cache(item, artifact)
+            finally:
+                self.runtime.ROOT = old_root
+                self.runtime.TEMPLATE_ARTIFACT_ROOT = old_trusted
+            installed = guest / "wheelhouse" / item["instance_id"] / "shared-1-py3-none-any.whl"
+            pooled = guest / "caches" / "wheels" / sha
+            self.assertEqual(installed.read_bytes(), wheel_bytes)
+            self.assertEqual(pooled.read_bytes(), wheel_bytes)
+            self.assertEqual(installed.stat().st_ino, wheel.stat().st_ino)
+            self.assertEqual(pooled.stat().st_ino, wheel.stat().st_ino)
+
+    def test_legacy_format1_cache_remains_installable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            guest, payload = root / "guest", root / "payload"
+            for path in (guest, payload / "caches", payload / "wheelhouse" / "fixture-task",
+                         payload / "task-provenance"):
+                path.mkdir(parents=True, exist_ok=True)
+            item = self.item()
+            legacy = payload / "wheelhouse" / item["instance_id"] / "legacy.whl"
+            legacy.write_bytes(b"legacy wheel bytes")
+            (payload / "identity.json").write_text(json.dumps({key: item[key]
+                for key in ("instance_id", "repo", "base_commit", "env_hash")}))
+            archive = root / "legacy.tar.gz"
+            integrity = self.pack(payload, archive)
+            old_root = self.runtime.ROOT
+            try:
+                self.runtime.ROOT = guest
+                self.runtime.install_setup_cache(item, {**integrity, "path": str(archive)})
+            finally:
+                self.runtime.ROOT = old_root
+            self.assertEqual((guest / "wheelhouse" / item["instance_id"] / "legacy.whl").read_bytes(),
+                             b"legacy wheel bytes")
+
+    def test_wheel_manifest_rejects_traversal_and_boolean_sizes(self):
+        sha = "a" * 64
+        for name in (".", "..", "../x.whl", "a/b.whl", "a\\b.whl"):
+            with self.assertRaises(RuntimeError):
+                self.runtime._wheel_files({name: {"sha256": sha, "size": 1}})
+        with self.assertRaises(RuntimeError):
+            self.runtime._wheel_files({"x.whl": {"sha256": sha, "size": True}})
+
+
 class LocalGenerationTests(unittest.TestCase):
     def setUp(self):
         if os.geteuid() != 0: self.skipTest("real root-ownership fixture required")
@@ -115,6 +198,22 @@ class LocalGenerationTests(unittest.TestCase):
                 row = f.registry.artifact({**record, "logical_task_id": logical}, mapping[kind])
                 self.assertEqual(local.digest(row["host_path"]), row["sha256"])
         self.assertFalse(f.folder.stat().st_mode & 0o222)
+
+    def test_shared_wheel_cas_is_referenced_by_multiple_tasks_without_duplicate_bytes(self):
+        f = self.files
+        objects = []
+        for logical in (f.task1, f.task2):
+            task = f.contract["tasks"][logical]
+            selected = f.registry.select(task["template_id"])
+            mapping = f.registry.task_scope(selected, logical)
+            row = f.registry.artifact({**selected, "logical_task_id": logical}, mapping["setup_cache"])
+            self.assertEqual(row["cache_format"], 2)
+            self.assertEqual(len(row["wheel_objects"]), 1)
+            objects.append(row["wheel_objects"][0])
+        self.assertEqual(len(f.manifest["wheel_cas"]), 1)
+        self.assertEqual(objects[0]["sha256"], objects[1]["sha256"])
+        self.assertEqual(objects[0]["host_path"], objects[1]["host_path"])
+        self.assertEqual(objects[0]["host_path"].stat().st_ino, objects[1]["host_path"].stat().st_ino)
 
     def test_permanent_reuse_changes_no_bytes_permissions_or_timestamps(self):
         before = self.snapshot()

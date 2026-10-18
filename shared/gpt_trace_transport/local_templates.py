@@ -65,6 +65,22 @@ def relative(name):
     return path
 
 
+def wheel_files(value):
+    if not isinstance(value, dict) or len(value) > 4096:
+        raise ValueError("invalid task wheel manifest")
+    checked = {}
+    for name, row in sorted(value.items()):
+        if (not isinstance(name, str) or not name or name in {".", ".."} or
+                PurePosixPath(name).name != name or "/" in name or "\\" in name or "\0" in name):
+            raise ValueError("invalid task wheel filename")
+        if (not isinstance(row, dict) or set(row) != {"sha256", "size"} or
+                SHA.fullmatch(str(row.get("sha256"))) is None or type(row.get("size")) is not int or
+                not 0 <= row["size"] <= 2**43):
+            raise ValueError("invalid task wheel integrity record")
+        checked[name] = {"sha256": row["sha256"], "size": row["size"]}
+    return checked
+
+
 def safe(path, *, immutable=False, directory=False):
     path = Path(path).absolute()
     for parent in (path, *path.parents):
@@ -237,7 +253,7 @@ def verify_local_validation(folder, manifest, *, expected, hasher=digest, comple
     files = validation["files"]
     if not isinstance(files, dict) or not {"manifest.json", "resolved-inputs.json", "common.qcow2", "audit/offline-setups.json"} <= set(files):
         raise ValueError("local generation byte inventory is incomplete")
-    if len(files) > 10000: raise ValueError("oversized local generation inventory")
+    if len(files) > 50000: raise ValueError("oversized local generation inventory")
     for name, row in files.items():
         relative(name)
         if name == "local-validation.json" or any(str(p) in files for p in PurePosixPath(name).parents if str(p) != "."):
@@ -262,6 +278,11 @@ def verify_local_validation(folder, manifest, *, expected, hasher=digest, comple
         relative(name)
         if files.get(name) != {"size": artifact.get("size"), "sha256": artifact.get("sha256")}:
             raise ValueError("task archive differs from the complete byte inventory")
+    for sha, row in manifest.get("wheel_cas", {}).items():
+        name = row.get("path")
+        relative(name)
+        if row.get("sha256") != sha or files.get(name) != {"size": row.get("size"), "sha256": sha}:
+            raise ValueError("shared wheel CAS differs from the complete byte inventory")
     for template in manifest.get("templates", {}).values():
         for record in template["chain"][:-1]:
             name = str(relative(record.get("path")))
@@ -306,6 +327,8 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
         raise ValueError("resolved template generation/input SHA-256 mismatch")
     for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation"):
         if manifest.get(key) != resolved.get(key): raise ValueError("manifest/resolved input mismatch: " + key)
+    if manifest.get("wheel_cas", {}) != resolved.get("wheel_cas", {}):
+        raise ValueError("manifest/resolved input mismatch: wheel_cas")
     manifest_abi = manifest.get("template_abi", 1 if manifest.get("recipe_version") == 2 else None)
     resolved_abi = resolved.get("template_abi", 1 if resolved.get("recipe_version") == 2 else None)
     if manifest_abi != resolved_abi or manifest_abi != expected["template_abi"]:
@@ -328,6 +351,17 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     clean = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
     isolations = manifest["isolation_validation"]
     repos = {row["repo"] for row in contract["tasks"].values()}
+    wheel_cas = manifest.get("wheel_cas", {})
+    if not isinstance(wheel_cas, dict) or len(wheel_cas) > 50000:
+        raise ValueError("invalid shared wheel CAS inventory")
+    for sha, row in wheel_cas.items():
+        if (SHA.fullmatch(str(sha)) is None or not isinstance(row, dict) or set(row) != {"path", "sha256", "size"} or
+                row.get("sha256") != sha or row.get("path") != "wheel-cas/" + sha or
+                type(row.get("size")) is not int or not 0 <= row["size"] <= 2**43):
+            raise ValueError("invalid shared wheel CAS record")
+        path = folder / relative(row["path"])
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != row["size"] or digest(path) != sha:
+            raise ValueError("shared wheel CAS object integrity differs")
     if not isinstance(isolations, dict) or set(isolations) != repos | {"common"} or any(
             row != clean for row in isolations.values()):
         raise ValueError("permanent template source-isolation proof differs")
@@ -342,6 +376,20 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
             identity = {key: task[key] for key in ("instance_id", "repo", "base_commit")}
             if artifact.get("source_identity") != identity or artifact.get("kind") != kind:
                 raise ValueError("local task artifact source provenance differs")
+            if kind == "setup_cache":
+                cache_format = artifact.get("cache_format", 1)
+                if type(cache_format) is not int:
+                    raise ValueError("unsupported task setup cache format")
+                if cache_format == 1:
+                    if "wheel_files" in artifact:
+                        raise ValueError("legacy setup cache unexpectedly declares wheel CAS references")
+                elif cache_format == 2:
+                    for wheel in wheel_files(artifact.get("wheel_files")).values():
+                        shared = wheel_cas.get(wheel["sha256"])
+                        if shared is None or shared.get("size") != wheel["size"]:
+                            raise ValueError("task setup cache references an unknown shared wheel")
+                else:
+                    raise ValueError("unsupported task setup cache format")
     if set(manifest["templates"]) != {row["template_id"] for row in contract["tasks"].values()}:
         raise ValueError("local template IDs differ from the pinned contract")
     environments = json.loads((folder / "audit/environment-inventories.json").read_bytes())

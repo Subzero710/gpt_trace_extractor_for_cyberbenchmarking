@@ -109,7 +109,7 @@ def fixture(parent, *, activate=True, label="repo"):
     root = parent / "templates"
     namespace = root / "swe-gym-lite"
     folder = namespace / (".build-" + hashlib.sha256(label.encode()).hexdigest()[:16])
-    for name in ("repos", "sources", "setup-caches", "audit", "os/swe-gym-os"):
+    for name in ("repos", "sources", "setup-caches", "wheel-cas", "audit", "os/swe-gym-os"):
         (folder / name).mkdir(mode=0o755, parents=True, exist_ok=True)
     base = parent / "kali-base.qcow2"
     if not base.exists():
@@ -143,6 +143,14 @@ def fixture(parent, *, activate=True, label="repo"):
             {"path": str(base), "sha256": local.digest(base)}]}
         infos[image] = {"format": "qcow2", "backing-filename": "../common.qcow2"}
     artifacts, mapping, proofs, caches = {}, {}, {}, {}
+    shared_wheel = folder / "wheel-cas" / hashlib.sha256(b"synthetic-shared-wheel").hexdigest()
+    shared_wheel.write_bytes(b"synthetic-shared-wheel")
+    shared_wheel.chmod(0o444)
+    wheel_sha = shared_wheel.name
+    wheel_cas = {wheel_sha: {"path": shared_wheel.relative_to(folder).as_posix(),
+                             "sha256": wheel_sha, "size": shared_wheel.stat().st_size}}
+    wheel_files = {"synthetic_shared-1-py3-none-any.whl": {"sha256": wheel_sha,
+                                                             "size": shared_wheel.stat().st_size}}
     for logical, task in contract["tasks"].items():
         mapping[logical] = {"template_id": task["template_id"]}
         proofs[logical] = {"base_commit": task["base_commit"], "env_hash": task["env_hash"], "offline": True}
@@ -156,6 +164,7 @@ def fixture(parent, *, activate=True, label="repo"):
                 "source_identity": {k: task[k] for k in ("instance_id", "repo", "base_commit")},
                 "path": output.relative_to(folder).as_posix(), "size": output.stat().st_size, "sha256": local.digest(output)}
             if kind == "setup_cache":
+                artifacts[key].update(cache_format=2, wheel_files=wheel_files)
                 name = key + ".downloads.json"
                 local.atomic_json(folder / "audit" / name, {})
                 caches[name] = local.digest(folder / "audit" / name)
@@ -175,7 +184,7 @@ def fixture(parent, *, activate=True, label="repo"):
     clean = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
     resolved = {"schema_version": 2, "recipe_version": 2, "template_abi": expected["template_abi"],
         "pins": expected["pins"], "source_fingerprint": expected["source_fingerprint"], "security": local.SECURITY,
-        "templates": templates, "artifacts": artifacts, "task_artifacts": mapping,
+        "templates": templates, "artifacts": artifacts, "task_artifacts": mapping, "wheel_cas": wheel_cas,
         "isolation_validation": {name: clean for name in repos | {"common"}},
         "golden": {"sha256": expected["golden_sha256"], "provenance": expected["golden_provenance"]},
         "builder_sources": {**{(local.RUNTIME / name).as_posix(): sha for name, sha in build_contract["runtime_sources"].items()},

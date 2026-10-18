@@ -785,14 +785,19 @@ def build(args):
                 body += "module['warm_task'](item,artifact)\n"
                 body += "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')\n"
                 body += "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)\n"
-                completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"]}
+                completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"],
+                              "cache_format": 2}
             else:
-                body += "cache=" + repr({**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}) + "\n"
+                delivered = {**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}
+                if cache.get("cache_format") == 2:
+                    delivered["wheel_store"] = "/opt/swe-gym-task/wheel-cas"
+                body += "cache=" + repr(delivered) + "\n"
                 body += "module['install_setup_cache'](item,cache)\n"
                 body += "prefix=module['prepare'](item,artifact=artifact,log=module['ROOT']/'logs/offline.log')\n"
                 body += "module['evaluation_setup'](item,prefix,item['eval_setup_commands'],module['ROOT']/'logs')\n"
                 body += "json.dump({'base_commit':item['base_commit'],'env_hash':item['env_hash'],'offline':True},open('/opt/swe-gym-task/offline-proof.json','w'))\n"
-                completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"]}
+                completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"],
+                              "cache_format": cache.get("cache_format", 1), "cache_sha256": cache["sha256"]}
             body += "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)\n"
             return "/usr/bin/python3 - <<'PY_GUEST'\n" + body + "PY_GUEST\n", completion
 
@@ -828,9 +833,91 @@ def build(args):
                     continue
                 mirror_for("https://github.com/" + repo + ".git", repo.replace("/", "_") + ".git")
             verify_sources(inputs, cache_root)
-            source_folder, cache_folder, audit = staged / "sources", staged / "setup-caches", staged / "audit"
-            for folder in (source_folder, cache_folder, audit): folder.mkdir(exist_ok=True)
+            source_folder, cache_folder, wheel_cas, audit = (staged / "sources", staged / "setup-caches",
+                                                               staged / "wheel-cas", staged / "audit")
+            for folder in (source_folder, cache_folder, wheel_cas, audit): folder.mkdir(exist_ok=True)
             artifacts, mapping = {}, {}
+
+            def checked_wheel_files(value):
+                if not isinstance(value, dict) or len(value) > 4096:
+                    raise RuntimeError("invalid task wheel manifest")
+                checked = {}
+                for name, record in sorted(value.items()):
+                    if (not isinstance(name, str) or not name or name in {".", ".."} or
+                            name != Path(name).name or "/" in name or "\\" in name or "\x00" in name):
+                        raise RuntimeError("invalid task wheel filename")
+                    if (not isinstance(record, dict) or set(record) != {"sha256", "size"} or
+                            re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256"))) is None or
+                            type(record.get("size")) is not int or not 0 <= record["size"] <= 2**43):
+                        raise RuntimeError("invalid task wheel integrity record")
+                    checked[name] = {"sha256": record["sha256"], "size": record["size"]}
+                return checked
+
+            def verify_wheel_object(path, sha, size):
+                return (path.is_file() and not path.is_symlink() and path.stat().st_size == size and
+                        digest(path) == sha)
+
+            def import_wheel_cas(image, logical, proof):
+                if proof.get("cache_format") != 2:
+                    raise RuntimeError("warm task did not produce content-addressed setup cache")
+                wheels = checked_wheel_files(proof.get("wheel_files"))
+                unique = {}
+                for record in wheels.values():
+                    previous = unique.setdefault(record["sha256"], record["size"])
+                    if previous != record["size"]:
+                        raise RuntimeError("wheel SHA-256 size collision")
+                missing = {sha: size for sha, size in unique.items()
+                           if not verify_wheel_object(wheel_cas / sha, sha, size)}
+                if not missing:
+                    return wheels
+                with tempfile.TemporaryDirectory(dir=cache_folder, prefix=".wheel-export-") as temporary:
+                    cmd("virt-copy-out", "-a", str(image),
+                        "/opt/swe-gym-lite/wheelhouse/" + logical, temporary)
+                    exported = Path(temporary) / logical
+                    if exported.is_symlink() or not exported.is_dir():
+                        raise RuntimeError("task wheel export is missing")
+                    actual = {path.name for path in exported.iterdir()}
+                    if actual != set(wheels):
+                        raise RuntimeError("task wheel export population differs from proof")
+                    for filename, record in wheels.items():
+                        source = exported / filename
+                        sha, size = record["sha256"], record["size"]
+                        if not verify_wheel_object(source, sha, size):
+                            raise RuntimeError("task wheel changed during export")
+                        target = wheel_cas / sha
+                        if target.exists():
+                            if not verify_wheel_object(target, sha, size):
+                                raise RuntimeError("persisted wheel CAS object changed")
+                            continue
+                        source.chmod(0o444)
+                        os.link(source, target)
+                        with target.open("rb") as stream:
+                            os.fsync(stream.fileno())
+                    fd = os.open(wheel_cas, os.O_DIRECTORY)
+                    try: os.fsync(fd)
+                    finally: os.close(fd)
+                return wheels
+
+            def stage_task_wheels(incoming, cache_record):
+                cache_format = cache_record.get("cache_format", 1)
+                if type(cache_format) is not int:
+                    raise RuntimeError("unsupported persisted setup-cache format")
+                if cache_format != 2:
+                    return
+                wheels = checked_wheel_files(cache_record.get("wheel_files"))
+                folder = incoming / "wheel-cas"
+                folder.mkdir()
+                unique = {}
+                for record in wheels.values():
+                    sha, size = record["sha256"], record["size"]
+                    previous = unique.setdefault(sha, size)
+                    if previous != size:
+                        raise RuntimeError("wheel SHA-256 size collision")
+                for sha, size in unique.items():
+                    source = wheel_cas / sha
+                    if not verify_wheel_object(source, sha, size):
+                        raise RuntimeError("persisted wheel CAS object changed")
+                    os.link(source, folder / sha)
             for logical, item in sorted(inputs["tasks"].items()):
                 free_space(staged, margin)
                 key = tools.artifact_id("task_source", logical)
@@ -1024,7 +1111,30 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 except (OSError, ValueError, subprocess.SubprocessError):
                     legacy_common_complete = False
             common_ready = completion_matches(common, COMMON_COMPLETION, common_completion) or legacy_common_complete
+
+            def refresh_common_runtime():
+                source = subprocess.run(["virt-cat", "-a", str(common), "/opt/swe-gym-lite/runtime.py"],
+                    capture_output=True, timeout=180, check=False)
+                current = digest(GUEST)
+                if source.returncode == 0 and hashlib.sha256(source.stdout).hexdigest() == current:
+                    return
+                # Runtime implementation changes do not invalidate the 25 frozen
+                # Conda environment checkpoints. Replace only the trusted helper
+                # bytes and keep the expensive common image contents in place.
+                original_mode = stat.S_IMODE(common.stat().st_mode)
+                common.chmod(0o600)
+                try:
+                    cmd("virt-customize", "--no-network", "-a", str(common),
+                        "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
+                    updated = subprocess.check_output(["virt-cat", "-a", str(common),
+                        "/opt/swe-gym-lite/runtime.py"], timeout=180)
+                    if hashlib.sha256(updated).hexdigest() != current:
+                        raise RuntimeError("common runtime update did not verify")
+                finally:
+                    common.chmod(original_mode)
+
             if common_ready:
+                refresh_common_runtime()
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
                 print("reused verified complete common QCOW2", flush=True)
             else:
@@ -1035,16 +1145,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     ["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0)
                 if has_conda:
-                    source = subprocess.run(["virt-cat", "-a", str(common), "/opt/swe-gym-lite/runtime.py"],
-                        capture_output=True, timeout=180, check=False)
-                    current = digest(GUEST)
-                    if source.returncode != 0 or hashlib.sha256(source.stdout).hexdigest() != current:
-                        cmd("virt-customize", "--no-network", "-a", str(common),
-                            "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
-                        updated = subprocess.check_output(["virt-cat", "-a", str(common),
-                            "/opt/swe-gym-lite/runtime.py"], timeout=180)
-                        if hashlib.sha256(updated).hexdigest() != current:
-                            raise RuntimeError("unfinished common runtime update did not verify")
+                    refresh_common_runtime()
                 else:
                     if not initial_common:
                         cmd("virt-customize", "--no-network", "-a", str(common),
@@ -1101,6 +1202,35 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 backing_path = Path(backing_name) if Path(backing_name).is_absolute() else image.parent / backing_name
                 return info.get("format") == "qcow2" and backing_path.resolve() == common.resolve()
 
+            def ensure_cache_wheels(cache_record, stage):
+                cache_format = cache_record.get("cache_format", 1)
+                if type(cache_format) is not int:
+                    raise RuntimeError("unsupported persisted setup-cache format")
+                if cache_format == 1:
+                    return
+                if cache_format != 2:
+                    raise RuntimeError("unsupported persisted setup-cache format")
+                wheels = checked_wheel_files(cache_record.get("wheel_files"))
+                unique = {}
+                for record in wheels.values():
+                    sha, size = record["sha256"], record["size"]
+                    previous = unique.setdefault(sha, size)
+                    if previous != size:
+                        raise RuntimeError("wheel SHA-256 size collision")
+                source_root = stage / "wheel-cas"
+                for sha, size in unique.items():
+                    source = source_root / sha
+                    if not verify_wheel_object(source, sha, size):
+                        raise RuntimeError("verified task wheel CAS object changed")
+                    if stage == staged:
+                        continue
+                    target = wheel_cas / sha
+                    if target.exists():
+                        if not verify_wheel_object(target, sha, size):
+                            raise RuntimeError("current wheel CAS conflicts with historical checkpoint; preserved")
+                    else:
+                        os.link(source, target)
+
             def recover_historical_task(logical, item, source_record, ckpt_name):
                 if (checkpoints / ckpt_name).exists():
                     return False
@@ -1128,10 +1258,11 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         if (old_archive.stat().st_size != cache_record.get("size") or
                                 digest(old_archive) != cache_record.get("sha256")):
                             continue
+                        ensure_cache_wheels(cache_record, old)
                         old_downloads = safe(old / "audit" / (key + ".downloads.json"), immutable=True)
                         if not isinstance(json.loads(old_downloads.read_bytes()), dict):
                             continue
-                    except (OSError, ValueError, KeyError, TypeError):
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                         continue
                     archive = staged / expected_relative
                     if archive.exists():
@@ -1174,6 +1305,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                             done["offline"] != {"base_commit": item["base_commit"],
                                                 "env_hash": item["env_hash"], "offline": True}):
                         raise RuntimeError("verified task checkpoint changed; refusing unsafe reuse")
+                    ensure_cache_wheels(cache_record, staged)
                     artifacts[mapping[logical]["setup_cache"]] = cache_record
                     vcs_provenance[logical] = done["vcs"]
                     task_inventories[logical] = done["inventories"]
@@ -1189,8 +1321,9 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 warm_boot, warm_completion = task_boot(item, source_record, warm=True)
                 legacy_warm_ready = False
                 if scratch_uses_common(warm) and generic_guest_complete(warm):
+                    old_proof = guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json")
                     legacy_warm_ready = (guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item and
-                        isinstance(guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json"), dict))
+                                         isinstance(old_proof, dict) and old_proof.get("cache_format") == 2)
                 warm_ready = (scratch_uses_common(warm) and
                               completion_matches(warm, TASK_COMPLETION, warm_completion)) or legacy_warm_ready
                 if warm_ready:
@@ -1200,6 +1333,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     provision(warm, warm_boot, incoming, network=True,
                               completion=(TASK_COMPLETION, warm_completion))
                 proof = guest_json(warm, "/opt/swe-gym-task/cache-proof.json")
+                wheels = import_wheel_cas(warm, logical, proof)
                 key = mapping[logical]["setup_cache"]
                 archive = cache_folder / (key + ".tar.gz")
                 if not (archive.is_file() and not archive.is_symlink() and
@@ -1217,7 +1351,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     raise RuntimeError("task setup cache changed during export")
                 cache_record = {"kind": "setup_cache", "logical_task_id": logical, "allowed_template_id": item["template_id"],
                                 "source_identity": source_record["source_identity"], "sha256": proof["sha256"], "size": proof["size"],
-                                "path": archive.relative_to(staged).as_posix()}
+                                "path": archive.relative_to(staged).as_posix(), "cache_format": 2, "wheel_files": wheels}
                 artifacts[key] = cache_record
                 atomic_json(audit / (key + ".downloads.json"), proof["files"])
                 vcs_provenance[logical] = guest_json(warm, "/opt/swe-gym-lite/task-provenance/" + logical + ".vcs.json")
@@ -1226,14 +1360,12 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     "eval_setup": guest_json(warm, "/opt/swe-gym-lite/task-provenance/" + logical + ".json")}
                 archive.chmod(0o444)
                 shutil.copyfile(archive, incoming / "setup-cache.tar.gz")
+                stage_task_wheels(incoming, cache_record)
 
                 replay_boot, replay_completion = task_boot(item, source_record, warm=False, cache=cache_record)
                 expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
-                legacy_replay_ready = (scratch_uses_common(replay) and generic_guest_complete(replay) and
-                    guest_json_optional(replay, "/opt/swe-gym-task/item.json") == item and
-                    guest_json_optional(replay, "/opt/swe-gym-task/offline-proof.json") == expected_offline)
                 replay_ready = (scratch_uses_common(replay) and
-                                completion_matches(replay, TASK_COMPLETION, replay_completion)) or legacy_replay_ready
+                                completion_matches(replay, TASK_COMPLETION, replay_completion))
                 if replay_ready:
                     print("reused completed task replay scratch: " + logical, flush=True)
                 else:
@@ -1313,6 +1445,32 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 tools.validate_artifact(item, staged / record["path"], record)
             if len(mapping) != 230 or len(templates) != 11 or len(environments) != 25 or len(offline_proofs) != 230:
                 raise RuntimeError("final task/template/environment/replay coverage changed")
+
+            referenced_wheels = {}
+            wheel_reference_bytes = 0
+            for record in artifacts.values():
+                if record.get("kind") != "setup_cache" or record.get("cache_format", 1) != 2:
+                    continue
+                for wheel in checked_wheel_files(record.get("wheel_files")).values():
+                    sha, size = wheel["sha256"], wheel["size"]
+                    previous = referenced_wheels.setdefault(sha, size)
+                    if previous != size:
+                        raise RuntimeError("wheel SHA-256 size collision")
+                    wheel_reference_bytes += size
+            for path in list(wheel_cas.iterdir()):
+                if path.is_symlink() or not path.is_file() or re.fullmatch(r"[0-9a-f]{64}", path.name) is None:
+                    raise RuntimeError("unexpected wheel CAS entry")
+                if path.name not in referenced_wheels:
+                    path.unlink()
+            wheel_cas_manifest = {}
+            for sha, size in sorted(referenced_wheels.items()):
+                path = wheel_cas / sha
+                if not verify_wheel_object(path, sha, size):
+                    raise RuntimeError("final wheel CAS object differs")
+                path.chmod(0o444)
+                wheel_cas_manifest[sha] = {"path": path.relative_to(staged).as_posix(),
+                                           "sha256": sha, "size": size}
+
             from workstation_broker.templates import SECURITY_CONTRACT, TemplateRegistry
             resolved = {"schema_version": 2, "recipe_version": 2,
                 "template_abi": job["compatibility"]["template_abi"], "pins": pins,
@@ -1328,8 +1486,9 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 "task_inventories_sha256": digest(audit / 'task-inventories.json'),
                 "vcs_provenance_sha256": digest(audit / 'vcs-provenance.json'),
                 "cache_provenance": {path.name: digest(path) for path in sorted(audit.glob('*.downloads.json'))},
-                "artifacts": artifacts, "task_artifacts": mapping, "templates": templates,
-                "isolation_validation": isolations, "offline_setups_sha256": digest(audit / 'offline-setups.json')}
+                "artifacts": artifacts, "task_artifacts": mapping, "wheel_cas": wheel_cas_manifest,
+                "templates": templates, "isolation_validation": isolations,
+                "offline_setups_sha256": digest(audit / 'offline-setups.json')}
             # All resolved input bytes AND final QCOW2 hashes are now known. Disk
             # backings are relative, so the final directory name is not an input.
             generation = generation_identity(resolved)
@@ -1342,14 +1501,18 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                        "task_sources_physical_bytes": physical_bytes(source_folder.glob('*.tar.gz')),
                        "task_sources_logical_bytes": sum(p.stat().st_size for p in source_folder.glob('*.tar.gz')),
                        "setup_caches_physical_bytes": physical_bytes(cache_folder.glob('*.tar.gz')),
-                       "setup_caches_logical_bytes": sum(p.stat().st_size for p in cache_folder.glob('*.tar.gz'))}
+                       "setup_caches_logical_bytes": sum(p.stat().st_size for p in cache_folder.glob('*.tar.gz')),
+                       "wheel_cas_physical_bytes": physical_bytes(wheel_cas.glob('*')),
+                       "wheel_cas_unique_logical_bytes": sum(referenced_wheels.values()),
+                       "wheel_references_logical_bytes": wheel_reference_bytes}
             manifest = {"schema_version": 2, "recipe_version": 2, "template_abi": job["compatibility"]["template_abi"],
                 "generation": generation, "source_fingerprint": inputs["source_fingerprint"],
                 "pins": pins, "security": SECURITY_CONTRACT,
                 "resolved_inputs_sha256": digest(staged / 'resolved-inputs.json'),
                 "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0},
                 "env_mapping": {key: value['stored_name'] for key, value in inputs['environments'].items()},
-                "templates": templates, "artifacts": artifacts, "task_artifacts": mapping, "sizes": sizes,
+                "templates": templates, "artifacts": artifacts, "task_artifacts": mapping,
+                "wheel_cas": wheel_cas_manifest, "sizes": sizes,
                 "isolation_validation": isolations, "allocation": summary}
 
             from gpt_trace_transport.local_templates import compatibility, seal_validation, activate
