@@ -121,16 +121,6 @@ def stream_digest(path):
     return digest.hexdigest()
 
 
-def task_runtime_fingerprint():
-    """Bind resumable task proofs to the exact guest setup implementation."""
-    value = hashlib.sha256()
-    value.update(("task-runtime-schema:" + str(TASK_RUNTIME_SCHEMA) + "\n").encode())
-    for name in ("runtime.py", "task_sources.py", "os_packages.py"):
-        value.update(name.encode() + b"\0")
-        value.update(stream_digest(ROOT / name).encode() + b"\n")
-    return value.hexdigest()
-
-
 # Build-only environment transformation: pinned official inputs stay byte-for-byte
 # unchanged, while Python's final version is constrained before the first solve.
 # Reproducibility records BOTH scripts and the solver policy in the guest image.
@@ -491,7 +481,6 @@ def warm_task_ready(item):
                 state_path.is_symlink() or not state_path.is_file() or
                 json.loads(state_path.read_text()) != {
                     "schema": TASK_RUNTIME_SCHEMA,
-                    "runtime_fingerprint": task_runtime_fingerprint(),
                     "instance_id": item["instance_id"], "repo": item["repo"],
                     "base_commit": item["base_commit"], "env_hash": item["env_hash"]} or
                 setup_record.is_symlink() or final_record.is_symlink() or
@@ -536,7 +525,6 @@ def _write_warm_state(item):
     path = Path("/opt/swe-gym-task/warm-state.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"schema": TASK_RUNTIME_SCHEMA,
-                                "runtime_fingerprint": task_runtime_fingerprint(),
                                 "instance_id": item["instance_id"],
                                 "repo": item["repo"], "base_commit": item["base_commit"],
                                 "env_hash": item["env_hash"]}, sort_keys=True))
@@ -684,7 +672,6 @@ def replay_task_ready(item):
                 state_path.is_symlink() or not state_path.is_file() or
                 json.loads(state_path.read_text()) != {
                     "schema": TASK_RUNTIME_SCHEMA,
-                    "runtime_fingerprint": task_runtime_fingerprint(),
                     "instance_id": item["instance_id"]} or
                 not prefix.is_dir() or not (prefix / "bin/python").is_file()):
             return False
@@ -711,7 +698,6 @@ def replay_task(item, artifact, cache):
     path.write_text(json.dumps(proof, sort_keys=True))
     state = Path("/opt/swe-gym-task/replay-state.json")
     state.write_text(json.dumps({"schema": TASK_RUNTIME_SCHEMA,
-                                 "runtime_fingerprint": task_runtime_fingerprint(),
                                  "instance_id": item["instance_id"]}, sort_keys=True))
     for durable in (path, state):
         with durable.open("rb") as handle:

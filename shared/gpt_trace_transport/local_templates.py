@@ -24,6 +24,7 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
+TASK_RUNTIME_SCHEMA = 2
 # Stable trust anchors for already-installed immutable Kali goldens. New
 # upstream goldens append a tuple here; old tuples stay forever so unrelated
 # checkout changes never invalidate bytes that were already built and sealed.
@@ -161,6 +162,7 @@ def template_contract(source_root=ROOT):
     if digest(source_root / RUNTIME / "contract.json") != pins["contract_sha256"]:
         raise ValueError("pinned Lite source contract differs")
     return {"schema_version": 2, "recipe_version": 2, "template_abi": TEMPLATE_ABI,
+        "task_runtime_schema": TASK_RUNTIME_SCHEMA,
         "pins": pins, "source_fingerprint": hashlib.sha256(canonical(pins)).hexdigest(),
         "security": SECURITY}
 
@@ -179,6 +181,9 @@ def normalized_template_compatibility(value):
     if not isinstance(value, dict):
         raise ValueError("invalid template compatibility record")
     abi = value.get("template_abi", 1 if value.get("recipe_version") == 2 else None)
+    # task_runtime_schema intentionally stays out of expensive-stage compatibility:
+    # bumping it invalidates task proofs/final generations while preserving reusable
+    # common/source work. TEMPLATE_ABI is for actual permanent-template incompatibility.
     keys = ("schema_version", "recipe_version", "pins", "source_fingerprint", "security",
             "architecture", "golden_sha256", "golden_provenance_sha256", "golden_provenance")
     result = {key: value.get(key) for key in keys}
@@ -325,7 +330,7 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     generation = hashlib.sha256(canonical(resolved)).hexdigest()
     if manifest.get("generation") != generation or manifest.get("resolved_inputs_sha256") != digest(resolved_path):
         raise ValueError("resolved template generation/input SHA-256 mismatch")
-    for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation"):
+    for key in ("schema_version", "recipe_version", "task_runtime_schema", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation"):
         if manifest.get(key) != resolved.get(key): raise ValueError("manifest/resolved input mismatch: " + key)
     if manifest.get("wheel_cas", {}) != resolved.get("wheel_cas", {}):
         raise ValueError("manifest/resolved input mismatch: wheel_cas")
@@ -333,7 +338,7 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     resolved_abi = resolved.get("template_abi", 1 if resolved.get("recipe_version") == 2 else None)
     if manifest_abi != resolved_abi or manifest_abi != expected["template_abi"]:
         raise ValueError("template ABI compatibility mismatch")
-    for key in ("schema_version", "recipe_version", "pins", "source_fingerprint", "security"):
+    for key in ("schema_version", "recipe_version", "task_runtime_schema", "pins", "source_fingerprint", "security"):
         if manifest.get(key) != expected[key]: raise ValueError("template recipe/security compatibility mismatch: " + key)
     if resolved.get("golden", {}).get("sha256") != expected["golden_sha256"]:
         raise ValueError("template uses another Kali golden")

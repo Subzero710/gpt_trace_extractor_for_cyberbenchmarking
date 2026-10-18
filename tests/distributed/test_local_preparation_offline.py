@@ -102,17 +102,19 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertIn("template_abi", candidates[0])
 
-    def test_task_checkpoint_reuse_is_runtime_bound_and_never_falls_back_to_stored_env(self):
+    def test_task_checkpoint_reuse_uses_semantic_schema_and_never_falls_back_to_stored_env(self):
         builder_source = (ROOT / "scripts/build_local_templates.py").read_text()
         guest_source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
         self.assertIn("TASK_RUNTIME_SCHEMA = 2", builder_source)
-        self.assertIn("runtime_fingerprint", builder_source)
         self.assertIn('"task-v" + str(TASK_RUNTIME_SCHEMA)', builder_source)
+        self.assertNotIn("runtime_fingerprint", builder_source)
+        self.assertNotIn("task_runtime_fingerprint", guest_source)
         recovery = guest_source.split("def recovery_env_prefix(item):", 1)[1].split("\ndef ", 1)[0]
         self.assertIn('/opt/miniconda3/envs/testbed', recovery)
         self.assertNotIn("stored_env_prefix(item)", recovery)
-        self.assertIn("task_runtime_fingerprint()", guest_source)
         self.assertIn("replay-state.json", guest_source)
+        contract = local.template_contract(ROOT)
+        self.assertEqual(contract["task_runtime_schema"], 2)
 
     def test_package_capture_prefers_built_wheels_and_uses_all_four_guest_cpus(self):
         source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()

@@ -183,6 +183,7 @@ def fixture(parent, *, activate=True, label="repo"):
     local.atomic_json(deb.parent / "manifest.json", os_manifest)
     clean = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
     resolved = {"schema_version": 2, "recipe_version": 2, "template_abi": expected["template_abi"],
+        "task_runtime_schema": expected["task_runtime_schema"],
         "pins": expected["pins"], "source_fingerprint": expected["source_fingerprint"], "security": local.SECURITY,
         "templates": templates, "artifacts": artifacts, "task_artifacts": mapping, "wheel_cas": wheel_cas,
         "isolation_validation": {name: clean for name in repos | {"common"}},

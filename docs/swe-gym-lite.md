@@ -155,9 +155,10 @@ Fetch first runs the unchanged benchmark source fetcher, which verifies the offi
 
 The native broker starts one detached, finite worker and responds immediately. Short status requests report `starting`, `running`, `validating`, `ready`, or an explicit terminal error. A root-only state directory and an inherited flock identify the job across disconnects and broker restarts. PID, boot ID, start time and private process session prevent ambiguous duplicate mutations. A lost response never causes an automatic start retry. Rerunning the explicit fetch rediscovers the ID; only a proved-dead failed/interrupted job can be retried. Sealed results interrupted before activation can be validated and activated without rebuilding. Failed build stages, logs and original valid generations remain available for investigation.
 Task checkpoints and interrupted scratch recovery are additionally bound to a
-fingerprint of the exact guest runtime helpers and to a real Conda `testbed`
-clone. A code-only runtime change therefore leaves older checkpoint files on disk
-for diagnostics but does not authorize their reuse.
+small semantic task-runtime schema and to a real Conda `testbed` clone. Compatible
+implementation-only edits keep the same schema and can reuse completed work; a
+semantic setup change bumps the schema, leaving older checkpoint files on disk for
+diagnostics without authorizing their reuse.
 
 Fetch returns success only after complete validation and activation, and records the actual generation. Permanent reuse checks the full immutable inventory, provenance and recorded integrity signatures. GAIA fetch remains unchanged and does not invoke the Lite builder. Source/dependency downloads needed for this local construction are verified by the existing pins, Git commits, package hashes and resolved provenance. No external image publication or image registry is used.
 
