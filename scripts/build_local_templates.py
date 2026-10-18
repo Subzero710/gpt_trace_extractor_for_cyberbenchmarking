@@ -50,6 +50,7 @@ COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
+TASK_RUNTIME_SCHEMA = 2
 
 
 class RecoverableBuildError(RuntimeError):
@@ -268,6 +269,18 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def task_runtime_fingerprint():
+    """Hash the exact helpers whose semantics authorize task checkpoint reuse."""
+    value = hashlib.sha256()
+    value.update(("task-runtime-schema:" + str(TASK_RUNTIME_SCHEMA) + "\n").encode())
+    for guest_name, path in (("runtime.py", GUEST),
+                             ("task_sources.py", GUEST.with_name("task_sources.py")),
+                             ("os_packages.py", GUEST.with_name("os_packages.py"))):
+        value.update(guest_name.encode() + b"\0")
+        value.update(digest(path).encode() + b"\n")
+    return value.hexdigest()
 
 
 def atomic_json(path, value):
@@ -627,6 +640,7 @@ def build(args):
         from gpt_trace_transport.local_templates import safe
         safe(checkpoints, directory=True)
         historical_stages = _compatible_stage_candidates(target_root, staged, identity)
+        task_runtime = task_runtime_fingerprint()
         scratch_root = target_root / ".scratch"
         scratch_root.mkdir(mode=0o700, exist_ok=True)
         safe(scratch_root, directory=True)
@@ -789,8 +803,9 @@ def build(args):
                 "artifact=" + repr({**artifact, "path": "/opt/swe-gym-task/source.tar.gz"}),
             ]
             if mode in {"warm", "warm-recover"}:
-                completion = {"schema": 1, "kind": "task-warm", "logical_task_id": item["instance_id"],
-                              "cache_format": 2}
+                completion = {"schema": TASK_RUNTIME_SCHEMA, "kind": "task-warm",
+                              "logical_task_id": item["instance_id"], "cache_format": 2,
+                              "runtime_fingerprint": task_runtime}
                 if mode == "warm":
                     lines += [
                         "module['warm_task'](item,artifact)",
@@ -812,8 +827,11 @@ def build(args):
                 delivered = {**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}
                 if cache.get("cache_format") == 2:
                     delivered["wheel_store"] = "/opt/swe-gym-task/wheel-cas"
-                completion = {"schema": 1, "kind": "task-replay", "logical_task_id": item["instance_id"],
-                              "cache_format": cache.get("cache_format", 1), "cache_sha256": cache["sha256"]}
+                completion = {"schema": TASK_RUNTIME_SCHEMA, "kind": "task-replay",
+                              "logical_task_id": item["instance_id"],
+                              "cache_format": cache.get("cache_format", 1),
+                              "cache_sha256": cache["sha256"],
+                              "runtime_fingerprint": task_runtime}
                 lines.append("cache=" + repr(delivered))
                 if mode == "replay":
                     lines += [
@@ -1295,6 +1313,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         done = json.loads(safe(old_checkpoint, immutable=True).read_bytes())
                         cache_record = done["cache_record"]
                         if (done.get("logical_task_id") != logical or
+                                done.get("task_runtime_schema") != TASK_RUNTIME_SCHEMA or
+                                done.get("runtime_fingerprint") != task_runtime or
                                 cache_record.get("kind") != "setup_cache" or
                                 cache_record.get("logical_task_id") != logical or
                                 cache_record.get("allowed_template_id") != item["template_id"] or
@@ -1341,13 +1361,17 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
                 free_space(staged, margin)
                 source_record = artifacts[mapping[logical]["task_source"]]
-                ckpt_name = "task-" + tools.artifact_id("task_source", logical) + ".json"
+                ckpt_name = ("task-v" + str(TASK_RUNTIME_SCHEMA) + "-" +
+                             tools.artifact_id("task_source", logical) + "-" +
+                             task_runtime[:16] + ".json")
                 recover_historical_task(logical, item, source_record, ckpt_name)
                 done = read_checkpoint(ckpt_name)
                 if done is not None:
                     cache_record = done["cache_record"]
                     archive = staged / cache_record["path"]
                     if (done.get("logical_task_id") != logical or
+                            done.get("task_runtime_schema") != TASK_RUNTIME_SCHEMA or
+                            done.get("runtime_fingerprint") != task_runtime or
                             cache_record["kind"] != "setup_cache" or
                             cache_record["source_identity"] != source_record["source_identity"] or
                             archive.is_symlink() or not archive.is_file() or
@@ -1370,16 +1394,10 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
 
                 warm_boot, warm_completion = task_boot(item, source_record, mode="warm")
-                legacy_warm_ready = False
-                warm_matches_item = False
-                if scratch_uses_common(warm):
-                    warm_matches_item = guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item
-                    if generic_guest_complete(warm):
-                        old_proof = guest_json_optional(warm, "/opt/swe-gym-task/cache-proof.json")
-                        legacy_warm_ready = (warm_matches_item and isinstance(old_proof, dict) and
-                                             old_proof.get("cache_format") == 2)
-                warm_ready = (scratch_uses_common(warm) and
-                              completion_matches(warm, TASK_COMPLETION, warm_completion)) or legacy_warm_ready
+                warm_matches_item = (scratch_uses_common(warm) and
+                                     guest_json_optional(warm, "/opt/swe-gym-task/item.json") == item)
+                warm_ready = (warm_matches_item and
+                              completion_matches(warm, TASK_COMPLETION, warm_completion))
                 warm_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".warm.serial.log")
                 if warm_ready:
                     print("reused completed task warm scratch: " + logical, flush=True)
@@ -1431,10 +1449,10 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
 
                 replay_boot, replay_completion = task_boot(item, source_record, mode="replay", cache=cache_record)
                 expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
-                replay_ready = (scratch_uses_common(replay) and
-                                completion_matches(replay, TASK_COMPLETION, replay_completion))
                 replay_matches_item = (scratch_uses_common(replay) and
                                        guest_json_optional(replay, "/opt/swe-gym-task/item.json") == item)
+                replay_ready = (replay_matches_item and
+                                completion_matches(replay, TASK_COMPLETION, replay_completion))
                 replay_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".replay.serial.log")
                 if replay_ready:
                     print("reused completed task replay scratch: " + logical, flush=True)
@@ -1456,6 +1474,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
                     raise RuntimeError("fresh task replay proof differs from exact base/environment")
                 write_checkpoint(ckpt_name, {"logical_task_id": logical,
+                    "task_runtime_schema": TASK_RUNTIME_SCHEMA,
+                    "runtime_fingerprint": task_runtime,
                     "cache_record": cache_record, "vcs": vcs_provenance[logical],
                     "inventories": task_inventories[logical], "offline": offline_proofs[logical]})
                 # Scratch disks remain at two fixed paths and are reset in-place for

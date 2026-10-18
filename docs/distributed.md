@@ -6,7 +6,11 @@ broker, KVM guests, and immutable images. The shared `config/distributed.toml` i
 committed. Each host chooses its role using its private `.env`. For this installation,
 Fossil is `execution` (Intel VT-x, 4 vCPU, 12 GiB Kali RAM, 512 GiB sparse
 QCOW2 on its second HDD); Acer is `control` (PostgreSQL, runner, KasmVNC).
-The roles are NOT hard-coded to hostnames in the tracked repository.
+The roles are NOT hard-coded to hostnames in the tracked repository. The parent
+directory of `paths.base_image` is also the execution-host storage boundary: it
+must already be the actual writable local `ext4`/`xfs` mount target. If that data
+disk is absent, execution-host commands fail instead of writing QCOW2 data to the
+Ubuntu root filesystem.
 
 ## Cloudflare Tunnel (without Cloudflare Access)
 

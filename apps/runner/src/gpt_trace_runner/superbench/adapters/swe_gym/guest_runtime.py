@@ -30,6 +30,7 @@ def run(*args, cwd=None, env=None, input=None):
 
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 BUILDER_WHEEL_STORE = Path("/opt/swe-gym-task/wheel-cas")
+TASK_RUNTIME_SCHEMA = 2
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -120,6 +121,16 @@ def stream_digest(path):
     return digest.hexdigest()
 
 
+def task_runtime_fingerprint():
+    """Bind resumable task proofs to the exact guest setup implementation."""
+    value = hashlib.sha256()
+    value.update(("task-runtime-schema:" + str(TASK_RUNTIME_SCHEMA) + "\n").encode())
+    for name in ("runtime.py", "task_sources.py", "os_packages.py"):
+        value.update(name.encode() + b"\0")
+        value.update(stream_digest(ROOT / name).encode() + b"\n")
+    return value.hexdigest()
+
+
 # Build-only environment transformation: pinned official inputs stay byte-for-byte
 # unchanged, while Python's final version is constrained before the first solve.
 # Reproducibility records BOTH scripts and the solver policy in the guest image.
@@ -186,16 +197,18 @@ def optimized_build_script(env_hash, record):
 
 
 def build_limits(env=None):
-    """Bound compile workers, not guest vCPU count or the frozen package set."""
+    """Use all four preparation vCPUs while keeping builders bounded."""
     result = dict(os.environ if env is None else env)
+    workers = max(1, min(4, os.cpu_count() or 1))
     # The pinned Miniconda already ships libmamba. Strict channel priority
     # avoids exploring conflicting defaults/conda-forge variants.
     result.update(CONDA_SOLVER="libmamba", CONDA_CHANNEL_PRIORITY="strict",
                   CONDA_REMOTE_MAX_RETRIES="10", CONDA_REMOTE_BACKOFF_FACTOR="2",
                   CONDA_REMOTE_CONNECT_TIMEOUT_SECS="30", CONDA_REMOTE_READ_TIMEOUT_SECS="180",
                   PIP_RETRIES="10", PIP_TIMEOUT="180",
-                  MAKEFLAGS="-j2", CMAKE_BUILD_PARALLEL_LEVEL="2",
-                  MAX_JOBS="2", npm_config_jobs="2")
+                  MAKEFLAGS="-j" + str(workers),
+                  CMAKE_BUILD_PARALLEL_LEVEL=str(workers),
+                  MAX_JOBS=str(workers), npm_config_jobs=str(workers))
     return result
 
 
@@ -235,12 +248,8 @@ def clone_env(item, *, offline):
 
 
 def recovery_env_prefix(item):
-    testbed = Path("/opt/miniconda3/envs/testbed")
-    if testbed.is_dir() and (testbed / "bin/python").is_file():
-        return testbed
-    # Compatibility with a scratch produced by the short-lived direct-prefix
-    # builder: recovery is read-only and never treats that layout as a fresh task.
-    return stored_env_prefix(item)
+    # Recovery is valid only for the real upstream testbed clone.
+    return Path("/opt/miniconda3/envs/testbed")
 
 
 def pip_versions(prefix):
@@ -473,11 +482,19 @@ def warm_task_ready(item):
     """Deep proof used to salvage a warm scratch that failed after expensive setup."""
     instance = item["instance_id"]
     prefix = recovery_env_prefix(item)
+    state_path = Path("/opt/swe-gym-task/warm-state.json")
     setup_record = ROOT / "task-provenance" / (instance + ".setup.json")
     final_record = ROOT / "task-provenance" / (instance + ".json")
     wheelhouse = ROOT / "wheelhouse" / instance
     try:
-        if (not prefix.is_dir() or setup_record.is_symlink() or final_record.is_symlink() or
+        if (not prefix.is_dir() or not (prefix / "bin/python").is_file() or
+                state_path.is_symlink() or not state_path.is_file() or
+                json.loads(state_path.read_text()) != {
+                    "schema": TASK_RUNTIME_SCHEMA,
+                    "runtime_fingerprint": task_runtime_fingerprint(),
+                    "instance_id": item["instance_id"], "repo": item["repo"],
+                    "base_commit": item["base_commit"], "env_hash": item["env_hash"]} or
+                setup_record.is_symlink() or final_record.is_symlink() or
                 not setup_record.is_file() or not final_record.is_file() or
                 wheelhouse.is_symlink() or not wheelhouse.is_dir()):
             return False
@@ -518,11 +535,28 @@ def warm_task_ready(item):
 def _write_warm_state(item):
     path = Path("/opt/swe-gym-task/warm-state.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"schema": 1, "instance_id": item["instance_id"],
+    path.write_text(json.dumps({"schema": TASK_RUNTIME_SCHEMA,
+                                "runtime_fingerprint": task_runtime_fingerprint(),
+                                "instance_id": item["instance_id"],
                                 "repo": item["repo"], "base_commit": item["base_commit"],
                                 "env_hash": item["env_hash"]}, sort_keys=True))
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
+
+
+def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse):
+    """Prefer built wheels so offline replay does not rebuild source distributions."""
+    env = runtime_environment(item, offline=False)
+    try:
+        run(str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps",
+            "--wheel-dir", str(wheelhouse), "--requirement", str(requirements_file), env=env)
+    except subprocess.CalledProcessError:
+        for path in wheelhouse.iterdir():
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError("unexpected partial wheelhouse entry")
+            path.unlink()
+        run(str(prefix / "bin/python"), "-m", "pip", "download", "--no-deps",
+            "--dest", str(wheelhouse), "--requirement", str(requirements_file), env=env)
 
 
 def warm_task(item, artifact):
@@ -571,9 +605,8 @@ print(json.dumps(result))
     requirements_file.write_text("\n".join(reqs) + "\n")
     if reqs:
         _timed(item, "warm_capture_wheels",
-               lambda: run(str(prefix / "bin/python"), "-m", "pip", "download", "--no-deps",
-                           "--dest", str(wheelhouse), "--requirement", str(requirements_file),
-                           env=runtime_environment(item, offline=False)))
+               lambda: _capture_install_artifacts(
+                   item, prefix, requirements_file, wheelhouse))
     requirements_file.unlink()
     _timed(item, "warm_freeze_vcs", lambda: freeze_vcs_dependencies(item, prefix))
     pool = ROOT / "caches/wheels"
@@ -644,9 +677,16 @@ def configure_vcs_cache(item):
 
 def replay_task_ready(item):
     proof_path = Path("/opt/swe-gym-task/offline-proof.json")
+    state_path = Path("/opt/swe-gym-task/replay-state.json")
     prefix = recovery_env_prefix(item)
     try:
-        if proof_path.is_symlink() or not proof_path.is_file() or not prefix.is_dir():
+        if (proof_path.is_symlink() or not proof_path.is_file() or
+                state_path.is_symlink() or not state_path.is_file() or
+                json.loads(state_path.read_text()) != {
+                    "schema": TASK_RUNTIME_SCHEMA,
+                    "runtime_fingerprint": task_runtime_fingerprint(),
+                    "instance_id": item["instance_id"]} or
+                not prefix.is_dir() or not (prefix / "bin/python").is_file()):
             return False
         if json.loads(proof_path.read_text()) != {
                 "base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
@@ -669,8 +709,13 @@ def replay_task(item, artifact, cache):
     proof = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
     path = Path("/opt/swe-gym-task/offline-proof.json")
     path.write_text(json.dumps(proof, sort_keys=True))
-    with path.open("rb") as handle:
-        os.fsync(handle.fileno())
+    state = Path("/opt/swe-gym-task/replay-state.json")
+    state.write_text(json.dumps({"schema": TASK_RUNTIME_SCHEMA,
+                                 "runtime_fingerprint": task_runtime_fingerprint(),
+                                 "instance_id": item["instance_id"]}, sort_keys=True))
+    for durable in (path, state):
+        with durable.open("rb") as handle:
+            os.fsync(handle.fileno())
 
 def install_offline_apt_guard():
     """Validate frozen prerequisites; campaigns never upgrade OS packages."""

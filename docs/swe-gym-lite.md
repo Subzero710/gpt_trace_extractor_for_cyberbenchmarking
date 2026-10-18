@@ -72,7 +72,11 @@ successful fresh offline replay; failed disks remain diagnostic state.
 
 Task-dependent downloads, VCS dependencies, wheelhouses, npm state and PDM/pipx
 prerequisites are likewise frozen into separate HOST-ONLY setup-cache artifacts.
-Every task is warmed in its own disposable VM and then validated in another new,
+The warm build cache persists only package-manager download/build cache across
+tasks; captured setup artifacts remain task-scoped. Package capture prefers built
+wheels and falls back to source archives only when a dependency cannot be wheeled,
+so the fresh offline replay avoids repeating avoidable source builds. Every task
+is warmed in its own disposable VM and then validated in another new,
 network-disabled VM. No earlier task filesystem or source-containing cache can
 enter a later task's permanent image or overlay.
 
@@ -150,6 +154,10 @@ make export-parquet
 Fetch first runs the unchanged benchmark source fetcher, which verifies the official pinned dataset and exact task contract. control host and execution host then compare their source/recipe fingerprints. A preparation ID is derived from these exact inputs and the actual verified golden. Only callers authenticated with the control host's independent administrative broker bearer token can start/query the job through the dedicated tunnel. No physical hostname or private LAN address is pinned in application code. Controller/MCP/model/guest credentials cannot access preparation, lifecycle or evaluator routes. There is no shell RPC, arbitrary command or task-controlled installation path.
 
 The native broker starts one detached, finite worker and responds immediately. Short status requests report `starting`, `running`, `validating`, `ready`, or an explicit terminal error. A root-only state directory and an inherited flock identify the job across disconnects and broker restarts. PID, boot ID, start time and private process session prevent ambiguous duplicate mutations. A lost response never causes an automatic start retry. Rerunning the explicit fetch rediscovers the ID; only a proved-dead failed/interrupted job can be retried. Sealed results interrupted before activation can be validated and activated without rebuilding. Failed build stages, logs and original valid generations remain available for investigation.
+Task checkpoints and interrupted scratch recovery are additionally bound to a
+fingerprint of the exact guest runtime helpers and to a real Conda `testbed`
+clone. A code-only runtime change therefore leaves older checkpoint files on disk
+for diagnostics but does not authorize their reuse.
 
 Fetch returns success only after complete validation and activation, and records the actual generation. Permanent reuse checks the full immutable inventory, provenance and recorded integrity signatures. GAIA fetch remains unchanged and does not invoke the Lite builder. Source/dependency downloads needed for this local construction are verified by the existing pins, Git commits, package hashes and resolved provenance. No external image publication or image registry is used.
 

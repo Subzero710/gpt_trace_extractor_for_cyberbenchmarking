@@ -160,14 +160,24 @@ def host(role, cfg, *, docker=True, build_tools=False):
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
         image_directory = cfg["paths"]["base_image"].parent
-        parent = image_directory
-        while not parent.exists() and parent != parent.parent: parent = parent.parent
-        device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
-        filesystem = run(["findmnt", "-n", "-o", "FSTYPE", "-T", parent], capture=True, timeout=10)
-        # An HDD is supported: the images must be backed by a local filesystem,
-        # not mergerfs/FUSE, NFS, overlayfs or an ephemeral RAM filesystem.
-        if not device.startswith("/dev/") or filesystem not in {"ext4", "xfs"}:
-            raise RuntimeError("Kali images require a directly mounted local ext4/xfs filesystem")
+        if (not image_directory.is_dir() or image_directory.is_symlink()):
+            raise RuntimeError("configured Kali image directory must already exist as a dedicated mount")
+        target = run(["findmnt", "-n", "-o", "TARGET", "-T", image_directory],
+                     capture=True, timeout=10)
+        device = run(["findmnt", "-n", "-o", "SOURCE", "-T", image_directory],
+                     capture=True, timeout=10)
+        filesystem = run(["findmnt", "-n", "-o", "FSTYPE", "-T", image_directory],
+                         capture=True, timeout=10)
+        options = run(["findmnt", "-n", "-o", "OPTIONS", "-T", image_directory],
+                      capture=True, timeout=10)
+        # The configured image directory itself is the storage boundary. Requiring
+        # it to be the actual mount target prevents a missing data disk from
+        # silently falling back to Ubuntu's root filesystem.
+        if (Path(target).resolve() != image_directory.resolve() or
+                not device.startswith("/dev/") or filesystem not in {"ext4", "xfs"} or
+                "rw" not in options.split(",")):
+            raise RuntimeError(
+                "Kali image directory must be the dedicated writable local ext4/xfs mount target")
 
 
 def environment(cfg):

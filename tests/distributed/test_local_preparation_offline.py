@@ -102,6 +102,24 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertIn("template_abi", candidates[0])
 
+    def test_task_checkpoint_reuse_is_runtime_bound_and_never_falls_back_to_stored_env(self):
+        builder_source = (ROOT / "scripts/build_local_templates.py").read_text()
+        guest_source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
+        self.assertIn("TASK_RUNTIME_SCHEMA = 2", builder_source)
+        self.assertIn("runtime_fingerprint", builder_source)
+        self.assertIn('"task-v" + str(TASK_RUNTIME_SCHEMA)', builder_source)
+        recovery = guest_source.split("def recovery_env_prefix(item):", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('/opt/miniconda3/envs/testbed', recovery)
+        self.assertNotIn("stored_env_prefix(item)", recovery)
+        self.assertIn("task_runtime_fingerprint()", guest_source)
+        self.assertIn("replay-state.json", guest_source)
+
+    def test_package_capture_prefers_built_wheels_and_uses_all_four_guest_cpus(self):
+        source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
+        self.assertIn('workers = max(1, min(4, os.cpu_count() or 1))', source)
+        self.assertIn('"pip", "wheel", "--no-deps"', source)
+        self.assertIn('"pip", "download", "--no-deps"', source)
+
 
 class WheelCacheFormatTests(unittest.TestCase):
     @classmethod
@@ -228,6 +246,14 @@ class WheelCacheFormatTests(unittest.TestCase):
                 self.runtime._wheel_files({name: {"sha256": sha, "size": 1}})
         with self.assertRaises(RuntimeError):
             self.runtime._wheel_files({"x.whl": {"sha256": sha, "size": True}})
+
+
+class DistributedMountPolicyTests(unittest.TestCase):
+    def test_execution_image_storage_requires_exact_mount_target(self):
+        source = (ROOT / "scripts/distributed.py").read_text()
+        self.assertIn('"TARGET", "-T", image_directory', source)
+        self.assertIn("Path(target).resolve() != image_directory.resolve()", source)
+        self.assertIn("dedicated writable local ext4/xfs mount target", source)
 
 
 class LocalGenerationTests(unittest.TestCase):
