@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECT_IMAGE_LABEL = "io.gpttrace.project=gpt-trace-extractor"
 DELETE_VOLUMES = ("postgres_data", "runner_state", "browser_profile")
 PRESERVE_VOLUMES = ("benchmark_sources",)
-ATTEMPTS = Path("/var/lib/libvirt/images/gpt-trace/attempts")
 
 
 class ThrowError(RuntimeError):
@@ -228,18 +227,6 @@ def remove_project_images() -> None:
         run(["docker", "image", "rm", "-f", *ids])
 
 
-def verify_attempts_empty() -> None:
-    if not ATTEMPTS.exists():
-        return
-    if ATTEMPTS.is_symlink() or not ATTEMPTS.is_dir():
-        raise ThrowError(f"unexpected workstation attempts path: {ATTEMPTS}")
-    remaining = sorted(entry.name for entry in ATTEMPTS.iterdir())
-    if remaining:
-        raise ThrowError(
-            "workstation attempts survived destroy_all: " + ", ".join(remaining)
-        )
-
-
 
 
 def main() -> int:
@@ -262,7 +249,7 @@ def main() -> int:
         "WARNING: destructive inter-generation reset.\n"
         "Deletes: active project containers/VM attempts, postgres_data, runner_state, "
         "browser_profile, exports, host runtime state, host broker venv, final "
-        "project Docker images, and Fossil SWE-Gym template/checkpoint storage.\n"
+        "project Docker images, and execution-host SWE-Gym template/checkpoint storage.\n"
         "Preserves: benchmark_sources, Kali download/golden image, BuildKit cache, "
         ".env, .secrets and App/tunnel registration.",
         flush=True,

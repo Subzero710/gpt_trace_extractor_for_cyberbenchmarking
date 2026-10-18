@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +28,19 @@ from workstation_broker.preparation_resources import JobScope, source_containers
 
 TERMINAL = frozenset({"ready", "failed", "interrupted", "canceled"})
 PHASES = TERMINAL | {"starting", "running", "validating"}
-BASE = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
+def configured_base_image():
+    source = ROOT / "config/distributed.toml"
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError("missing/unsafe distributed configuration")
+    with source.open("rb") as stream:
+        config = tomllib.load(stream)
+    value = config.get("paths", {}).get("base_image")
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise RuntimeError("config/distributed.toml paths.base_image must be an absolute path")
+    return Path(value)
+
+
+BASE = configured_base_image()
 PROC = Path("/proc")  # Fixed host process table; never configurable through RPC.
 
 

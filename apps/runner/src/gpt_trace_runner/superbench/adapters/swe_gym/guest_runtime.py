@@ -212,7 +212,7 @@ def stored_env_prefix(item):
     return prefix
 
 
-def pristine_env(item):
+def pristine_stored_env(item):
     prefix = stored_env_prefix(item)
     expected = json.loads((ROOT / "environments" / (item["env_hash"] + ".json")).read_text())
     if env_inventory(prefix) != expected:
@@ -220,10 +220,26 @@ def pristine_env(item):
     return prefix
 
 
+def clone_env(item, *, offline):
+    stored = pristine_stored_env(item)
+    prefix = Path("/opt/miniconda3/envs/testbed")
+    if prefix.exists():
+        run(str(CONDA), "env", "remove", "--prefix", str(prefix), "-y")
+    args = [str(CONDA), "create", "--name", "testbed", "--clone", str(stored), "--yes"]
+    if offline:
+        args.append("--offline")
+    run(*args)
+    if not (prefix / "bin/python").is_file():
+        raise RuntimeError("Conda did not materialize testbed")
+    return prefix
+
+
 def recovery_env_prefix(item):
-    legacy = Path("/opt/miniconda3/envs/testbed")
-    if legacy.is_dir() and (legacy / "bin/python").is_file():
-        return legacy
+    testbed = Path("/opt/miniconda3/envs/testbed")
+    if testbed.is_dir() and (testbed / "bin/python").is_file():
+        return testbed
+    # Compatibility with a scratch produced by the short-lived direct-prefix
+    # builder: recovery is read-only and never treats that layout as a fresh task.
     return stored_env_prefix(item)
 
 
@@ -231,22 +247,6 @@ def pip_versions(prefix):
     return {entry["name"].lower().replace("_", "-"): entry["version"]
             for entry in json.loads(run(str(prefix / "bin/python"), "-m", "pip",
                                         "list", "--format=json").decode())}
-
-
-def activation_command(prefix):
-    return "conda activate " + shlex.quote(str(prefix)) + "; export CONDA_DEFAULT_ENV=testbed"
-
-
-def adapt_environment_commands(commands, prefix):
-    adapted = []
-    for line in commands:
-        if line.strip() == "conda activate testbed":
-            adapted.append(activation_command(prefix))
-        elif re.search(r"\bconda\s+activate\s+testbed\b", line):
-            raise RuntimeError("unsupported embedded testbed environment activation in pinned recipe")
-        else:
-            adapted.append(line)
-    return adapted
 
 
 def repo_name(repo):
@@ -291,7 +291,7 @@ def setup_commands(item, destination, prefix):
             frozen_python = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"]) / "bin/python"
             line = "test -x /root/.local/bin/pdm || pipx install pdm --python " + shlex.quote(str(frozen_python))
         adapted.append(line)
-    commands = adapt_environment_commands(adapted, prefix)
+    commands = adapted
     commands.append("git remote | xargs -r -n1 git remote remove")
     commands.append("test \"$(git rev-parse HEAD)\" = " + shlex.quote(item["base_commit"]))
     commands.append("test \"$CONDA_PREFIX\" = " + shlex.quote(str(prefix)))
@@ -328,8 +328,8 @@ def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
         if any(line.startswith("pipx install pdm") for line in item["repo_script_list"]) and not Path("/root/.local/bin/pdm").is_file():
             raise RuntimeError("frozen PDM tool is missing; runtime cannot install it")
         configure_vcs_cache(item)
-    prefix = _timed(item, prefix_name + "_select_env",
-                    lambda: pristine_env(item))
+    prefix = _timed(item, prefix_name + "_clone_env",
+                    lambda: clone_env(item, offline=offline))
     commands = setup_commands(item, destination, prefix)
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
@@ -382,7 +382,6 @@ def verify_candidate(item, candidate, artifact, destination):
 
 
 def evaluation_setup(item, prefix, commands, folder, *, destination="/testbed"):
-    commands = adapt_environment_commands(commands, prefix)
     _timed(item, "replay_eval_setup",
            lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=True),
                          offline=True, log=folder / "eval-setup.log"))
@@ -417,8 +416,7 @@ def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
     folder = Path(folder)
     apply_candidate(candidate, destination, sha256=candidate_sha256, size=candidate_size)
     shell(hidden, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "hidden.log")
-    script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate\n' + \
-             activation_command(stored_env_prefix(item)) + '\nset +e\n' + test_command
+    script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate testbed\nset +e\n' + test_command
     script += ' >' + shlex.quote(str(folder / 'tests.log')) + ' 2>&1\nstatus=$?\n'
     script += 'printf "%s\\n" "$status" >' + shlex.quote(str(folder / 'tests.exit')) + '\nexit 0\n'
     shell([script], cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "test-launch.log")
@@ -530,14 +528,13 @@ def _write_warm_state(item):
 def warm_task(item, artifact):
     prime_shared_pip_cache(item)
     _reset_task_warm_outputs(item)
-    baseline = pip_versions(pristine_env(item))
+    baseline = pip_versions(pristine_stored_env(item))
     prefix = prepare(item, artifact=artifact, offline=False,
                      log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
     (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(
         json.dumps(env_inventory(prefix), sort_keys=True))
-    eval_commands = adapt_environment_commands(item["eval_setup_commands"], prefix)
     _timed(item, "warm_eval_setup",
-           lambda: shell(eval_commands, cwd="/testbed", env=runtime_environment(item, offline=False),
+           lambda: shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
                          log=ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)

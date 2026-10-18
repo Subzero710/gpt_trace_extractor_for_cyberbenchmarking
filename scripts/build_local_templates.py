@@ -217,8 +217,10 @@ def guest_resources():
     memory_mib = ((total_mib - reserve_mib) // 256) * 256
     if memory_mib < 4096:
         raise RuntimeError("execution host needs at least 6 GiB RAM for local SWE-Gym preparation")
+    # QEMU vCPUs are scheduled normally by the host; reserving a whole logical
+    # CPU only slows sequential package builds without providing isolation.
     cpus = os.cpu_count() or 1
-    vcpus = max(1, min(8, cpus - 1 if cpus > 1 else 1))
+    vcpus = max(1, min(8, cpus))
     return memory_mib, vcpus
 
 
@@ -685,6 +687,13 @@ def build(args):
                     os.fsync(handle.fileno())
             overlay(image, backing)
 
+        def runtime_upload_arguments():
+            return [
+                "--upload", str(GUEST) + ":/opt/swe-gym-lite/runtime.py",
+                "--upload", str(GUEST.with_name("task_sources.py")) + ":/opt/swe-gym-lite/task_sources.py",
+                "--upload", str(GUEST.with_name("os_packages.py")) + ":/opt/swe-gym-lite/os_packages.py",
+            ]
+
         def provision(image, boot, payload=None, *, network, completion=None,
                       cache_disk=None, trim=True, serial_log=None, refresh_runtime=False):
             boot_file = staged / "firstboot.sh"
@@ -693,8 +702,7 @@ def build(args):
             if payload is not None:
                 argv += ["--copy-in", str(payload) + ":/opt"]
             if refresh_runtime:
-                for runtime_source in (GUEST, GUEST.with_name("task_sources.py"), GUEST.with_name("os_packages.py")):
-                    argv += ["--copy-in", str(runtime_source) + ":/opt/swe-gym-lite"]
+                argv += runtime_upload_arguments()
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
@@ -725,10 +733,8 @@ def build(args):
             original_mode = stat.S_IMODE(image.stat().st_mode)
             image.chmod(0o600)
             try:
-                argv = ["virt-customize", "--no-network", "-a", str(image)]
-                for runtime_source in (GUEST, GUEST.with_name("task_sources.py"), GUEST.with_name("os_packages.py")):
-                    argv += ["--copy-in", str(runtime_source) + ":/opt/swe-gym-lite"]
-                cmd(*argv, timeout=14400)
+                cmd("virt-customize", "--no-network", "-a", str(image),
+                    *runtime_upload_arguments(), timeout=14400)
             finally:
                 image.chmod(original_mode)
 
@@ -1142,23 +1148,22 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             common_ready = completion_matches(common, COMMON_COMPLETION, common_completion) or legacy_common_complete
 
             def refresh_incomplete_common_runtime():
-                source = subprocess.run(["virt-cat", "-a", str(common), "/opt/swe-gym-lite/runtime.py"],
-                    capture_output=True, timeout=180, check=False)
-                current = digest(GUEST)
-                if source.returncode == 0 and hashlib.sha256(source.stdout).hexdigest() == current:
-                    return
-                # This path is only used while common.qcow2 is still incomplete.
-                # A completed common is an immutable backing image and is never
-                # rewritten under existing task/repository overlays.
+                # Only incomplete common images are mutable. Refresh all helper
+                # files by their exact guest names so a resumed build never runs a
+                # stale runtime inherited from an earlier checkout.
                 original_mode = stat.S_IMODE(common.stat().st_mode)
                 common.chmod(0o600)
                 try:
                     cmd("virt-customize", "--no-network", "-a", str(common),
-                        "--copy-in", str(GUEST) + ":/opt/swe-gym-lite", timeout=14400)
-                    updated = subprocess.check_output(["virt-cat", "-a", str(common),
-                        "/opt/swe-gym-lite/runtime.py"], timeout=180)
-                    if hashlib.sha256(updated).hexdigest() != current:
-                        raise RuntimeError("common runtime update did not verify")
+                        "--run-command", "mkdir -p /opt/swe-gym-lite",
+                        *runtime_upload_arguments(), timeout=14400)
+                    for source, guest_path in (
+                            (GUEST, "/opt/swe-gym-lite/runtime.py"),
+                            (GUEST.with_name("task_sources.py"), "/opt/swe-gym-lite/task_sources.py"),
+                            (GUEST.with_name("os_packages.py"), "/opt/swe-gym-lite/os_packages.py")):
+                        updated = subprocess.check_output(["virt-cat", "-a", str(common), guest_path], timeout=180)
+                        if hashlib.sha256(updated).hexdigest() != digest(source):
+                            raise RuntimeError("common helper update did not verify: " + guest_path)
                 finally:
                     common.chmod(original_mode)
 

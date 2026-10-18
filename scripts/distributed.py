@@ -160,9 +160,6 @@ def host(role, cfg, *, docker=True, build_tools=False):
         run(["virsh", "-c", "qemu:///system", "list", "--all"], capture=True, timeout=30)
         run(["nft", "list", "tables"], capture=True, timeout=30)
         image_directory = cfg["paths"]["base_image"].parent
-        # Fossil binds HDD2 here. Do not fill Ubuntu's root disk if the mount is absent.
-        if image_directory == Path("/var/lib/libvirt/images/gpt-trace") and not image_directory.is_mount():
-            raise RuntimeError("the dedicated HDD2 libvirt image mount is missing")
         parent = image_directory
         while not parent.exists() and parent != parent.parent: parent = parent.parent
         device = run(["findmnt", "-n", "-o", "SOURCE", "-T", parent], capture=True, timeout=10)
@@ -680,8 +677,8 @@ def control(cfg, action, args):
                            "/app/tools/distributed_acceptance.py", *values)
         node = Path("/dev/dri/renderD128")
         driver = Path("/sys/class/drm/renderD128/device/driver")
-        # Acer can use Intel i915/xe; AMD/Nouveau are also acceptable.  The
-        # real Chromium renderer is verified by teacher_gpu_doctor.py below.
+        # Intel i915/xe, AMD and Nouveau render nodes are acceptable; the real
+        # Chromium renderer is verified by teacher_gpu_doctor.py below.
         if not node.is_char_device() or not driver.exists():
             raise RuntimeError("control host needs a working GPU DRM render node")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
@@ -747,8 +744,6 @@ def execution(cfg, action, args):
             raise RuntimeError("preserve existing attempts before installing broker/images")
         import build
         build.build_host_broker(ROOT)
-        if paths["base_image"] != Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2"):
-            raise RuntimeError("verified golden installer requires the configured fixed libvirt image path")
         if paths["base_image"].exists(): build.verify_workstation_image(ROOT)
         else:
             build.build_workstation_base_image(ROOT)

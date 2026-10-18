@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,7 +22,19 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE = "https://cdimage.kali.org/kali-2026.2/"
 ARCHIVE = "kali-linux-2026.2-qemu-amd64.7z"
 ARCHIVE_SHA256 = "c7c35588d05277c482c908bf7a136d348f76ffa68700b04ff53c0b217e6bd071"
-DEST = Path("/var/lib/libvirt/images/gpt-trace/kali-base.qcow2")
+def configured_base_image():
+    source = ROOT / "config/distributed.toml"
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError("missing/unsafe distributed configuration")
+    with source.open("rb") as stream:
+        config = tomllib.load(stream)
+    value = config.get("paths", {}).get("base_image")
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise RuntimeError("config/distributed.toml paths.base_image must be an absolute path")
+    return Path(value)
+
+
+DEST = configured_base_image()
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
 PROVISION_TIMEOUT_SECONDS = 7200
