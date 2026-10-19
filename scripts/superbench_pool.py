@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download-only, append-only SWE-Gym Lite dependency pool (Acer).
+"""Download-only, append-only SWE-Gym Lite dependency pool (execution host).
 
 The fetcher never invokes KVM, executes task recipes, installs packages, builds
 wheels, changes live Python environments or removes any persistent file.

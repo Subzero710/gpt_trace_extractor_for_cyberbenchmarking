@@ -398,7 +398,7 @@ def preparation_fetch(cfg):
                 if (type(start) is int and type(end) is int and isinstance(encoded, str)
                         and start >= 0 and end >= start):
                     if last_log_offset < start:
-                        print("[fetch] log advanced before polling; earlier output remains on Acer", flush=True)
+                        print("[fetch] log advanced before polling; earlier output remains on execution host", flush=True)
                     if end > last_log_offset:
                         # The backend returns a bounded suffix; do not duplicate
                         # already printed log bytes when a poll repeats a status.

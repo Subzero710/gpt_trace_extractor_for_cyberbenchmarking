@@ -517,7 +517,7 @@ class PreparationManager:
 
 
 def _prepare(manager, state):
-    # Download on Acer without guest VMs or persistent deletion capabilities.
+    # Download on the execution host without guest VMs or persistent deletion capabilities.
     import pwd
     import grp
 
