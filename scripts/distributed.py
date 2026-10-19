@@ -418,12 +418,13 @@ def preparation_fetch(cfg):
                 last_phase = phase
             if phase == "ready":
                 result = status.get("result")
-                if (not isinstance(result, dict) or re.fullmatch(r"[0-9a-f]{64}", str(result.get("generation"))) is None
-                        or result.get("invariants") != {"tasks": 230, "repos": 11, "env_hashes": 25}
-                        or not result.get("verified_signature")):
-                    raise RuntimeError("preparation returned no verified complete generation")
+                if (not isinstance(result,dict) or result.get("kind") != "download-only-pool"
+                        or result.get("complete") is not True or result.get("tasks") != 230
+                        or result.get("repos") != 11 or result.get("conda_recipes") != 25
+                        or result.get("runtime_integrated") is not False):
+                    raise RuntimeError("broker reported no validated dependency pool")
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
-                print("SWE-Gym Lite ready on execution host: " + result["generation"], flush=True)
+                print("SWE-Gym Lite dependency downloads READY; runtime integration pending", flush=True)
                 return result
             if phase in {"not_started", "failed", "interrupted", "canceled"}:
                 if started:
@@ -434,14 +435,16 @@ def preparation_fetch(cfg):
                             "ADAPTER=swe-gym-lite to rediscover it; "
                             "no mutation was blindly retried")
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
-                # A new explicit fetch may retry a previously proved-dead job.
-                # This command NEVER repeats a start after a lost response.
+                # Aborted or failed jobs are zombies, not resumable fetches.
+                if phase != "not_started":
+                    raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
+                                       str(status.get("error")) + "; administrative cleanup required")
                 started = True
                 # Start exactly once. A lost response triggers read-only
                 # reconciliation instead of a duplicate start request.
                 try:
                     broker(cfg, "prepare_templates", {"operation_id": operation_id,
-                        "compatibility": identified["compatibility"], "retry": phase != "not_started"}, timeout=60)
+                        "compatibility": identified["compatibility"], "retry": False}, timeout=60)
                 except (TransportFailure, RemoteFailure) as exc:
                     if isinstance(exc, IdentityFailure):
                         raise

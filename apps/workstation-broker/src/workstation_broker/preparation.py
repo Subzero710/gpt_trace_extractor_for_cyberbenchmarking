@@ -184,7 +184,9 @@ class PreparationManager:
         finally: os.close(fd)
 
     def expected(self):
-        return self.templates.expected()
+        # Different identity from legacy QCOW2 preparation. A prior template
+        # generation can NEVER be mistaken for a finished dependency pool.
+        return {**self.templates.expected(), "fetch_kind": "download-only-pool-v1"}
 
     def probe(self, payload):
         if set(payload) != {"source_contract"} or payload["source_contract"] != source_contract(self.source_root):
@@ -267,15 +269,26 @@ class PreparationManager:
         return closed
 
     def _verify_ready(self, state):
+        # An immutable, sealed pool is ready; no template generation is implied.
         try:
             result = state["result"]
-            registry = safe(self.template_root / "swe-gym-lite/registry.json", immutable=True)
-            if (json.loads(registry.read_bytes()) != {"schema_version": 2, "generation": result["generation"]}
+            if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
+                    or result.get("complete") is not True
                     or state["compatibility"] != self.expected()
-                    or result["verified_signature"] != generation_signature(self.template_root, self.base, result["generation"])):
-                raise ValueError("activated generation or verified immutable bytes changed")
-        except (OSError, ValueError, KeyError) as exc:
-            state = {**state, "phase": "failed", "error": "ready generation invalid: " + str(exc), "result": None}
+                    or result.get("tasks") != 230 or result.get("repos") != 11):
+                raise RuntimeError("pool proof/recipe changed")
+            folder = self.base.parent / "dependency-pool" / "ready"
+            manifest = safe(folder / "inventory.json", immutable=True)
+            raw = manifest.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != result["manifest_sha256"]:
+                raise RuntimeError("sealed pool manifest changed")
+            inventory = json.loads(raw)
+            if (inventory.get("complete") is not True or inventory.get("kind") != result["kind"]
+                    or inventory.get("tasks") != result["tasks"]
+                    or inventory.get("repos") != result["repos"]):
+                raise RuntimeError("pool inventory no longer matches sealed proof")
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            state = {**state, "phase": "failed", "error": "ready pool invalid: " + str(exc), "result": None}
             self._write(state)
         return state
 
@@ -305,9 +318,10 @@ class PreparationManager:
                     previous = self._verify_ready(previous)
                 if previous["phase"] == "ready" or previous["phase"] not in TERMINAL:
                     return self._public(previous)
-                # failed/interrupted/canceled are resumable only after a new explicit fetch.
-                if not payload["retry"]:
-                    return self._public(previous)
+                # An interrupted or failed fetch is a zombie. Fetch must NEVER
+                # retry, overwrite, prune or delete it, not even explicitly.
+                raise RuntimeError("fetch interrupted/failed; pool zombie preserved; "
+                                   "an explicit privileged maintenance action is required")
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")
             elif payload["retry"]:
@@ -503,68 +517,109 @@ class PreparationManager:
 
 
 def _prepare(manager, state):
-    from workstation_broker.templates import TemplateRegistry
-    expected = compatibility(manager.base, manager.source_root)
-    if expected != state["compatibility"]: raise RuntimeError("golden/recipe changed since preparation was identified")
-    root = manager.template_root
-    namespace = root / "swe-gym-lite"
+    # Download on Acer without guest VMs or persistent deletion capabilities.
+    import pwd
+    import grp
 
-    checked_images = {}
-    def image_info(path):
-        value = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(path)], timeout=60))
-        signature = file_signature(path)
-        if checked_images.get(path) != signature:
-            subprocess.run(["qemu-img", "check", str(path)], check=True, timeout=3600)
-            checked_images[path] = signature
-        return value
+    name = "gpttrace-fetch"
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        # Administrative one-time account provisioning happens in the broker,
+        # not in the unprivileged dependency downloader.
+        subprocess.run(["useradd", "--system", "--no-create-home",
+                        "--shell", "/usr/sbin/nologin", name], check=True)
+        account = pwd.getpwnam(name)
+    if account.pw_uid == 0:
+        raise RuntimeError("refusing root pool download account")
+    root = manager.base.parent / "dependency-pool"
+    root.mkdir(mode=0o770, exist_ok=True)
+    if root.is_symlink() or root.stat().st_uid != 0:
+        raise RuntimeError("untrusted dependency pool root")
+    os.chown(root, 0, account.pw_gid)
+    # Sticky root-owned directory: workers can create a new stage, but cannot
+    # delete/replace root-owned sealed pool files from a previous fetch.
+    root.chmod(0o1770)
+    ready = root / "ready"
+    stage = root / "incoming"
+    if ready.exists() or ready.is_symlink():
+        raise RuntimeError("dependency pool already published; manual version migration required")
+    if stage.exists() or stage.is_symlink():
+        raise RuntimeError("interrupted pool stage exists; zombie preserved: " + str(stage))
+    program = manager.source_root / "scripts/superbench_pool.py"
+    if program.is_symlink() or not program.is_file():
+        raise RuntimeError("missing/untrusted download-only fetch worker")
+    env = os.environ.copy()
+    env["HOME"] = str(root)
+    env["XDG_CACHE_HOME"] = str(root / "incoming" / "metadata")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-    def factory(template_root, base):
-        return TemplateRegistry(template_root, base, image_info, source_root=manager.source_root)
+    def drop_privileges():
+        os.setgroups([])
+        os.setgid(account.pw_gid)
+        os.setuid(account.pw_uid)
+        os.umask(0o077)
 
-    selected = state.get("built_generation")
-    if selected is not None:
-        activate(root, manager.base, identifier(selected), factory, manager.source_root)
-        return selected, True
-    candidates = []
-    registry_path = namespace / "registry.json"
-    if registry_path.exists():
-        safe(registry_path, immutable=True)
-        current = json.loads(registry_path.read_bytes())
-        if set(current) != {"schema_version", "generation"} or current["schema_version"] != 2:
-            raise RuntimeError("invalid existing local registry; preserved")
-        folder = namespace / "generations" / identifier(current["generation"])
-        manifest = json.loads(safe(folder / "manifest.json", immutable=True).read_bytes())
-        validation = json.loads(safe(folder / "local-validation.json", immutable=True).read_bytes())
-        # Existing local generations remain protected even if a new compatible
-        # recipe is now requested. Corruption never authorizes replacement.
-        verify_manifest(folder, validation["compatibility"], source_root=manager.source_root)
-        verify_local_validation(folder, manifest, expected=validation["compatibility"])
-        from gpt_trace_transport.local_templates import compatible_template_identity
-        if compatible_template_identity(validation["compatibility"], expected): candidates.append(current["generation"])
-    generations = namespace / "generations"
-    if generations.exists():
-        safe(generations, directory=True)
-        for folder in sorted(generations.iterdir()):
-            safe(folder, immutable=True, directory=True)
-            identifier(folder.name)
-            validation_path = folder / "local-validation.json"
-            if not validation_path.exists(): raise RuntimeError("unvalidated permanent generation; preserved")
-            validation = json.loads(safe(validation_path, immutable=True).read_bytes())
-            from gpt_trace_transport.local_templates import compatible_template_identity
-            if compatible_template_identity(validation.get("compatibility"), expected) and folder.name not in candidates:
-                candidates.append(folder.name)
-    if candidates:
-        selected = candidates[0]
-        record_built_generation(state["operation_id"], selected)
-        activate(root, manager.base, selected, factory, manager.source_root)
-        return selected, True
-    spec = __import__("importlib.util", fromlist=["util"]).spec_from_file_location(
-        "gpt_trace_local_lite_builder", manager.source_root / "scripts/build_local_templates.py")
-    module = __import__("importlib.util", fromlist=["util"]).module_from_spec(spec)
-    spec.loader.exec_module(module)
-    final = module.build(SimpleNamespace(operation_id=state["operation_id"], free_space_gib=module.FREE_SPACE_GIB,
-        virtual_gib=module.VIRTUAL_GIB, build_timeout_hours=module.BUILD_TIMEOUT_HOURS))
-    return identifier(final.name), False
+    # Use only the local audited worker file, with fixed validated arguments.
+    # No shell, no template builder, no qemu, no guest execution.
+    subprocess.run([sys.executable, "-B", str(program), "--repo-root",
+                    str(manager.source_root), "--stage", str(stage),
+                    "--operation-id", state["operation_id"]],
+                   cwd=manager.source_root, env=env, preexec_fn=drop_privileges,
+                   check=True)
+    inventory_path = stage / "inventory.json"
+    if inventory_path.is_symlink() or not inventory_path.is_file():
+        raise RuntimeError("download worker returned no pool inventory")
+    raw = inventory_path.read_bytes()
+    inventory = json.loads(raw)
+    if (inventory.get("schema") != 1 or inventory.get("complete") is not True
+            or inventory.get("tasks") != 230 or inventory.get("repos") != 11
+            or inventory.get("conda_recipes") != 25
+            or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
+            or inventory.get("issues") or not isinstance(inventory.get("files"),list)):
+        raise RuntimeError("incomplete/unverified downloaded dependency pool")
+    expected = set()
+    for entry in inventory["files"]:
+        relative = entry["path"]
+        if (not isinstance(relative,str) or not relative or Path(relative).is_absolute()
+                or ".." in Path(relative).parts or relative in expected):
+            raise RuntimeError("unsafe/duplicate pool entry")
+        expected.add(relative)
+        item = stage / relative
+        if entry.get("type") == "symlink":
+            if (not item.is_symlink() or os.readlink(item) != entry.get("target")
+                    or os.path.isabs(os.readlink(item))
+                    or not (item.parent / os.readlink(item)).resolve().is_relative_to(stage.resolve())):
+                raise RuntimeError("unsafe pool symlink: " + relative)
+            continue
+        if item.is_symlink() or not item.is_file() or item.stat().st_size != entry["size"]:
+            raise RuntimeError("pool artifact mismatch: " + relative)
+        digest = hashlib.sha256()
+        with item.open("rb") as stream:
+            for block in iter(lambda: stream.read(1048576), b""):
+                digest.update(block)
+        if digest.hexdigest() != entry["sha256"]:
+            raise RuntimeError("pool artifact digest mismatch: " + relative)
+    # Seal as root. The unprivileged worker is not allowed to publish/mutate a
+    # ready pool: it only downloads into an append-only staging namespace.
+    for item in sorted(stage.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if item.is_symlink():
+            if os.path.isabs(os.readlink(item)) or not (item.parent / os.readlink(item)).resolve().is_relative_to(stage.resolve()):
+                raise RuntimeError("escaping pool symlink: " + str(item))
+            os.chown(item, 0, 0, follow_symlinks=False)
+            continue
+        os.chown(item, 0, 0)
+        item.chmod(0o555 if item.is_dir() else 0o444)
+    os.chown(stage, 0, 0)
+    stage.chmod(0o555)
+    os.rename(stage, ready)
+    return {"kind": "download-only-pool", "complete": True,
+            "tasks": 230, "repos": 11, "conda_recipes": 25,
+            "python_versions": inventory["python_versions"],
+            "file_count": len(inventory["files"]),
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "pool_directory": str(ready),
+            "runtime_integrated": False}
 
 
 def worker(operation_id, slot_fd):
@@ -603,12 +658,9 @@ def worker(operation_id, slot_fd):
         manager._write({**state, "phase": "running", "worker": stamp})
     try:
         state = verify_worker_claim(operation_id)
-        generation, reused = _prepare(manager, state)
-        # Activation has completed and all bytes/QCOW2 chains were validated.
-        signature = generation_signature(templates.root, BASE, generation)
+        result = _prepare(manager, state)
         state = verify_worker_claim(operation_id)
-        manager._write({**state, "phase": "ready", "result": {"generation": generation, "reused": reused,
-            "verified_signature": signature, "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25}}, "error": None})
+        manager._write({**state, "phase": "ready", "result": result, "error": None})
     except BaseException as exc:
         state = manager._read(operation_id)
         # Every template-build failure preserves durable bytes/checkpoints.  A later
