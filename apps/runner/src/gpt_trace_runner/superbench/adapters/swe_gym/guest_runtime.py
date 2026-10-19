@@ -468,6 +468,28 @@ def _validate_vcs_provenance(item):
     return True
 
 
+def _compatible_warm_state(path, item):
+    """Accept historical schema-2 state with exactly one obsolete extra field.
+
+    Never infer compatibility from the metadata alone: warm_task_ready validates
+    installed package inventory, Git commit, VCS provenance and frozen OS state.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    expected = {"schema": TASK_RUNTIME_SCHEMA,
+                "instance_id": item["instance_id"], "repo": item["repo"],
+                "base_commit": item["base_commit"], "env_hash": item["env_hash"]}
+    if data == expected:
+        return True
+    if data.keys() == expected.keys() | {"runtime_fingerprint"}:
+        return {key: data[key] for key in expected} == expected and isinstance(data["runtime_fingerprint"], str)
+    return False
+
+
 def warm_task_ready(item):
     """Deep proof used to salvage a warm scratch that failed after expensive setup."""
     instance = item["instance_id"]
@@ -479,10 +501,7 @@ def warm_task_ready(item):
     try:
         if (not prefix.is_dir() or not (prefix / "bin/python").is_file() or
                 state_path.is_symlink() or not state_path.is_file() or
-                json.loads(state_path.read_text()) != {
-                    "schema": TASK_RUNTIME_SCHEMA,
-                    "instance_id": item["instance_id"], "repo": item["repo"],
-                    "base_commit": item["base_commit"], "env_hash": item["env_hash"]} or
+                not _compatible_warm_state(state_path, item) or
                 setup_record.is_symlink() or final_record.is_symlink() or
                 not setup_record.is_file() or not final_record.is_file() or
                 wheelhouse.is_symlink() or not wheelhouse.is_dir()):
@@ -755,10 +774,9 @@ def build_common(inputs):
         # Valid environments and the verified Conda package download cache survive.
         if prefix.is_symlink() or inventory_file.is_symlink() or recipe_file.is_symlink():
             raise RuntimeError("untrusted Conda checkpoint path")
-        inventory_file.unlink(missing_ok=True)
-        recipe_file.unlink(missing_ok=True)
-        if prefix.exists():
-            shutil.rmtree(prefix)
+        if prefix.exists() or inventory_file.exists() or recipe_file.exists():
+            raise RuntimeError("existing Conda environment/checkpoint is not verified; preserving "
+                               + str(prefix) + "; inspect or migrate explicitly")
         print("SWE-Gym environment " + env_hash + ": python=" +
               str(recipe_proof["single_solve_python"] or "upstream") +
               ", solver=libmamba, channels=strict", flush=True)
@@ -784,7 +802,8 @@ def build_common(inputs):
                 if prefix.is_symlink():
                     raise RuntimeError("untrusted partial Conda prefix") from exc
                 if prefix.exists():
-                    shutil.rmtree(prefix)
+                    raise RuntimeError("transient Conda failure left an incomplete environment; "
+                                       "preserving " + str(prefix) + " for inspection") from exc
                 time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
         # Persist proof only after all official commands and the exact installed
         # package inventory succeeded. Atomic rename avoids torn JSON checkpoints.

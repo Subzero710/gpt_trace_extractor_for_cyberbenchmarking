@@ -380,12 +380,36 @@ def preparation_fetch(cfg):
     print("execution host local preparation: " + operation_id, flush=True)
     started = False
     last_phase = None
+    last_log_attempt = None
+    last_log_offset = 0
     try:
         while True:
             status = broker_read_resilient(cfg, "template_preparation_status", {"operation_id": operation_id})
             if status.get("operation_id") != operation_id or status.get("deployment") != deployment:
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
+            live = status.get("live_log")
+            attempt = status.get("attempt")
+            if attempt != last_log_attempt:
+                last_log_attempt = attempt
+                last_log_offset = 0
+            if isinstance(live, dict):
+                start, end, encoded = live.get("start"), live.get("end"), live.get("content_b64")
+                if (type(start) is int and type(end) is int and isinstance(encoded, str)
+                        and start >= 0 and end >= start):
+                    if last_log_offset < start:
+                        print("[fetch] log advanced before polling; earlier output remains on Acer", flush=True)
+                    if end > last_log_offset:
+                        # The backend returns a bounded suffix; do not duplicate
+                        # already printed log bytes when a poll repeats a status.
+                        import base64
+                        raw = base64.b64decode(encoded, validate=True)
+                        if len(raw) != end - start:
+                            raise RuntimeError("invalid remote fetch log byte range")
+                        data = raw[max(0, last_log_offset - start):]
+                        sys.stdout.write(data.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+                        last_log_offset = end
             if phase != last_phase:
                 print("preparation " + operation_id + ": attempt=" +
                       str(status.get("attempt", "?")) + ", phase=" + str(phase), flush=True)

@@ -20,7 +20,7 @@ import tomllib
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -291,7 +291,7 @@ def free_space(path, margin):
         raise RuntimeError(f"host free-space safety margin reached: {free} < {margin} bytes")
 
 
-def command(*args, cwd=None, timeout=3600, log=None, margin=0, monitor=None, **kwargs):
+def command(*args, cwd=None, timeout=3600, log=None, margin=0, monitor=None, tail_file=None, **kwargs):
     print("+", " ".join(str(arg) for arg in args), flush=True)
     if monitor:
         free_space(monitor, margin)
@@ -300,14 +300,34 @@ def command(*args, cwd=None, timeout=3600, log=None, margin=0, monitor=None, **k
     try:
         with subprocess.Popen(args, cwd=cwd, stdout=output, stderr=subprocess.STDOUT, **kwargs) as process:
             deadline = time.monotonic() + timeout
+            serial_cursor = 0
+            serial_pending = b""
+            def stream_serial_phases():
+                nonlocal serial_cursor, serial_pending
+                if tail_file is None or not Path(tail_file).is_file():
+                    return
+                with Path(tail_file).open("rb") as serial:
+                    serial.seek(serial_cursor)
+                    while chunk := serial.read(65536):
+                        serial_cursor += len(chunk)
+                        serial_pending += chunk
+                        while b"\n" in serial_pending:
+                            line, serial_pending = serial_pending.split(b"\n", 1)
+                            if b"GPTTRACE_PHASE " in line:
+                                print("[guest] " + line.decode("utf-8", errors="replace")[-2000:], flush=True)
+                        if len(serial_pending) > 65536:
+                            serial_pending = serial_pending[-65536:]
             try:
                 while process.poll() is None:
+                    stream_serial_phases()
                     if time.monotonic() >= deadline:
                         raise TimeoutError("host build command timed out")
                     if monitor:
                         free_space(monitor, margin)
                     time.sleep(1)
+                stream_serial_phases()
             except BaseException:
+                stream_serial_phases()
                 process.terminate()
                 try: process.wait(timeout=15)
                 except subprocess.TimeoutExpired:
@@ -678,17 +698,26 @@ def build(args):
                 str(args.virtual_gib) + "G", cwd=image.parent)
 
         def reset_scratch_overlay(image, backing):
-            """Reuse one fixed scratch volume path; never unlink a QCOW2."""
+            """Allocate a brand-new overlay; NEVER rewrite an existing QCOW2.
+        
+            Existing images may hold the only reusable copy of an expensive setup.
+            A failed metadata/recovery check does not authorize truncating them.
+            """
             if image.is_symlink() or (image.exists() and not image.is_file()):
                 raise RuntimeError("unsafe scratch QCOW2 volume: " + str(image))
-            image.parent.mkdir(mode=0o700, exist_ok=True)
-            if image.exists():
-                image.chmod(0o600)
-                with image.open("r+b") as handle:
-                    handle.truncate(0)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            overlay(image, backing)
+            image.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            candidate = image
+            retry = 0
+            while candidate.exists() or candidate.is_symlink():
+                retry += 1
+                candidate = image.with_name(image.stem + ".retry-" + str(retry) + image.suffix)
+                if retry > 1000:
+                    raise RuntimeError("too many preserved task scratch attempts: " + str(image))
+            if retry:
+                print("preserving unrecognized task QCOW2; allocating a NEW scratch: "
+                      + str(candidate), flush=True)
+            overlay(candidate, backing)
+            return candidate
 
         def runtime_upload_arguments():
             return [
@@ -723,7 +752,8 @@ def build(args):
                 print("live task phase log: " + str(serial_log), flush=True)
                 serial = ["-serial", "file:" + str(serial_log)]
             cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", *serial,
-                "-monitor", "none", "-no-reboot", timeout=args.build_timeout_hours * 3600)
+                "-monitor", "none", "-no-reboot", timeout=args.build_timeout_hours * 3600,
+                tail_file=serial_log)
             if not generic_guest_complete(image):
                 raise RuntimeError("guest build completion proof is missing; "
                                    "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
@@ -876,6 +906,9 @@ def build(args):
             source_folder, cache_folder, wheel_cas, audit = (staged / "sources", staged / "setup-caches",
                                                                staged / "wheel-cas", staged / "audit")
             for folder in (source_folder, cache_folder, wheel_cas, audit): folder.mkdir(exist_ok=True)
+            shared_wheel_pool = cache_root / "wheels"
+            shared_wheel_pool.mkdir(mode=0o700, exist_ok=True)
+            safe(shared_wheel_pool, directory=True)
             artifacts, mapping = {}, {}
 
             def checked_wheel_files(value):
@@ -906,6 +939,15 @@ def build(args):
                     previous = unique.setdefault(record["sha256"], record["size"])
                     if previous != record["size"]:
                         raise RuntimeError("wheel SHA-256 size collision")
+                for sha, size in unique.items():
+                    current, persistent = wheel_cas / sha, shared_wheel_pool / sha
+                    if current.exists() and not verify_wheel_object(current, sha, size):
+                        raise RuntimeError("current wheel object changed; preserved")
+                    if persistent.exists():
+                        if not verify_wheel_object(persistent, sha, size):
+                            raise RuntimeError("persistent wheel pool object changed; preserved")
+                        if not current.exists():
+                            os.link(persistent, current)
                 missing = {sha: size for sha, size in unique.items()
                            if not verify_wheel_object(wheel_cas / sha, sha, size)}
                 if not missing:
@@ -930,7 +972,13 @@ def build(args):
                                 raise RuntimeError("persisted wheel CAS object changed")
                             continue
                         source.chmod(0o444)
-                        os.link(source, target)
+                        persistent = shared_wheel_pool / sha
+                        if persistent.exists():
+                            if not verify_wheel_object(persistent, sha, size):
+                                raise RuntimeError("persistent wheel pool conflict; preserved")
+                        else:
+                            os.link(source, persistent)
+                        os.link(persistent, target)
                         with target.open("rb") as stream:
                             os.fsync(stream.fileno())
                     fd = os.open(wheel_cas, os.O_DIRECTORY)
@@ -1278,6 +1326,12 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     source = source_root / sha
                     if not verify_wheel_object(source, sha, size):
                         raise RuntimeError("verified task wheel CAS object changed")
+                    persistent = shared_wheel_pool / sha
+                    if persistent.exists():
+                        if not verify_wheel_object(persistent, sha, size):
+                            raise RuntimeError("persistent wheel pool conflicts with historical checkpoint; preserved")
+                    else:
+                        os.link(source, persistent)
                     if stage == staged:
                         continue
                     target = wheel_cas / sha
@@ -1285,7 +1339,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         if not verify_wheel_object(target, sha, size):
                             raise RuntimeError("current wheel CAS conflicts with historical checkpoint; preserved")
                     else:
-                        os.link(source, target)
+                        os.link(persistent, target)
 
             def recover_historical_task(logical, item, source_record, ckpt_name):
                 if (checkpoints / ckpt_name).exists():
@@ -1293,62 +1347,98 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 key = mapping[logical]["setup_cache"]
                 expected_relative = Path("setup-caches") / (key + ".tar.gz")
                 for old in historical_stages:
-                    old_checkpoint = old / ".checkpoints" / ckpt_name
-                    if not old_checkpoint.exists():
-                        continue
-                    try:
-                        done = json.loads(safe(old_checkpoint, immutable=True).read_bytes())
-                        cache_record = done["cache_record"]
-                        if (done.get("logical_task_id") != logical or
-                                done.get("task_runtime_schema") != TASK_RUNTIME_SCHEMA or
-                                cache_record.get("kind") != "setup_cache" or
-                                cache_record.get("logical_task_id") != logical or
-                                cache_record.get("allowed_template_id") != item["template_id"] or
-                                cache_record.get("source_identity") != source_record["source_identity"] or
-                                Path(cache_record.get("path", "")) != expected_relative or
-                                done.get("offline") != {"base_commit": item["base_commit"],
-                                                        "env_hash": item["env_hash"], "offline": True} or
-                                not isinstance(done.get("inventories"), dict) or
-                                not isinstance(done.get("vcs"), list)):
+                    old_checkpoints = [old / ".checkpoints" / ckpt_name]
+                    prefix = ckpt_name.removesuffix(".json") + "-"
+                    old_checkpoints += [p for p in sorted((old / ".checkpoints").glob(prefix + "*.json"))
+                                        if re.fullmatch(r"[0-9a-f]{64}", p.name.removeprefix(prefix).removesuffix(".json"))]
+                    for old_checkpoint in old_checkpoints:
+                        if not old_checkpoint.exists():
                             continue
-                        old_archive = safe(old / expected_relative, immutable=True)
-                        if (old_archive.stat().st_size != cache_record.get("size") or
-                                digest(old_archive) != cache_record.get("sha256")):
+                        try:
+                            done = json.loads(safe(old_checkpoint, immutable=True).read_bytes())
+                            cache_record = done["cache_record"]
+                            if (done.get("logical_task_id") != logical or
+                                    done.get("task_runtime_schema") != TASK_RUNTIME_SCHEMA or
+                                    cache_record.get("kind") != "setup_cache" or
+                                    cache_record.get("logical_task_id") != logical or
+                                    cache_record.get("allowed_template_id") != item["template_id"] or
+                                    cache_record.get("source_identity") != source_record["source_identity"] or
+                                    Path(cache_record.get("path", "")) != expected_relative or
+                                    done.get("offline") != {"base_commit": item["base_commit"],
+                                                            "env_hash": item["env_hash"], "offline": True} or
+                                    not isinstance(done.get("inventories"), dict) or
+                                    not isinstance(done.get("vcs"), list)):
+                                continue
+                            old_archive = safe(old / expected_relative, immutable=True)
+                            if (old_archive.stat().st_size != cache_record.get("size") or
+                                    digest(old_archive) != cache_record.get("sha256")):
+                                continue
+                            ensure_cache_wheels(cache_record, old)
+                            old_downloads = safe(old / "audit" / (key + ".downloads.json"), immutable=True)
+                            if not isinstance(json.loads(old_downloads.read_bytes()), dict):
+                                continue
+                        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                             continue
-                        ensure_cache_wheels(cache_record, old)
-                        old_downloads = safe(old / "audit" / (key + ".downloads.json"), immutable=True)
-                        if not isinstance(json.loads(old_downloads.read_bytes()), dict):
-                            continue
-                    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
-                        continue
-                    archive = staged / expected_relative
-                    if archive.exists():
-                        if (archive.is_symlink() or not archive.is_file() or
-                                archive.stat().st_size != cache_record["size"] or
-                                digest(archive) != cache_record["sha256"]):
-                            raise RuntimeError("current setup-cache artifact conflicts with a verified historical checkpoint; preserved")
-                    else:
-                        os.link(old_archive, archive)
-                    downloads = audit / (key + ".downloads.json")
-                    if downloads.exists():
-                        if downloads.is_symlink() or digest(downloads) != digest(old_downloads):
-                            raise RuntimeError("current setup-cache provenance conflicts with a verified historical checkpoint; preserved")
-                    else:
-                        os.link(old_downloads, downloads)
-                    write_checkpoint(ckpt_name, done)
-                    print("reused verified task from compatible historical stage: " + logical, flush=True)
-                    return True
+                        archive = staged / expected_relative
+                        if archive.exists():
+                            if (archive.is_symlink() or not archive.is_file() or
+                                    archive.stat().st_size != cache_record["size"] or
+                                    digest(archive) != cache_record["sha256"]):
+                                raise RuntimeError("current setup-cache artifact conflicts with a verified historical checkpoint; preserved")
+                        else:
+                            os.link(old_archive, archive)
+                        downloads = audit / (key + ".downloads.json")
+                        if downloads.exists():
+                            if downloads.is_symlink() or digest(downloads) != digest(old_downloads):
+                                raise RuntimeError("current setup-cache provenance conflicts with a verified historical checkpoint; preserved")
+                        else:
+                            os.link(old_downloads, downloads)
+                        write_checkpoint(ckpt_name, done)
+                        print("reused verified task from compatible historical stage: " + logical, flush=True)
+                        return True
                 return False
 
             offline_proofs, vcs_provenance, task_inventories = {}, {}, {}
-            warm = scratch_root / "task-warm.qcow2"
-            replay = scratch_root / "task-replay.qcow2"
             incoming = scratch_root / "swe-gym-task"
+            scratch_tasks_root = scratch_root / "tasks"
+            scratch_tasks_root.mkdir(mode=0o700, exist_ok=True)
             for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
                 free_space(staged, margin)
+                task_scratch = scratch_tasks_root / ("task-" + quote(logical, safe="-_."))
+                task_scratch.mkdir(mode=0o700, exist_ok=True)
+                warm = task_scratch / "warm.qcow2"
+                replay = task_scratch / "replay.qcow2"
+                # Historical fixed scratch disks may still contain a valid,
+                # interrupted environment. Inspect them read-only and select
+                # the matching task; do not overwrite/move/rebase the image.
+                for kind, candidate in (("warm", scratch_root / "task-warm.qcow2"),
+                                        ("replay", scratch_root / "task-replay.qcow2")):
+                    current = warm if kind == "warm" else replay
+                    if (not current.exists() and candidate.exists() and
+                            scratch_uses_common(candidate) and
+                            guest_json_optional(candidate, "/opt/swe-gym-task/item.json") == item):
+                        if kind == "warm":
+                            warm = candidate
+                        else:
+                            replay = candidate
+                        print("found preserved historical " + kind + " scratch for " + logical, flush=True)
                 source_record = artifacts[mapping[logical]["task_source"]]
                 ckpt_name = ("task-v" + str(TASK_RUNTIME_SCHEMA) + "-" +
                              tools.artifact_id("task_source", logical) + ".json")
+                # Older schema-2 builds used task-v2-<artifact>-<fingerprint>.json.
+                # Keep the old file and adopt its payload under the new stable
+                # name. The full artifact/offline checks below still apply.
+                if not (checkpoints / ckpt_name).exists():
+                    prefix = ckpt_name.removesuffix(".json") + "-"
+                    for previous in sorted(checkpoints.glob(prefix + "*.json")):
+                        suffix = previous.name.removeprefix(prefix).removesuffix(".json")
+                        if not re.fullmatch(r"[0-9a-f]{64}", suffix):
+                            continue
+                        old_proof = json.loads(safe(previous, immutable=True).read_bytes())
+                        if old_proof.get("logical_task_id") == logical and old_proof.get("task_runtime_schema") == TASK_RUNTIME_SCHEMA:
+                            write_checkpoint(ckpt_name, old_proof)
+                            print("migrated old task checkpoint: " + logical, flush=True)
+                            break
                 recover_historical_task(logical, item, source_record, ckpt_name)
                 done = read_checkpoint(ckpt_name)
                 if done is not None:
@@ -1396,7 +1486,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         warm_ready = (recovery == {"reusable": True} and
                                       completion_matches(warm, TASK_COMPLETION, warm_completion))
                     if not warm_ready:
-                        reset_scratch_overlay(warm, common)
+                        warm = reset_scratch_overlay(warm, common)
                         provision(warm, warm_boot, incoming, network=True,
                                   completion=(TASK_COMPLETION, warm_completion),
                                   cache_disk=warm_cache, trim=False, serial_log=warm_serial,
@@ -1450,7 +1540,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         replay_ready = (recovery == {"reusable": True} and
                                         completion_matches(replay, TASK_COMPLETION, replay_completion))
                     if not replay_ready:
-                        reset_scratch_overlay(replay, common)
+                        replay = reset_scratch_overlay(replay, common)
                         provision(replay, replay_boot, incoming, network=False,
                                   completion=(TASK_COMPLETION, replay_completion),
                                   trim=False, serial_log=replay_serial, refresh_runtime=True)
@@ -1461,8 +1551,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     "task_runtime_schema": TASK_RUNTIME_SCHEMA,
                     "cache_record": cache_record, "vcs": vcs_provenance[logical],
                     "inventories": task_inventories[logical], "offline": offline_proofs[logical]})
-                # Scratch disks remain at two fixed paths and are reset in-place for
-                # the next task; no QCOW2 volume is ever unlinked here.
+                # Per-task scratch disks remain addressable and are never truncated.
+                # A later fetch can salvage interrupted setups without reinstallation.
                 shutil.rmtree(incoming)
             atomic_json(audit / "task-inventories.json", task_inventories)
             atomic_json(audit / "vcs-provenance.json", vcs_provenance)

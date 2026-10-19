@@ -216,8 +216,24 @@ class PreparationManager:
     def _public(self, state):
         if state['phase'] == 'ready' and (JobScope.members(state) or self._containers(state)):
             state = {**state, 'phase': 'validating'}  # Wait for the finite worker/helpers to exit.
-        return {k: state[k] for k in ("operation_id", "phase", "attempt", "created_at", "updated_at",
+        result = {k: state[k] for k in ("operation_id", "phase", "attempt", "created_at", "updated_at",
             "result", "error", "deployment") if k in state}
+        # Read-only, bounded tail of the durable child log. No mutations, no
+        # additional RPC, and no guessed progress based on wall-clock time.
+        if isinstance(state.get("attempt"), int):
+            log = self._path(state["operation_id"]).parent / f"attempt-{state['attempt']:04d}.log"
+            if log.is_file() and not log.is_symlink():
+                info = log.stat()
+                if info.st_uid != 0 or info.st_mode & 0o022:
+                    raise RuntimeError("untrusted preparation log permissions")
+                start = max(0, info.st_size - 65536)
+                with log.open("rb") as stream:
+                    stream.seek(start)
+                    raw = stream.read(65536)
+                result["live_log"] = {"start": start, "end": start + len(raw),
+                                      "total": info.st_size,
+                                      "content_b64": __import__("base64").b64encode(raw).decode("ascii")}
+        return result
 
     def _reap(self):
         for pid, process in list(self._children.items()):
