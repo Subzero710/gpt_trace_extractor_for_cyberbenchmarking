@@ -186,10 +186,11 @@ class PreparationManager:
     def expected(self):
         # Different identity from legacy QCOW2 preparation. A prior template
         # generation can NEVER be mistaken for a finished dependency pool.
-        return {**self.templates.expected(), "fetch_kind": "download-only-pool-v1"}
+        from gpt_trace_transport.local_templates import pool_contract
+        return pool_contract(self.source_root)
 
     def probe(self, payload):
-        if set(payload) != {"source_contract"} or payload["source_contract"] != source_contract(self.source_root):
+        if set(payload) != {"source_contract"} or payload["source_contract"] != self.expected():
             raise ValueError("control/execution pinned preparation sources differ")
         expected = self.expected()
         return {"operation_id": hashlib.sha256(canonical(expected)).hexdigest(),
@@ -269,27 +270,17 @@ class PreparationManager:
         return closed
 
     def _verify_ready(self, state):
-        # An immutable, sealed pool is ready; no template generation is implied.
-        try:
-            result = state["result"]
-            if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
-                    or result.get("complete") is not True
-                    or state["compatibility"] != self.expected()
-                    or result.get("tasks") != 230 or result.get("repos") != 11):
-                raise RuntimeError("pool proof/recipe changed")
-            folder = self.base.parent / "dependency-pool" / "ready"
-            manifest = safe(folder / "inventory.json", immutable=True)
-            raw = manifest.read_bytes()
-            if hashlib.sha256(raw).hexdigest() != result["manifest_sha256"]:
-                raise RuntimeError("sealed pool manifest changed")
-            inventory = json.loads(raw)
-            if (inventory.get("complete") is not True or inventory.get("kind") != result["kind"]
-                    or inventory.get("tasks") != result["tasks"]
-                    or inventory.get("repos") != result["repos"]):
-                raise RuntimeError("pool inventory no longer matches sealed proof")
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            state = {**state, "phase": "failed", "error": "ready pool invalid: " + str(exc), "result": None}
-            self._write(state)
+        """No rehash after the pool was verified and sealed at publication."""
+        result = state.get("result")
+        if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
+                or result.get("complete") is not True or result.get("tasks") != 230
+                or result.get("repos") != 11 or state.get("compatibility") != self.expected()):
+            self._write({**state, "phase": "failed", "error": "invalid pool publication record"})
+            return {**state, "phase": "failed", "error": "invalid pool publication record"}
+        # No hash/re-scan: sealed root-owned files are immutable after initial verification.
+        folder = self.base.parent / "dependency-pool" / "ready"
+        safe(folder, immutable=True, directory=True)
+        safe(folder / "inventory.json", immutable=True)
         return state
 
     def status(self, payload):
@@ -572,13 +563,17 @@ def _prepare(manager, state):
         raise RuntimeError("download worker returned no pool inventory")
     raw = inventory_path.read_bytes()
     inventory = json.loads(raw)
-    if (inventory.get("schema") != 1 or inventory.get("complete") is not True
+    if (inventory.get("schema") != 2 or inventory.get("complete") is not True
             or inventory.get("tasks") != 230 or inventory.get("repos") != 11
             or inventory.get("conda_recipes") != 25
             or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
-            or inventory.get("issues") or not isinstance(inventory.get("files"),list)):
+             or inventory.get("issues") or not isinstance(inventory.get("files"),list)
+             or not isinstance(inventory.get("task_plan"),dict)
+             or len(inventory["task_plan"]) != 230
+             or not isinstance(inventory.get("objects"),dict)):
         raise RuntimeError("incomplete/unverified downloaded dependency pool")
     expected = set()
+    checked_inodes = {}
     for entry in inventory["files"]:
         relative = entry["path"]
         if (not isinstance(relative,str) or not relative or Path(relative).is_absolute()
@@ -594,12 +589,34 @@ def _prepare(manager, state):
             continue
         if item.is_symlink() or not item.is_file() or item.stat().st_size != entry["size"]:
             raise RuntimeError("pool artifact mismatch: " + relative)
-        digest = hashlib.sha256()
-        with item.open("rb") as stream:
-            for block in iter(lambda: stream.read(1048576), b""):
-                digest.update(block)
-        if digest.hexdigest() != entry["sha256"]:
+        ino = (item.stat().st_dev, item.stat().st_ino)
+        actual = checked_inodes.get(ino)
+        if actual is None:
+            digest = hashlib.sha256()
+            with item.open("rb") as stream:
+                for block in iter(lambda: stream.read(1048576), b""):
+                    digest.update(block)
+            actual = digest.hexdigest()
+            checked_inodes[ino] = actual
+        if actual != entry["sha256"]:
             raise RuntimeError("pool artifact digest mismatch: " + relative)
+    # Canonicalize equal bytes into one inode while this stage is still new.
+    # Only this uncommitted candidate is touched; no prior ready/zombie data.
+    import secrets
+    canonical_by_sha = {}
+    for entry in inventory["files"]:
+        path = stage / entry["path"]
+        sha = entry["sha256"]
+        reference = canonical_by_sha.setdefault(sha, path)
+        if path == reference or path.samefile(reference):
+            continue
+        temporary = path.parent / (".dedup-" + secrets.token_hex(16))
+        os.link(reference, temporary)
+        try:
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
     # Seal as root. The unprivileged worker is not allowed to publish/mutate a
     # ready pool: it only downloads into an append-only staging namespace.
     for item in sorted(stage.rglob("*"), key=lambda p: len(p.parts), reverse=True):

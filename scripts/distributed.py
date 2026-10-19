@@ -358,17 +358,17 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=3600):
 
 def preparation_fetch(cfg):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
-    from gpt_trace_transport.local_templates import source_contract, template_contract, atomic_json
+    from gpt_trace_transport.local_templates import pool_contract, atomic_json
     broker_read_resilient(cfg, "probe")
-    identified = broker_read_resilient(cfg, "template_preparation_probe", {"source_contract": source_contract(ROOT)})
+    identified = broker_read_resilient(cfg, "template_preparation_probe", {"source_contract": pool_contract(ROOT)})
     operation_id = identified.get("operation_id")
     deployment = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
     if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
             or identified.get("deployment") != deployment or not isinstance(identified.get("compatibility"), dict)):
         raise RuntimeError("execution host preparation identity differs")
-    recipe = template_contract(ROOT)
-    if any(identified["compatibility"].get(key) != value for key, value in recipe.items()):
-        raise RuntimeError("execution host preparation recipe differs from control host")
+    recipe = pool_contract(ROOT)
+    if identified["compatibility"] != recipe:
+        raise RuntimeError("execution host pool contract differs from control host")
     if hashlib.sha256(json.dumps(identified["compatibility"], sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, allow_nan=False).encode()).hexdigest() != operation_id:
         raise RuntimeError("execution host preparation content identity differs")

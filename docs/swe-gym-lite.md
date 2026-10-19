@@ -1,8 +1,11 @@
 # SWE-Gym Lite
 
 `swe-gym-lite` uses the ordinary Kali Workstation App with runner-owned setup,
-candidate capture and native grading. Template construction is triggered only by explicit control host
-`make superbench-fetch ADAPTER=swe-gym-lite`. Campaigns never build missing permanent environments.
+candidate capture and native grading. `make superbench-fetch ADAPTER=swe-gym-lite`
+now performs download-only acquisition on `execution`, without KVM, QCOW2,
+Conda environment creation or runtime installation. Artifacts are verified once
+before immutable pool publication; an interrupted fetch remains a terminal zombie.
+The runtime described below remains legacy and is not yet integrated with this pool.
 
 ## Pinned sources and validated contract
 

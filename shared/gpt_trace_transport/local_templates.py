@@ -451,3 +451,16 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
             raise ValueError("local template chain shape differs")
         relative(chain[0].get("path"))
     return manifest
+
+
+def pool_contract(source_root=ROOT):
+    """Content identity for dependency acquisition; independent of KVM/golden/runtime."""
+    source_root = Path(source_root)
+    pins = json.loads((source_root / PINS).read_bytes())
+    if pins.get("schema_version") != 2 or pins.get("recipe_version") != 2:
+        raise RuntimeError("unsupported pinned Lite contract")
+    if digest(source_root / RUNTIME / "contract.json") != pins["contract_sha256"]:
+        raise RuntimeError("SWE-Gym Lite source contract differs")
+    return {"fetch_kind": "download-only-pool-v2", "pool_schema": 2,
+            "pins": pins, "platform": "linux-x86_64",
+            "fetcher_sha256": digest(source_root / "scripts/superbench_pool.py")}

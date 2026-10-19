@@ -2,10 +2,10 @@
 
 This project runs benchmarks through the ChatGPT web UI, captures tool trajectories, and stores every exportable trajectory in one canonical Parquet corpus. The teacher browser and storage/control services run in Docker. A trusted host broker creates one disposable KVM/QEMU Kali workstation per model attempt. The single local MCP App is `kali-workstation` 3.0.0.
 
-SWE-Gym Lite uses the same teacher and App with pinned native grading and immutable
-common/repo VM templates, host-only task-scoped sources, and a fresh isolated
-evaluator for native grading. Recipe/schema/adapter version 2 rejects old unsafe
-Lite generations. See [the local preparation and recovery guide](docs/swe-gym-lite.md).
+SWE-Gym Lite uses pinned 230-task sources and a host-only dependency pool.
+`superbench-fetch` downloads and seals package/source artifacts on `execution`;
+it does not construct VM templates. The existing runtime still expects legacy
+templates and has not yet been connected to the new pool. See [the local preparation and recovery guide](docs/swe-gym-lite.md).
 
 ## Workflow
 
@@ -45,7 +45,7 @@ make superbench-fetch ADAPTER=swe-gym-lite
 make run ADAPTER=swe-gym-lite LIMIT=1
 ```
 
-Fetch verifies the official pinned 230-task dataset on the control host, identifies an administrative local preparation on the execution host over the Cloudflare Tunnel HTTPS channel, starts or rediscovers its finite worker and waits for validated activation. The execution host builds the 25 environments, 11 repository images and 230 scoped source/setup archives once. All image bytes remain on the execution host. Repeated fetch reuses verified permanent bytes; lost responses are rediscovered without blindly repeating mutations. `run` and `resume` cannot construct templates and fail with this fetch command when local artifacts are absent or incompatible.
+Fetch validates the pinned public 230-task dataset on `control`, then invokes a finite download-only worker on `execution`. This worker downloads five Python versions, the 25 Conda recipes, exact Git sources and required dependency archives into an append-only stage. The privileged broker verifies every file once, merges identical bytes and publishes a root-owned read-only pool. Published files are never rehashed on fetch status/reuse. Failure leaves an explicit non-resumable zombie for separate administrative cleanup. No KVM/VM-template build runs during fetch. The legacy `run`/`resume` runtime is not yet integrated with the pool.
 
 ## Manual Kali lifecycle
 
