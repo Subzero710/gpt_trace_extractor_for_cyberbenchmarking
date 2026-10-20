@@ -260,6 +260,25 @@ class PreparationManager:
             if time.time() - state['updated_at'] > 30:
                 raise RuntimeError('preparation spawn has no claimed identity; slot is still held; no duplicate permitted')
             return state
+        # Recovery is allowed ONLY for an already-verified, atomically
+        # published result. No download, process restart, or post-ready hash.
+        proof = state.get('publication_verified')
+        if state['phase'] in {'running', 'validating', 'interrupted', 'canceled'} and isinstance(proof, dict):
+            ready = self.base.parent / 'dependency-pool' / 'ready'
+            if ready.exists() or ready.is_symlink():
+                safe(ready, immutable=True, directory=True)
+                inventory_path = safe(ready / 'inventory.json', immutable=True)
+                inventory = json.loads(inventory_path.read_bytes())
+                if (proof.get('kind') != 'download-only-pool' or proof.get('complete') is not True
+                        or proof.get('pool_directory') != str(ready)
+                        or inventory.get('operation_id') != state['operation_id']
+                        or inventory.get('complete') is not True
+                        or inventory.get('tasks') != proof.get('tasks')
+                        or inventory.get('repos') != proof.get('repos')
+                        or inventory.get('conda_recipes') != proof.get('conda_recipes')):
+                    raise RuntimeError('published pool does not match the durable verified publication record')
+                state = {**state, 'phase': 'ready', 'result': proof, 'error': None}
+                self._write(state)
         if state['phase'] not in TERMINAL:
             if self.slot_busy(): raise RuntimeError('unidentified active build slot; outcome unconfirmed')
             state = {**state, 'phase': 'interrupted', 'error': 'worker/descendants absent; interrupted preparation retained'}
@@ -274,7 +293,9 @@ class PreparationManager:
         result = state.get("result")
         if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
                 or result.get("complete") is not True or result.get("tasks") != 230
-                or result.get("repos") != 11 or state.get("compatibility") != self.expected()):
+                or result.get("repos") != 11 or result.get("conda_recipes") != 25
+                or result.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
+                or state.get("compatibility") != self.expected()):
             self._write({**state, "phase": "failed", "error": "invalid pool publication record"})
             return {**state, "phase": "failed", "error": "invalid pool publication record"}
         # No hash/re-scan: sealed root-owned files are immutable after initial verification.
@@ -565,8 +586,9 @@ def _prepare(manager, state):
     inventory = json.loads(raw)
     if (inventory.get("schema") != 2 or inventory.get("complete") is not True
             or inventory.get("tasks") != 230 or inventory.get("repos") != 11
-            or inventory.get("conda_recipes") != 25
-            or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
+             or inventory.get("conda_recipes") != 25
+            or inventory.get("operation_id") != state["operation_id"]
+             or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
              or inventory.get("issues") or not isinstance(inventory.get("files"),list)
              or not isinstance(inventory.get("task_plan"),dict)
              or len(inventory["task_plan"]) != 230
@@ -600,6 +622,16 @@ def _prepare(manager, state):
             checked_inodes[ino] = actual
         if actual != entry["sha256"]:
             raise RuntimeError("pool artifact digest mismatch: " + relative)
+    # The worker inventory must cover every file in the stage, with no
+    # concealed unlisted payload. inventory.json was created last by the worker.
+    actual_files = set()
+    for item in stage.rglob("*"):
+        if item.is_symlink() or (not item.is_file() and not item.is_dir()):
+            raise RuntimeError("unexpected pool filesystem entry: " + str(item))
+        if item.is_file(): actual_files.add(item.relative_to(stage).as_posix())
+    if actual_files != expected | {"inventory.json"}:
+        raise RuntimeError("unlisted/missing pool artifacts: " +
+                           str(sorted(actual_files ^ (expected | {"inventory.json"}))[:12]))
     # Canonicalize equal bytes into one inode while this stage is still new.
     # Only this uncommitted candidate is touched; no prior ready/zombie data.
     import secrets
@@ -629,14 +661,21 @@ def _prepare(manager, state):
         item.chmod(0o555 if item.is_dir() else 0o444)
     os.chown(stage, 0, 0)
     stage.chmod(0o555)
+    # Write a durable verified-publication record BEFORE the atomic rename.
+    # If the process dies after rename, reconciliation can acknowledge the
+    # ALREADY VERIFIED immutable result without retrying or rehashing files.
+    result = {"kind": "download-only-pool", "complete": True,
+              "tasks": 230, "repos": 11, "conda_recipes": 25,
+              "python_versions": inventory["python_versions"],
+              "file_count": len(inventory["files"]),
+              "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+              "pool_directory": str(ready), "runtime_integrated": False}
+    manager._write({**state, "phase": "validating", "publication_verified": result})
     os.rename(stage, ready)
-    return {"kind": "download-only-pool", "complete": True,
-            "tasks": 230, "repos": 11, "conda_recipes": 25,
-            "python_versions": inventory["python_versions"],
-            "file_count": len(inventory["files"]),
-            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-            "pool_directory": str(ready),
-            "runtime_integrated": False}
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+    return result
 
 
 def worker(operation_id, slot_fd):

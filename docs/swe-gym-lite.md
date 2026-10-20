@@ -3,8 +3,10 @@
 `swe-gym-lite` uses the ordinary Kali Workstation App with runner-owned setup,
 candidate capture and native grading. `make superbench-fetch ADAPTER=swe-gym-lite`
 now performs download-only acquisition on `execution`, without KVM, QCOW2,
-Conda environment creation or runtime installation. Artifacts are verified once
-before immutable pool publication; an interrupted fetch remains a terminal zombie.
+Conda environment creation or runtime installation. Artifacts are verified during initial acquisition and publication, never rehashed
+after immutable pool publication. A durable pre-publication proof allows
+acknowledging an already published pool after a crash without restarting fetch.
+An incomplete or interrupted fetch remains a terminal zombie.
 The runtime described below remains legacy and is not yet integrated with this pool.
 
 ## Pinned sources and validated contract

@@ -45,7 +45,7 @@ make superbench-fetch ADAPTER=swe-gym-lite
 make run ADAPTER=swe-gym-lite LIMIT=1
 ```
 
-Fetch validates the pinned public 230-task dataset on `control`, then invokes a finite download-only worker on `execution`. This worker downloads five Python versions, the 25 Conda recipes, exact Git sources and required dependency archives into an append-only stage. The privileged broker verifies every file once, merges identical bytes and publishes a root-owned read-only pool. Published files are never rehashed on fetch status/reuse. Failure leaves an explicit non-resumable zombie for separate administrative cleanup. No KVM/VM-template build runs during fetch. The legacy `run`/`resume` runtime is not yet integrated with the pool.
+Fetch validates the pinned public 230-task dataset on `control`, then invokes a finite download-only worker on `execution`. This worker downloads five Python versions, the 25 Conda recipes, exact Git sources and required dependency archives into an append-only stage. The privileged broker verifies the complete staging inventory before publication, merges identical bytes and publishes a root-owned read-only pool. A durable publication proof is recorded before the atomic rename, allowing a verified publication to be acknowledged after a crash without repeating any acquisition or hashing. Published files are never rehashed on fetch status/reuse. Failure leaves an explicit non-resumable zombie for separate administrative cleanup. No KVM/VM-template build runs during fetch. The legacy `run`/`resume` runtime is not yet integrated with the pool.
 
 ## Manual Kali lifecycle
 

@@ -406,13 +406,20 @@ class DurableJobProcessTests(unittest.TestCase):
     """Real finite children/locks/files; /proc records and KVM are explicit fixtures."""
     def setUp(self):
         if os.geteuid() != 0: self.skipTest("real root-owned process/file fixture required")
-        self.temp = tempfile.TemporaryDirectory()
+        # cgroup filesystem ownership tests require a non-writable ancestor;
+        # /tmp itself is world-writable and cannot model that security boundary.
+        import pwd
+        trusted_temp_parent = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        if (trusted_temp_parent.is_symlink() or trusted_temp_parent.stat().st_uid != 0
+                or trusted_temp_parent.stat().st_mode & 0o022):
+            self.skipTest("root-private temporary parent required for cgroup fixture")
+        self.temp = tempfile.TemporaryDirectory(dir=trusted_temp_parent)
         self.parent = Path(self.temp.name)
         self.files = fixture(self.parent)
         self.deployment = {"control_id": "fixture-control", "execution_id": "fixture-execution"}
         self.manager = jobs.PreparationManager(self.files.base, self.files.root, self.files.registry,
             source_root=ROOT, deployment=self.deployment)
-        self.identified = self.manager.probe({"source_contract": local.source_contract(ROOT)})
+        self.identified = self.manager.probe({"source_contract": local.pool_contract(ROOT)})
         self.operation_id = self.identified["operation_id"]
         self.children = []
         self.original_popen = subprocess.Popen
@@ -454,15 +461,23 @@ def physical_boundary(manager,state):
     with count.open('ab') as output: output.write(b'one\\n')
     time.sleep(0.3 if mode != 'long' else 30)
     if mode == 'error': raise RuntimeError('explicit synthetic build boundary failure')
-    folder = FOLDER_PATH
-    manifest = json.loads((folder/'manifest.json').read_bytes())
-    def info(path):
-        if path == jobs.BASE: return {'format':'qcow2'}
-        if path.name == 'common.qcow2': return {'format':'qcow2','backing-filename':str(jobs.BASE)}
-        return {'format':'qcow2','backing-filename':'../common.qcow2'}
-    registry = TemplateRegistry(manager.template_root,jobs.BASE,info)
-    registry.validate_generation(GENERATION,complete=True,check_images=True)
-    return GENERATION, True
+    # Software fixture: the physical network/acquisition boundary is replaced,
+    # but the actual broker worker/status/reconciliation path runs unmodified.
+    pool = manager.base.parent / 'dependency-pool'
+    pool.mkdir(exist_ok=True)
+    ready = pool / 'ready'
+    ready.mkdir()
+    record = {'schema': 2, 'operation_id': state['operation_id'],
+              'complete': True, 'tasks': 230, 'repos': 11, 'conda_recipes': 25}
+    (ready/'inventory.json').write_text(json.dumps(record))
+    (ready/'inventory.json').chmod(0o444)
+    ready.chmod(0o555)
+    result = {'kind': 'download-only-pool', 'complete': True, 'tasks': 230,
+              'repos': 11, 'conda_recipes': 25,
+              'python_versions': ['3.8','3.9','3.10','3.11','3.12'],
+              'file_count': 0, 'manifest_sha256': 'a' * 64,
+              'pool_directory': str(ready), 'runtime_integrated': False}
+    return result
 jobs._prepare = physical_boundary
 try:
     jobs.worker(sys.argv[2],int(sys.argv[3]))
@@ -537,38 +552,36 @@ finally:
             status = restarted.start({"operation_id": self.operation_id, "compatibility": self.identified["compatibility"], "retry": False})
         self.assertIn(status["phase"], {"running", "validating", "ready"})
         ready = self.wait_phase({"ready"}, restarted)
-        self.assertEqual(ready["result"]["generation"], self.files.generation)
+        self.assertEqual(ready["result"]["kind"], "download-only-pool")
         self.assertEqual(self.count.read_bytes(), b"one\n")
         self.assertEqual(len(self.children), 1)
         self.assertEqual(restarted.status({"operation_id": self.operation_id})["phase"], "ready")
 
-    def test_ready_is_idempotent_and_changed_bytes_are_never_reported_ready(self):
+    def test_ready_is_idempotent_and_is_not_rehashed_after_publication(self):
         self.start(); self.wait_phase({"ready"})
         self.assertEqual(self.start()["phase"], "ready")
         self.assertEqual(self.count.read_bytes(), b"one\n")
+        # Legacy QCOW2 bytes are unrelated to the immutable dependency pool.
         path = self.files.repo
-        path.chmod(0o644); path.write_bytes(b"corruption"); path.chmod(0o444)
-        failed = self.manager.status({"operation_id": self.operation_id})
-        self.assertEqual(failed["phase"], "failed")
-        self.assertIn("invalid", failed["error"])
-        self.assertIsNone(failed["result"])
+        path.chmod(0o644); path.write_bytes(b"legacy template changed"); path.chmod(0o444)
+        self.assertEqual(self.manager.status({"operation_id": self.operation_id})["phase"], "ready")
 
-    def test_explicit_error_keeps_valid_generation_and_requires_explicit_retry(self):
+    def test_explicit_error_keeps_data_and_prohibits_all_automatic_retries(self):
         before = self.files.registry_path.read_bytes()
         self.mode = "error"
         self.start()
         failed = self.wait_phase({"interrupted"})
         self.assertIn("synthetic build boundary failure", failed["error"])
         for process in self.children: process.wait(timeout=5)
-        self.assertEqual(self.start()["phase"], "interrupted")
+        with self.assertRaisesRegex(RuntimeError, "zombie"):
+            self.start()
         self.assertEqual(len(self.children), 1)
         self.assertEqual(self.files.registry_path.read_bytes(), before)
         self.assertTrue(list(self.manager.root.rglob("*.log")))
         self.mode = "success"
-        self.start(retry=True)
-        ready = self.wait_phase({"ready"})
-        self.assertEqual(ready["attempt"], 2)
-        self.assertTrue((self.manager.root / self.operation_id / "attempt-0001.json").is_file())
+        with self.assertRaisesRegex(RuntimeError, "zombie"):
+            self.start(retry=True)
+        self.assertEqual(len(self.children), 1)
 
     def test_down_cancels_only_recorded_session_and_keeps_permanent_files(self):
         self.mode = "long"
@@ -616,7 +629,7 @@ finally:
         status = self.manager.status({'operation_id': self.operation_id})
         self.assertEqual(status['phase'], 'interrupted')
         self.assertIn('descendants', status['error'])
-        with self.assertRaisesRegex(RuntimeError, 'remains'):
+        with self.assertRaisesRegex(RuntimeError, 'zombie'):
             self.start(retry=True)
         original_members = resources.JobScope.members
         def observed(state):
@@ -654,7 +667,8 @@ finally:
         value = self.wait_phase({'failed'})
         self.assertIn('spawn rejected', value['error'])
         with patch.object(jobs.subprocess, "Popen", side_effect=AssertionError("blind retry")):
-            self.assertEqual(self.start()["phase"], "failed")
+            with self.assertRaisesRegex(RuntimeError, "zombie"):
+                self.start()
 
 
 class SourceContainerOwnershipTests(unittest.TestCase):
@@ -745,12 +759,8 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
     def test_single_explicit_fetch_polls_and_never_repeats_a_lost_start(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
-            recipe = local.template_contract(ROOT)
-            source_recipe = local.source_contract(ROOT)
-            expected = {**recipe, "architecture": "x86_64",
-                "golden_sha256": hashlib.sha256(b"actual fixture golden bytes").hexdigest(),
-                "golden_provenance_sha256": hashlib.sha256(b"fixture provenance").hexdigest(),
-                "golden_provenance": {"fixture": True}}
+            recipe = local.pool_contract(ROOT)
+            expected = recipe
             operation_id = hashlib.sha256(local.canonical(expected)).hexdigest()
             identified = {"operation_id": operation_id, "compatibility": expected, "deployment": cfg["deployment"]}
             calls = []
@@ -762,9 +772,10 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 if action == "prepare_templates": return {"phase": "starting"}
                 phase = next(phases)
                 return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": phase,
-                    "result": {"generation": hashlib.sha256(b"fixture generation").hexdigest(),
-                        "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25}, "verified_signature": {"actual_fixture": [1]}}}
-            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=source_recipe), patch.object(local, "template_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+                    "result": {"kind": "download-only-pool", "complete": True,
+                        "tasks": 230, "repos": 11, "conda_recipes": 25,
+                        "runtime_integrated": False}}
+            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "pool_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
                 self.dispatch.preparation_fetch(cfg)
             self.assertEqual(calls.count("prepare_templates"), 1)
             self.assertEqual(calls.count("template_preparation_status"), 3)
@@ -775,7 +786,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 if action == "template_preparation_probe": return identified
                 if action == "template_preparation_status": return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": "not_started"}
                 raise TransportFailure("lost reply after remote start")
-            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "source_contract", return_value=source_recipe), patch.object(local, "template_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=lost), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "pool_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=lost), contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(RuntimeError, "rediscover"):
                     self.dispatch.preparation_fetch(cfg)
             self.assertEqual(calls.count("prepare_templates"), 1)
