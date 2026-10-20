@@ -110,7 +110,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                     archives = stage / 'apt/archives'
                     (archives/'testpkg_1_all.deb').write_bytes(b'fixture .deb')
                 return ''
-            def dpkg(args, **kwargs): return 'testpkg\n1\nall\n'
+            def dpkg(args, **kwargs): return 'Package: testpkg\nVersion: 1\nArchitecture: all\n'
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
                  patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(['gpg'], 0)), \
@@ -187,6 +187,112 @@ class TestPublicationRecovery(unittest.TestCase):
         self.assertIn('publication_verified', source)
         self.assertIn("inventory.get('operation_id')", source)
         self.assertIn('actual_files != expected | {"inventory.json"}', source)
+
+
+class TestPinnedRealWorldRegressions(unittest.TestCase):
+    def test_hydra_file_backed_install_requires_without_execution(self):
+        # Matches actual hydra 94bbaaad setup.py metadata source syntax.
+        setup = ("""from setuptools import setup
+import pathlib
+import pkg_resources
+with pathlib.Path("requirements/requirements.txt").open() as requirements_txt:
+    install_requires = [str(requirement) for requirement in pkg_resources.parse_requirements(requirements_txt)]
+setup(install_requires=install_requires)
+""")
+        data = {'requirements/requirements.txt':'omegaconf>=2.0\nantlr4-python3-runtime==4.8\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(setup,
+            lambda name, required=False:data[name])
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'omegaconf>=2.0','antlr4-python3-runtime==4.8'})
+
+    def test_conan_file_backed_install_requires_without_execution(self):
+        # Matches actual conan 345be91 setup.py metadata source syntax.
+        setup = ("""from setuptools import setup
+project_requirements = get_requires("conans/requirements.txt")
+project_requirements.extend(get_requires("conans/requirements_server.txt"))
+setup(install_requires=project_requirements)
+""")
+        data = {'conans/requirements.txt':'requests>=2\n',
+                'conans/requirements_server.txt':'bottle==0.12\n',
+                'conans/requirements_dev.txt':'pytest>=6\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(setup,
+            lambda name, required=False:data[name], extras={'dev'})
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'requests>=2','bottle==0.12','pytest>=6'})
+
+    def test_unrecognized_dynamic_setup_fails_closed(self):
+        deps, remote, issues = pool.setup_requirements_from_sources(
+            'setup(install_requires=run_untrusted_setup())',
+            lambda name, required=False: 'bad')
+        self.assertFalse(deps); self.assertFalse(remote); self.assertTrue(issues)
+
+    def test_git_project_with_tool_only_pyproject_still_parses_setup(self):
+        with patch.object(pool, 'git_file', side_effect=lambda mirror, commit, path, **kwargs:
+                {'pyproject.toml':'[tool.black]\nline-length=88\n',
+                 'setup.py':'setup(install_requires=["dep==1.0"])\n'}.get(path)):
+            deps,remote,issues = pool.git_requirements('unused','a'*40)
+        self.assertEqual(deps,{'dep==1.0'})
+        self.assertEqual(remote,set()); self.assertEqual(issues,[])
+
+    def test_git_project_with_pep508_nested_reference(self):
+        with patch.object(pool, 'git_file', side_effect=lambda mirror, commit, path, **kwargs:
+                {'pyproject.toml':('[project]\nname="thing"\n'
+                    'dependencies=["other @ git+https://github.com/example/other.git@'
+                    + 'a'*40 + '"]\n')}.get(path)):
+            deps,remote,issues = pool.git_requirements('unused','a'*40)
+        self.assertEqual(deps,set()); self.assertEqual(issues,[])
+        self.assertEqual(len(remote),1)
+
+    def test_no_deps_is_not_dropped_by_pip_parser(self):
+        _,_,_,problems,_,_,steps = pool.pip_commands(['python -m pip install --no-deps -e .'])
+        self.assertEqual(problems,[])
+        self.assertEqual(len(steps),1)
+        self.assertTrue(steps[0]['no_deps'])
+
+    def test_bokeh_requires_pinned_tags_in_git_mirror(self):
+        calls=[]
+        def fake(args,**kwargs):
+            calls.append([str(x) for x in args])
+            if 'tag' in args: return 'v1\nv2\nv3\nv4\nv5\n'
+            return ''
+        with tempfile.TemporaryDirectory() as tmp,patch.object(pool,'invoke',side_effect=fake):
+            pool.mirror_commits(Path(tmp),'bokeh/bokeh',{'a'*40})
+        self.assertTrue(any('+refs/tags/*:refs/tags/*' in c for c in calls))
+
+    def test_published_contract_cannot_be_empty_cas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp)
+            (stage/'metadata').mkdir()
+            candidate=pool.Pool(stage)
+            with self.assertRaisesRegex(RuntimeError,'incomplete dependency closure'):
+                pool.audit_inventory(candidate,{}, {}, {}, 'a'*64)
+            inventory=json.loads((stage/'inventory.json').read_text())
+            self.assertFalse(inventory['complete'])
+            self.assertTrue(any('no acquired content-addressed objects' in x for x in inventory['issues']))
+
+    def test_broker_does_not_export_credential_environment(self):
+        broker=(ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
+        physical=broker.split('def _prepare(manager, state):',1)[1].split('def worker(operation_id, slot_fd):',1)[0]
+        self.assertNotIn('os.environ.copy()',physical)
+        self.assertNotIn('dict(os.environ',physical)
+        self.assertIn('PIP_CONFIG_FILE',physical)
+        self.assertIn('child.wait(timeout=24 * 3600)',physical)
+        self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
+
+    def test_conda_link_solution_not_just_fetch(self):
+        records=[{'fn':'a.tar.bz2','url':'https://x/a.tar.bz2','sha256':'a'*64},
+                 {'fn':'b.tar.bz2','url':'https://x/b.tar.bz2','sha256':'b'*64}]
+        operations=[]
+        class Candidate:
+            stage=Path('/tmp')
+            def download(self,*args,**kwargs):operations.append(kwargs['sha'])
+        original_write=pool.write_new
+        with patch.object(pool,'invoke',return_value=json.dumps({'success':True,
+             'actions':{'LINK':records,'FETCH':records[:1]}})),patch.object(pool,'write_new'):
+            pool.conda_resolve('fake',Candidate(),'test',['python=3.10'])
+        self.assertEqual(operations,['a'*64,'b'*64])
 
 
 if __name__ == '__main__':

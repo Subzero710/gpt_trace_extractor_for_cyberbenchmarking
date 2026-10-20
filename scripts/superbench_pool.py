@@ -40,11 +40,11 @@ def digest(path):
     return h.hexdigest()
 
 
-def invoke(argv, *, cwd=None, capture=False, env=None):
+def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
     command = [str(v) for v in argv]
     print('[pool]', ' '.join(command), flush=True)
     result = subprocess.run(command, cwd=cwd, env=env, check=True,
-                            text=True, stdout=subprocess.PIPE if capture else None)
+                            text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
     return result.stdout if capture else None
 
 
@@ -148,6 +148,15 @@ def mirror_commits(root, repo, commits, *, label='git'):
     cmd=['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch','--no-tags',
          '--depth=1','https://github.com/'+repo+'.git',*sorted(commits)]
     invoke(cmd)
+    if repo in {'bokeh/bokeh', 'pandas-dev/pandas'} and label == 'git':
+        # Their real setup/commands require the upstream tags. Retain annotated
+        # tag objects and their references, without fetching all branch history.
+        invoke(['git', '-c', 'protocol.file.allow=never', '--git-dir', folder,
+                'fetch', '--depth=1', '--no-recurse-submodules',
+                'https://github.com/'+repo+'.git', '+refs/tags/*:refs/tags/*'])
+        tags = invoke(['git','--git-dir',folder,'tag','--list'],capture=True).splitlines()
+        if repo == 'bokeh/bokeh' and len(tags) < 5:
+            raise RuntimeError('Bokeh build requires at least five Git tags')
     for commit in commits:
         invoke(['git','--git-dir',folder,'cat-file','-e',commit+'^{commit}'])
     return folder
@@ -307,6 +316,63 @@ def setup_static(source):
 
 
 
+def setup_requirements_from_sources(source, get_file, *, extras=()):
+    """Resolve TWO pinned upstream setup.py file-backed patterns without executing code.
+
+    Unsupported dynamic code still fails closed. No imports, setup() invocation,
+    shell evaluation, or build backend execution is permitted.
+    """
+    deps, issues = setup_static(source)
+    vcs = set()
+    if not issues or get_file is None:
+        return deps, vcs, issues
+    if ('install_requires=install_requires' in source
+            and 'pkg_resources.parse_requirements(requirements_txt)' in source
+            and 'pathlib.Path("requirements/requirements.txt").open()' in source):
+        data = get_file('requirements/requirements.txt', required=True)
+        normal, remote, limits = parse_requirements(data, 'requirements/requirements.txt', get_file)
+        if limits: return deps, vcs, ['unhandled Hydra setup.py requirements constraints']
+        return deps | normal, remote, []
+    if ('project_requirements = get_requires("conans/requirements.txt")' in source
+            and 'project_requirements.extend(get_requires("conans/requirements_server.txt"))' in source
+            and 'install_requires=project_requirements' in source):
+        for name in ('conans/requirements.txt', 'conans/requirements_server.txt'):
+            data = get_file(name, required=True)
+            normal, remote, limits = parse_requirements(data, name, get_file)
+            if limits: return deps, vcs, ['unhandled Conan setup.py requirements constraints']
+            deps.update(normal); vcs.update(remote)
+        if 'dev' in extras or 'test' in extras or '*' in extras:
+            name = 'conans/requirements_dev.txt'
+            data = get_file(name, required=True)
+            normal, remote, limits = parse_requirements(data, name, get_file)
+            if limits: return deps, vcs, ['unhandled Conan development constraints']
+            deps.update(normal); vcs.update(remote)
+        return deps, vcs, []
+    return deps, vcs, issues
+
+
+def git_requirements(mirror, commit):
+    """Combine all declarative metadata sources, including tool-only pyprojects."""
+    get_file = lambda path, required=False: git_file(mirror, commit, path, required=required)
+    specs, vcs, issues = set(), set(), []
+    pyproject = get_file('pyproject.toml')
+    if pyproject:
+        try:
+            deps, remote, errors = static_project(pyproject)
+            specs.update(deps); vcs.update(remote); issues.extend(errors)
+        except (ValueError, TypeError) as exc:
+            issues.append('invalid VCS pyproject.toml: '+str(exc))
+    cfg, errors = setup_cfg_static(get_file('setup.cfg'))
+    specs.update(cfg); issues.extend(errors)
+    source = get_file('setup.py')
+    if source:
+        deps, remote, errors = setup_requirements_from_sources(source, get_file)
+        specs.update(deps); vcs.update(remote); issues.extend(errors)
+    if not (pyproject or source or get_file('setup.cfg')):
+        issues.append('VCS source lacks Python build metadata')
+    return specs, vcs, issues
+
+
 def pip_commands(commands):
     """Parse literal pip invocations as *ordered independent* acquisition steps."""
     specs, files, vcs, issues, local_extras, constraints, steps = set(), set(), set(), [], set(), set(), []
@@ -317,9 +383,14 @@ def pip_commands(commands):
             try: parts = shlex.split(fragment)
             except ValueError: issues.append('unparseable pip command'); continue
             ss, ff, vv, cc, ee = set(), set(), set(), set(), set()
+            no_deps = False
             i = 0
             while i < len(parts):
                 arg = parts[i]
+                if arg == '--no-deps':
+                    no_deps = True
+                    i += 1
+                    continue
                 if arg in ('-r', '--requirement', '-c', '--constraint'):
                     if i + 1 >= len(parts): issues.append('pip requirements filename absent'); break
                     (cc if arg in ('-c', '--constraint') else ff).add(parts[i+1]); i += 2; continue
@@ -335,7 +406,7 @@ def pip_commands(commands):
                         if '[' in target: ee.update(t.strip() for t in re.findall(r'\[([^]]+)\]', target)[0].split(','))
                     else: issues.append('unknown editable target ' + target)
                     i += 2; continue
-                if arg in ('--no-deps', '--no-build-isolation', '--no-use-pep517', '--upgrade',
+                if arg in ('--no-build-isolation', '--no-use-pep517', '--upgrade',
                            '-U', '-q', '--quiet', '-v', '--verbose', '--prefer-binary',
                            '--no-warn-script-location', '--no-input'):
                     i += 1; continue
@@ -358,7 +429,8 @@ def pip_commands(commands):
             specs.update(ss); files.update(ff); vcs.update(vv)
             constraints.update(cc); local_extras.update(ee)
             steps.append({'requirements': ss, 'files': ff, 'constraints': cc,
-                          'vcs': vv, 'local_extras': ee, 'command': fragment})
+                           'vcs': vv, 'local_extras': ee,
+                           'no_deps': no_deps, 'command': fragment})
     return specs, files, vcs, issues, local_extras, constraints, steps
 
 
@@ -585,10 +657,23 @@ def conda_resolve(micro, pool, key, args):
     except ValueError as exc:raise RuntimeError('invalid micromamba solve JSON for '+key) from exc
     if data.get('success') is False:raise RuntimeError('unsatisfiable Conda recipe '+key)
     actions=data.get('actions') or {}
-    packages=actions.get('FETCH',[])
-    if not packages:
-        packages=actions.get('LINK',[])
-    if not packages:raise RuntimeError('micromamba returned empty closure for '+key)
+    fetches = actions.get('FETCH') or []
+    links = actions.get('LINK') or []
+    if not fetches and not links:
+        raise RuntimeError('micromamba returned empty closure for '+key)
+    # LINK describes the actual solved installation. FETCH alone can be
+    # incomplete when an archive is already present in a package cache.
+    by_name = {i.get('fn'): i for i in fetches if isinstance(i, dict) and i.get('fn')}
+    packages = []
+    for item in (links or fetches):
+        if not isinstance(item, dict):
+            raise RuntimeError('invalid micromamba package record for '+key)
+        source = by_name.get(item.get('fn'), {})
+        packages.append({**source, **{k: v for k, v in item.items() if v not in (None, '')}})
+    if links:
+        linked = {i.get('fn') for i in links if isinstance(i, dict)}
+        if any(i.get('fn') not in linked for i in fetches):
+            raise RuntimeError('micromamba FETCH and LINK disagree for '+key)
     resolved=[]
     for item in packages:
         url=item.get('url')
@@ -630,11 +715,15 @@ def apt_closure(pool,packages):
     if not debs:raise RuntimeError('APT closure did not download any .deb')
     meta=[]
     for path in debs:
-        fields=subprocess.check_output(['dpkg-deb','-f',str(path),'Package','Version','Architecture'],text=True).splitlines()
+        control = subprocess.check_output(['dpkg-deb','-f',str(path)], text=True, timeout=90)
+        fields = {}
+        for field in ('Package','Version','Architecture'):
+            found = re.search(r'^'+field+r':\s*(\S+)\s*$', control, flags=re.M)
+            if not found: raise RuntimeError('APT archive missing '+field+': '+path.name)
+            fields[field] = found.group(1)
         sha=pool.put(path,'apt','kali-last-snapshot')
-        meta.append({'sha256':sha,'package':fields[0] if fields else '',
-                     'version':fields[1] if len(fields)>1 else '',
-                     'architecture':fields[2] if len(fields)>2 else ''})
+        meta.append({'sha256':sha,'package':fields['Package'],
+                     'version':fields['Version'], 'architecture':fields['Architecture']})
     write_new(stage/'metadata'/'apt-closure.json',json.dumps({'requested':sorted(packages),'resolved':meta},sort_keys=True))
 
 
@@ -708,7 +797,7 @@ def acquire_pinned_sdist(pool, requirement, plan_key):
     return {'filename': archive_name, 'sha256': sha, 'requirements': sorted(requirements)}
 
 
-def pip_closure(pool, version, reqs, key, *, constraints=()):
+def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
     if not reqs: return
     stage = pool.stage
     outfile = stage / 'metadata' / ('pip-' + key + '.txt')
@@ -725,6 +814,7 @@ def pip_closure(pool, version, reqs, key, *, constraints=()):
                 '--python-version', version, '--abi', 'cp' + version.replace('.', ''),
                 '--platform', 'manylinux2014_x86_64', '--find-links', shared,
                 '--dest', dest, '-r', needed_file,
+                *(['--no-deps'] if no_deps else []),
                 *(['--constraint', str(constraint_file)] if constraints else [])])
     sources = []
     try:
@@ -741,7 +831,7 @@ def pip_closure(pool, version, reqs, key, *, constraints=()):
             info = acquire_pinned_sdist(pool, requirement, key)
             sources.append(info)
             remaining.remove(requirement)
-            remaining.update(info['requirements'])
+            if not no_deps: remaining.update(info['requirements'])
         if remaining:
             binary_download(remaining)
     names = []
@@ -763,7 +853,7 @@ def pip_closure(pool, version, reqs, key, *, constraints=()):
         raise RuntimeError('pip closure has no downloadable packages')
     write_new(stage / 'metadata' / ('pip-plan-' + key + '.json'),
               json.dumps({'python': version, 'requested': sorted(reqs),
-                          'constraints': sorted(constraints),
+                          'constraints': sorted(constraints), 'no_deps': no_deps,
                           'files': names, 'source_archives': sources}, sort_keys=True))
 
 
@@ -788,7 +878,7 @@ def npm_global_bootstrap(pool):
         'version': info.get('version'), 'url': tarball, 'sha256': sha, 'integrity': sri}, sort_keys=True))
 
 
-def audit_inventory(pool,task_plan,envplan,gitplan,operation_id):
+def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tasks=None):
     stage=pool.stage
     files=[];seen_inodes={}
     for path in sorted(stage.rglob('*')):
@@ -811,6 +901,97 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id):
     for recipe in envplan:
         if not (stage / 'metadata' / ('conda-env-' + recipe + '.json')).is_file():
             pool.issue(recipe, 'resolved Conda environment closure missing')
+    # Structural coverage proof. Counter-only inventories with empty CAS or
+    # unreferenced JSON must never be reported as a complete dependency pool.
+    def reject(label, detail):
+        pool.issue('inventory:'+label, detail)
+    if not pool.links:
+        reject('CAS','no acquired content-addressed objects')
+    if len(task_plan) != 230 or len(envplan) != 25 or len(gitplan) != 11:
+        reject('contract','unexpected 230/25/11 contract coverage')
+    for kind in ('tools','conda','git','apt'):
+        if not pool.provenance.get(kind):
+            reject('provenance','no acquired '+kind+' artifacts')
+    for sha, row in pool.links.items():
+        if not SHA.fullmatch(sha) or row.get('sha256') != sha:
+            reject('CAS','invalid object identity '+str(sha)); continue
+        expected = ('objects/sha256/'+sha[:2]+'/'+sha)
+        target = stage / expected
+        if (row.get('path') != expected or not target.is_file() or target.is_symlink()
+                or type(row.get('size')) is not int or target.stat().st_size != row['size']):
+            reject('CAS','missing/bad object '+sha)
+    for category, groups_ in pool.provenance.items():
+        for identity, digests in groups_.items():
+            if not isinstance(digests,list) or not digests:
+                reject(category,'empty artifact provenance '+identity)
+                continue
+            for sha in digests:
+                if sha not in pool.links:
+                    reject(category,'unregistered artifact '+sha)
+    if contract_tasks is not None:
+        if set(task_plan) != set(contract_tasks):
+            reject('tasks','missing or extra task identity')
+    for logical, plan in task_plan.items():
+        if contract_tasks is not None and logical in contract_tasks:
+            expected = contract_tasks[logical]
+            if (plan.get('repo') != expected['repo'] or plan.get('base_commit') != expected['base_commit']
+                    or plan.get('env_hash') != expected['env_hash']):
+                reject(logical,'task identity diverges from pinned contract')
+        repo, commit, env = plan.get('repo'), plan.get('base_commit'), plan.get('env_hash')
+        if (repo not in gitplan or commit not in gitplan[repo].get('commits',[])
+                or env not in envplan or plan.get('python') != envplan[env]):
+            reject(logical,'unresolved repo/commit/Conda environment')
+        for key in plan.get('pip_steps',[]):
+            metadata = stage/'metadata'/('pip-plan-'+key+'.json')
+            if not metadata.is_file():
+                reject(logical,'missing pip closure '+key)
+                continue
+            try:
+                closure=json.loads(metadata.read_bytes())
+                if not closure.get('files') and not closure.get('source_archives'):
+                    raise ValueError('empty closure')
+                for artifact in closure.get('files',[]):
+                    if artifact.get('sha256') not in pool.links:
+                        raise ValueError('unregistered wheel '+str(artifact))
+                for artifact in closure.get('source_archives',[]):
+                    if artifact.get('sha256') not in pool.links:
+                        raise ValueError('unregistered source '+str(artifact))
+            except (ValueError,TypeError,KeyError) as exc:
+                reject(logical,'invalid pip closure '+key+': '+str(exc))
+    for key in ['python-'+version for version in PYTHONS] + ['env-'+env for env in envplan]:
+        metadata = stage/'metadata'/('conda-'+key+'.json')
+        if not metadata.is_file():
+            reject(key,'missing Conda solution')
+            continue
+        try:
+            solution = json.loads(metadata.read_bytes())
+            if not isinstance(solution,list) or not solution:
+                raise ValueError('empty Conda package list')
+            for artifact in solution:
+                if artifact.get('sha256') not in pool.links:
+                    raise ValueError('Conda archive not acquired')
+        except (ValueError,TypeError,AttributeError) as exc:
+            reject(key,'invalid Conda solution: '+str(exc))
+    apt_path=stage/'metadata'/'apt-closure.json'
+    try:
+        apt=json.loads(apt_path.read_bytes())
+        if not apt.get('requested') or not apt.get('resolved'):
+            raise ValueError('empty APT package resolution')
+        for item in apt['resolved']:
+            if (item.get('sha256') not in pool.links or not item.get('package')
+                    or not item.get('version') or item.get('architecture') not in ('all','amd64')):
+                raise ValueError('incomplete/bad APT archive metadata')
+    except (OSError,ValueError,TypeError,AttributeError) as exc:
+        reject('APT','missing/bad signed Kali closure: '+str(exc))
+    frozen_path=stage/'metadata'/'vcs-frozen.json'
+    try:
+        frozen=json.loads(frozen_path.read_bytes())
+        for logical,plan in task_plan.items():
+            for ref in plan.get('vcs',[]):
+                if ref not in frozen or not COMMIT.fullmatch(frozen[ref]):
+                    reject(logical,'VCS source not frozen: '+ref)
+    except (OSError,ValueError,TypeError) as exc:
+        reject('VCS','missing/bad VCS pin manifest: '+str(exc))
     issues=sorted(set(pool.issues))
     summary={'schema':2,'kind':'download-only-pool','complete':not issues,
               'operation_id':operation_id,
@@ -871,12 +1052,9 @@ def main(argv=None):
                     if path=='mypy/typeshed':
                         gitplan[repo]['submodules'][path]={'repo':subrepo,'commit':sha}
                         ensure_commit(stage,subrepo,sha,label='git-extra')
-    # Git packs are content-addressed internally and only referenced commits are fetched.
-    for path in sorted((stage/'git').rglob('*')):
-        if path.is_file() and not path.is_symlink():pool.put(path,'git',path.relative_to(stage/'git').parts[0])
-    for path in sorted((stage/'git-extra').rglob('*')):
-        if path.is_file() and not path.is_symlink():pool.put(path,'git-extra',path.relative_to(stage/'git-extra').parts[0])
+    # Git files must not be linked to CAS while Git may still mutate refs.
     envplan={};requirements_by_env=defaultdict(set);vcs=set()
+    vcs_by_env=defaultdict(set)
     for version in PYTHONS:
         print('[pool] Python '+version,flush=True)
         conda_resolve(str(resolver),pool,'python-'+version,['python='+version,'pip'])
@@ -897,7 +1075,10 @@ def main(argv=None):
             conda_resolve(str(resolver),pool,'env-'+env,['--file',str(file),'python='+version])
             for dep in pips:
                 if not dep or dep.startswith('#'):continue
-                if dep.startswith('git+https://'):vcs.add(dep)
+                if vcs_reference(dep):
+                    canonical=vcs_reference(dep)
+                    vcs.add(canonical)
+                    vcs_by_env[env].add(canonical)
                 else:requirements_by_env[env].add(dep)
     # Trusted, pinned upstream spec table contains the evaluator prelude only.
     constants_file=adapter/'upstream'/'constants.py'
@@ -926,7 +1107,7 @@ def main(argv=None):
                     makefile=get_file('Makefile',required=True)
                     commands.extend(make_commands(makefile,match.group(1)))
                 except (ValueError,RuntimeError) as exc:pool.issue(logical,str(exc))
-        reqs=set(requirements_by_env[task['env_hash']]);vcs_task=set()
+        reqs=set(requirements_by_env[task['env_hash']]);vcs_task=set(vcs_by_env[task['env_hash']])
         explicit,reqfiles,external,problems,extras,constraint_files,steps=pip_commands(commands)
         inline_constraints = set()
         for command in commands:
@@ -948,17 +1129,19 @@ def main(argv=None):
         reqs.update(cfg_deps)
         for ptext in cfg_problems:pool.issue(logical,ptext)
         setup=get_file('setup.py')
-        deps,problems=setup_static(setup)
-        reqs.update(deps)
+        deps,remote,problems=setup_requirements_from_sources(setup,get_file,extras=extras|{'test','dev'})
+        reqs.update(deps); vcs_task.update(remote)
         for ptext in problems:pool.issue(logical,ptext)
         # Each independent pip command becomes a separate closure. Combining
         # `install A; install B` into one solve is not equivalent to the recipe.
         task_steps=[]
-        def register(req, constraints, name):
+        def register(req, constraints, name, *, no_deps=False):
             if not req: return None
-            key=hashlib.sha256(json.dumps([version,sorted(req),sorted(constraints)],sort_keys=True).encode()).hexdigest()[:20]
+            key=hashlib.sha256(json.dumps([version, sorted(req), sorted(constraints), no_deps],
+                                        sort_keys=True).encode()).hexdigest()[:20]
             group=groups.setdefault(key,{'version':version,'requirements':sorted(req),
-                                          'constraints':sorted(constraints),'tasks':[],'steps':[]})
+                                          'constraints':sorted(constraints), 'no_deps':no_deps,
+                                          'tasks':[],'steps':[]})
             if logical not in group['tasks']:group['tasks'].append(logical)
             group['steps'].append(name)
             task_steps.append(key)
@@ -979,8 +1162,9 @@ def main(argv=None):
             # Local editable/develop is a separate installation against the
             # static package metadata. Remote VCS input is fetched separately.
             if step['local_extras'] or re.search(r'(^|\s)(?:-e|--editable|-ve|-ev)\s+\.',step['command']):
-                dependencies.update(reqs)
-            register(dependencies,step_constraints,step['command'])
+                if not step['no_deps']:
+                    dependencies.update(reqs)
+            register(dependencies,step_constraints,step['command'],no_deps=step['no_deps'])
         # The static project and conda-YAML pip requirements have their own
         # closure rather than being combined with every independently pinned step.
         for command in commands:
@@ -996,18 +1180,34 @@ def main(argv=None):
             if re.search(r'\b(?:curl|wget)\b\s+https?://',command):
                 pool.issue(logical,'shell download needs explicit pinned hash: '+command[:90])
         primary=register(reqs,set(),'declarative-project-metadata')
+        normalized_vcs={vcs_reference(item) or item for item in vcs_task}
         task_plan[logical]={'repo':repo,'base_commit':commit,'env_hash':task['env_hash'],
                             'python':version,'pip_plan':primary,'pip_steps':task_steps,
-                            'vcs':sorted(vcs_task)}
-        vcs.update(vcs_task)
+                            'vcs':sorted(normalized_vcs)}
+        vcs.update(normalized_vcs)
         if index%25==0:print(f'[pool] Static task recipes {index}/230',flush=True)
+    # Reject known-invalid pinned metadata BEFORE costly pip / VCS / npm / APT downloads.
+    if pool.issues:
+        write_new(stage/'metadata'/'static-errors.json', json.dumps(sorted(set(pool.issues)), indent=2))
+        raise RuntimeError('static dependency closure rejected before network resolution: '+pool.issues[0])
     for key,group in sorted(groups.items()):
-        try:pip_closure(pool,group['version'],group['requirements'],key, constraints=group['constraints'])
+        try:pip_closure(pool,group['version'],group['requirements'],key,
+                        constraints=group['constraints'],no_deps=group['no_deps'])
         except subprocess.CalledProcessError as exc:pool.issue('pip:'+key,'binary dependency solve unavailable: '+str(exc))
         except RuntimeError as exc:pool.issue('pip:'+key,str(exc))
-    # Pin VCS inputs to the exact fetched commit; inspect their PEP621 metadata.
+    # Pin VCS inputs, resolve metadata from pyproject/setup.cfg/setup.py, and
+    # propagate nested VCS references only to the tasks that depend on them.
     vcs_frozen={}
-    for value in sorted(vcs):
+    vcs_tasks=defaultdict(set)
+    for logical,plan in task_plan.items():
+        for value in plan['vcs']:
+            vcs_tasks[value].add(logical)
+    pending=set(vcs)
+    while pending:
+        if len(vcs_frozen) + len(pending) > 256:
+            raise RuntimeError('VCS closure exceeds the audited finite bound')
+        value=sorted(pending)[0]; pending.remove(value)
+        if value in vcs_frozen: continue
         canonical = vcs_reference(value)
         if canonical is None:
             pool.issue('VCS','unrecognized Git reference '+value);continue
@@ -1022,7 +1222,6 @@ def main(argv=None):
         if pinned and not COMMIT.fullmatch(pinned):
             if not re.fullmatch(r'[a-f0-9]{7,39}',pinned):
                 pool.issue('VCS','unresolved Git ref: '+value);continue
-            # Resolve an abbreviated immutable commit without executing project code.
             api='https://api.github.com/repos/'+repo_ref+'/commits/'+pinned
             try:
                 with urllib.request.urlopen(urllib.request.Request(api,headers={'User-Agent':'gpt-trace-dependency-pool/2'}),timeout=60) as res:
@@ -1034,8 +1233,6 @@ def main(argv=None):
             except (OSError,ValueError) as exc:
                 pool.issue('VCS','unable to freeze abbreviated Git reference '+value+': '+str(exc));continue
         if not pinned:
-            # Freeze the upstream HEAD to an exact full commit at acquisition.
-            # It is never re-resolved after publication.
             ref=invoke(['git','ls-remote','https://github.com/'+repo_ref+'.git','HEAD'],capture=True)
             match=re.fullmatch(r'([a-f0-9]{40})\s+HEAD\s*',ref)
             if not match:pool.issue('VCS','HEAD could not be frozen: '+value);continue
@@ -1043,31 +1240,37 @@ def main(argv=None):
         vcs_frozen[value]=pinned
         try:
             folder=ensure_commit(stage,repo_ref,pinned,label='git-extra')
-            rawproj=git_file(folder,pinned,'pyproject.toml')
-            if rawproj:
-                deps,_,problems=static_project(rawproj)
-                for ptext in problems:pool.issue(value,ptext)
-                # Only target versions of tasks actually using this Git source.
-                relevant={task_plan[item]['python'] for item in task_plan if value in task_plan[item]['vcs']}
-                for version in sorted(relevant):
-                    if not deps: continue
-                    try:pip_closure(pool,version,deps,hashlib.sha256((value+version).encode()).hexdigest()[:20])
-                    except subprocess.CalledProcessError as exc:pool.issue(value,'VCS transitive solve: '+str(exc))
-            else:
-                src=git_file(folder,pinned,'setup.py')
-                if src:
-                    deps,problems=setup_static(src)
-                    for ptext in problems:pool.issue(value,ptext)
-                    relevant={task_plan[item]['python'] for item in task_plan if value in task_plan[item]['vcs']}
-                    for version in sorted(relevant):
-                        if not deps: continue
-                        try:pip_closure(pool,version,deps,hashlib.sha256((value+version).encode()).hexdigest()[:20])
-                        except subprocess.CalledProcessError as exc:pool.issue(value,'VCS setup.py transitive solve: '+str(exc))
-                else:pool.issue(value,'VCS source lacks static Python metadata')
-            for path in folder.rglob('*'):
-                if path.is_file() and not path.is_symlink():pool.put(path,'git-extra',repo_ref)
-        except (RuntimeError,subprocess.CalledProcessError) as exc:pool.issue(value,'VCS fetch failed: '+str(exc))
+            deps,nested,problems=git_requirements(folder,pinned)
+            for ptext in problems:pool.issue(value,ptext)
+            dependants=set(vcs_tasks[value])
+            for remote in nested:
+                normalized=vcs_reference(remote)
+                if normalized is None:
+                    pool.issue(value,'invalid nested VCS reference: '+remote)
+                    continue
+                vcs_tasks[normalized].update(dependants)
+                for logical in dependants:
+                    plan=task_plan[logical]
+                    if normalized not in plan['vcs']:
+                        plan['vcs']=sorted([*plan['vcs'],normalized])
+                if normalized not in vcs_frozen:pending.add(normalized)
+            relevant={task_plan[item]['python'] for item in dependants}
+            for version in sorted(relevant):
+                if not deps: continue
+                key=hashlib.sha256((value+version).encode()).hexdigest()[:20]
+                try:pip_closure(pool,version,deps,key)
+                except (RuntimeError,subprocess.CalledProcessError) as exc:
+                    pool.issue(value,'VCS transitive solve: '+str(exc))
+        except (RuntimeError,subprocess.CalledProcessError) as exc:
+            pool.issue(value,'VCS fetch failed: '+str(exc))
     write_new(stage/'metadata'/'vcs-frozen.json',json.dumps(vcs_frozen,sort_keys=True,indent=2))
+    # Freeze Git metadata only after all commits/tags/refs have been fetched.
+    # Git FETCH_HEAD and refs are mutable during acquisition and must never be
+    # hardlinked into content-addressed objects before that point.
+    for kind in ('git','git-extra'):
+        for path in sorted((stage/kind).rglob('*')):
+            if path.is_file() and not path.is_symlink():
+                pool.put(path,kind,path.relative_to(stage/kind).parts[0])
     # NPM lockfiles pinned via Subresource Integrity; no npm install executed.
     npm_urls={}
     for repo,commits in sorted(grouped.items()):
@@ -1119,7 +1322,7 @@ def main(argv=None):
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
         pool.issue('APT','signed Kali closure unavailable: '+str(exc))
-    audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id)
+    audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks)
 
 
 if __name__=='__main__':

@@ -561,10 +561,23 @@ def _prepare(manager, state):
     program = manager.source_root / "scripts/superbench_pool.py"
     if program.is_symlink() or not program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
-    env = os.environ.copy()
-    env["HOME"] = str(root)
-    env["XDG_CACHE_HOME"] = str(root / "incoming" / "metadata")
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Strict allowlist: administrative bearer tokens, service credentials,
+    # cloud tunnel configuration and deployment secrets must never reach the
+    # unprivileged downloader or any of its subprocesses. No proxy/auth env.
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": str(root),
+        "XDG_CACHE_HOME": str(root / "incoming" / "metadata"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "PIP_CONFIG_FILE": "/dev/null",
+        "PIP_NO_CACHE_DIR": "1",
+        "NPM_CONFIG_USERCONFIG": "/dev/null",
+        "NPM_CONFIG_GLOBALCONFIG": "/dev/null",
+    }
 
     def drop_privileges():
         os.setgroups([])
@@ -574,11 +587,22 @@ def _prepare(manager, state):
 
     # Use only the local audited worker file, with fixed validated arguments.
     # No shell, no template builder, no qemu, no guest execution.
-    subprocess.run([sys.executable, "-B", str(program), "--repo-root",
+    child = subprocess.Popen([sys.executable, "-B", str(program), "--repo-root",
                     str(manager.source_root), "--stage", str(stage),
                     "--operation-id", state["operation_id"]],
                    cwd=manager.source_root, env=env, preexec_fn=drop_privileges,
-                   check=True)
+                   stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        exitcode = child.wait(timeout=24 * 3600)
+    except subprocess.TimeoutExpired as exc:
+        # Only the private process group created above may be terminated.
+        # Never kill a guessed PID or an unrelated service.
+        try: os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        child.wait()
+        raise RuntimeError("download worker exceeded its 24-hour deadline; zombie preserved") from exc
+    if exitcode != 0:
+        raise subprocess.CalledProcessError(exitcode, child.args)
     inventory_path = stage / "inventory.json"
     if inventory_path.is_symlink() or not inventory_path.is_file():
         raise RuntimeError("download worker returned no pool inventory")
