@@ -28,6 +28,12 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertFalse(requirements)
         self.assertTrue(issues)
 
+    def test_dynamic_setup_kwargs_is_not_silently_ignored(self):
+        source = 'setup_args={"name": dynamic_name(), "install_requires": ["dep==1"]}\nsetup(**setup_args)\n'
+        requirements, issues = pool.setup_static(source)
+        self.assertFalse(requirements)
+        self.assertTrue(any('**kwargs' in item for item in issues))
+
     def test_requirements_and_constraints_remain_separate(self):
         sources = {'nested.txt': 'urllib3>=1\n', 'limits.txt': 'urllib3<2\n'}
         reqs, git, constraints = pool.parse_requirements(
@@ -272,6 +278,48 @@ setup(install_requires=project_requirements)
         self.assertEqual(issues, [])
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'requests>=2','bottle==0.12','pytest>=6'})
+
+    def test_conan_legacy_single_runtime_file_without_execution(self):
+        # Matches the older Conan layout used by eight pinned SWE-Gym commits.
+        setup = ("""from setuptools import setup
+project_requirements = get_requires('conans/requirements.txt')
+dev_requirements = get_requires('conans/requirements_dev.txt')
+setup(install_requires = project_requirements,
+      extras_require={'dev': dev_requirements, 'test': dev_requirements})
+""")
+        data = {'conans/requirements.txt':'requests>=2\nurllib3<2\n',
+                'conans/requirements_dev.txt':'pytest>=6\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(setup,
+            lambda name, required=False:data[name], extras={'test'})
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'requests>=2','urllib3<2','pytest>=6'})
+
+    def test_modin_spreadsheet_setup_kwargs_reads_pinned_runtime_requirements(self):
+        # Matches modin-spreadsheet@49ffd89: dynamic setup_args metadata plus a
+        # fixed requirements.txt used for install_requires.
+        setup = ("""from setuptools import setup
+
+def read_requirements(basename):
+    return dynamic_reader(basename)
+
+def extras_require():
+    return {'test': ['pytest']}
+
+reqs = read_requirements("requirements.txt")
+setup_args = {
+    "name": dynamic_name(),
+    "install_requires": reqs,
+    "extras_require": extras_require(),
+}
+setup(version=dynamic_version(), **setup_args)
+""")
+        data = {'requirements.txt':'jupyter>=1.0.0\nnotebook>=6.0.3\nipywidgets>=7.0.0\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(setup,
+            lambda name, required=False:data[name])
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'jupyter>=1.0.0','notebook>=6.0.3','ipywidgets>=7.0.0'})
 
     def test_unrecognized_dynamic_setup_fails_closed(self):
         deps, remote, issues = pool.setup_requirements_from_sources(

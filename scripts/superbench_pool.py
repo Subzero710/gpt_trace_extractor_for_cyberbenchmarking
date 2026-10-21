@@ -589,28 +589,36 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
     for statement in tree.body:
         apply_statement(statement)
 
+    deps,issues=set(),[]
+
     def fields_from_call(call):
         fields={kw.arg:kw.value for kw in call.keywords if kw.arg is not None}
         for kw in call.keywords:
             if kw.arg is not None: continue
             try:mapping=evaluate(kw.value)
-            except (TypeError,ValueError,KeyError,IndexError): continue
-            if isinstance(mapping,dict):
-                for key,value in mapping.items():
-                    if key in fields:continue
-                    if value is unresolved:
+            except (TypeError,ValueError,KeyError,IndexError) as exc:
+                # Never silently discard an unresolved **kwargs mapping: it may
+                # contain install_requires/setup_requires/extras_require. Known
+                # pinned projects with audited file-backed mappings are handled
+                # by setup_requirements_from_sources below.
+                issues.append('setup.py computes **kwargs dynamically: '+str(exc))
+                continue
+            if not isinstance(mapping,dict):
+                issues.append('setup.py **kwargs is not a mapping')
+                continue
+            for key,value in mapping.items():
+                if key in fields:continue
+                if value is unresolved:
+                    fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
+                else:
+                    # The mapping contains already-evaluated values; wrap
+                    # them in a literal AST so the same validation path below
+                    # can be used without executing code. Non-literal sentinels
+                    # remain explicitly unresolved.
+                    try:fields[key]=ast.parse(repr(value),mode='eval').body
+                    except SyntaxError:
                         fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
-                    else:
-                        # The mapping contains already-evaluated values; wrap
-                        # them in a literal AST so the same validation path below
-                        # can be used without executing code. Non-literal sentinels
-                        # remain explicitly unresolved.
-                        try:fields[key]=ast.parse(repr(value),mode='eval').body
-                        except SyntaxError:
-                            fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
         return fields
-
-    deps,issues=set(),[]
     for node in ast.walk(tree):
         if not isinstance(node,ast.Call) or getattr(node.func,'id',None)!='setup': continue
         fields=fields_from_call(node)
@@ -643,7 +651,7 @@ def setup_requirements_from_sources(source, get_file, *, extras=(), python_versi
     vcs = set()
     if not source:
         return deps, vcs, issues
-    if not issues or get_file is None:
+    if get_file is None:
         return deps, vcs, issues
 
     def add_requirements(name):
@@ -661,13 +669,21 @@ def setup_requirements_from_sources(source, get_file, *, extras=(), python_versi
         except RuntimeError as exc: return deps, vcs, [str(exc)]
         return deps, vcs, []
 
-    # Conan 1.x composes two runtime files and optionally its development file.
-    if ('project_requirements = get_requires("conans/requirements.txt")' in source
-            and 'project_requirements.extend(get_requires("conans/requirements_server.txt"))' in source
-            and 'install_requires=project_requirements' in source):
+    # Conan 1.x has two pinned layouts in SWE-Gym Lite. Older commits read only
+    # conans/requirements.txt; newer commits extend it with requirements_server.
+    # Both use the same literal get_requires helper and assign the result to
+    # install_requires. Development/test extras come from requirements_dev.txt.
+    conan_runtime = re.search(
+        r'\bproject_requirements\s*=\s*get_requires\(["\']conans/requirements\.txt["\']\)',
+        source)
+    conan_install = re.search(r'\binstall_requires\s*=\s*project_requirements\b', source)
+    if conan_runtime and conan_install:
         try:
             add_requirements('conans/requirements.txt')
-            add_requirements('conans/requirements_server.txt')
+            if re.search(
+                    r'project_requirements\.extend\(get_requires\(["\']conans/requirements_server\.txt["\']\)\)',
+                    source):
+                add_requirements('conans/requirements_server.txt')
             if 'dev' in extras or 'test' in extras or '*' in extras:
                 add_requirements('conans/requirements_dev.txt')
         except RuntimeError as exc: return deps, vcs, [str(exc)]
@@ -680,15 +696,20 @@ def setup_requirements_from_sources(source, get_file, *, extras=(), python_versi
         except RuntimeError as exc: return deps, vcs, [str(exc)]
         return deps, vcs, []
 
-    # modin-spreadsheet@49ffd89 stores the same fixed file in setup_args and
-    # passes that mapping via **setup_args. The JavaScript build closure is
-    # handled separately from package.json.
-    if ('reqs = read_requirements("requirements.txt")' in source
-            and '"install_requires": reqs' in source and '**setup_args' in source):
+    # modin-spreadsheet@49ffd89 stores runtime dependencies in a fixed
+    # requirements.txt, then passes a larger setup_args mapping via **setup_args.
+    # The mapping also contains dynamic non-runtime metadata, so the generic AST
+    # evaluator intentionally flags it. Resolve only the audited pinned runtime
+    # file here; JavaScript build dependencies are handled from js/package.json.
+    if (re.search(r'\breqs\s*=\s*read_requirements\(["\']requirements\.txt["\']\)', source)
+            and re.search(r'["\']install_requires["\']\s*:\s*reqs\b', source)
+            and '**setup_args' in source):
         try: add_requirements('requirements.txt')
         except RuntimeError as exc: return deps, vcs, [str(exc)]
         return deps, vcs, []
 
+    if not issues:
+        return deps, vcs, []
     return deps, vcs, issues
 
 
