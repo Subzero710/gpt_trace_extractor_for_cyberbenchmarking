@@ -15,7 +15,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
+import tempfile
 import subprocess
 import sys
 import time
@@ -31,6 +33,8 @@ COMMIT = re.compile(r'[a-f0-9]{40}\Z')
 SHA = re.compile(r'[a-f0-9]{64}\Z')
 KALI_SIGNING_FPR = '827C8569F2518CC677FECA1AED65462EC8D5E4C5'
 MAX_SOURCE = 12 * 1024 * 1024
+NPM_NODE18_VERSION = '10.9.9'
+GOLDEN_SYSTEM_PYTHON = '3.13'  # Kali 2026.2 pinned by infra/workstation/image/build.py
 
 
 def digest(path):
@@ -227,30 +231,141 @@ def parse_requirements(text, filename, get_file, *, seen=None, constraint=False)
 
 
 
+def _poetry_version_spec(name, value):
+    """Translate the finite Poetry constraint forms used by pinned inputs to PEP 440."""
+    if not isinstance(value, str):
+        raise ValueError('Poetry dependency version is not a string: ' + name)
+    value = value.strip()
+    if value in ('', '*'):
+        return name
+    if '||' in value:
+        raise ValueError('unsupported Poetry disjunction for ' + name)
+    if value.startswith('^'):
+        base = value[1:]
+        if not re.fullmatch(r'\d+(?:\.\d+){0,3}(?:[A-Za-z0-9.+-]*)?', base):
+            raise ValueError('unsupported Poetry caret version for ' + name + ': ' + value)
+        release = base.split('-', 1)[0].split('+', 1)[0]
+        numeric = []
+        for part in release.split('.'):
+            match = re.match(r'(\d+)', part)
+            if not match: break
+            numeric.append(int(match.group(1)))
+        while len(numeric) < 3: numeric.append(0)
+        major, minor, patch = numeric[:3]
+        if major:
+            upper = f'{major + 1}.0.0'
+        elif minor:
+            upper = f'0.{minor + 1}.0'
+        else:
+            upper = f'0.0.{patch + 1}'
+        return name + '>=' + base + ',<' + upper
+    if value.startswith('~') and not value.startswith('~='):
+        base = value[1:]
+        if not re.fullmatch(r'\d+(?:\.\d+){0,3}(?:[A-Za-z0-9.+-]*)?', base):
+            raise ValueError('unsupported Poetry tilde version for ' + name + ': ' + value)
+        numeric = [int(x) for x in re.findall(r'^\d+|\.(\d+)', base) if x != '']
+        # re.findall with a capture is awkward for the first component; derive
+        # the release again without ever evaluating project code.
+        release = base.split('-', 1)[0].split('+', 1)[0]
+        parts = [int(re.match(r'\d+', x).group()) for x in release.split('.') if re.match(r'\d+', x)]
+        if len(parts) <= 1:
+            upper = f'{parts[0] + 1}.0.0'
+        else:
+            upper = f'{parts[0]}.{parts[1] + 1}.0'
+        return name + '>=' + base + ',<' + upper
+    if re.fullmatch(r'\d+(?:\.\d+)*(?:[A-Za-z0-9.+-]*)?', value):
+        return name + '==' + value
+    if re.fullmatch(r'\d+(?:\.\d+)*\.\*', value):
+        return name + '==' + value
+    if value.startswith(('=', '<', '>', '!', '~=')):
+        return name + value
+    # Comma-separated standard constraints such as ">=1,<2".
+    if any(value.startswith(prefix) for prefix in ('>=', '<=', '!=', '==')):
+        return name + value
+    raise ValueError('unsupported Poetry dependency version for ' + name + ': ' + value)
+
+
 def static_project(file, *, extra_groups=()):
-    """Interpret declared metadata without running setup.py or a build backend."""
+    """Interpret declarative pyproject metadata without executing a backend."""
     if not file: return set(),set(),[]
     issues=[]; deps=set();git=set()
     data=tomllib.loads(file)
     project=data.get('project',{})
-    deps.update(project.get('dependencies',[]))
+    raw_dependencies = project.get('dependencies', [])
+    if not isinstance(raw_dependencies, list):
+        issues.append('invalid PEP621 dependencies')
+    else:
+        deps.update(raw_dependencies)
     # Offline builds also need their declared isolated build backend.
-    deps.update(data.get('build-system',{}).get('requires',[]))
+    build_requires = data.get('build-system',{}).get('requires',[])
+    if isinstance(build_requires, list): deps.update(build_requires)
+    else: issues.append('invalid build-system requires')
     for k in ('dependencies','optional-dependencies'):
         if k in project.get('dynamic',[]):issues.append('dynamic PEP621 '+k)
     for name,items in project.get('optional-dependencies',{}).items():
-        if name in extra_groups or '*' in extra_groups: deps.update(items)
+        if name in extra_groups or '*' in extra_groups:
+            if isinstance(items, list): deps.update(items)
+            else: issues.append('invalid PEP621 optional dependency group '+name)
     pdm=data.get('tool',{}).get('pdm',{})
     for group,items in pdm.get('dev-dependencies',{}).items():
-        if group in extra_groups or '*' in extra_groups:deps.update(items)
+        if group in extra_groups or '*' in extra_groups:
+            if isinstance(items, list): deps.update(items)
+            else: issues.append('invalid PDM dependency group '+group)
     poetry=data.get('tool',{}).get('poetry',{})
-    for name,spec in poetry.get('dependencies',{}).items():
-        if name=='python':continue
-        if isinstance(spec,str):deps.add(name+(spec if spec.startswith(('=','<','>','!','~')) else ''))
-        elif isinstance(spec,dict) and isinstance(spec.get('version'),str):deps.add(name+spec['version'])
-        else:issues.append('unresolved Poetry dependency '+name)
+    poetry_extras = poetry.get('extras', {}) if isinstance(poetry.get('extras', {}), dict) else {}
+    selected_optional = set()
+    for group,names in poetry_extras.items():
+        if group in extra_groups or '*' in extra_groups:
+            if isinstance(names,list): selected_optional.update(str(name) for name in names)
+            else: issues.append('invalid Poetry extra '+group)
+    poetry_dependencies = poetry.get('dependencies', {})
+    if isinstance(poetry_dependencies, dict):
+        for name,spec in poetry_dependencies.items():
+            if name=='python':continue
+            optional = isinstance(spec,dict) and spec.get('optional') is True
+            if optional and name not in selected_optional:
+                continue
+            try:
+                if isinstance(spec,str):
+                    deps.add(_poetry_version_spec(name,spec))
+                elif isinstance(spec,dict):
+                    if 'git' in spec:
+                        url = spec.get('git')
+                        ref = spec.get('rev') or spec.get('tag') or spec.get('branch')
+                        if (not isinstance(url,str) or
+                                not re.fullmatch(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?',url)):
+                            raise ValueError('untrusted Poetry Git dependency '+name)
+                        direct = name+' @ git+'+url
+                        if isinstance(ref,str) and ref: direct += '@'+ref
+                        git.add(vcs_reference(direct) or direct)
+                    elif isinstance(spec.get('version'),str):
+                        deps.add(_poetry_version_spec(name,spec['version']))
+                    else:
+                        raise ValueError('unresolved Poetry dependency '+name)
+                else:
+                    raise ValueError('unresolved Poetry dependency '+name)
+            except ValueError as exc:
+                issues.append(str(exc))
+    elif poetry_dependencies:
+        issues.append('invalid Poetry dependencies table')
+    poetry_dev = poetry.get('dev-dependencies',{})
+    if ('dev' in extra_groups or 'test' in extra_groups or '*' in extra_groups):
+        if isinstance(poetry_dev,dict):
+            for name,spec in poetry_dev.items():
+                try:
+                    if isinstance(spec,str): deps.add(_poetry_version_spec(name,spec))
+                    elif isinstance(spec,dict) and isinstance(spec.get('version'),str):
+                        deps.add(_poetry_version_spec(name,spec['version']))
+                    else: issues.append('unresolved Poetry dev dependency '+name)
+                except ValueError as exc: issues.append(str(exc))
+        elif poetry_dev:
+            issues.append('invalid Poetry dev dependency table')
     for row in list(deps):
-        if 'git+https://' in row:deps.remove(row);git.add(row)
+        if not isinstance(row,str):
+            deps.remove(row); issues.append('non-string Python dependency metadata'); continue
+        ref=vcs_reference(row)
+        if ref:
+            deps.remove(row);git.add(ref)
     return deps,git,issues
 
 
@@ -267,15 +382,14 @@ def setup_cfg_static(source, *, extras=()):
             if value and not value.startswith('#'): specs.add(value)
     add('options', 'install_requires')
     add('options', 'setup_requires')
-    add('options', 'tests_require')
     if parsed.has_section('options.extras_require'):
         for group in parsed.options('options.extras_require'):
             if group in extras or '*' in extras: add('options.extras_require', group)
     return specs, []
 
 
-def setup_static(source):
-    """Evaluate literal metadata and simple top-level names; never execute setup.py."""
+def setup_static(source, *, extras=()):
+    """Evaluate literal setuptools metadata and selected extras; never execute it."""
     import ast
     if not source: return set(), []
     try: tree = ast.parse(source)
@@ -285,69 +399,133 @@ def setup_static(source):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name): definitions[target.id] = node.value
+
     def static(node, visiting=frozenset()):
         if isinstance(node, ast.Name):
             if node.id in visiting or node.id not in definitions:
                 raise ValueError('unresolved setup.py name ' + node.id)
             return static(definitions[node.id], visiting | {node.id})
-        if isinstance(node, (ast.List, ast.Tuple)):
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             return [static(e, visiting) for e in node.elts]
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if isinstance(node, ast.Dict):
+            result = {}
+            for key, value in zip(node.keys, node.values):
+                key_value = static(key, visiting)
+                if not isinstance(key_value, str):
+                    raise ValueError('non-string setup.py mapping key')
+                result[key_value] = value
+            return result
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bool, int, float)):
             return node.value
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return static(node.left, visiting) + static(node.right, visiting)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'str' and len(node.args)==1:
+            return str(static(node.args[0], visiting))
         raise ValueError('dynamic setup.py metadata expression')
+
+    def mapping_fields(node):
+        if isinstance(node, ast.Name):
+            if node.id not in definitions: return {}
+            node = definitions[node.id]
+        if not isinstance(node, ast.Dict): return {}
+        result = {}
+        for key, value in zip(node.keys, node.values):
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                result[key.value] = value
+        return result
+
     deps, issues = set(), []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or getattr(node.func, 'id', None) != 'setup':
             continue
+        fields = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
         for kw in node.keywords:
-            if kw.arg not in ('install_requires', 'setup_requires', 'tests_require'):
-                continue
-            try: values = static(kw.value)
+            if kw.arg is None:
+                fields.update({k:v for k,v in mapping_fields(kw.value).items() if k not in fields})
+        for name in ('install_requires', 'setup_requires'):
+            if name not in fields: continue
+            try: values = static(fields[name])
             except (TypeError, ValueError) as exc:
-                issues.append('setup.py computes ' + kw.arg + ' dynamically: ' + str(exc))
+                issues.append('setup.py computes ' + name + ' dynamically: ' + str(exc))
                 continue
             if isinstance(values, list) and all(isinstance(v, str) for v in values):
                 deps.update(values)
             else:
-                issues.append('setup.py unexpected ' + kw.arg)
+                issues.append('setup.py unexpected ' + name)
+        if extras and 'extras_require' in fields:
+            try:
+                mapping = static(fields['extras_require'])
+                if not isinstance(mapping, dict):
+                    raise ValueError('extras_require is not a mapping')
+                for group, value_node in mapping.items():
+                    if group not in extras and '*' not in extras:
+                        continue
+                    values = static(value_node)
+                    if not isinstance(values, list) or not all(isinstance(v,str) for v in values):
+                        raise ValueError('dynamic setup.py extra '+group)
+                    deps.update(values)
+            except (TypeError, ValueError) as exc:
+                issues.append('setup.py computes extras_require dynamically: ' + str(exc))
     return deps, issues
 
 
 
 def setup_requirements_from_sources(source, get_file, *, extras=()):
-    """Resolve TWO pinned upstream setup.py file-backed patterns without executing code.
+    """Resolve audited file-backed setuptools patterns without executing project code.
 
-    Unsupported dynamic code still fails closed. No imports, setup() invocation,
-    shell evaluation, or build backend execution is permitted.
+    Unsupported dynamic metadata fails closed. Only literal source reads whose
+    filenames are pinned Git inputs are recognized.
     """
-    deps, issues = setup_static(source)
+    deps, issues = setup_static(source, extras=extras)
     vcs = set()
+    if not source:
+        return deps, vcs, issues
     if not issues or get_file is None:
         return deps, vcs, issues
+
+    def add_requirements(name):
+        data = get_file(name, required=True)
+        normal, remote, limits = parse_requirements(data, name, get_file)
+        if limits:
+            raise RuntimeError('requirements constraints not valid as install metadata: '+name)
+        deps.update(normal); vcs.update(remote)
+
+    # Hydra 1.x reads its runtime requirements with pkg_resources.
     if ('install_requires=install_requires' in source
             and 'pkg_resources.parse_requirements(requirements_txt)' in source
             and 'pathlib.Path("requirements/requirements.txt").open()' in source):
-        data = get_file('requirements/requirements.txt', required=True)
-        normal, remote, limits = parse_requirements(data, 'requirements/requirements.txt', get_file)
-        if limits: return deps, vcs, ['unhandled Hydra setup.py requirements constraints']
-        return deps | normal, remote, []
+        try: add_requirements('requirements/requirements.txt')
+        except RuntimeError as exc: return deps, vcs, [str(exc)]
+        return deps, vcs, []
+
+    # Conan 1.x composes two runtime files and optionally its development file.
     if ('project_requirements = get_requires("conans/requirements.txt")' in source
             and 'project_requirements.extend(get_requires("conans/requirements_server.txt"))' in source
             and 'install_requires=project_requirements' in source):
-        for name in ('conans/requirements.txt', 'conans/requirements_server.txt'):
-            data = get_file(name, required=True)
-            normal, remote, limits = parse_requirements(data, name, get_file)
-            if limits: return deps, vcs, ['unhandled Conan setup.py requirements constraints']
-            deps.update(normal); vcs.update(remote)
-        if 'dev' in extras or 'test' in extras or '*' in extras:
-            name = 'conans/requirements_dev.txt'
-            data = get_file(name, required=True)
-            normal, remote, limits = parse_requirements(data, name, get_file)
-            if limits: return deps, vcs, ['unhandled Conan development constraints']
-            deps.update(normal); vcs.update(remote)
+        try:
+            add_requirements('conans/requirements.txt')
+            add_requirements('conans/requirements_server.txt')
+            if 'dev' in extras or 'test' in extras or '*' in extras:
+                add_requirements('conans/requirements_dev.txt')
+        except RuntimeError as exc: return deps, vcs, [str(exc)]
         return deps, vcs, []
+
+    # iterative/mock-ssh-server HEAD reads a fixed requirements.txt helper.
+    if ('install_requires=read_requirements()' in source
+            and 'requirements.txt' in source and 'def read_requirements' in source):
+        try: add_requirements('requirements.txt')
+        except RuntimeError as exc: return deps, vcs, [str(exc)]
+        return deps, vcs, []
+
+    # modin-spreadsheet@49ffd89 stores the same fixed file in setup_args and
+    # passes that mapping via **setup_args. The JavaScript build closure is
+    # handled separately from package.json.
+    if ('reqs = read_requirements("requirements.txt")' in source
+            and '"install_requires": reqs' in source and '**setup_args' in source):
+        try: add_requirements('requirements.txt')
+        except RuntimeError as exc: return deps, vcs, [str(exc)]
+        return deps, vcs, []
+
     return deps, vcs, issues
 
 
@@ -373,24 +551,61 @@ def git_requirements(mirror, commit):
     return specs, vcs, issues
 
 
+def shell_segments(line):
+    """Split a literal shell line on control operators while respecting quotes."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=';&|')
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    tokens = list(lexer)
+    segments=[]; current=[]; previous=None
+    for token in tokens:
+        if token in (';', '&&', '||', '|'):
+            if current:
+                segments.append((current, previous, token))
+                current=[]
+            previous=token
+        else:
+            current.append(token)
+    if current:
+        segments.append((current, previous, None))
+    return segments
+
+
 def pip_commands(commands):
-    """Parse literal pip invocations as *ordered independent* acquisition steps."""
+    """Parse ordered pip installs, preserving shell optionality and --no-deps."""
     specs, files, vcs, issues, local_extras, constraints, steps = set(), set(), set(), [], set(), set(), []
-    pattern = r'(?<![\w-])(?:(?:python(?:3(?:\.\d+)?)?\s+-m\s+))?pip(?:3)?\s+install\s+([^;\n]+)'
     for line in commands:
-        for m in re.finditer(pattern, line):
-            fragment = re.split(r'\s*(?:&&|\|\||\|)\s*', m.group(1), maxsplit=1)[0].strip()
-            try: parts = shlex.split(fragment)
-            except ValueError: issues.append('unparseable pip command'); continue
+        try:
+            segments=shell_segments(line)
+        except ValueError:
+            issues.append('unparseable shell command')
+            continue
+        for index,(tokens,previous,next_operator) in enumerate(segments):
+            pip_index=None
+            for pos, token in enumerate(tokens):
+                base=Path(token).name
+                if base in ('pip','pip3') and pos+1 < len(tokens) and tokens[pos+1]=='install':
+                    pip_index=pos
+                    break
+                if (base in ('python','python3') or re.fullmatch(r'python3\.\d+',base)) and pos+3 < len(tokens):
+                    if tokens[pos+1:pos+3]==['-m','pip'] and tokens[pos+3]=='install':
+                        pip_index=pos+2
+                        break
+            if pip_index is None:
+                continue
+            start = pip_index + 2
+            parts=tokens[start:]
+            optional = False
+            if next_operator == '||' and index + 1 < len(segments):
+                follower=segments[index+1][0]
+                optional = follower in (['true'], [':'])
             ss, ff, vv, cc, ee = set(), set(), set(), set(), set()
             no_deps = False
             i = 0
             while i < len(parts):
                 arg = parts[i]
                 if arg == '--no-deps':
-                    no_deps = True
-                    i += 1
-                    continue
+                    no_deps = True; i += 1; continue
                 if arg in ('-r', '--requirement', '-c', '--constraint'):
                     if i + 1 >= len(parts): issues.append('pip requirements filename absent'); break
                     (cc if arg in ('-c', '--constraint') else ff).add(parts[i+1]); i += 2; continue
@@ -403,7 +618,9 @@ def pip_commands(commands):
                     ref = vcs_reference(target)
                     if ref: vv.add(ref)
                     elif target in ('.', './') or target.startswith('.['):
-                        if '[' in target: ee.update(t.strip() for t in re.findall(r'\[([^]]+)\]', target)[0].split(','))
+                        if '[' in target:
+                            match=re.findall(r'\[([^]]+)\]', target)
+                            if match: ee.update(t.strip() for t in match[0].split(',') if t.strip())
                     else: issues.append('unknown editable target ' + target)
                     i += 2; continue
                 if arg in ('--no-build-isolation', '--no-use-pep517', '--upgrade',
@@ -411,6 +628,7 @@ def pip_commands(commands):
                            '--no-warn-script-location', '--no-input'):
                     i += 1; continue
                 if arg in ('--config-settings', '--upgrade-strategy', '--index-url', '--extra-index-url'):
+                    if i + 1 >= len(parts): issues.append('pip option value absent: '+arg); break
                     if arg in ('--index-url', '--extra-index-url'):
                         issues.append('untrusted custom package index: ' + arg)
                     i += 2; continue
@@ -428,9 +646,10 @@ def pip_commands(commands):
                 i += 1
             specs.update(ss); files.update(ff); vcs.update(vv)
             constraints.update(cc); local_extras.update(ee)
+            command = shlex.join(tokens[pip_index-2 if pip_index>=2 and tokens[pip_index-2:pip_index]==['-m','pip'] else pip_index:])
             steps.append({'requirements': ss, 'files': ff, 'constraints': cc,
-                           'vcs': vv, 'local_extras': ee,
-                           'no_deps': no_deps, 'command': fragment})
+                           'vcs': vv, 'local_extras': ee, 'no_deps': no_deps,
+                           'optional': optional, 'command': command})
     return specs, files, vcs, issues, local_extras, constraints, steps
 
 
@@ -520,6 +739,95 @@ def python_version(script):
     values=re.findall(r'\bpython\s*[= ]\s*(3\.(?:8|9|10|11|12))(?!\d)','\n'.join(script))
     if not values:raise RuntimeError('Conda environment has no Python constraint')
     return values[-1]
+
+
+
+def conda_direct_specs(script):
+    """Return literal package specs from a direct `conda create -n testbed ...`."""
+    found=[]
+    for command in script:
+        try: segments=shell_segments(command)
+        except ValueError: continue
+        for tokens,_,_ in segments:
+            if not tokens or Path(tokens[0]).name != 'conda' or len(tokens)<2 or tokens[1] != 'create':
+                continue
+            specs=[];i=2
+            while i < len(tokens):
+                token=tokens[i]
+                if token in ('-n','--name','-p','--prefix'):
+                    i += 2; continue
+                if token in ('-y','--yes','-q','--quiet'):
+                    i += 1; continue
+                if token.startswith('-'):
+                    raise RuntimeError('unsupported direct Conda create option: '+token)
+                specs.append(token);i+=1
+            if specs: found.append(specs)
+    if len(found)>1: raise RuntimeError('multiple direct Conda create commands in one environment')
+    return found[0] if found else None
+
+
+def conda_post_install_specs(script):
+    """Return package specs from literal post-create `conda install` transactions."""
+    result=[]
+    for command in script:
+        try: segments=shell_segments(command)
+        except ValueError: continue
+        for tokens,_,_ in segments:
+            try: pos=next(i for i,t in enumerate(tokens) if Path(t).name=='conda' and i+1<len(tokens) and tokens[i+1]=='install')
+            except StopIteration: continue
+            specs=[];i=pos+2
+            while i<len(tokens):
+                token=tokens[i]
+                if token in ('-n','--name','-p','--prefix'):
+                    i+=2;continue
+                if token in ('-y','--yes','-q','--quiet'):
+                    i+=1;continue
+                if token.startswith('-'):
+                    raise RuntimeError('unsupported post-create Conda option: '+token)
+                specs.append(token);i+=1
+            if specs: result.append(specs)
+    return result
+
+
+
+def apt_recipe_operations(commands):
+    """Extract install package names and upgrade intent from literal apt-get calls."""
+    packages=set(); upgrades=[]
+    for command in commands:
+        try: segments=shell_segments(command)
+        except ValueError:
+            raise RuntimeError('unparseable APT shell command')
+        for tokens,_,_ in segments:
+            for pos,token in enumerate(tokens):
+                if Path(token).name != 'apt-get':
+                    continue
+                i=pos+1
+                while i<len(tokens) and tokens[i].startswith('-'):
+                    # All task recipes use flag-only options before the verb.
+                    if tokens[i] in ('-o','--option'):
+                        if i+1>=len(tokens): raise RuntimeError('APT option value absent')
+                        i+=2
+                    else:i+=1
+                if i>=len(tokens): raise RuntimeError('APT operation absent')
+                verb=tokens[i];rest=tokens[i+1:]
+                if verb=='install':
+                    j=0
+                    while j<len(rest):
+                        value=rest[j]
+                        if value in ('-o','--option'):
+                            j+=2;continue
+                        if value.startswith('-'):
+                            j+=1;continue
+                        if not re.fullmatch(r'[A-Za-z0-9+._:-]+',value):
+                            raise RuntimeError('untrusted APT package token: '+value)
+                        packages.add(value);j+=1
+                elif verb in ('upgrade','dist-upgrade','full-upgrade'):
+                    upgrades.append(verb)
+                elif verb in ('update','clean','autoclean'):
+                    pass
+                else:
+                    raise RuntimeError('unsupported apt-get operation: '+verb)
+    return packages,upgrades
 
 
 class Pool:
@@ -648,10 +956,14 @@ class Pool:
         self.issues.append(f'{where}: {description}')
 
 
-def conda_resolve(micro, pool, key, args):
+def conda_resolve(micro, pool, key, args, *, channels=()):
+    """Resolve and acquire one Conda transaction without creating an environment."""
     stage=pool.stage
-    cmd=[micro,'create','--dry-run','--json','--strict-channel-priority','-c','conda-forge',
-         '--root-prefix',stage/'conda'/'root','--prefix',stage/'conda'/'proposed'/key,*args]
+    cmd=[micro,'create','--dry-run','--json',
+         '--root-prefix',stage/'conda'/'root','--prefix',stage/'conda'/'proposed'/key]
+    for channel in channels:
+        cmd.extend(['-c',channel])
+    cmd.extend(args)
     raw=invoke(cmd,capture=True)
     try: data=json.loads(raw)
     except ValueError as exc:raise RuntimeError('invalid micromamba solve JSON for '+key) from exc
@@ -680,10 +992,12 @@ def conda_resolve(micro, pool, key, args):
         hashval=item.get('sha256')
         if not url or not isinstance(hashval,str) or not SHA.fullmatch(hashval):
             raise RuntimeError('Conda closure has unpinned package '+key)
-        # Micromamba itself may fetch signed metadata, but it never installs packages.
         pool.download(url,'conda',key,sha=hashval)
-        resolved.append({'name':item.get('name'),'version':item.get('version'),'sha256':hashval})
+        resolved.append({'name':item.get('name'),'version':item.get('version'),
+                         'build':item.get('build_string') or item.get('build'),
+                         'url':url,'sha256':hashval})
     write_new(stage/'metadata'/('conda-'+key+'.json'),json.dumps(resolved,sort_keys=True))
+    return resolved
 
 
 def apt_closure(pool,packages):
@@ -858,9 +1172,87 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
 
 
 
+def npm_lock_urls(lock, label, *, workspace_checker=None):
+    """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""
+    urls={}
+    packages=lock.get('packages')
+    dependencies=lock.get('dependencies')
+    if isinstance(packages,dict) and packages:
+        records=list(packages.values())
+    elif isinstance(dependencies,dict):
+        records=list(dependencies.values())
+    else:
+        raise RuntimeError('npm lockfile has no package records: '+label)
+    for item in records:
+        if not isinstance(item,dict) or not item.get('resolved'):
+            continue
+        url=item['resolved'];integ=item.get('integrity')
+        if item.get('link') is True:
+            if workspace_checker is None:
+                raise RuntimeError('unexpected npm workspace link: '+label)
+            workspace_checker(url)
+            continue
+        if (not isinstance(url,str) or not url.startswith('https://registry.npmjs.org/')
+                or not isinstance(integ,str) or not integ):
+            raise RuntimeError('npm package has no trusted registry source/SRI: '+label)
+        if url in urls and urls[url] != integ:
+            raise RuntimeError('conflicting npm lockfile integrity for '+url)
+        urls[url]=integ
+    return urls
+
+
+def npm_package_json_closure(pool, mirror, commit, repo_ref, identity):
+    """Resolve a pinned VCS package.json to a lock only; never run npm scripts/install."""
+    package_text=git_file(mirror,commit,'js/package.json') or git_file(mirror,commit,'package.json')
+    if not package_text:
+        raise RuntimeError('npm-backed VCS source lacks package.json: '+repo_ref)
+    try: package=json.loads(package_text)
+    except ValueError as exc: raise RuntimeError('invalid VCS package.json: '+repo_ref) from exc
+    for key in ('dependencies','devDependencies'):
+        value=package.get(key,{})
+        if value is not None and not isinstance(value,dict):
+            raise RuntimeError('invalid npm dependency table in '+repo_ref)
+        for name,spec in (value or {}).items():
+            if not isinstance(name,str) or not isinstance(spec,str):
+                raise RuntimeError('non-string npm dependency in '+repo_ref)
+            if spec.startswith(('git','http:','https:','file:','link:','workspace:')):
+                raise RuntimeError('non-registry npm dependency requires explicit pin: '+name)
+    key=hashlib.sha256((repo_ref+'\0'+commit+'\0'+identity).encode()).hexdigest()[:20]
+    work=pool.stage/'npm'/('resolve-'+key)
+    work.mkdir()
+    write_new(work/'package.json',json.dumps(package,sort_keys=True,indent=2)+'\n')
+    cache=work/'cache'
+    env=dict(os.environ)
+    env.update({'npm_config_cache':str(cache),'npm_config_registry':'https://registry.npmjs.org/',
+                'npm_config_audit':'false','npm_config_fund':'false',
+                'npm_config_ignore_scripts':'true'})
+    invoke(['npm','install','--package-lock-only','--ignore-scripts','--no-audit','--no-fund',
+            '--registry=https://registry.npmjs.org/'],cwd=work,env=env,timeout=1800)
+    if (work/'node_modules').exists():
+        raise RuntimeError('npm resolver unexpectedly installed node_modules')
+    lock_path=work/'package-lock.json'
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise RuntimeError('npm resolver produced no lockfile')
+    lock=json.loads(lock_path.read_bytes())
+    urls=npm_lock_urls(lock,repo_ref)
+    if not urls: raise RuntimeError('npm resolver produced empty archive closure: '+repo_ref)
+    artifacts=[]
+    for url,sri in sorted(urls.items()):
+        sha=pool.download(url,'npm-vcs',identity,sri=sri)
+        artifacts.append({'url':url,'integrity':sri,'sha256':sha})
+    write_new(pool.stage/'metadata'/('npm-vcs-'+key+'.json'),json.dumps({
+        'repo':repo_ref,'commit':commit,'identity':identity,
+        'package_sha256':hashlib.sha256(package_text.encode()).hexdigest(),
+        'lockfile':lock,'artifacts':artifacts},sort_keys=True))
+    # Successful resolver scratch has no evidentiary value beyond the retained
+    # lock/manifest. Failed scratch is intentionally preserved in the zombie.
+    shutil.rmtree(work)
+    return artifacts
+
+
 def npm_global_bootstrap(pool):
-    """Freeze npm CLI tarball needed by Bokeh's global npm upgrade."""
-    metadata_url = 'https://registry.npmjs.org/npm/latest'
+    """Freeze an npm 10 CLI compatible with the pinned benchmark's Node >=18.17."""
+    metadata_url = 'https://registry.npmjs.org/npm/' + NPM_NODE18_VERSION
     request = urllib.request.Request(metadata_url, headers={'User-Agent':'gpt-trace-dependency-pool/2'})
     with urllib.request.urlopen(request, timeout=90) as response:
         if urllib.parse.urlsplit(response.url).hostname != 'registry.npmjs.org':
@@ -868,6 +1260,11 @@ def npm_global_bootstrap(pool):
         raw = response.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024: raise RuntimeError('oversized npm CLI metadata')
     info = json.loads(raw)
+    if info.get('version') != NPM_NODE18_VERSION:
+        raise RuntimeError('npm registry returned unexpected CLI version')
+    engine = (info.get('engines') or {}).get('node')
+    if not isinstance(engine, str) or '18.17.0' not in engine:
+        raise RuntimeError('pinned npm CLI no longer advertises Node 18.17 compatibility')
     dist = info.get('dist') or {}
     tarball, sri = dist.get('tarball'), dist.get('integrity')
     if not isinstance(tarball, str) or not tarball.startswith('https://registry.npmjs.org/npm/-/npm-'):
@@ -878,100 +1275,110 @@ def npm_global_bootstrap(pool):
         'version': info.get('version'), 'url': tarball, 'sha256': sha, 'integrity': sri}, sort_keys=True))
 
 
-def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tasks=None):
+def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tasks=None,
+                    conda_transactions=None):
     stage=pool.stage
     files=[];seen_inodes={}
     for path in sorted(stage.rglob('*')):
         if path.is_symlink():
-            # Reject symlinks, including package-manager caches.
             raise RuntimeError('symlink in dependency pool: '+str(path))
         if not path.is_file():continue
         rel=path.relative_to(stage).as_posix()
-        info=path.stat(); identity=(info.st_dev,info.st_ino)
+        info=path.stat();identity=(info.st_dev,info.st_ino)
         if identity in seen_inodes:
             row={'path':rel,'size':info.st_size,'sha256':seen_inodes[identity]}
         else:
             row={'path':rel,'size':info.st_size,'sha256':digest(path)}
             seen_inodes[identity]=row['sha256']
         files.append(row)
-    for logical, plan in task_plan.items():
-        for key in plan.get('pip_steps', []):
-            if not (stage / 'metadata' / ('pip-plan-' + key + '.json')).is_file():
-                pool.issue(logical, 'referenced pip closure is not present: ' + key)
-    for recipe in envplan:
-        if not (stage / 'metadata' / ('conda-env-' + recipe + '.json')).is_file():
-            pool.issue(recipe, 'resolved Conda environment closure missing')
-    # Structural coverage proof. Counter-only inventories with empty CAS or
-    # unreferenced JSON must never be reported as a complete dependency pool.
-    def reject(label, detail):
-        pool.issue('inventory:'+label, detail)
-    if not pool.links:
-        reject('CAS','no acquired content-addressed objects')
-    if len(task_plan) != 230 or len(envplan) != 25 or len(gitplan) != 11:
+
+    def reject(label,detail):
+        pool.issue('inventory:'+label,detail)
+
+    if not pool.links:reject('CAS','no acquired content-addressed objects')
+    if len(task_plan)!=230 or len(envplan)!=25 or len(gitplan)!=11:
         reject('contract','unexpected 230/25/11 contract coverage')
     for kind in ('tools','conda','git','apt'):
         if not pool.provenance.get(kind):
             reject('provenance','no acquired '+kind+' artifacts')
-    for sha, row in pool.links.items():
-        if not SHA.fullmatch(sha) or row.get('sha256') != sha:
-            reject('CAS','invalid object identity '+str(sha)); continue
-        expected = ('objects/sha256/'+sha[:2]+'/'+sha)
-        target = stage / expected
-        if (row.get('path') != expected or not target.is_file() or target.is_symlink()
-                or type(row.get('size')) is not int or target.stat().st_size != row['size']):
+    for sha,row in pool.links.items():
+        if not SHA.fullmatch(sha) or row.get('sha256')!=sha:
+            reject('CAS','invalid object identity '+str(sha));continue
+        expected='objects/sha256/'+sha[:2]+'/'+sha
+        target=stage/expected
+        if (row.get('path')!=expected or not target.is_file() or target.is_symlink()
+                or type(row.get('size')) is not int or target.stat().st_size!=row['size']):
             reject('CAS','missing/bad object '+sha)
-    for category, groups_ in pool.provenance.items():
-        for identity, digests in groups_.items():
+    for category,groups_ in pool.provenance.items():
+        for identity,digests in groups_.items():
             if not isinstance(digests,list) or not digests:
-                reject(category,'empty artifact provenance '+identity)
-                continue
+                reject(category,'empty artifact provenance '+identity);continue
             for sha in digests:
-                if sha not in pool.links:
-                    reject(category,'unregistered artifact '+sha)
-    if contract_tasks is not None:
-        if set(task_plan) != set(contract_tasks):
-            reject('tasks','missing or extra task identity')
-    for logical, plan in task_plan.items():
-        if contract_tasks is not None and logical in contract_tasks:
-            expected = contract_tasks[logical]
-            if (plan.get('repo') != expected['repo'] or plan.get('base_commit') != expected['base_commit']
-                    or plan.get('env_hash') != expected['env_hash']):
-                reject(logical,'task identity diverges from pinned contract')
-        repo, commit, env = plan.get('repo'), plan.get('base_commit'), plan.get('env_hash')
-        if (repo not in gitplan or commit not in gitplan[repo].get('commits',[])
-                or env not in envplan or plan.get('python') != envplan[env]):
-            reject(logical,'unresolved repo/commit/Conda environment')
-        for key in plan.get('pip_steps',[]):
-            metadata = stage/'metadata'/('pip-plan-'+key+'.json')
-            if not metadata.is_file():
-                reject(logical,'missing pip closure '+key)
-                continue
-            try:
-                closure=json.loads(metadata.read_bytes())
-                if not closure.get('files') and not closure.get('source_archives'):
-                    raise ValueError('empty closure')
-                for artifact in closure.get('files',[]):
-                    if artifact.get('sha256') not in pool.links:
-                        raise ValueError('unregistered wheel '+str(artifact))
-                for artifact in closure.get('source_archives',[]):
-                    if artifact.get('sha256') not in pool.links:
-                        raise ValueError('unregistered source '+str(artifact))
-            except (ValueError,TypeError,KeyError) as exc:
-                reject(logical,'invalid pip closure '+key+': '+str(exc))
-    for key in ['python-'+version for version in PYTHONS] + ['env-'+env for env in envplan]:
-        metadata = stage/'metadata'/('conda-'+key+'.json')
+                if sha not in pool.links:reject(category,'unregistered artifact '+sha)
+
+    if contract_tasks is not None and set(task_plan)!=set(contract_tasks):
+        reject('tasks','missing or extra task identity')
+
+    def validate_pip(logical,key,*,optional):
+        metadata=stage/'metadata'/('pip-plan-'+key+'.json')
         if not metadata.is_file():
-            reject(key,'missing Conda solution')
-            continue
+            reject(logical,('missing optional ' if optional else 'missing ')+'pip closure '+key)
+            return
         try:
-            solution = json.loads(metadata.read_bytes())
+            closure=json.loads(metadata.read_bytes())
+            failed=closure.get('optional_failed')
+            if failed:
+                if not optional or not isinstance(failed,str):
+                    raise ValueError('failure marker on required closure')
+                return
+            if not closure.get('files') and not closure.get('source_archives'):
+                raise ValueError('empty closure')
+            for artifact in closure.get('files',[]):
+                if artifact.get('sha256') not in pool.links:
+                    raise ValueError('unregistered wheel '+str(artifact))
+            for artifact in closure.get('source_archives',[]):
+                if artifact.get('sha256') not in pool.links:
+                    raise ValueError('unregistered source '+str(artifact))
+        except (ValueError,TypeError,KeyError) as exc:
+            reject(logical,'invalid pip closure '+key+': '+str(exc))
+
+    for logical,plan in task_plan.items():
+        if contract_tasks is not None and logical in contract_tasks:
+            expected=contract_tasks[logical]
+            if (plan.get('repo')!=expected['repo'] or plan.get('base_commit')!=expected['base_commit']
+                    or plan.get('env_hash')!=expected['env_hash']):
+                reject(logical,'task identity diverges from pinned contract')
+        repo,commit,env=plan.get('repo'),plan.get('base_commit'),plan.get('env_hash')
+        if (repo not in gitplan or commit not in gitplan[repo].get('commits',[])
+                or env not in envplan or plan.get('python')!=envplan[env]):
+            reject(logical,'unresolved repo/commit/Conda environment')
+        for key in plan.get('pip_steps',[]):validate_pip(logical,key,optional=False)
+        for key in plan.get('pip_optional_steps',[]):validate_pip(logical,key,optional=True)
+
+    if conda_transactions is None:
+        conda_transactions={env:['env-'+env] for env in envplan}
+    if set(conda_transactions)!=set(envplan):
+        reject('Conda','transaction plan does not cover all environments')
+    conda_keys=['python-'+version for version in PYTHONS]
+    for env in envplan:
+        keys=conda_transactions.get(env)
+        if not isinstance(keys,list) or not keys or keys[-1]!='env-'+env:
+            reject(env,'invalid Conda transaction sequence');continue
+        conda_keys.extend(keys)
+    for key in dict.fromkeys(conda_keys):
+        metadata=stage/'metadata'/('conda-'+key+'.json')
+        if not metadata.is_file():
+            reject(key,'missing Conda solution');continue
+        try:
+            solution=json.loads(metadata.read_bytes())
             if not isinstance(solution,list) or not solution:
                 raise ValueError('empty Conda package list')
             for artifact in solution:
-                if artifact.get('sha256') not in pool.links:
+                if artifact.get('sha256') not in pool.links or not artifact.get('url'):
                     raise ValueError('Conda archive not acquired')
         except (ValueError,TypeError,AttributeError) as exc:
             reject(key,'invalid Conda solution: '+str(exc))
+
     apt_path=stage/'metadata'/'apt-closure.json'
     try:
         apt=json.loads(apt_path.read_bytes())
@@ -983,22 +1390,63 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
                 raise ValueError('incomplete/bad APT archive metadata')
     except (OSError,ValueError,TypeError,AttributeError) as exc:
         reject('APT','missing/bad signed Kali closure: '+str(exc))
+
+    # `apt-get upgrade` in upstream setup is deliberately not replayed against
+    # the immutable Golden. Make the suppression explicit and contract-checked
+    # rather than silently pretending an empty-status APT solve covers upgrades.
+    try:
+        policy=json.loads((stage/'metadata'/'apt-policy.json').read_bytes())
+        flagged={logical for logical,plan in task_plan.items() if plan.get('apt_upgrade_suppressed') is True}
+        expected=set()
+        if contract_tasks is not None:
+            for logical,task in contract_tasks.items():
+                _,upgrades=apt_recipe_operations(task.get('repo_script_list',[]))
+                if upgrades:expected.add(logical)
+        if (policy.get('schema')!=1 or policy.get('upgrade_policy')!='suppress-on-frozen-golden'
+                or set(policy.get('suppressed_tasks',[]))!=flagged
+                or (contract_tasks is not None and flagged!=expected)):
+            raise ValueError('APT upgrade suppression does not match pinned recipes')
+    except (OSError,ValueError,TypeError) as exc:
+        reject('APT-policy','missing/bad frozen-Golden upgrade policy: '+str(exc))
+
     frozen_path=stage/'metadata'/'vcs-frozen.json'
     try:
         frozen=json.loads(frozen_path.read_bytes())
+        if not isinstance(frozen,dict):
+            raise ValueError('VCS manifest is not a mapping')
+        for ref,commit in frozen.items():
+            if not isinstance(ref,str) or not isinstance(commit,str) or not COMMIT.fullmatch(commit):
+                raise ValueError('invalid frozen VCS entry')
         for logical,plan in task_plan.items():
             for ref in plan.get('vcs',[]):
-                if ref not in frozen or not COMMIT.fullmatch(frozen[ref]):
+                if ref not in frozen:
                     reject(logical,'VCS source not frozen: '+ref)
     except (OSError,ValueError,TypeError) as exc:
         reject('VCS','missing/bad VCS pin manifest: '+str(exc))
+
+    try:
+        optional_failures=json.loads((stage/'metadata'/'vcs-optional-failures.json').read_bytes())
+        required_refs={ref for plan in task_plan.values() for ref in plan.get('vcs',[])}
+        optional_refs={ref for plan in task_plan.values() for ref in plan.get('optional_vcs',[])}
+        if not isinstance(optional_failures,dict):
+            raise ValueError('optional VCS failures are not a mapping')
+        if any(ref in required_refs or ref not in optional_refs for ref in optional_failures):
+            raise ValueError('required/unknown VCS source marked optional')
+    except (OSError,ValueError,TypeError) as exc:
+        reject('VCS-optional','bad optional VCS failure manifest: '+str(exc))
+
+    if any('modin-project/modin-spreadsheet' in ref
+           for plan in task_plan.values() for ref in plan.get('vcs',[])):
+        if not pool.provenance.get('npm-vcs'):
+            reject('npm-vcs','modin-spreadsheet JavaScript build closure missing')
+
     issues=sorted(set(pool.issues))
     summary={'schema':2,'kind':'download-only-pool','complete':not issues,
-              'operation_id':operation_id,
-             'tasks':len(task_plan),'repos':len(gitplan),'conda_recipes':len(envplan),
-             'python_versions':list(PYTHONS),'files':files,'issues':issues,
-             'objects':pool.links,'provenance':pool.provenance,
-             'task_plan':task_plan,'environment_plan':envplan,
+             'operation_id':operation_id,'tasks':len(task_plan),'repos':len(gitplan),
+             'conda_recipes':len(envplan),'python_versions':list(PYTHONS),
+             'files':files,'issues':issues,'objects':pool.links,
+             'provenance':pool.provenance,'task_plan':task_plan,
+             'environment_plan':envplan,'conda_transactions':conda_transactions,
              'git_plan':gitplan}
     write_new(stage/'inventory.json',json.dumps(summary,sort_keys=True,indent=2)+'\n')
     print('[pool] objects=',len(pool.links),'files=',len(files),'issues=',len(issues),flush=True)
@@ -1053,33 +1501,62 @@ def main(argv=None):
                         gitplan[repo]['submodules'][path]={'repo':subrepo,'commit':sha}
                         ensure_commit(stage,subrepo,sha,label='git-extra')
     # Git files must not be linked to CAS while Git may still mutate refs.
-    envplan={};requirements_by_env=defaultdict(set);vcs=set()
+    envplan={};conda_transaction_plan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set)
     for version in PYTHONS:
         print('[pool] Python '+version,flush=True)
-        conda_resolve(str(resolver),pool,'python-'+version,['python='+version,'pip'])
+        conda_resolve(str(resolver),pool,'python-'+version,['python='+version,'pip'],
+                      channels=('conda-forge',))
+    default_channels=('https://repo.anaconda.com/pkgs/main',
+                      'https://repo.anaconda.com/pkgs/r')
     for i,(env,entry) in enumerate(sorted(environments.items()),1):
-        version=python_version(entry['original_script']);envplan[env]=version
-        content=conda_yaml(entry['original_script'])
+        script=entry['original_script']
+        version=python_version(script);envplan[env]=version
+        content=conda_yaml(script)
+        pips=[]
+        print(f'[pool] Conda {i}/25, Python {version}',flush=True)
         if content:
             trimmed,pips=conda_pip_split(content)
             # The official upstream Dask recipe removes the pip section before
             # Conda sees it. Do not fetch packages from instructions it deletes.
             if any("sed -i '/- pip:/,/^ *-/d' environment.yml" in command
-                   for command in entry['original_script']):
+                   for command in script):
                 pips=[]
             trimmed=trimmed.replace('firefox =>96','firefox >=96')
             file=stage/'metadata'/('env-'+env+'.yml');write_new(file,trimmed)
-            print(f'[pool] Conda {i}/25, Python {version}',flush=True)
-            # --file accepts YAML. It resolves without creating an env or unpacking.
-            conda_resolve(str(resolver),pool,'env-'+env,['--file',str(file),'python='+version])
-            for dep in pips:
-                if not dep or dep.startswith('#'):continue
-                if vcs_reference(dep):
-                    canonical=vcs_reference(dep)
-                    vcs.add(canonical)
-                    vcs_by_env[env].add(canonical)
-                else:requirements_by_env[env].add(dep)
+            post=conda_post_install_specs(script)
+            if post:
+                transaction_keys=['env-'+env+'-base']
+                # Acquire the exact initial transaction as well as every later
+                # post-create solve. This is intentionally two-phase: merging a
+                # later Python override into the initial YAML can omit archives
+                # needed by the real first `conda env create`.
+                conda_resolve(str(resolver),pool,'env-'+env+'-base',['--file',str(file)])
+                cumulative=[]
+                for step_index,specs in enumerate(post,1):
+                    cumulative.extend(specs)
+                    key='env-'+env if step_index==len(post) else 'env-'+env+'-step'+str(step_index)
+                    conda_resolve(str(resolver),pool,key,['--file',str(file),*cumulative])
+                    transaction_keys.append(key)
+                conda_transaction_plan[env]=transaction_keys
+            else:
+                conda_resolve(str(resolver),pool,'env-'+env,['--file',str(file)])
+                conda_transaction_plan[env]=['env-'+env]
+        else:
+            direct=conda_direct_specs(script)
+            if not direct:
+                raise RuntimeError('environment has neither YAML nor direct Conda create: '+env)
+            # Upstream direct `conda create` uses Miniconda's defaults; do not
+            # silently substitute conda-forge.
+            conda_resolve(str(resolver),pool,'env-'+env,direct,channels=default_channels)
+            conda_transaction_plan[env]=['env-'+env]
+        for dep in pips:
+            if not dep or dep.startswith('#'):continue
+            if vcs_reference(dep):
+                canonical=vcs_reference(dep)
+                vcs.add(canonical)
+                vcs_by_env[env].add(canonical)
+            else:requirements_by_env[env].add(dep)
     # Trusted, pinned upstream spec table contains the evaluator prelude only.
     constants_file=adapter/'upstream'/'constants.py'
     if digest(constants_file)!=pins['upstream_files']['constants.py']:
@@ -1089,7 +1566,7 @@ def main(argv=None):
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     specs_table=module.MAP_REPO_VERSION_TO_SPECS
-    task_plan={};groups={};apt_requested=set()
+    task_plan={};groups={};apt_requested=set();apt_upgrade_tasks=set()
     for index,(logical,task) in enumerate(sorted(tasks.items()),1):
         repo=task['repo'];commit=task['base_commit'];mirror=mirrors[repo]
         version=envplan[task['env_hash']]
@@ -1108,109 +1585,162 @@ def main(argv=None):
                     commands.extend(make_commands(makefile,match.group(1)))
                 except (ValueError,RuntimeError) as exc:pool.issue(logical,str(exc))
         reqs=set(requirements_by_env[task['env_hash']]);vcs_task=set(vcs_by_env[task['env_hash']])
-        explicit,reqfiles,external,problems,extras,constraint_files,steps=pip_commands(commands)
+        vcs_optional=set()
+        explicit,reqfiles,_external,problems,extras,constraint_files,steps=pip_commands(commands)
         inline_constraints = set()
         for command in commands:
             if 'PIP_CONSTRAINT' in command:
                 inline_constraints.update(re.findall(
                     r"echo\s+['\"]([A-Za-z0-9_.-]+[<>=!~][^'\"]+)['\"]\s*>", command))
-        vcs_task.update(external)
         for problem in problems:pool.issue(logical,problem)
         # Project metadata is read at the pinned commit and after the recipe's
         # explicitly supported textual transformations.
         raw=get_file('pyproject.toml')
         if raw:
             try:
-                dep,git,problem=static_project(raw,extra_groups=extras|{'test','dev'})
+                dep,git,problem=static_project(raw,extra_groups=extras)
                 reqs.update(dep);vcs_task.update(git)
                 for ptext in problem:pool.issue(logical,ptext)
             except (ValueError,TypeError) as exc:pool.issue(logical,'invalid pyproject.toml: '+str(exc))
-        cfg_deps,cfg_problems=setup_cfg_static(get_file('setup.cfg'),extras=extras|{'test','dev'})
+        cfg_deps,cfg_problems=setup_cfg_static(get_file('setup.cfg'),extras=extras)
         reqs.update(cfg_deps)
         for ptext in cfg_problems:pool.issue(logical,ptext)
         setup=get_file('setup.py')
-        deps,remote,problems=setup_requirements_from_sources(setup,get_file,extras=extras|{'test','dev'})
+        deps,remote,problems=setup_requirements_from_sources(setup,get_file,extras=extras)
         reqs.update(deps); vcs_task.update(remote)
         for ptext in problems:pool.issue(logical,ptext)
-        # Each independent pip command becomes a separate closure. Combining
-        # `install A; install B` into one solve is not equivalent to the recipe.
-        task_steps=[]
-        def register(req, constraints, name, *, no_deps=False):
+
+        task_steps=[];optional_steps=[];optional_skips=[]
+        def register(req, constraints, name, *, no_deps=False, optional=False,
+                     resolver_version=None):
             if not req: return None
-            key=hashlib.sha256(json.dumps([version, sorted(req), sorted(constraints), no_deps],
-                                        sort_keys=True).encode()).hexdigest()[:20]
-            group=groups.setdefault(key,{'version':version,'requirements':sorted(req),
-                                          'constraints':sorted(constraints), 'no_deps':no_deps,
-                                          'tasks':[],'steps':[]})
+            selected_version = resolver_version or version
+            key=hashlib.sha256(json.dumps(
+                [selected_version,sorted(req),sorted(constraints),no_deps,optional],
+                sort_keys=True).encode()).hexdigest()[:20]
+            group=groups.setdefault(key,{'version':selected_version,'requirements':sorted(req),
+                                          'constraints':sorted(constraints),'no_deps':no_deps,
+                                          'optional':optional,'tasks':[],'steps':[]})
             if logical not in group['tasks']:group['tasks'].append(logical)
             group['steps'].append(name)
-            task_steps.append(key)
+            (optional_steps if optional else task_steps).append(key)
             return key
+
         for step in steps:
             dependencies=set(step['requirements']);step_constraints=set(inline_constraints)
+            step_vcs=set(step['vcs']);skip=False
             for filename in sorted(step['files']):
                 try:
-                    a,b,c=parse_requirements(get_file(filename,required=True),filename,get_file)
-                    dependencies.update(a);vcs_task.update(b);step_constraints.update(c)
-                except (ValueError,RuntimeError) as exc:pool.issue(logical,str(exc))
+                    source=get_file(filename,required=not step['optional'])
+                    if source is None and step['optional']:
+                        optional_skips.append(step['command']+' [missing '+filename+']')
+                        skip=True;break
+                    a,b,c=parse_requirements(source,filename,get_file)
+                    dependencies.update(a);step_vcs.update(b);step_constraints.update(c)
+                except (ValueError,RuntimeError) as exc:
+                    if step['optional']:
+                        optional_skips.append(step['command']+' ['+str(exc)+']')
+                        skip=True;break
+                    pool.issue(logical,str(exc))
+            if skip: continue
             for filename in sorted(step['constraints']):
                 try:
-                    a,b,c=parse_requirements(get_file(filename,required=True),filename,get_file,constraint=True)
+                    source=get_file(filename,required=not step['optional'])
+                    if source is None and step['optional']:
+                        optional_skips.append(step['command']+' [missing '+filename+']')
+                        skip=True;break
+                    a,b,c=parse_requirements(source,filename,get_file,constraint=True)
                     if a or b:raise RuntimeError('constraints incorrectly contain install targets')
                     step_constraints.update(c)
-                except (ValueError,RuntimeError) as exc:pool.issue(logical,str(exc))
+                except (ValueError,RuntimeError) as exc:
+                    if step['optional']:
+                        optional_skips.append(step['command']+' ['+str(exc)+']')
+                        skip=True;break
+                    pool.issue(logical,str(exc))
+            if skip: continue
+            (vcs_optional if step['optional'] else vcs_task).update(step_vcs)
             # Local editable/develop is a separate installation against the
             # static package metadata. Remote VCS input is fetched separately.
             if step['local_extras'] or re.search(r'(^|\s)(?:-e|--editable|-ve|-ev)\s+\.',step['command']):
                 if not step['no_deps']:
                     dependencies.update(reqs)
-            register(dependencies,step_constraints,step['command'],no_deps=step['no_deps'])
-        # The static project and conda-YAML pip requirements have their own
-        # closure rather than being combined with every independently pinned step.
+            register(dependencies,step_constraints,step['command'],
+                     no_deps=step['no_deps'],optional=step['optional'])
+
+        try:
+            packages,upgrades=apt_recipe_operations(commands)
+            apt_requested.update(packages)
+            if upgrades:apt_upgrade_tasks.add(logical)
+        except RuntimeError as exc:
+            pool.issue(logical,str(exc))
         for command in commands:
-            for match in re.finditer(r'\bapt-get\s+install\s+([^;\n&]+)',command):
-                try:
-                    tokens=shlex.split(match.group(1))
-                    apt_requested.update(x for x in tokens if not x.startswith('-') and re.fullmatch(r'[A-Za-z0-9+._-]+',x))
-                except ValueError:pool.issue(logical,'unparseable apt install command')
             for match in re.finditer(r'\bpipx\s+install\s+([\w.-]+)',command):
-                register({match.group(1)},set(),'pipx-application')
+                # pipx creates its application venv from Kali's system Python,
+                # not from the active historical Conda testbed interpreter.
+                register({match.group(1)},set(),'pipx-application',
+                         resolver_version=GOLDEN_SYSTEM_PYTHON)
             if re.search(r'\bpdm\s+add\s+pre-commit',command):
                 register({'pre-commit'},set(),'pdm-add')
             if re.search(r'\b(?:curl|wget)\b\s+https?://',command):
                 pool.issue(logical,'shell download needs explicit pinned hash: '+command[:90])
+
         primary=register(reqs,set(),'declarative-project-metadata')
         normalized_vcs={vcs_reference(item) or item for item in vcs_task}
+        normalized_optional={vcs_reference(item) or item for item in vcs_optional}
         task_plan[logical]={'repo':repo,'base_commit':commit,'env_hash':task['env_hash'],
                             'python':version,'pip_plan':primary,'pip_steps':task_steps,
-                            'vcs':sorted(normalized_vcs)}
-        vcs.update(normalized_vcs)
+                            'pip_optional_steps':optional_steps,
+                            'pip_optional_skips':optional_skips,
+                            'vcs':sorted(normalized_vcs),
+                            'optional_vcs':sorted(normalized_optional),
+                            # Frozen Golden policy: official blanket upgrades are
+                            # suppressed during eventual offline replay. Explicit
+                            # apt-get install packages are still acquired below.
+                            'apt_upgrade_suppressed':logical in apt_upgrade_tasks}
+        vcs.update(normalized_vcs);vcs.update(normalized_optional)
         if index%25==0:print(f'[pool] Static task recipes {index}/230',flush=True)
+
+    write_new(stage/'metadata'/'apt-policy.json',json.dumps({
+        'schema':1,'upgrade_policy':'suppress-on-frozen-golden',
+        'suppressed_tasks':sorted(apt_upgrade_tasks),
+        'requested_install_packages':sorted(apt_requested)},sort_keys=True,indent=2)+'\n')
+
     # Reject known-invalid pinned metadata BEFORE costly pip / VCS / npm / APT downloads.
     if pool.issues:
         write_new(stage/'metadata'/'static-errors.json', json.dumps(sorted(set(pool.issues)), indent=2))
         raise RuntimeError('static dependency closure rejected before network resolution: '+pool.issues[0])
     for key,group in sorted(groups.items()):
-        try:pip_closure(pool,group['version'],group['requirements'],key,
+        try:
+            pip_closure(pool,group['version'],group['requirements'],key,
                         constraints=group['constraints'],no_deps=group['no_deps'])
-        except subprocess.CalledProcessError as exc:pool.issue('pip:'+key,'binary dependency solve unavailable: '+str(exc))
-        except RuntimeError as exc:pool.issue('pip:'+key,str(exc))
+        except (subprocess.CalledProcessError,RuntimeError) as exc:
+            if group['optional']:
+                write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
+                    'python':group['version'],'requested':group['requirements'],
+                    'constraints':group['constraints'],'no_deps':group['no_deps'],
+                    'optional_failed':str(exc),'files':[],'source_archives':[]},sort_keys=True))
+            else:
+                pool.issue('pip:'+key,'dependency solve unavailable: '+str(exc))
     # Pin VCS inputs, resolve metadata from pyproject/setup.cfg/setup.py, and
-    # propagate nested VCS references only to the tasks that depend on them.
-    vcs_frozen={}
-    vcs_tasks=defaultdict(set)
+    # propagate nested VCS references only to tasks that depend on them.
+    vcs_frozen={};vcs_optional_failures={}
+    vcs_required_tasks=defaultdict(set);vcs_optional_tasks=defaultdict(set)
     for logical,plan in task_plan.items():
-        for value in plan['vcs']:
-            vcs_tasks[value].add(logical)
+        for value in plan['vcs']:vcs_required_tasks[value].add(logical)
+        for value in plan.get('optional_vcs',[]):vcs_optional_tasks[value].add(logical)
     pending=set(vcs)
     while pending:
         if len(vcs_frozen) + len(pending) > 256:
             raise RuntimeError('VCS closure exceeds the audited finite bound')
-        value=sorted(pending)[0]; pending.remove(value)
-        if value in vcs_frozen: continue
-        canonical = vcs_reference(value)
+        value=sorted(pending)[0];pending.remove(value)
+        if value in vcs_frozen:continue
+        required=bool(vcs_required_tasks[value])
+        def vcs_failure(detail):
+            if required:pool.issue('VCS:'+value,detail)
+            else:vcs_optional_failures[value]=detail
+        canonical=vcs_reference(value)
         if canonical is None:
-            pool.issue('VCS','unrecognized Git reference '+value);continue
+            vcs_failure('unrecognized Git reference');continue
         raw=canonical.removeprefix('git+').split('#',1)[0]
         parsed=urllib.parse.urlsplit(raw)
         repo_ref=parsed.path.strip('/')
@@ -1218,51 +1748,78 @@ def main(argv=None):
         if '@' in repo_ref:repo_ref,pinned=repo_ref.rsplit('@',1)
         repo_ref=repo_ref.removesuffix('.git')
         if parsed.scheme!='https' or parsed.hostname!='github.com' or not REPO.fullmatch(repo_ref):
-            pool.issue('VCS','unsupported source '+value);continue
+            vcs_failure('unsupported source');continue
         if pinned and not COMMIT.fullmatch(pinned):
             if not re.fullmatch(r'[a-f0-9]{7,39}',pinned):
-                pool.issue('VCS','unresolved Git ref: '+value);continue
+                vcs_failure('unresolved Git ref');continue
             api='https://api.github.com/repos/'+repo_ref+'/commits/'+pinned
             try:
-                with urllib.request.urlopen(urllib.request.Request(api,headers={'User-Agent':'gpt-trace-dependency-pool/2'}),timeout=60) as res:
+                with urllib.request.urlopen(urllib.request.Request(
+                        api,headers={'User-Agent':'gpt-trace-dependency-pool/2'}),timeout=60) as res:
                     response=json.loads(res.read(1048576))
                 resolved=response.get('sha')
                 if not isinstance(resolved,str) or not COMMIT.fullmatch(resolved) or not resolved.startswith(pinned):
                     raise ValueError('GitHub returned a different commit identity')
                 pinned=resolved
             except (OSError,ValueError) as exc:
-                pool.issue('VCS','unable to freeze abbreviated Git reference '+value+': '+str(exc));continue
+                vcs_failure('unable to freeze abbreviated Git reference: '+str(exc));continue
         if not pinned:
-            ref=invoke(['git','ls-remote','https://github.com/'+repo_ref+'.git','HEAD'],capture=True)
+            try:
+                ref=invoke(['git','ls-remote','https://github.com/'+repo_ref+'.git','HEAD'],capture=True)
+            except (RuntimeError,subprocess.CalledProcessError) as exc:
+                vcs_failure('HEAD lookup failed: '+str(exc));continue
             match=re.fullmatch(r'([a-f0-9]{40})\s+HEAD\s*',ref)
-            if not match:pool.issue('VCS','HEAD could not be frozen: '+value);continue
+            if not match:
+                vcs_failure('HEAD could not be frozen');continue
             pinned=match.group(1)
-        vcs_frozen[value]=pinned
         try:
             folder=ensure_commit(stage,repo_ref,pinned,label='git-extra')
             deps,nested,problems=git_requirements(folder,pinned)
-            for ptext in problems:pool.issue(value,ptext)
-            dependants=set(vcs_tasks[value])
+            if problems:
+                raise RuntimeError('; '.join(problems))
+            vcs_frozen[value]=pinned
+            required_dependants=set(vcs_required_tasks[value])
+            optional_dependants=set(vcs_optional_tasks[value])
             for remote in nested:
                 normalized=vcs_reference(remote)
                 if normalized is None:
-                    pool.issue(value,'invalid nested VCS reference: '+remote)
-                    continue
-                vcs_tasks[normalized].update(dependants)
-                for logical in dependants:
+                    raise RuntimeError('invalid nested VCS reference: '+remote)
+                vcs_required_tasks[normalized].update(required_dependants)
+                vcs_optional_tasks[normalized].update(optional_dependants)
+                for logical in required_dependants:
                     plan=task_plan[logical]
                     if normalized not in plan['vcs']:
                         plan['vcs']=sorted([*plan['vcs'],normalized])
+                for logical in optional_dependants:
+                    plan=task_plan[logical]
+                    if normalized not in plan['vcs'] and normalized not in plan['optional_vcs']:
+                        plan['optional_vcs']=sorted([*plan['optional_vcs'],normalized])
                 if normalized not in vcs_frozen:pending.add(normalized)
+            dependants=required_dependants|optional_dependants
             relevant={task_plan[item]['python'] for item in dependants}
             for version in sorted(relevant):
-                if not deps: continue
+                if not deps:continue
                 key=hashlib.sha256((value+version).encode()).hexdigest()[:20]
                 try:pip_closure(pool,version,deps,key)
                 except (RuntimeError,subprocess.CalledProcessError) as exc:
-                    pool.issue(value,'VCS transitive solve: '+str(exc))
-        except (RuntimeError,subprocess.CalledProcessError) as exc:
-            pool.issue(value,'VCS fetch failed: '+str(exc))
+                    if required_dependants:
+                        raise RuntimeError('VCS transitive solve: '+str(exc)) from exc
+                    vcs_optional_failures[value]='optional VCS transitive solve unavailable: '+str(exc)
+            setup_source=git_file(folder,pinned,'setup.py') or ''
+            if re.search(r'check_call\(\s*\[\s*["\']npm["\']\s*,\s*["\']install["\']',setup_source):
+                try:npm_package_json_closure(pool,folder,pinned,repo_ref,value)
+                except (RuntimeError,subprocess.CalledProcessError,OSError,ValueError) as exc:
+                    if required_dependants:
+                        raise RuntimeError('VCS npm closure: '+str(exc)) from exc
+                    vcs_optional_failures[value]='optional VCS npm closure unavailable: '+str(exc)
+        except (RuntimeError,subprocess.CalledProcessError,OSError,ValueError) as exc:
+            # Do not retain a freeze proof for a source whose required closure
+            # could not be inspected. Optional `|| true` sources may fail exactly
+            # as the upstream recipe permits.
+            vcs_frozen.pop(value,None)
+            vcs_failure('VCS fetch/closure failed: '+str(exc))
+    write_new(stage/'metadata'/'vcs-optional-failures.json',
+              json.dumps(vcs_optional_failures,sort_keys=True,indent=2)+'\n')
     write_new(stage/'metadata'/'vcs-frozen.json',json.dumps(vcs_frozen,sort_keys=True,indent=2))
     # Freeze Git metadata only after all commits/tags/refs have been fetched.
     # Git FETCH_HEAD and refs are mutable during acquisition and must never be
@@ -1271,7 +1828,7 @@ def main(argv=None):
         for path in sorted((stage/kind).rglob('*')):
             if path.is_file() and not path.is_symlink():
                 pool.put(path,kind,path.relative_to(stage/kind).parts[0])
-    # NPM lockfiles pinned via Subresource Integrity; no npm install executed.
+    # NPM lockfiles pinned via Subresource Integrity; no package scripts execute.
     npm_urls={}
     for repo,commits in sorted(grouped.items()):
         for commit in sorted(commits):
@@ -1280,29 +1837,24 @@ def main(argv=None):
                 if not source:continue
                 try:lock=json.loads(source)
                 except ValueError:pool.issue(repo,'invalid npm lockfile');continue
-                records=list((lock.get('packages') or {}).values()) or list((lock.get('dependencies') or {}).values())
-                for item in records:
-                    if not isinstance(item,dict) or not item.get('resolved'):continue
-                    url=item['resolved'];integ=item.get('integrity')
-                    if item.get('link') is True:
-                        # npm v3 local workspace link (not a remote package).
-                        if (not isinstance(url,str) or Path(url).is_absolute() or
-                                '..' in Path(url).parts or '\\' in url):
-                            pool.issue(repo,'unsafe npm workspace reference');continue
-                        directory = str(Path(filename).parent / url)
-                        row=invoke(['git','--git-dir',mirrors[repo],'ls-tree','-d',commit,'--',directory],capture=True).strip()
-                        if not re.fullmatch(r'040000 tree [a-f0-9]{40}\t.+',row):
-                            pool.issue(repo,'npm workspace missing from pinned Git source: '+directory)
-                        continue
-                    if not isinstance(url,str) or not url.startswith('https://registry.npmjs.org/') or not integ:
-                        pool.issue(repo,'npm package has no trusted source/SRI');continue
-                    if url in npm_urls and npm_urls[url] != integ:
-                        raise RuntimeError('conflicting npm lockfile integrity for ' + url)
+                def workspace(url, *, _repo=repo, _commit=commit, _filename=filename):
+                    if (not isinstance(url,str) or Path(url).is_absolute()
+                            or '..' in Path(url).parts or '\\' in url):
+                        raise RuntimeError('unsafe npm workspace reference')
+                    directory=str(Path(_filename).parent/url)
+                    row=invoke(['git','--git-dir',mirrors[_repo],'ls-tree','-d',
+                                _commit,'--',directory],capture=True).strip()
+                    if not re.fullmatch(r'040000 tree [a-f0-9]{40}\t.+',row):
+                        raise RuntimeError('npm workspace missing from pinned Git source: '+directory)
+                try:found=npm_lock_urls(lock,repo+':'+filename,workspace_checker=workspace)
+                except RuntimeError as exc:
+                    pool.issue(repo,str(exc));continue
+                for url,integ in found.items():
+                    if url in npm_urls and npm_urls[url]!=integ:
+                        raise RuntimeError('conflicting npm lockfile integrity for '+url)
                     npm_urls[url]=integ
-    for url, sri in sorted(npm_urls.items()):
-        # SHA-2 SRI is verified in the same pass as the first HTTP download.
-        # Identical SRI across different URLs avoids any subsequent HTTP call.
-        pool.download(url, 'npm', url, sri=sri)
+    for url,sri in sorted(npm_urls.items()):
+        pool.download(url,'npm',url,sri=sri)
     # Bokeh runs `npm install --location=global npm` before its lockfile CI.
     # The npm CLI release is outside package-lock.json and must be acquired.
     if any('npm install --location=global npm' in cmd
@@ -1322,7 +1874,8 @@ def main(argv=None):
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
         pool.issue('APT','signed Kali closure unavailable: '+str(exc))
-    audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks)
+    audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
+                    conda_transactions=conda_transaction_plan)
 
 
 if __name__=='__main__':

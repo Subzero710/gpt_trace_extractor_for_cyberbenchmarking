@@ -295,5 +295,183 @@ setup(install_requires=project_requirements)
         self.assertEqual(operations,['a'*64,'b'*64])
 
 
+class TestContractClosureRegressionV4(unittest.TestCase):
+    def test_contract_direct_conda_create_covers_all_five_non_yaml_envs(self):
+        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        direct = {}
+        tasks = {}
+        for env, entry in contract['environments'].items():
+            if pool.conda_yaml(entry['original_script']) is None:
+                direct[env] = pool.conda_direct_specs(entry['original_script'])
+        for task in contract['tasks'].values():
+            tasks[task['env_hash']] = tasks.get(task['env_hash'], 0) + 1
+        self.assertEqual(len(direct), 5)
+        self.assertEqual(sum(tasks[env] for env in direct), 205)
+        self.assertEqual({tuple(value) for value in direct.values()},
+                         {('python=3.8',),('python=3.9',),('python=3.10',),
+                          ('python=3.11',),('python=3.12',)})
+
+    def test_contract_post_create_conda_overrides_are_detected_as_separate_transactions(self):
+        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        post = {env: pool.conda_post_install_specs(entry['original_script'])
+                for env, entry in contract['environments'].items()}
+        post = {env: value for env, value in post.items() if value}
+        self.assertEqual(len(post), 5)
+        self.assertTrue(all(len(value) == 1 for value in post.values()))
+        self.assertEqual(sorted(value[0][0] for value in post.values()),
+                         ['python=3.10','python=3.9','python=3.9','python=3.9','python=3.9'])
+
+    def test_poetry_isort_optional_dependencies_do_not_become_invalid_pip_specs(self):
+        pyproject = """[tool.poetry]
+name="isort"
+version="4.3.21"
+[tool.poetry.dependencies]
+python="^3.6"
+appdirs={version="^1.4.0", optional=true}
+pipreqs={version="*", optional=true}
+tomlkit={version="0.5.3", optional=true}
+[tool.poetry.extras]
+xdg_home=["appdirs"]
+[build-system]
+requires=["poetry>=0.12"]
+build-backend="poetry.masonry.api"
+"""
+        deps, vcs, issues = pool.static_project(pyproject)
+        self.assertEqual(issues, [])
+        self.assertEqual(vcs, set())
+        self.assertEqual(deps, {'poetry>=0.12'})
+        deps, _, issues = pool.static_project(pyproject, extra_groups={'xdg_home'})
+        self.assertEqual(issues, [])
+        self.assertIn('appdirs>=1.4.0,<2.0.0', deps)
+
+    def test_dvc_shell_chain_keeps_second_and_command_and_optional_true_steps(self):
+        command = ('python -m pip install "cython<3.0.0" && '
+                   'python -m pip install --no-build-isolation pyyaml==5.4.1; '
+                   'python -m pip install -r test-requirements.txt || true')
+        _, _, _, issues, _, _, steps = pool.pip_commands([command])
+        self.assertEqual(issues, [])
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(steps[0]['requirements'], {'cython<3.0.0'})
+        self.assertEqual(steps[1]['requirements'], {'pyyaml==5.4.1'})
+        self.assertFalse(steps[1]['optional'])
+        self.assertEqual(steps[2]['files'], {'test-requirements.txt'})
+        self.assertTrue(steps[2]['optional'])
+
+    def test_dvc_setup_extras_resolve_all_remote_lists_without_execution(self):
+        setup = """from setuptools import setup
+install_requires=["ply>=3.9"]
+gs=["google-cloud-storage==1.13.0"]
+s3=["boto3==1.7.4"]
+azure=["azure-storage-blob==1.3.0"]
+ssh=["paramiko>=2.4.1"]
+all_remotes=gs+s3+azure+ssh
+setup(install_requires=install_requires,
+      extras_require={"all":all_remotes,"gs":gs,"s3":s3,"azure":azure,"ssh":ssh})
+"""
+        deps, issues = pool.setup_static(
+            setup, extras={'tests','dev','all_remotes','all','testing'})
+        self.assertEqual(issues, [])
+        self.assertTrue({'google-cloud-storage==1.13.0','boto3==1.7.4',
+                         'azure-storage-blob==1.3.0','paramiko>=2.4.1'} <= deps)
+
+    def test_modin_spreadsheet_setup_args_reads_pinned_requirements(self):
+        setup = """def read_requirements(basename): pass
+reqs = read_requirements("requirements.txt")
+setup_args = {"install_requires": reqs}
+setup(version=get_version(), **setup_args)
+"""
+        files = {'requirements.txt':'jupyter>=1.0.0\nnotebook>=6.0.3\nipywidgets>=7.0.0\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(
+            setup, lambda name, required=False: files.get(name))
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'jupyter>=1.0.0','notebook>=6.0.3','ipywidgets>=7.0.0'})
+
+    def test_mock_ssh_server_file_backed_requirements_are_static(self):
+        setup = """def read_requirements(): pass
+setup(install_requires=read_requirements())
+# requirements.txt
+"""
+        files = {'requirements.txt':'paramiko>=2.1\ncryptography>=1.5\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(
+            setup, lambda name, required=False: files.get(name))
+        self.assertEqual(issues, [])
+        self.assertEqual(remote, set())
+        self.assertEqual(deps, {'paramiko>=2.1','cryptography>=1.5'})
+
+    def test_normal_install_does_not_require_setup_tests_require(self):
+        setup = """from setuptools import setup
+def run_setup():
+    tests_require = read_tests()
+    setup(install_requires=["six>=1.4"], tests_require=tests_require)
+"""
+        deps, issues = pool.setup_static(setup)
+        self.assertEqual(deps, {'six>=1.4'})
+        self.assertEqual(issues, [])
+
+    def test_contract_apt_upgrade_is_explicitly_identified_for_64_tasks(self):
+        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        upgrade = []
+        packages = set()
+        for logical, task in contract['tasks'].items():
+            found, verbs = pool.apt_recipe_operations(task['repo_script_list'])
+            packages.update(found)
+            if verbs: upgrade.append(logical)
+        self.assertEqual(len(upgrade), 64)
+        self.assertTrue({'cmake','build-essential','openjdk-17-jdk',
+                         'openjdk-17-jre','libpq-dev'} <= packages)
+
+    def test_vcs_npm_resolution_is_lock_only_and_ignores_scripts(self):
+        package = json.dumps({'name':'fixture','version':'1.0.0',
+                              'dependencies':{'dep':'^1.0.0'}})
+        integrity = 'sha512-' + __import__('base64').b64encode(
+            hashlib.sha512(b'archive').digest()).decode()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = pool.Pool(Path(tmp))
+            (Path(tmp)/'npm').mkdir()
+            (Path(tmp)/'metadata').mkdir()
+            commands = []
+            def git_source(mirror, commit, path, **kwargs):
+                return package if path == 'package.json' else None
+            def run(args, *, cwd=None, capture=False, env=None, timeout=3600):
+                commands.append([str(x) for x in args])
+                lock={'packages':{'':{'name':'fixture','version':'1.0.0'},
+                                  'node_modules/dep':{
+                                      'version':'1.2.3',
+                                      'resolved':'https://registry.npmjs.org/dep/-/dep-1.2.3.tgz',
+                                      'integrity':integrity}}}
+                (Path(cwd)/'package-lock.json').write_text(json.dumps(lock))
+                return ''
+            with patch.object(pool,'git_file',side_effect=git_source), \
+                 patch.object(pool,'invoke',side_effect=run), \
+                 patch.object(candidate,'download',return_value='a'*64):
+                artifacts=pool.npm_package_json_closure(
+                    candidate,'mirror','b'*40,'owner/repo','identity')
+            self.assertEqual(len(artifacts),1)
+            flat=' '.join(commands[0])
+            self.assertIn('--package-lock-only',flat)
+            self.assertIn('--ignore-scripts',flat)
+            self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
+
+    def test_execution_host_requirements_include_npm_resolver(self):
+        requirements=(ROOT/'requirements.txt').read_text().splitlines()
+        self.assertIn('nodejs',requirements)
+        self.assertIn('npm',requirements)
+
+
+    def test_bokeh_npm_cli_is_pinned_to_node18_compatible_npm10(self):
+        self.assertEqual(pool.NPM_NODE18_VERSION, '10.9.9')
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertIn("'https://registry.npmjs.org/npm/' + NPM_NODE18_VERSION", source)
+        self.assertNotIn("registry.npmjs.org/npm/latest", source)
+
+    def test_pipx_application_uses_pinned_kali_system_python_not_testbed_python(self):
+        self.assertEqual(pool.GOLDEN_SYSTEM_PYTHON, '3.13')
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertIn("resolver_version=GOLDEN_SYSTEM_PYTHON", source)
+        self.assertIn("pipx creates its application venv from Kali's system Python", source)
+
+
+
 if __name__ == '__main__':
     unittest.main()
