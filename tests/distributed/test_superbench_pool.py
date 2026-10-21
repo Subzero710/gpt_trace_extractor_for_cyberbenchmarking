@@ -67,29 +67,80 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertEqual(set(pool.PYTHONS), {'3.8','3.9','3.10','3.11','3.12'})
 
 
+    def test_dvc_file_backed_tests_extra_and_target_python_append_are_static(self):
+        setup = """from pathlib import Path
+import sys
+from setuptools import setup
+install_requires=["base>=1"]
+if sys.version_info[0] == 2:
+    install_requires.append("networkx>=2.1,<2.3")
+else:
+    install_requires.append("networkx>=2.1")
+tests_requirements=(Path("test_requirements.txt").read_text().strip().splitlines())
+if sys.version_info >= (3, 6):
+    tests_requirements.append("black==19.3b0")
+setup(install_requires=install_requires, extras_require={"tests": tests_requirements})
+"""
+        files={'test_requirements.txt':'pytest>=6\ncollective.checkdocs\n'}
+        deps, remote, issues = pool.setup_requirements_from_sources(
+            setup, lambda name, required=False: files.get(name),
+            extras={'tests'}, python_version='3.8')
+        self.assertEqual(remote, set())
+        self.assertEqual(issues, [])
+        self.assertTrue({'base>=1','networkx>=2.1','pytest>=6',
+                         'collective.checkdocs','black==19.3b0'} <= deps)
+        self.assertNotIn('networkx>=2.1,<2.3', deps)
+
+    def test_pep621_self_extras_expand_locally_instead_of_fetching_dvc(self):
+        pyproject = """[build-system]
+requires=["setuptools>=61"]
+[project]
+name="dvc"
+dependencies=["base>=1"]
+[project.optional-dependencies]
+azure=["dvc-azure==2.21.1"]
+testing=["pytest-test-utils"]
+tests=["dvc[testing]", "pytest>=7"]
+dev=["dvc[azure,tests]"]
+"""
+        deps, vcs, issues = pool.static_project(pyproject, extra_groups={'dev'})
+        self.assertEqual(vcs, set())
+        self.assertEqual(issues, [])
+        self.assertTrue({'dvc-azure==2.21.1','pytest-test-utils','pytest>=7','base>=1'} <= deps)
+        self.assertFalse(any(item.startswith('dvc[') for item in deps))
+
+    def test_conda_solution_python_records_base_interpreter_phase(self):
+        solution=[{'name':'openssl','version':'3.0.0'},
+                  {'name':'python','version':'3.11.9','url':'https://example/python','sha256':'a'*64}]
+        self.assertEqual(pool.conda_solution_python(solution),'3.11')
+
+
+
 class TestAcquisitionFallbacks(unittest.TestCase):
-    def test_pinned_sdist_then_static_binary_dependencies(self):
+    def test_non_exact_source_only_requirement_uses_static_resolver_stub(self):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
             candidate = pool.Pool(Path(tmp))
             (Path(tmp) / 'metadata').mkdir()
             (Path(tmp) / 'wheels').mkdir()
             calls = []
-            def pipeline(argv, *, cwd=None, capture=False, env=None):
+            def pipeline(argv, **kwargs):
                 calls.append(argv)
                 if len(calls) == 1:
-                    raise subprocess.CalledProcessError(1, argv)
-                dest = Path(argv[argv.index('--dest') + 1])
-                (dest / 'buildreq-1.0-py3-none-any.whl').write_bytes(b'fake wheel')
-            source = {'filename': 'old-1.0.tar.gz', 'sha256': '1' * 64,
-                      'requirements': ['buildreq==1.0']}
-            with patch.object(pool, 'invoke', side_effect=pipeline), \
-                 patch.object(pool, 'acquire_pinned_sdist', return_value=source):
-                pool.pip_closure(candidate, '3.10', {'old==1.0'}, 'plan-key')
+                    return subprocess.CompletedProcess(argv, 1,
+                        stdout='ERROR: Could not find a version that satisfies the requirement collective.checkdocs (from versions: none)\n')
+                return subprocess.CompletedProcess(argv, 0, stdout='')
+            source = {'name':'collective.checkdocs','version':'0.2.1',
+                      'requested':'collective.checkdocs','filename':'collective.checkdocs-0.2.1.tar.gz',
+                      'sha256':'1'*64,'requirements':['setuptools'],'provides_extra':[]}
+            with patch.object(pool.subprocess, 'run', side_effect=pipeline), \
+                 patch.object(pool, 'acquire_source_distribution', return_value=source) as acquire:
+                pool.pip_closure(candidate, '3.10', {'collective.checkdocs'}, 'plan-key')
             plan = json.loads((Path(tmp) / 'metadata/pip-plan-plan-key.json').read_text())
             self.assertEqual(plan['source_archives'], [source])
-            self.assertEqual(len(plan['files']), 1)
+            self.assertEqual(plan['files'], [])
             self.assertEqual(len(calls), 2)
+            acquire.assert_called_once_with(candidate, 'collective.checkdocs', 'plan-key', '3.10', constraints=())
 
     def test_apt_key_uses_downloaded_content_address(self):
         import subprocess
@@ -321,6 +372,22 @@ class TestContractClosureRegressionV4(unittest.TestCase):
         self.assertEqual(sorted(value[0][0] for value in post.values()),
                          ['python=3.10','python=3.9','python=3.9','python=3.9','python=3.9'])
 
+    def test_contract_environment_pip_phase_precedes_python_override(self):
+        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        phased=[]
+        for env,entry in contract['environments'].items():
+            content=pool.conda_yaml(entry['original_script'])
+            if not content: continue
+            _,pips=pool.conda_pip_split(content)
+            post=pool.conda_post_install_specs(entry['original_script'])
+            if pips and post: phased.append((env,pips,post))
+        self.assertEqual(len(phased),5)
+        self.assertTrue(all(rows and post for _,rows,post in phased))
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertIn('environment_pip_python',source)
+        self.assertIn('base_python=conda_solution_python(base_solution)',source)
+        self.assertIn("bucket='environment'",source)
+
     def test_poetry_isort_optional_dependencies_do_not_become_invalid_pip_specs(self):
         pyproject = """[tool.poetry]
 name="isort"
@@ -433,7 +500,7 @@ def run_setup():
             commands = []
             def git_source(mirror, commit, path, **kwargs):
                 return package if path == 'package.json' else None
-            def run(args, *, cwd=None, capture=False, env=None, timeout=3600):
+            def run(candidate_pool, args, *, cwd, env, timeout=1800):
                 commands.append([str(x) for x in args])
                 lock={'packages':{'':{'name':'fixture','version':'1.0.0'},
                                   'node_modules/dep':{
@@ -443,7 +510,7 @@ def run_setup():
                 (Path(cwd)/'package-lock.json').write_text(json.dumps(lock))
                 return ''
             with patch.object(pool,'git_file',side_effect=git_source), \
-                 patch.object(pool,'invoke',side_effect=run), \
+                 patch.object(pool,'_run_pinned_npm',side_effect=run), \
                  patch.object(candidate,'download',return_value='a'*64):
                 artifacts=pool.npm_package_json_closure(
                     candidate,'mirror','b'*40,'owner/repo','identity')
@@ -452,6 +519,7 @@ def run_setup():
             self.assertIn('--package-lock-only',flat)
             self.assertIn('--ignore-scripts',flat)
             self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
+            self.assertNotIn("invoke(['npm'", (ROOT/'scripts/superbench_pool.py').read_text())
 
     def test_execution_host_requirements_include_npm_resolver(self):
         requirements=(ROOT/'requirements.txt').read_text().splitlines()
@@ -462,8 +530,9 @@ def run_setup():
     def test_bokeh_npm_cli_is_pinned_to_node18_compatible_npm10(self):
         self.assertEqual(pool.NPM_NODE18_VERSION, '10.9.9')
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertIn("'https://registry.npmjs.org/npm/' + NPM_NODE18_VERSION", source)
+        self.assertIn("'https://registry.npmjs.org/npm/'+NPM_NODE18_VERSION", source)
         self.assertNotIn("registry.npmjs.org/npm/latest", source)
+        self.assertIn("_run_pinned_npm(pool", source)
 
     def test_pipx_application_uses_pinned_kali_system_python_not_testbed_python(self):
         self.assertEqual(pool.GOLDEN_SYSTEM_PYTHON, '3.13')
