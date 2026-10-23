@@ -50,6 +50,20 @@ def trusted_fetch_python():
         parent_info = parent.stat()
         if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
             raise RuntimeError("trusted system Python path is writable by a non-root principal")
+    probe = subprocess.run(
+        [str(interpreter), "-I", "-B", "-m", "pip", "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr.strip() or probe.stdout.strip())[:500]
+        raise RuntimeError(
+            "trusted system Python cannot import pip required by dependency fetch"
+            + (": " + detail if detail else "")
+        )
     return interpreter
 
 
@@ -96,14 +110,30 @@ def remove_fetch_sources(snapshot):
     shutil.rmtree(snapshot)
 
 
-def legacy_fetch_exec_retryable(state, base):
-    """Recognize only the historical pre-download broker-venv exec failure."""
+def pre_download_fetch_retryable(state, base):
+    """Allow explicit retry only for known failures before any pool byte exists."""
     if state.get("phase") not in {"failed", "interrupted"} or state.get("result") is not None:
         return False
     error = state.get("error")
-    if (not isinstance(error, str)
-            or not error.startswith("PermissionError: [Errno 13] Permission denied:")
-            or "/.venv-workstation-broker/bin/python" not in error):
+    known = (
+        isinstance(error, str)
+        and (
+            (
+                error.startswith("PermissionError: [Errno 13] Permission denied:")
+                and "/.venv-workstation-broker/bin/python" in error
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python for dependency fetch is unavailable"
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python path is writable by a non-root principal"
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python cannot import pip required by dependency fetch"
+            )
+        )
+    )
+    if not known:
         return False
     pool = Path(base).parent / "dependency-pool"
     if pool.is_symlink() or not pool.is_dir() or pool.stat().st_uid != 0:
@@ -416,7 +446,7 @@ class PreparationManager:
                 # dropping to gpttrace-fetch. It failed in execve before the
                 # downloader could create a stage or write any pool bytes. A
                 # user-explicit fetch may retry exactly that proved-empty case.
-                if not (payload["retry"] and legacy_fetch_exec_retryable(previous, self.base)):
+                if not (payload["retry"] and pre_download_fetch_retryable(previous, self.base)):
                     raise RuntimeError("fetch interrupted/failed; pool zombie preserved; "
                                        "an explicit privileged maintenance action is required")
                 if JobScope.members(previous) or self._containers(previous):
@@ -674,7 +704,7 @@ def _prepare(manager, state):
 
     # Use only the local audited worker file, with fixed validated arguments.
     # No shell, no template builder, no qemu, no guest execution.
-    child = subprocess.Popen([str(interpreter), "-B", str(program), "--repo-root",
+    child = subprocess.Popen([str(interpreter), "-I", "-B", str(program), "--repo-root",
                     str(source_root), "--stage", str(stage),
                     "--operation-id", state["operation_id"]],
                    cwd=source_root, env=env, preexec_fn=drop_privileges,

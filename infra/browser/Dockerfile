@@ -70,6 +70,8 @@ COPY clipboard_server.py /usr/local/bin/clipboard-server
 COPY kasm_healthcheck.py /usr/local/bin/kasm-healthcheck
 COPY kasm_auth_proxy.py /usr/local/bin/kasm-auth-proxy
 COPY auth_proxy_healthcheck.py /usr/local/bin/auth-proxy-healthcheck
+COPY kasm_auth_proxy.py /opt/gpt-trace-browser/kasm_auth_proxy.py
+COPY tests /opt/gpt-trace-browser/tests
 COPY kasmvnc.yaml /etc/kasmvnc/kasmvnc.yaml
 
 RUN chmod +x \

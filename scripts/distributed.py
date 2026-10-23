@@ -356,17 +356,50 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=3600):
             return result
 
 
+def retryable_preparation_error(error):
+    """Errors which are safe to ask the execution host to retry if its pool is empty."""
+    return (
+        isinstance(error, str)
+        and (
+            (
+                error.startswith("PermissionError: [Errno 13] Permission denied:")
+                and "/.venv-workstation-broker/bin/python" in error
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python for dependency fetch is unavailable"
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python path is writable by a non-root principal"
+            )
+            or error.startswith(
+                "RuntimeError: trusted system Python cannot import pip required by dependency fetch"
+            )
+        )
+    )
+
+
 def doctor_tests(role):
-    """Run all role-local pytest suites shipped in the built deployment."""
+    """Run every maintained automated test suite on the host that owns it."""
+    from host_requirements import verify_host_requirements
+    if not verify_host_requirements(
+        role=role,
+        require_root=role == "execution",
+        golden_build=role == "execution",
+    ):
+        raise RuntimeError(role + " host prerequisites failed")
     if role == "control":
         for service in ("runner", "storage", "workstation-gateway", "kali-workstation-controller"):
             compose("run", "--rm", "--no-deps", "--entrypoint", "python", service,
                     "-m", "pytest", "-q")
+        compose("exec", "-T", "teacher-browser", "python3", "-m", "unittest",
+                "discover", "-s", "/opt/gpt-trace-browser/tests",
+                "-p", "test_*.py", "-v")
         return
     if role == "execution":
         python = ROOT / ".venv-workstation-broker/bin/python"
-        return run([python, "-B", "-m", "pytest", "-q",
-                    str(ROOT / "apps/workstation-broker/tests")], timeout=1800)
+        for suite in (ROOT / "apps/workstation-broker/tests", ROOT / "tests/distributed"):
+            run([python, "-B", "-m", "pytest", "-q", str(suite)], timeout=1800)
+        return
     raise ValueError("unknown doctor test role")
 
 
@@ -450,11 +483,11 @@ def preparation_fetch(cfg):
                             "no mutation was blindly retried")
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
                 error = status.get("error")
-                legacy_exec_failure = (phase in {"failed", "interrupted"}
-                    and isinstance(error, str)
-                    and error.startswith("PermissionError: [Errno 13] Permission denied:")
-                    and "/.venv-workstation-broker/bin/python" in error)
-                if phase != "not_started" and not legacy_exec_failure:
+                retryable_preflight_failure = (
+                    phase in {"failed", "interrupted"}
+                    and retryable_preparation_error(error)
+                )
+                if phase != "not_started" and not retryable_preflight_failure:
                     raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
                                        str(error) + "; administrative cleanup required")
                 started = True
@@ -463,7 +496,7 @@ def preparation_fetch(cfg):
                 try:
                     broker(cfg, "prepare_templates", {"operation_id": operation_id,
                         "compatibility": identified["compatibility"],
-                        "retry": legacy_exec_failure}, timeout=60)
+                        "retry": retryable_preflight_failure}, timeout=60)
                 except (TransportFailure, RemoteFailure) as exc:
                     if isinstance(exc, IdentityFailure):
                         raise

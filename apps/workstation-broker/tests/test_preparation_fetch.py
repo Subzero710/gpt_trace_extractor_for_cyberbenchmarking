@@ -17,7 +17,7 @@ def _source_tree(root: Path) -> None:
         path.write_text(relative + "\n")
 
 
-def test_legacy_venv_exec_failure_is_retryable_only_before_any_pool_bytes(tmp_path):
+def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path):
     base = tmp_path / "golden.qcow2"
     pool = tmp_path / "dependency-pool"
     pool.mkdir()
@@ -27,9 +27,18 @@ def test_legacy_venv_exec_failure_is_retryable_only_before_any_pool_bytes(tmp_pa
         "error": "PermissionError: [Errno 13] Permission denied: "
                  "'/private/repo/.venv-workstation-broker/bin/python'",
     }
-    assert jobs.legacy_fetch_exec_retryable(state, base)
+    assert jobs.pre_download_fetch_retryable(state, base)
+    state["error"] = (
+        "RuntimeError: trusted system Python cannot import pip required by dependency fetch"
+    )
+    assert jobs.pre_download_fetch_retryable(state, base)
+    state["error"] = "RuntimeError: arbitrary worker failure"
+    assert not jobs.pre_download_fetch_retryable(state, base)
+    state["error"] = (
+        "RuntimeError: trusted system Python cannot import pip required by dependency fetch"
+    )
     (pool / "incoming").mkdir()
-    assert not jobs.legacy_fetch_exec_retryable(state, base)
+    assert not jobs.pre_download_fetch_retryable(state, base)
 
 
 def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
@@ -59,5 +68,9 @@ def test_fetch_worker_uses_system_python_not_broker_venv():
     )[0]
     assert "trusted_fetch_python()" in physical
     assert "stage_fetch_sources(manager, root)" in physical
-    assert "subprocess.Popen([str(interpreter)" in physical
+    assert 'subprocess.Popen([str(interpreter), "-I", "-B"' in physical
     assert "sys.executable" not in physical
+    trusted = source.split("def trusted_fetch_python():", 1)[1].split(
+        "def stage_fetch_sources", 1
+    )[0]
+    assert '"-m", "pip", "--version"' in trusted

@@ -124,6 +124,18 @@ class InterfaceAndShutdownTests(unittest.TestCase):
     def setUpClass(cls):
         cls.dispatch = load("unified_dispatch_test", ROOT / "scripts/distributed.py")
 
+    def test_doctor_runs_every_maintained_role_test_root(self):
+        source = (ROOT / "scripts/distributed.py").read_text()
+        doctor = source.split("def doctor_tests(role):", 1)[1].split(
+            "def preparation_fetch", 1
+        )[0]
+        for marker in (
+            "runner", "storage", "workstation-gateway",
+            "kali-workstation-controller", "/opt/gpt-trace-browser/tests",
+            "apps/workstation-broker/tests", "tests/distributed",
+        ):
+            self.assertIn(marker, doctor)
+
     def test_make_has_exactly_the_retained_historical_targets(self):
         make = (ROOT / "Makefile").read_text()
         targets = set(re.findall(r"^([A-Za-z0-9_-]+):", make, re.M))

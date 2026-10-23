@@ -32,6 +32,7 @@ COMMAND_PACKAGES = {
     "ip": "iproute2",
     "curl": "curl",
     "git": "git",
+    "openssl": "openssl",
 }
 
 GOLDEN_BUILD_COMMAND_PACKAGES = {
@@ -121,6 +122,11 @@ def _probe_venv() -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _probe_system_fetch_pip() -> tuple[bool, str]:
+    """Verify the exact system Python used by the unprivileged fetch worker."""
+    return _probe(("/usr/bin/python3", "-I", "-B", "-m", "pip", "--version"))
+
+
 def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True, role: str | None = None) -> bool:
     if role is None and (ROOT / "config/distributed.toml").exists():
         from distributed import config as deployment_config
@@ -157,7 +163,8 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
     if packages and shutil.which("dpkg-query") is not None:
         missing_packages = [package for package in packages if not _package_installed(package)]
 
-    command_packages = {key: value for key, value in COMMAND_PACKAGES.items() if role != "control" or key in {"ip", "curl", "git"}}
+    command_packages = {key: value for key, value in COMMAND_PACKAGES.items()
+                        if role != "control" or key in {"ip", "curl", "git", "openssl"}}
     if golden_build:
         command_packages.update(GOLDEN_BUILD_COMMAND_PACKAGES)
     for command, package in command_packages.items():
@@ -174,6 +181,13 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
             failures.append(
                 "python3 venv/ensurepip is not functional; reinstall python3-venv"
                 + (f" ({detail})" if detail else "")
+            )
+    if role == "execution" and "python3-pip" not in missing_packages:
+        ok, detail = _probe_system_fetch_pip()
+        if not ok:
+            failures.append(
+                "/usr/bin/python3 cannot import pip required by benchmark fetch"
+                + (f": {detail}" if detail else "")
             )
 
     docker = shutil.which("docker")

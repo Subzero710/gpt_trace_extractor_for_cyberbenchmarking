@@ -569,10 +569,12 @@ def run_setup():
             self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
             self.assertNotIn("invoke(['npm'", (ROOT/'scripts/superbench_pool.py').read_text())
 
-    def test_execution_host_requirements_include_npm_resolver(self):
+    def test_execution_host_requirements_include_fetch_runtime(self):
         requirements=(ROOT/'requirements.txt').read_text().splitlines()
-        self.assertIn('nodejs',requirements)
-        self.assertIn('npm',requirements)
+        self.assertIn('python3-pip', requirements)
+        self.assertIn('openssl', requirements)
+        self.assertIn('nodejs', requirements)
+        self.assertIn('npm', requirements)
 
 
     def test_bokeh_npm_cli_is_pinned_to_node18_compatible_npm10(self):

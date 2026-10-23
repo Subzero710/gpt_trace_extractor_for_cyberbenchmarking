@@ -7,6 +7,8 @@
 # The packages below are needed by the trusted host broker, libvirt/KVM boundary,
 # golden-image installation, or host filesystem/firewall lifecycle.
 python3-venv
+python3-pip
+openssl
 qemu-system-x86
 qemu-utils
 libvirt-daemon-system
