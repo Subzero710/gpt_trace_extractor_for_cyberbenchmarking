@@ -356,6 +356,20 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=3600):
             return result
 
 
+def doctor_tests(role):
+    """Run all role-local pytest suites shipped in the built deployment."""
+    if role == "control":
+        for service in ("runner", "storage", "workstation-gateway", "kali-workstation-controller"):
+            compose("run", "--rm", "--no-deps", "--entrypoint", "python", service,
+                    "-m", "pytest", "-q")
+        return
+    if role == "execution":
+        python = ROOT / ".venv-workstation-broker/bin/python"
+        return run([python, "-B", "-m", "pytest", "-q",
+                    str(ROOT / "apps/workstation-broker/tests")], timeout=1800)
+    raise ValueError("unknown doctor test role")
+
+
 def preparation_fetch(cfg):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
     from gpt_trace_transport.local_templates import pool_contract, atomic_json
@@ -435,16 +449,21 @@ def preparation_fetch(cfg):
                             "ADAPTER=swe-gym-lite to rediscover it; "
                             "no mutation was blindly retried")
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
-                # Aborted or failed jobs are zombies, not resumable fetches.
-                if phase != "not_started":
+                error = status.get("error")
+                legacy_exec_failure = (phase in {"failed", "interrupted"}
+                    and isinstance(error, str)
+                    and error.startswith("PermissionError: [Errno 13] Permission denied:")
+                    and "/.venv-workstation-broker/bin/python" in error)
+                if phase != "not_started" and not legacy_exec_failure:
                     raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
-                                       str(status.get("error")) + "; administrative cleanup required")
+                                       str(error) + "; administrative cleanup required")
                 started = True
                 # Start exactly once. A lost response triggers read-only
                 # reconciliation instead of a duplicate start request.
                 try:
                     broker(cfg, "prepare_templates", {"operation_id": operation_id,
-                        "compatibility": identified["compatibility"], "retry": False}, timeout=60)
+                        "compatibility": identified["compatibility"],
+                        "retry": legacy_exec_failure}, timeout=60)
                 except (TransportFailure, RemoteFailure) as exc:
                     if isinstance(exc, IdentityFailure):
                         raise
@@ -712,6 +731,7 @@ def control(cfg, action, args):
             values = ["--adapter", args.adapter] if args.adapter else []
             return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner",
                            "/app/tools/distributed_acceptance.py", *values)
+        doctor_tests("control")
         node = Path("/dev/dri/renderD128")
         driver = Path("/sys/class/drm/renderD128/device/driver")
         # Intel i915/xe, AMD and Nouveau render nodes are acceptable; the real
@@ -817,6 +837,7 @@ def execution(cfg, action, args):
         execution_tunnel(cfg, 'ps')
         print(json.dumps(broker(cfg, "inventory", local=True), indent=2))
         if action == "doctor":
+            doctor_tests("execution")
             run([sys.executable, "infra/workstation/image/build.py", "--verify"])
             limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
             if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024 ** 3:

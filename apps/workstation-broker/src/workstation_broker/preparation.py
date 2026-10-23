@@ -28,6 +28,88 @@ from workstation_broker.preparation_resources import JobScope, source_containers
 
 TERMINAL = frozenset({"ready", "failed", "interrupted", "canceled"})
 PHASES = TERMINAL | {"starting", "running", "validating"}
+
+FETCH_PYTHON = Path("/usr/bin/python3")
+FETCH_SOURCE_FILES = (
+    "scripts/superbench_pool.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
+)
+
+
+def trusted_fetch_python():
+    """Return the root-owned system interpreter used after dropping privileges."""
+    interpreter = FETCH_PYTHON.resolve(strict=True)
+    info = interpreter.stat()
+    if (not interpreter.is_file() or not info.st_mode & 0o111 or info.st_uid != 0
+            or info.st_mode & 0o022):
+        raise RuntimeError("trusted system Python for dependency fetch is unavailable")
+    for parent in interpreter.parents:
+        parent_info = parent.stat()
+        if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
+            raise RuntimeError("trusted system Python path is writable by a non-root principal")
+    return interpreter
+
+
+def stage_fetch_sources(manager, pool_root):
+    """Copy the finite audited fetch inputs out of the private repository tree."""
+    repository = manager.source_root.resolve(strict=True)
+    snapshot = pool_root / "source"
+    if snapshot.exists() or snapshot.is_symlink():
+        raise RuntimeError("interrupted fetch source snapshot exists; zombie preserved: " + str(snapshot))
+    snapshot.mkdir(mode=0o755)
+    for relative in FETCH_SOURCE_FILES:
+        source = manager.source_root / relative
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError("missing/untrusted fetch source: " + relative)
+        resolved = source.resolve(strict=True)
+        if not resolved.is_relative_to(repository):
+            raise RuntimeError("fetch source escapes repository: " + relative)
+        target = snapshot / relative
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        os.chown(target, 0, 0)
+        target.chmod(0o444)
+    for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
+                            key=lambda p: len(p.parts), reverse=True):
+        os.chown(directory, 0, 0)
+        directory.chmod(0o555)
+    os.chown(snapshot, 0, 0)
+    snapshot.chmod(0o555)
+    return snapshot, snapshot / "scripts/superbench_pool.py"
+
+
+def remove_fetch_sources(snapshot):
+    """Remove only the finite source snapshot after a successful worker exit."""
+    snapshot = Path(snapshot)
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise RuntimeError("unsafe fetch source snapshot")
+    for item in (snapshot, *snapshot.rglob("*")):
+        if item.is_symlink():
+            raise RuntimeError("unsafe symlink in fetch source snapshot")
+    for item in sorted(snapshot.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if item.is_dir(): item.chmod(0o700)
+        else: item.chmod(0o600)
+    snapshot.chmod(0o700)
+    shutil.rmtree(snapshot)
+
+
+def legacy_fetch_exec_retryable(state, base):
+    """Recognize only the historical pre-download broker-venv exec failure."""
+    if state.get("phase") not in {"failed", "interrupted"} or state.get("result") is not None:
+        return False
+    error = state.get("error")
+    if (not isinstance(error, str)
+            or not error.startswith("PermissionError: [Errno 13] Permission denied:")
+            or "/.venv-workstation-broker/bin/python" not in error):
+        return False
+    pool = Path(base).parent / "dependency-pool"
+    if pool.is_symlink() or not pool.is_dir() or pool.stat().st_uid != 0:
+        return False
+    return not any(pool.iterdir())
+
 def configured_base_image():
     source = ROOT / "config/distributed.toml"
     if source.is_symlink() or not source.is_file():
@@ -330,10 +412,13 @@ class PreparationManager:
                     previous = self._verify_ready(previous)
                 if previous["phase"] == "ready" or previous["phase"] not in TERMINAL:
                     return self._public(previous)
-                # An interrupted or failed fetch is a zombie. Fetch must NEVER
-                # retry, overwrite, prune or delete it, not even explicitly.
-                raise RuntimeError("fetch interrupted/failed; pool zombie preserved; "
-                                   "an explicit privileged maintenance action is required")
+                # The historical pre-download crash used the broker venv after
+                # dropping to gpttrace-fetch. It failed in execve before the
+                # downloader could create a stage or write any pool bytes. A
+                # user-explicit fetch may retry exactly that proved-empty case.
+                if not (payload["retry"] and legacy_fetch_exec_retryable(previous, self.base)):
+                    raise RuntimeError("fetch interrupted/failed; pool zombie preserved; "
+                                       "an explicit privileged maintenance action is required")
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")
             elif payload["retry"]:
@@ -558,9 +643,11 @@ def _prepare(manager, state):
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
         raise RuntimeError("interrupted pool stage exists; zombie preserved: " + str(stage))
-    program = manager.source_root / "scripts/superbench_pool.py"
-    if program.is_symlink() or not program.is_file():
+    source_program = manager.source_root / "scripts/superbench_pool.py"
+    if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
+    interpreter = trusted_fetch_python()
+    source_root, program = stage_fetch_sources(manager, root)
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
     # unprivileged downloader or any of its subprocesses. No proxy/auth env.
@@ -587,10 +674,10 @@ def _prepare(manager, state):
 
     # Use only the local audited worker file, with fixed validated arguments.
     # No shell, no template builder, no qemu, no guest execution.
-    child = subprocess.Popen([sys.executable, "-B", str(program), "--repo-root",
-                    str(manager.source_root), "--stage", str(stage),
+    child = subprocess.Popen([str(interpreter), "-B", str(program), "--repo-root",
+                    str(source_root), "--stage", str(stage),
                     "--operation-id", state["operation_id"]],
-                   cwd=manager.source_root, env=env, preexec_fn=drop_privileges,
+                   cwd=source_root, env=env, preexec_fn=drop_privileges,
                    stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         exitcode = child.wait(timeout=24 * 3600)
@@ -603,6 +690,7 @@ def _prepare(manager, state):
         raise RuntimeError("download worker exceeded its 24-hour deadline; zombie preserved") from exc
     if exitcode != 0:
         raise subprocess.CalledProcessError(exitcode, child.args)
+    remove_fetch_sources(source_root)
     inventory_path = stage / "inventory.json"
     if inventory_path.is_symlink() or not inventory_path.is_file():
         raise RuntimeError("download worker returned no pool inventory")

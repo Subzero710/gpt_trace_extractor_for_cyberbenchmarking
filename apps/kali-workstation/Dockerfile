@@ -6,5 +6,6 @@ COPY apps/kali-workstation/src /app/src
 COPY shared /app/shared
 RUN pip install --no-cache-dir /app/shared
 COPY apps/kali-workstation/tool-manifest.json /app/tool-manifest.json
-RUN pip install --no-cache-dir -e .
+COPY apps/kali-workstation/tests /app/tests
+RUN pip install --no-cache-dir -e ".[test]"
 ENTRYPOINT ["python", "-m", "kali_workstation.server"]

@@ -25,7 +25,7 @@ def build_host_broker(root: Path) -> None:
         shutil.rmtree(venv)
     run([sys.executable, "-m", "venv", str(venv)])
     run([str(python), "-m", "pip", "install", "--disable-pip-version-check",
-         "-e", str(root / "shared"), "-e", str(root / "apps/workstation-broker")])
+         "-e", str(root / "shared"), "-e", str(root / "apps/workstation-broker") + "[test]"])
 
 
 def compose_service_image(root: Path, service: str) -> str:
