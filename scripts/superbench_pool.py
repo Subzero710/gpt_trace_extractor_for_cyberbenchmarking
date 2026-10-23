@@ -47,8 +47,23 @@ def digest(path):
 def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
     command = [str(v) for v in argv]
     print('[pool]', ' '.join(command), flush=True)
-    result = subprocess.run(command, cwd=cwd, env=env, check=True,
-                            text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
+    try:
+        result = subprocess.run(command, cwd=cwd, env=env, check=True,
+                                text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
+    except subprocess.CalledProcessError as exc:
+        # Captured stdout is otherwise lost from the durable preparation log.
+        # Solvers such as micromamba report structured failure diagnostics there.
+        if capture and exc.stdout:
+            output = exc.stdout if len(exc.stdout) <= 65536 else exc.stdout[-65536:]
+            if len(output) != len(exc.stdout):
+                print('[pool] failed command stdout truncated to final 65536 characters',
+                      file=sys.stderr, flush=True)
+            print('[pool] failed command captured stdout:', file=sys.stderr, flush=True)
+            sys.stderr.write(output)
+            if not output.endswith('\n'):
+                sys.stderr.write('\n')
+            sys.stderr.flush()
+        raise
     return result.stdout if capture else None
 
 
@@ -918,6 +933,33 @@ def conda_pip_split(content):
         if inside and (not line.strip() or line.lstrip().startswith('#')):continue
         inside=False;out.append(line)
     return ''.join(out),pip
+
+
+def conda_solver_yaml(content):
+    """Translate only audited pinned upstream syntax that libmamba cannot parse."""
+    output=[]; meson_extra=False
+    for line in content.splitlines(keepends=True):
+        if line.endswith('\r\n'):
+            body,eol=line[:-2],'\r\n'
+        elif line.endswith('\n'):
+            body,eol=line[:-1],'\n'
+        else:
+            body,eol=line,''
+        match=re.fullmatch(
+            r'(?P<prefix>\s*-\s*)meson\[ninja\]=1\.2\.1(?P<suffix>\s*(?:#.*)?)',
+            body,
+        )
+        if match:
+            if meson_extra:
+                raise RuntimeError('duplicate audited meson[ninja] Conda workaround')
+            prefix,suffix=match.group('prefix'),match.group('suffix')
+            output.append(prefix+'meson=1.2.1'+suffix+eol)
+            output.append(prefix+'ninja'+eol)
+            meson_extra=True
+        else:
+            output.append(line)
+    # Historical pinned recipe typo; keep the correction finite and explicit.
+    return ''.join(output).replace('firefox =>96','firefox >=96')
 
 
 def python_version(script):
@@ -1948,7 +1990,7 @@ def main(argv=None):
             if any("sed -i '/- pip:/,/^ *-/d' environment.yml" in command
                    for command in script):
                 pips=[]
-            trimmed=trimmed.replace('firefox =>96','firefox >=96')
+            trimmed=conda_solver_yaml(trimmed)
             file=stage/'metadata'/('env-'+env+'.yml');write_new(file,trimmed)
             post=conda_post_install_specs(script)
             if post:

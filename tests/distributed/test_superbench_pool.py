@@ -1,9 +1,12 @@
 """Download-only SWE-Gym Lite fetcher regression tests; no network/KVM/VM."""
 from __future__ import annotations
 import hashlib
+import contextlib
+import io
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -71,6 +74,34 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertEqual(len(contract['environments']), 25)
         self.assertEqual(len({row['repo'] for row in contract['tasks'].values()}), 11)
         self.assertEqual(set(pool.PYTHONS), {'3.8','3.9','3.10','3.11','3.12'})
+
+    def test_pandas_meson_ninja_extra_is_normalized_for_conda_solver(self):
+        contract = json.loads(
+            (ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes()
+        )
+        script = contract['environments']['0bb835c6e5fbdbe6998741']['original_script']
+        content = pool.conda_yaml(script)
+        self.assertIsNotNone(content)
+        trimmed, _ = pool.conda_pip_split(content)
+        normalized = pool.conda_solver_yaml(trimmed)
+        self.assertNotIn('meson[ninja]', normalized)
+        self.assertIn('  - meson=1.2.1\n', normalized)
+        self.assertIn('  - ninja\n', normalized)
+        self.assertIn('  - meson-python=0.13.1\n', normalized)
+
+    def test_failed_captured_command_logs_solver_stdout(self):
+        failure = subprocess.CalledProcessError(
+            1,
+            ['micromamba'],
+            output='{"success":false,"solver_problems":["unsupported request"]}\n',
+        )
+        captured = io.StringIO()
+        with patch.object(pool.subprocess, 'run', side_effect=failure), \
+             contextlib.redirect_stderr(captured), \
+             self.assertRaises(subprocess.CalledProcessError):
+            pool.invoke(['micromamba', '--json'], capture=True)
+        self.assertIn('failed command captured stdout', captured.getvalue())
+        self.assertIn('unsupported request', captured.getvalue())
 
 
     def test_dvc_file_backed_tests_extra_and_target_python_append_are_static(self):
