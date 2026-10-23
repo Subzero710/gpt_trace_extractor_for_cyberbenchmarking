@@ -9,6 +9,9 @@
 !scripts/
 !scripts/distributed_acceptance.py
 !scripts/teacher_gpu_doctor.py
+!scripts/build_local_templates.py
+!config/
+!config/distributed.toml
 **/__pycache__/
 **/*.pyc
 **/*.egg-info/

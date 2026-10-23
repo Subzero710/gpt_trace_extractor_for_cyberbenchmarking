@@ -13,7 +13,16 @@ import pytest
 
 from gpt_trace_runner.superbench.adapters.swe_gym import guest_runtime, os_packages
 
-ROOT = Path(__file__).resolve().parents[3]
+def repository_root() -> Path:
+    candidates = (*Path(__file__).resolve().parents, Path("/repo"))
+    for candidate in candidates:
+        if ((candidate / "scripts/build_local_templates.py").is_file()
+                and (candidate / "config/distributed.toml").is_file()):
+            return candidate
+    raise RuntimeError("repository contract files are unavailable")
+
+
+ROOT = repository_root()
 spec = importlib.util.spec_from_file_location("lite_template_builder", ROOT / "scripts/build_local_templates.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)

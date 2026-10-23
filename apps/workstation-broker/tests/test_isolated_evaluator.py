@@ -69,7 +69,7 @@ def host(files, tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_evaluator_uses_original_immutable_backing_without_teacher_mutations_or_routes(host):
     broker = host.broker
-    teacher = await broker.create(IDENT, ID, "task-1")
+    teacher = await broker.create(IDENT, ID, host.files.task1)
     Path(teacher["overlay"]).write_bytes(b"TEACHER CORRUPTION: conda gitconfig etc PATH background process")
     # A registry update must never redirect this evaluator to a newer template.
     host.files.registry_path.write_text(json.dumps({"schema_version":2,"generation":"f"*64}))
@@ -94,7 +94,7 @@ async def test_evaluator_uses_original_immutable_backing_without_teacher_mutatio
 @pytest.mark.asyncio
 async def test_failed_evaluator_is_preserved_until_explicit_resume_and_retry_is_fresh(host):
     broker = host.broker
-    teacher = await broker.create(IDENT, ID, "task-1")
+    teacher = await broker.create(IDENT, ID, host.files.task1)
     failed = await broker.create_evaluator(IDENT)
     Path(failed["overlay"]).write_bytes(b"half-mutated evaluation")
     with pytest.raises(ValueError, match="explicit"):
@@ -112,7 +112,7 @@ async def test_failed_evaluator_is_preserved_until_explicit_resume_and_retry_is_
 @pytest.mark.asyncio
 async def test_evaluator_construction_failure_keeps_index_and_partial_disk_for_reset(host, monkeypatch):
     broker = host.broker
-    await broker.create(IDENT, ID, "task-1")
+    await broker.create(IDENT, ID, host.files.task1)
     def fail(directory):
         (directory / "disk").mkdir()
         raise RuntimeError("quota/VM failure")
@@ -176,7 +176,7 @@ async def test_template_artifact_over_256_mib_is_streamed_by_broker_in_bounded_c
 @pytest.mark.asyncio
 async def test_hidden_data_rpc_resolves_only_exact_evaluator_identity(host, monkeypatch):
     broker = host.broker
-    await broker.create(IDENT, ID, "task-1")
+    await broker.create(IDENT, ID, host.files.task1)
     evaluator = await broker.create_evaluator(IDENT)
     targets = []
     async def rpc(ident, method, args):

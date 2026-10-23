@@ -48,7 +48,7 @@ def test_registry_rejects_symlink_mutable_digest_and_backing_mismatch(files, tmp
     with pytest.raises(ValueError, match="mutable"): files.registry.select(ID)
     files.repo.write_bytes(b"changed")
     files.repo.chmod(0o444)
-    with pytest.raises(ValueError, match="digest"): files.registry.select(ID)
+    with pytest.raises(ValueError, match="SHA-256 mismatch"): files.registry.select(ID)
     files.repo.chmod(0o644)
     files.repo.write_bytes(b"repo")
     files.repo.chmod(0o444)

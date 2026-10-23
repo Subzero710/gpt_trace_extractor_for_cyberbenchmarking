@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir /app/shared
 COPY apps/runner/tests /app/tests
 COPY scripts/distributed_acceptance.py /app/tools/distributed_acceptance.py
 COPY scripts/teacher_gpu_doctor.py /app/tools/teacher_gpu_doctor.py
+COPY scripts/build_local_templates.py /repo/scripts/build_local_templates.py
+COPY config/distributed.toml /repo/config/distributed.toml
 RUN pip install --no-cache-dir -e ".[test]"
 ENTRYPOINT ["gpt-trace"]
 CMD ["--help"]

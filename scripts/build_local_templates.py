@@ -550,9 +550,10 @@ def install_generation(staged, target_root, manifest, validate):
     fd = os.open(generations, os.O_DIRECTORY)
     try: os.fsync(fd)
     finally: os.close(fd)
-    from workstation_broker.preparation import record_built_generation
     operation_id = os.environ.get("GPT_TRACE_PREPARATION_ID")
-    if operation_id is not None: record_built_generation(operation_id, generation)
+    if operation_id is not None:
+        from workstation_broker.preparation import record_built_generation
+        record_built_generation(operation_id, generation)
     try:
         validate(final, generation)
     except BaseException:
