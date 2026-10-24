@@ -207,6 +207,85 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
 
 
+class TestNetworkRetries(unittest.TestCase):
+    class Response:
+        def __init__(self, url, events, headers=None):
+            self.url = url
+            self.events = list(events)
+            self.headers = headers or {}
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+        def read(self, _size):
+            if not self.events: return b''
+            item = self.events.pop(0)
+            if isinstance(item, BaseException): raise item
+            return item
+
+    def test_midstream_timeout_retries_from_zero_and_discards_partial(self):
+        url = 'https://repo.example.test/pkg.conda'
+        payload = b'complete artifact'
+        expected = hashlib.sha256(payload).hexdigest()
+        first = self.Response(url, [b'partial bytes', TimeoutError('read timed out')])
+        second = self.Response(url, [payload, b''])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'artifact'
+            log = io.StringIO()
+            with patch.object(pool.urllib.request, 'urlopen', side_effect=[first, second]) as opener, \
+                 patch.object(pool.time, 'sleep') as sleeper, \
+                 contextlib.redirect_stderr(log):
+                actual = pool.fetch(url, path, sha=expected)
+            self.assertEqual(actual, expected)
+            self.assertEqual(path.read_bytes(), payload)
+            self.assertEqual(opener.call_count, 2)
+            sleeper.assert_called_once_with(1)
+            self.assertIn('network retry 2/5 in 1s after TimeoutError', log.getvalue())
+
+    def test_retryable_http_503_is_retried_for_metadata(self):
+        url = 'https://pypi.org/pypi/demo/json'
+        failure = pool.urllib.error.HTTPError(url, 503, 'service unavailable', {}, None)
+        response = self.Response(url, [b'{"name":"demo"}'])
+        with patch.object(pool.urllib.request, 'urlopen', side_effect=[failure, response]) as opener, \
+             patch.object(pool.time, 'sleep') as sleeper:
+            self.assertEqual(pool._pypi_json(url), {'name': 'demo'})
+        self.assertEqual(opener.call_count, 2)
+        sleeper.assert_called_once_with(1)
+
+    def test_nonretryable_http_404_fails_immediately(self):
+        url = 'https://pypi.org/pypi/missing/json'
+        failure = pool.urllib.error.HTTPError(url, 404, 'missing', {}, None)
+        with patch.object(pool.urllib.request, 'urlopen', side_effect=failure) as opener, \
+             patch.object(pool.time, 'sleep') as sleeper, \
+             self.assertRaises(pool.urllib.error.HTTPError):
+            pool._pypi_json(url)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+
+    def test_network_retry_budget_is_bounded(self):
+        url = 'https://repo.example.test/pkg.conda'
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pool.urllib.request, 'urlopen', side_effect=[TimeoutError('x')] * 5) as opener, \
+             patch.object(pool.time, 'sleep') as sleeper, \
+             self.assertRaises(TimeoutError):
+            pool.fetch(url, Path(tmp) / 'artifact')
+        self.assertEqual(opener.call_count, 5)
+        self.assertEqual(sleeper.call_count, 4)
+
+    def test_checksum_mismatch_is_not_retried(self):
+        url = 'https://repo.example.test/pkg.conda'
+        payload = b'bad bytes'
+        expected = hashlib.sha256(b'good bytes').hexdigest()
+        response = self.Response(url, [payload, b''])
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pool.urllib.request, 'urlopen', return_value=response) as opener, \
+             patch.object(pool.time, 'sleep') as sleeper, \
+             self.assertRaisesRegex(RuntimeError, 'sha256 mismatch'):
+            pool.fetch(url, Path(tmp) / 'artifact', sha=expected)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
+
+
 class TestDeduplication(unittest.TestCase):
     def test_sha_and_url_share_one_download(self):
         with tempfile.TemporaryDirectory() as tmp:

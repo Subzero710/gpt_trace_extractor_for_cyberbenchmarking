@@ -24,6 +24,9 @@ import time
 import tomllib
 import urllib.parse
 import urllib.request
+import http.client
+import ssl
+import urllib.error
 from collections import defaultdict
 from pathlib import Path
 
@@ -35,6 +38,9 @@ KALI_SIGNING_FPR = '827C8569F2518CC677FECA1AED65462EC8D5E4C5'
 MAX_SOURCE = 12 * 1024 * 1024
 NPM_NODE18_VERSION = '10.9.9'
 GOLDEN_SYSTEM_PYTHON = '3.13'  # Kali 2026.2 pinned by infra/workstation/image/build.py
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+DOWNLOAD_RETRY_BACKOFF = (1, 2, 4, 8)
 
 
 def digest(path):
@@ -110,35 +116,99 @@ def verify_sri(path, sri):
         raise RuntimeError('integrity mismatch for cached package')
 
 
+def _discard_partial_download(path):
+    path=Path(path)
+    try: info=path.lstat()
+    except FileNotFoundError: return
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RuntimeError('unsafe partial download path: '+str(path))
+    path.unlink()
+
+
+def _retryable_network_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in DOWNLOAD_RETRY_HTTP
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError, http.client.IncompleteRead,
+                        http.client.BadStatusLine, ssl.SSLEOFError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason=exc.reason
+        if isinstance(reason, ssl.SSLCertVerificationError): return False
+        return isinstance(reason, (TimeoutError, ConnectionError, OSError))
+    return False
+
+
+def _network_retry(label, operation, *, cleanup=None):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS+1):
+        if cleanup is not None: cleanup()
+        try:
+            return operation()
+        except Exception as exc:
+            if not _retryable_network_error(exc): raise
+            if cleanup is not None: cleanup()
+            if attempt >= DOWNLOAD_ATTEMPTS: raise
+            delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
+            detail=('HTTP '+str(exc.code)) if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+            print(f'[pool] network retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s after {detail}: {label}',
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
+    raise AssertionError('unreachable network retry loop')
+
+
+def _read_https(url, *, timeout, limit, user_agent, expected_host=None):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise RuntimeError('untrusted HTTPS endpoint: '+str(url))
+    label=(parsed.hostname or '')+parsed.path
+    def read_once():
+        request=urllib.request.Request(url, headers={'User-Agent':user_agent})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            redirected=urllib.parse.urlsplit(response.url)
+            if redirected.scheme != 'https': raise RuntimeError('untrusted HTTPS redirect')
+            if expected_host is not None and redirected.hostname != expected_host:
+                raise RuntimeError('untrusted HTTPS redirect host')
+            length=response.headers.get('Content-Length','')
+            if length.isdigit() and int(length)>limit: raise RuntimeError('HTTPS response exceeds limit')
+            raw=response.read(limit+1)
+        if len(raw)>limit: raise RuntimeError('HTTPS response exceeds limit')
+        return raw
+    return _network_retry(label, read_once)
+
+
 def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None):
     parsed=urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise RuntimeError('untrusted download endpoint: '+str(url))
     path=Path(path)
-    request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
-    with urllib.request.urlopen(request,timeout=180) as response:
-        if urllib.parse.urlsplit(response.url).scheme != 'https':
-            raise RuntimeError('untrusted download redirect')
-        if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
-            raise RuntimeError('download exceeds limit')
-        h=hashlib.sha256(); size=0
-        other_hashes = {algorithm: hashlib.new(algorithm) for algorithm in ('sha384', 'sha512')} if integrity_digests is not None else {}
-        checks = [(hashlib.new(algo), expected) for algo, expected in (sri_parts(sri) or ())]
-        with path.open('xb') as stream:
-            for block in iter(lambda: response.read(1048576),b''):
-                size += len(block)
-                if size>limit: raise RuntimeError('download exceeds limit; partial retained')
-                stream.write(block);h.update(block)
-                for other in other_hashes.values(): other.update(block)
-                for sri_hash, _ in checks: sri_hash.update(block)
-            stream.flush(); os.fsync(stream.fileno())
-    actual=h.hexdigest()
-    if sha and actual != sha: raise RuntimeError('download sha256 mismatch: '+str(path))
-    if checks and not any(h.digest() == expected for h, expected in checks):
-        raise RuntimeError('download integrity mismatch: '+str(path))
-    if integrity_digests is not None:
-        integrity_digests.update({algo: h.digest() for algo, h in other_hashes.items()})
-    return actual
+    label=(parsed.hostname or '')+parsed.path
+    def transfer():
+        request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
+        with urllib.request.urlopen(request,timeout=180) as response:
+            if urllib.parse.urlsplit(response.url).scheme != 'https':
+                raise RuntimeError('untrusted download redirect')
+            if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
+                raise RuntimeError('download exceeds limit')
+            h=hashlib.sha256(); size=0
+            other_hashes={algorithm:hashlib.new(algorithm) for algorithm in ('sha384','sha512')} if integrity_digests is not None else {}
+            checks=[(hashlib.new(algo),expected) for algo,expected in (sri_parts(sri) or ())]
+            with path.open('xb') as stream:
+                for block in iter(lambda:response.read(1048576),b''):
+                    size+=len(block)
+                    if size>limit: raise RuntimeError('download exceeds limit; partial retained')
+                    stream.write(block); h.update(block)
+                    for other in other_hashes.values(): other.update(block)
+                    for sri_hash,_ in checks: sri_hash.update(block)
+                stream.flush(); os.fsync(stream.fileno())
+        actual=h.hexdigest()
+        if sha and actual != sha: raise RuntimeError('download sha256 mismatch: '+str(path))
+        if checks and not any(h.digest()==expected for h,expected in checks):
+            raise RuntimeError('download integrity mismatch: '+str(path))
+        if integrity_digests is not None:
+            integrity_digests.update({algo:h.digest() for algo,h in other_hashes.items()})
+        return actual
+    return _network_retry(label, transfer, cleanup=lambda:_discard_partial_download(path))
 
 
 def git_file(mirror, commit, path, *, required=False):
@@ -1308,12 +1378,8 @@ def _target_marker_environment(python_version):
 
 
 def _pypi_json(url, *, limit=16*1024*1024):
-    request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/3'})
-    with urllib.request.urlopen(request,timeout=90) as response:
-        if urllib.parse.urlsplit(response.url).hostname!='pypi.org':
-            raise RuntimeError('untrusted PyPI metadata redirect')
-        raw=response.read(limit+1)
-        if len(raw)>limit:raise RuntimeError('oversized PyPI metadata')
+    raw=_read_https(url,timeout=90,limit=limit,user_agent='gpt-trace-dependency-pool/3',
+                    expected_host='pypi.org')
     try:return json.loads(raw)
     except ValueError as exc:raise RuntimeError('invalid PyPI metadata JSON') from exc
 
@@ -1605,12 +1671,8 @@ def npm_lock_urls(lock, label, *, workspace_checker=None):
 def _npm_cli_metadata():
     """Fetch immutable-version npm registry metadata; never use the moving `latest` tag."""
     metadata_url='https://registry.npmjs.org/npm/'+NPM_NODE18_VERSION
-    request=urllib.request.Request(metadata_url,headers={'User-Agent':'gpt-trace-dependency-pool/3'})
-    with urllib.request.urlopen(request,timeout=90) as response:
-        if urllib.parse.urlsplit(response.url).hostname!='registry.npmjs.org':
-            raise RuntimeError('untrusted npm CLI metadata redirect')
-        raw=response.read(4*1024*1024+1)
-        if len(raw)>4*1024*1024:raise RuntimeError('oversized npm CLI metadata')
+    raw=_read_https(metadata_url,timeout=90,limit=4*1024*1024,
+                    user_agent='gpt-trace-dependency-pool/3',expected_host='registry.npmjs.org')
     try:info=json.loads(raw)
     except ValueError as exc:raise RuntimeError('invalid npm CLI metadata') from exc
     if info.get('version')!=NPM_NODE18_VERSION:
@@ -2244,9 +2306,8 @@ def main(argv=None):
                 vcs_failure('unresolved Git ref');continue
             api='https://api.github.com/repos/'+repo_ref+'/commits/'+pinned
             try:
-                with urllib.request.urlopen(urllib.request.Request(
-                        api,headers={'User-Agent':'gpt-trace-dependency-pool/2'}),timeout=60) as res:
-                    response=json.loads(res.read(1048576))
+                response=json.loads(_read_https(api,timeout=60,limit=1048576,
+                    user_agent='gpt-trace-dependency-pool/2',expected_host='api.github.com'))
                 resolved=response.get('sha')
                 if not isinstance(resolved,str) or not COMMIT.fullmatch(resolved) or not resolved.startswith(pinned):
                     raise ValueError('GitHub returned a different commit identity')
