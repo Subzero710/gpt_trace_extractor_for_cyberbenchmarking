@@ -128,7 +128,7 @@ async def test_provider_create_selects_template_but_identity_remains_exact(tmp_p
             "template_id": task.workstation_template, "backing_path": "/trusted/python_mypy.qcow2",
             "backing_sha256": "b"*64, "template_generation": "c"*64, "template_source_fingerprint": "d"*64})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://broker") as client:
-        provider = LibvirtWorkstationProvider(tmp_path/"sock", token, client=client)
+        provider = LibvirtWorkstationProvider(tmp_path/"sock", token, client=client, remote=False)
         created = await provider.create(task, {"kali-workstation": "env"}, "a"*64, attempt=1, control_token="s"*40)
         assert calls[0][1]["template_id"] == task.workstation_template
         assert created.metadata()["apps"]["kali-workstation"]["template_generation"] == "c"*64
@@ -255,10 +255,10 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
         compile(program, "trusted-guest-validation", "exec")
         programs.append(program)
         targets.append(runtime.purpose)
-        if "prepare(item, artifact=artifact, log=ROOT" in program:
-            return {"stdout": json.dumps({"base_commit": item["base_commit"], "env_hash": item["env_hash"]})}
         if "proof = prepare_evaluator" in program:
             return {"stdout":json.dumps({"base_commit":item["base_commit"],"env_hash":item["env_hash"],"source_sha256":"a"*64})}
+        if "prepare(item, artifact=artifact, log=ROOT" in program:
+            return {"stdout": json.dumps({"base_commit": item["base_commit"], "env_hash": item["env_hash"]})}
         return {"stdout": json.dumps({"test_exit_status": 0})}
     monkeypatch.setattr(module, "execute", execute)
     patch = b"candidate bytes"

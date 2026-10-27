@@ -19,7 +19,7 @@ async def test_provider_verifies_exact_broker_identity_and_never_requests_host_c
         if request.url.path.endswith('destroy_attempt'):return httpx.Response(200,json={'destroyed':True})
         return httpx.Response(200,json={'identity':payload,'provider':'libvirt','domain':'gpt-trace-ws-123'})
     client=httpx.AsyncClient(transport=httpx.MockTransport(handler),base_url='http://broker')
-    provider=LibvirtWorkstationProvider(tmp_path/'broker.sock',token,client=client)
+    provider=LibvirtWorkstationProvider(tmp_path/'broker.sock',token,client=client,remote=False)
     created=await provider.create(task,env,fingerprint,attempt=1,control_token='s'*40)
     assert set(created.resources)=={'kali-workstation'}
     assert created.resources['kali-workstation'].backend_url=='http://kali-workstation-controller:8000'

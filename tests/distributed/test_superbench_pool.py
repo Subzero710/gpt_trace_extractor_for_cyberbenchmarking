@@ -265,18 +265,38 @@ class TestNetworkRetries(unittest.TestCase):
         self.assertEqual(opener.call_count, 5)
         self.assertEqual(sleeper.call_count, 4)
 
-    def test_checksum_mismatch_is_not_retried(self):
+    def test_checksum_mismatch_retries_from_zero_and_discards_bad_bytes(self):
         url = 'https://repo.example.test/pkg.conda'
-        payload = b'bad bytes'
+        good = b'good bytes'
+        expected = hashlib.sha256(good).hexdigest()
+        first = self.Response(url, [b'bad bytes', b''])
+        second = self.Response(url, [good, b''])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'artifact'
+            log = io.StringIO()
+            with patch.object(pool.urllib.request, 'urlopen', side_effect=[first, second]) as opener, \
+                 patch.object(pool.time, 'sleep') as sleeper, \
+                 contextlib.redirect_stderr(log):
+                actual = pool.fetch(url, path, sha=expected)
+            self.assertEqual(actual, expected)
+            self.assertEqual(path.read_bytes(), good)
+            self.assertEqual(opener.call_count, 2)
+            sleeper.assert_called_once_with(1)
+            self.assertIn('network retry 2/5 in 1s after DownloadIntegrityError', log.getvalue())
+
+    def test_checksum_mismatch_retry_budget_is_bounded(self):
+        url = 'https://repo.example.test/pkg.conda'
         expected = hashlib.sha256(b'good bytes').hexdigest()
-        response = self.Response(url, [payload, b''])
-        with tempfile.TemporaryDirectory() as tmp, \
-             patch.object(pool.urllib.request, 'urlopen', return_value=response) as opener, \
-             patch.object(pool.time, 'sleep') as sleeper, \
-             self.assertRaisesRegex(RuntimeError, 'sha256 mismatch'):
-            pool.fetch(url, Path(tmp) / 'artifact', sha=expected)
-        self.assertEqual(opener.call_count, 1)
-        sleeper.assert_not_called()
+        responses = [self.Response(url, [b'bad bytes', b'']) for _ in range(pool.DOWNLOAD_ATTEMPTS)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'artifact'
+            with patch.object(pool.urllib.request, 'urlopen', side_effect=responses) as opener, \
+                 patch.object(pool.time, 'sleep') as sleeper, \
+                 self.assertRaisesRegex(pool.DownloadIntegrityError, 'sha256 mismatch'):
+                pool.fetch(url, path, sha=expected)
+            self.assertEqual(opener.call_count, pool.DOWNLOAD_ATTEMPTS)
+            self.assertEqual(sleeper.call_count, pool.DOWNLOAD_ATTEMPTS - 1)
+            self.assertFalse(path.exists())
 
 
 class TestDeduplication(unittest.TestCase):

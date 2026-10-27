@@ -25,6 +25,17 @@ def _repository_makefile_text() -> str:
     )
 
 
+def _repository_distributed_text() -> str:
+    candidates = [Path("/repo/scripts/distributed.py")]
+    candidates.extend(parent / "scripts" / "distributed.py" for parent in Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise AssertionError(
+        "scripts/distributed.py is unavailable; runner image must include it at /repo/scripts/distributed.py"
+    )
+
+
 @pytest.mark.asyncio
 async def test_navigation_uses_wrapped_page_goto_and_commit() -> None:
     page = type("PageDouble", (), {})()
@@ -201,16 +212,18 @@ async def test_resume_auth_check_rejects_missing_session_without_reload() -> Non
 
 
 def test_make_run_and_resume_use_no_deps_superbench_commands() -> None:
-    from pathlib import Path
-
     makefile = _repository_makefile_text()
     run_block = makefile.split("run:", 1)[1].split("pause:", 1)[0]
     resume_block = makefile.split("resume:", 1)[1].split("status:", 1)[0]
 
-    assert "docker compose run --rm --no-deps" in run_block
-    assert "runner superbench-run" in run_block
-    assert "docker compose run --rm --no-deps" in resume_block
-    assert "runner superbench-resume-active" in resume_block
+    assert "scripts/distributed.py run" in run_block
+    assert "scripts/distributed.py resume" in resume_block
+
+    distributed = _repository_distributed_text()
+    control = distributed.split("def control(", 1)[1].split("def execution(", 1)[0]
+    assert '"run": "superbench-run"' in control
+    assert '"resume": "superbench-resume-active"' in control
+    assert 'compose("run", "--rm", "--no-deps"' in control
 
 
 def test_superbench_run_does_not_invoke_doctor_preflight_per_task() -> None:

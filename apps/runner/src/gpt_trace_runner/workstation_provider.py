@@ -58,11 +58,12 @@ class WorkstationProvider(Protocol):
 
 
 class LibvirtWorkstationProvider:
-    def __init__(self, socket: Path, token_file: Path, *, client: httpx.AsyncClient | None = None):
+    def __init__(self, socket: Path, token_file: Path, *, client: httpx.AsyncClient | None = None,
+                 remote: bool | None = None):
         self.socket = socket
         self.token_file = token_file
         self._owns_client = client is None
-        self.remote = distributed()
+        self.remote = distributed() if remote is None else remote
         self.client = client or make_client(socket)
 
     async def close(self) -> None:

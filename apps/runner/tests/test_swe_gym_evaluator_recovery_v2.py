@@ -41,6 +41,7 @@ def grading(tmp_path):
         def __init__(self):
             self.pending, self.created, self.destroyed, self.imported, self.programs, self.actions = None, [], [], [], [], []
             self.verdict, self.broken = "pass", False
+            self.remote = False
         def _identity(self, task, environments, fingerprint, attempt):
             return {"task_id":task.task_id,"attempt":attempt,"environment_id":"env","fingerprint":fingerprint}
         async def snapshot(self, *args, **kwargs):

@@ -126,7 +126,17 @@ def _discard_partial_download(path):
     path.unlink()
 
 
+class DownloadIntegrityError(RuntimeError):
+    """A completed transfer did not match its pinned integrity identity."""
+    pass
+
+
 def _retryable_network_error(exc):
+    if isinstance(exc, DownloadIntegrityError):
+        # A transport can terminate cleanly after delivering truncated/corrupted
+        # bytes, so urllib may expose no network exception. Retry from byte zero;
+        # the artifact is still accepted only after exact integrity verification.
+        return True
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in DOWNLOAD_RETRY_HTTP
     if isinstance(exc, ssl.SSLCertVerificationError):
@@ -203,9 +213,10 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None)
                     for sri_hash,_ in checks: sri_hash.update(block)
                 stream.flush(); os.fsync(stream.fileno())
         actual=h.hexdigest()
-        if sha and actual != sha: raise RuntimeError('download sha256 mismatch: '+str(path))
+        if sha and actual != sha:
+            raise DownloadIntegrityError('download sha256 mismatch: '+str(path))
         if checks and not any(h.digest()==expected for h,expected in checks):
-            raise RuntimeError('download integrity mismatch: '+str(path))
+            raise DownloadIntegrityError('download integrity mismatch: '+str(path))
         if integrity_digests is not None:
             integrity_digests.update({algo:h.digest() for algo,h in other_hashes.items()})
         return actual

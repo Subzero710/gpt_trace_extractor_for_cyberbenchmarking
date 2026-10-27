@@ -23,6 +23,17 @@ def _repository_makefile_text() -> str:
     )
 
 
+def _repository_distributed_text() -> str:
+    candidates = [Path("/repo/scripts/distributed.py")]
+    candidates.extend(parent / "scripts" / "distributed.py" for parent in Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise AssertionError(
+        "scripts/distributed.py is unavailable; runner image must include it at /repo/scripts/distributed.py"
+    )
+
+
 def fp():
     return task_fingerprint(TASK)
 
@@ -233,10 +244,16 @@ def test_submission_journal_persists_user_message_identity(tmp_path: Path) -> No
 
 def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None:
     makefile = _repository_makefile_text()
-    block = makefile.split("reset-recovery:", 1)[1].split("throw_volumes:", 1)[0]
-    assert 'test -n "$(TASK)"' in block
-    assert "docker compose run --rm --no-deps runner superbench-reset-recovery" in block
-    assert '"$(TASK)" --yes' in block
+    block = makefile.split("reset-recovery:", 1)[1].split("superbench-fetch:", 1)[0]
+    assert 'scripts/distributed.py reset-recovery' in block
+    assert '$(if $(TASK),--task "$(TASK)",)' in block
+
+    distributed = _repository_distributed_text()
+    control = distributed.split("def control(", 1)[1].split("def execution(", 1)[0]
+    assert '"reset-recovery": "superbench-reset-recovery"' in control
+    assert 'if not args.task: raise ValueError("TASK is required")' in control
+    assert 'arguments = [args.task, "--yes"]' in control
+    assert 'compose("run", "--rm", "--no-deps"' in control
 
 
 def test_runner_deletes_completed_remote_conversation_before_app_reset() -> None:
