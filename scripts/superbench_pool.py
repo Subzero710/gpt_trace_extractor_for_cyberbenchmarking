@@ -7,6 +7,7 @@ starts a VM, invokes a task script, installs software or deletes persisted data.
 """
 from __future__ import annotations
 import argparse
+import concurrent.futures
 import base64
 import configparser
 import hashlib
@@ -58,7 +59,7 @@ def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
                                 text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
     except subprocess.CalledProcessError as exc:
         # Captured stdout is otherwise lost from the durable preparation log.
-        # Solvers such as micromamba report structured failure diagnostics there.
+        # Some dependency tools report structured failure diagnostics there.
         if capture and exc.stdout:
             output = exc.stdout if len(exc.stdout) <= 65536 else exc.stdout[-65536:]
             if len(output) != len(exc.stdout):
@@ -1005,33 +1006,6 @@ def conda_pip_split(content):
     return ''.join(out),pip
 
 
-def conda_solver_yaml(content):
-    """Translate only audited pinned upstream syntax that libmamba cannot parse."""
-    output=[]; meson_extra=False
-    for line in content.splitlines(keepends=True):
-        if line.endswith('\r\n'):
-            body,eol=line[:-2],'\r\n'
-        elif line.endswith('\n'):
-            body,eol=line[:-1],'\n'
-        else:
-            body,eol=line,''
-        match=re.fullmatch(
-            r'(?P<prefix>\s*-\s*)meson\[ninja\]=1\.2\.1(?P<suffix>\s*(?:#.*)?)',
-            body,
-        )
-        if match:
-            if meson_extra:
-                raise RuntimeError('duplicate audited meson[ninja] Conda workaround')
-            prefix,suffix=match.group('prefix'),match.group('suffix')
-            output.append(prefix+'meson=1.2.1'+suffix+eol)
-            output.append(prefix+'ninja'+eol)
-            meson_extra=True
-        else:
-            output.append(line)
-    # Historical pinned recipe typo; keep the correction finite and explicit.
-    return ''.join(output).replace('firefox =>96','firefox >=96')
-
-
 def python_version(script):
     values=re.findall(r'\bpython\s*[= ]\s*(3\.(?:8|9|10|11|12))(?!\d)','\n'.join(script))
     if not values:raise RuntimeError('Conda environment has no Python constraint')
@@ -1253,48 +1227,160 @@ class Pool:
         self.issues.append(f'{where}: {description}')
 
 
-def conda_resolve(micro, pool, key, args, *, channels=()):
-    """Resolve and acquire one Conda transaction without creating an environment."""
-    stage=pool.stage
-    cmd=[micro,'create','--dry-run','--json',
-         '--root-prefix',stage/'conda'/'root','--prefix',stage/'conda'/'proposed'/key]
-    for channel in channels:
-        cmd.extend(['-c',channel])
-    cmd.extend(args)
-    raw=invoke(cmd,capture=True)
-    try: data=json.loads(raw)
-    except ValueError as exc:raise RuntimeError('invalid micromamba solve JSON for '+key) from exc
-    if data.get('success') is False:raise RuntimeError('unsatisfiable Conda recipe '+key)
-    actions=data.get('actions') or {}
-    fetches = actions.get('FETCH') or []
-    links = actions.get('LINK') or []
-    if not fetches and not links:
-        raise RuntimeError('micromamba returned empty closure for '+key)
-    # LINK describes the actual solved installation. FETCH alone can be
-    # incomplete when an archive is already present in a package cache.
-    by_name = {i.get('fn'): i for i in fetches if isinstance(i, dict) and i.get('fn')}
-    packages = []
-    for item in (links or fetches):
-        if not isinstance(item, dict):
-            raise RuntimeError('invalid micromamba package record for '+key)
-        source = by_name.get(item.get('fn'), {})
-        packages.append({**source, **{k: v for k, v in item.items() if v not in (None, '')}})
-    if links:
-        linked = {i.get('fn') for i in links if isinstance(i, dict)}
-        if any(i.get('fn') not in linked for i in fetches):
-            raise RuntimeError('micromamba FETCH and LINK disagree for '+key)
-    resolved=[]
-    for item in packages:
-        url=item.get('url')
-        hashval=item.get('sha256')
-        if not url or not isinstance(hashval,str) or not SHA.fullmatch(hashval):
-            raise RuntimeError('Conda closure has unpinned package '+key)
-        pool.download(url,'conda',key,sha=hashval)
-        resolved.append({'name':item.get('name'),'version':item.get('version'),
-                         'build':item.get('build_string') or item.get('build'),
-                         'url':url,'sha256':hashval})
-    write_new(stage/'metadata'/('conda-'+key+'.json'),json.dumps(resolved,sort_keys=True))
-    return resolved
+# GPT_TRACE_SWEGYM_CONDA_LOCK_V1
+CONDA_LOCK_SCHEMA = 1
+CONDA_LOCK_WORKERS = 8
+CONDA_LOCK_HOSTS = frozenset({'conda.anaconda.org', 'repo.anaconda.com'})
+
+
+def conda_recipe_fingerprint(script):
+    return hashlib.sha256(json.dumps(script,sort_keys=True,separators=(',',':'),
+        ensure_ascii=False).encode()).hexdigest()
+
+
+def conda_expected_transaction_keys(env,script):
+    post=conda_post_install_specs(script)
+    if not post:return ['env-'+env]
+    result=['env-'+env+'-base']
+    for index in range(1,len(post)+1):
+        result.append('env-'+env if index==len(post) else 'env-'+env+'-step'+str(index))
+    return result
+
+
+def _validate_conda_lock_url(url,name,version,build):
+    parsed=urllib.parse.urlsplit(str(url))
+    if (parsed.scheme!='https' or parsed.hostname not in CONDA_LOCK_HOSTS or parsed.username
+            or parsed.password or parsed.query or parsed.fragment):
+        raise RuntimeError('untrusted Conda lock URL: '+str(url))
+    filename=Path(parsed.path).name
+    expected=str(name)+'-'+str(version)+'-'+str(build)
+    if filename not in (expected+'.conda',expected+'.tar.bz2'):
+        raise RuntimeError('Conda lock package identity/URL mismatch: '+filename)
+    return str(url)
+
+
+def load_conda_lock(adapter,pins,contract):
+    path=Path(adapter)/'conda-lock.json'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing pinned SWE-Gym Conda lock; run scripts/generate_swegym_conda_lock.py')
+    raw=path.read_bytes();lock_sha=hashlib.sha256(raw).hexdigest()
+    try:lock=json.loads(raw)
+    except ValueError as exc:raise RuntimeError('invalid SWE-Gym Conda lock JSON') from exc
+    if (not isinstance(lock,dict) or lock.get('schema')!=CONDA_LOCK_SCHEMA
+            or lock.get('kind')!='swe-gym-lite-conda-image-lock'
+            or lock.get('platform')!='linux-x86_64'
+            or lock.get('contract_sha256')!=pins.get('contract_sha256')
+            or lock.get('image_prefix')!='xingyaoww/sweb.eval.x86_64.'):
+        raise RuntimeError('SWE-Gym Conda lock header differs from pinned contract')
+    artifacts=lock.get('artifacts');environments=lock.get('environments')
+    if (not isinstance(artifacts,dict) or not artifacts or len(artifacts)>50000
+            or not isinstance(environments,dict)
+            or set(environments)!=set(contract.get('environments',{}))):
+        raise RuntimeError('SWE-Gym Conda lock coverage differs')
+    by_url={}
+    checked={}
+    for sha,item in artifacts.items():
+        if not isinstance(sha,str) or not SHA.fullmatch(sha) or not isinstance(item,dict):
+            raise RuntimeError('invalid Conda lock artifact identity')
+        if item.get('sha256')!=sha:
+            raise RuntimeError('Conda lock artifact key/SHA mismatch')
+        name=item.get('name');version=item.get('version');build=item.get('build')
+        if not all(isinstance(value,str) and value for value in (name,version,build)):
+            raise RuntimeError('incomplete Conda lock package identity')
+        if item.get('subdir') not in ('linux-64','noarch'):
+            raise RuntimeError('unsupported Conda lock package subdir')
+        url=_validate_conda_lock_url(item.get('url'),name,version,build)
+        previous=by_url.setdefault(url,sha)
+        if previous!=sha:raise RuntimeError('Conda lock URL maps to conflicting SHA-256 values')
+        checked[sha]={'name':name,'version':version,'build':build,'url':url,'sha256':sha,
+                      'channel':item.get('channel'),'subdir':item.get('subdir')}
+    tasks_by_env=defaultdict(list)
+    for logical,task in contract.get('tasks',{}).items():tasks_by_env[task.get('env_hash')].append(logical)
+    referenced=set()
+    normalized_envs={}
+    for env,recipe in contract['environments'].items():
+        row=environments.get(env)
+        if not isinstance(row,dict):raise RuntimeError('invalid Conda lock environment '+env)
+        candidates=sorted(tasks_by_env.get(env,[]))
+        instance=row.get('instance_id')
+        if instance not in candidates:
+            raise RuntimeError('Conda lock environment references unrelated task image: '+env)
+        expected_image='xingyaoww/sweb.eval.x86_64.'+instance.replace('__','_s_')
+        if row.get('image')!=expected_image or re.fullmatch(r'sha256:[0-9a-f]{64}',str(row.get('image_digest'))) is None:
+            raise RuntimeError('invalid Conda lock image provenance: '+env)
+        script=recipe.get('original_script')
+        if row.get('recipe_sha256')!=conda_recipe_fingerprint(script):
+            raise RuntimeError('Conda lock recipe fingerprint differs: '+env)
+        expected_keys=conda_expected_transaction_keys(env,script)
+        transactions=row.get('transactions')
+        if not isinstance(transactions,list) or [x.get('key') if isinstance(x,dict) else None for x in transactions]!=expected_keys:
+            raise RuntimeError('Conda lock transaction sequence differs: '+env)
+        normalized=[]
+        for transaction in transactions:
+            python=transaction.get('python');packages=transaction.get('packages')
+            if python not in PYTHONS or not isinstance(packages,list) or not packages or len(packages)!=len(set(packages)):
+                raise RuntimeError('invalid Conda lock transaction: '+transaction.get('key','?'))
+            names=set();solution=[]
+            for sha in packages:
+                if sha not in checked:raise RuntimeError('Conda lock transaction references unknown archive')
+                item=checked[sha]
+                if item['name'] in names:raise RuntimeError('duplicate package name in Conda lock transaction')
+                names.add(item['name']);solution.append(item)
+                referenced.add(sha)
+            if conda_solution_python(solution)!=python:
+                raise RuntimeError('Conda lock transaction Python metadata differs')
+            normalized.append({'key':transaction['key'],'python':python,'packages':list(packages)})
+        if normalized[-1]['python']!=python_version(script):
+            raise RuntimeError('Conda lock final Python differs from contract: '+env)
+        normalized_envs[env]={**row,'transactions':normalized}
+    if referenced!=set(checked):raise RuntimeError('Conda lock has unreferenced archive records')
+    return {**lock,'artifacts':checked,'environments':normalized_envs},lock_sha
+
+
+def acquire_locked_conda(pool,lock):
+    """Acquire each immutable Conda archive once, then materialize transaction snapshots."""
+    artifacts=lock['artifacts'];references=defaultdict(set)
+    for env,row in lock['environments'].items():
+        for transaction in row['transactions']:
+            for sha in transaction['packages']:references[sha].add(transaction['key'])
+    missing=[sha for sha in sorted(references)
+             if not (pool.objects/sha[:2]/sha).is_file()]
+    print('[pool] Conda lock: '+str(len(lock['environments']))+' environments, '
+          +str(sum(len(row['transactions']) for row in lock['environments'].values()))
+          +' transactions, '+str(len(references))+' unique archives',flush=True)
+    downloaded={}
+    def transfer(sha):
+        raw=pool.stage/'downloads'/('conda-'+sha)
+        actual=fetch(artifacts[sha]['url'],raw,sha=sha)
+        if actual!=sha:raise RuntimeError('Conda lock download identity changed')
+        return sha,raw
+    if missing:
+        workers=min(CONDA_LOCK_WORKERS,len(missing))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                                   thread_name_prefix='conda-lock') as executor:
+            futures={executor.submit(transfer,sha):sha for sha in missing}
+            for future in concurrent.futures.as_completed(futures):
+                sha,raw=future.result();downloaded[sha]=raw
+    # Pool's provenance dictionaries remain single-threaded. Only byte transfer
+    # occurs concurrently; CAS registration and reference sharing are serialized.
+    for sha in sorted(references):
+        item=artifacts[sha];identities=sorted(references[sha])
+        if sha in downloaded:
+            raw=downloaded[sha]
+            pool.put(raw,'conda',identities[0],verified_sha=sha)
+            raw.unlink()
+        for identity in identities:
+            pool.download(item['url'],'conda',identity,sha=sha)
+    plans={};base_python={}
+    for env,row in sorted(lock['environments'].items()):
+        keys=[]
+        for transaction in row['transactions']:
+            key=transaction['key'];keys.append(key)
+            solution=[artifacts[sha] for sha in transaction['packages']]
+            write_new(pool.stage/'metadata'/('conda-'+key+'.json'),
+                      json.dumps(solution,sort_keys=True,separators=(',',':')))
+        plans[env]=keys;base_python[env]=row['transactions'][0]['python']
+    return plans,base_python
 
 
 def conda_solution_python(resolved):
@@ -1790,7 +1876,7 @@ def npm_global_bootstrap(pool):
                                    'sha256':sha,'integrity':meta['integrity']},sort_keys=True))
 
 def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tasks=None,
-                    conda_transactions=None):
+                    conda_transactions=None,conda_lock_sha256=None):
     stage=pool.stage
     files=[];seen_inodes={}
     for path in sorted(stage.rglob('*')):
@@ -1812,7 +1898,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
     if not pool.links:reject('CAS','no acquired content-addressed objects')
     if len(task_plan)!=230 or len(envplan)!=25 or len(gitplan)!=11:
         reject('contract','unexpected 230/25/11 contract coverage')
-    for kind in ('tools','conda','git','apt'):
+    for kind in ('conda','git','apt'):
         if not pool.provenance.get(kind):
             reject('provenance','no acquired '+kind+' artifacts')
     for sha,row in pool.links.items():
@@ -1877,7 +1963,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         conda_transactions={env:['env-'+env] for env in envplan}
     if set(conda_transactions)!=set(envplan):
         reject('Conda','transaction plan does not cover all environments')
-    conda_keys=['python-'+version for version in PYTHONS]
+    conda_keys=[]
     for env in envplan:
         keys=conda_transactions.get(env)
         if not isinstance(keys,list) or not keys or keys[-1]!='env-'+env:
@@ -1977,7 +2063,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
              'files':files,'issues':issues,'objects':pool.links,
              'provenance':pool.provenance,'task_plan':task_plan,
              'environment_plan':envplan,'conda_transactions':conda_transactions,
-             'git_plan':gitplan}
+             'conda_lock_sha256':conda_lock_sha256,'git_plan':gitplan}
     write_new(stage/'inventory.json',json.dumps(summary,sort_keys=True,indent=2)+'\n')
     print('[pool] objects=',len(pool.links),'files=',len(files),'issues=',len(issues),flush=True)
     if issues:raise RuntimeError('incomplete dependency closure: '+issues[0]+
@@ -2000,6 +2086,7 @@ def main(argv=None):
     if digest(adapter/'contract.json')!=pins['contract_sha256']:
         raise RuntimeError('pinned SWE-Gym Lite contract changed')
     contract=json.loads((adapter/'contract.json').read_bytes())
+    conda_lock,conda_lock_sha256=load_conda_lock(adapter,pins,contract)
     tasks=contract['tasks'];environments=contract['environments']
     if len(tasks)!=230 or len(environments)!=25 or len({r['repo'] for r in tasks.values()})!=11:
         raise RuntimeError('unexpected SWE-Gym Lite coverage')
@@ -2009,11 +2096,6 @@ def main(argv=None):
         (stage/name).mkdir(exist_ok=True)
     write_new(stage/'STAGING','Uncommitted, non-resumable dependency acquisition.\n')
     pool=Pool(stage)
-    resolver=stage/'metadata'/'micromamba'
-    fetch('https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-linux-64',
-          resolver,sha='366cd9cd8be14df1ab8ed50352a82111082a36686b2d389fdb79a92c3fafb3e3',limit=30*1024*1024)
-    resolver.chmod(0o500)
-    pool.put(resolver,'tools','micromamba-2.9.0')
     grouped=defaultdict(set)
     for task in tasks.values():grouped[task['repo']].add(task['base_commit'])
     mirrors={};gitplan={}
@@ -2031,59 +2113,35 @@ def main(argv=None):
                         gitplan[repo]['submodules'][path]={'repo':subrepo,'commit':sha}
                         ensure_commit(stage,subrepo,sha,label='git-extra')
     # Git files must not be linked to CAS while Git may still mutate refs.
-    envplan={};conda_transaction_plan={};requirements_by_env=defaultdict(set);vcs=set()
+    envplan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set);environment_pip_python={}
-    for version in PYTHONS:
-        print('[pool] Python '+version,flush=True)
-        conda_resolve(str(resolver),pool,'python-'+version,['python='+version,'pip'],
-                      channels=('conda-forge',))
-    default_channels=('https://repo.anaconda.com/pkgs/main',
-                      'https://repo.anaconda.com/pkgs/r')
+    conda_transaction_plan,locked_base_python=acquire_locked_conda(pool,conda_lock)
     for i,(env,entry) in enumerate(sorted(environments.items()),1):
         script=entry['original_script']
         version=python_version(script);envplan[env]=version
+        locked=conda_lock['environments'][env]
+        if locked['transactions'][-1]['python']!=version:
+            raise RuntimeError('locked final Python differs from environment recipe: '+env)
         content=conda_yaml(script)
         pips=[]
-        print(f'[pool] Conda {i}/25, Python {version}',flush=True)
+        print(f'[pool] Conda lock {i}/25, final Python {version}',flush=True)
         if content:
-            trimmed,pips=conda_pip_split(content)
+            _,pips=conda_pip_split(content)
             # The official upstream Dask recipe removes the pip section before
             # Conda sees it. Do not fetch packages from instructions it deletes.
             if any("sed -i '/- pip:/,/^ *-/d' environment.yml" in command
                    for command in script):
                 pips=[]
-            trimmed=conda_solver_yaml(trimmed)
-            file=stage/'metadata'/('env-'+env+'.yml');write_new(file,trimmed)
-            post=conda_post_install_specs(script)
-            if post:
-                transaction_keys=['env-'+env+'-base']
-                # Acquire the exact initial transaction as well as every later
-                # post-create solve. Pip entries embedded in environment.yml run
-                # during this *base* environment creation, before any later
-                # `conda install python=...` override, so record that interpreter.
-                base_solution=conda_resolve(str(resolver),pool,'env-'+env+'-base',['--file',str(file)])
-                base_python=conda_solution_python(base_solution)
-                cumulative=[]
-                for step_index,specs in enumerate(post,1):
-                    cumulative.extend(specs)
-                    key='env-'+env if step_index==len(post) else 'env-'+env+'-step'+str(step_index)
-                    conda_resolve(str(resolver),pool,key,['--file',str(file),*cumulative])
-                    transaction_keys.append(key)
-                conda_transaction_plan[env]=transaction_keys
-            else:
-                solution=conda_resolve(str(resolver),pool,'env-'+env,['--file',str(file)])
-                base_python=conda_solution_python(solution)
-                conda_transaction_plan[env]=['env-'+env]
+            if conda_expected_transaction_keys(env,script)!=conda_transaction_plan[env]:
+                raise RuntimeError('locked Conda transaction shape differs: '+env)
             if pips:
-                environment_pip_python[env]=base_python
+                environment_pip_python[env]=locked_base_python[env]
         else:
             direct=conda_direct_specs(script)
             if not direct:
                 raise RuntimeError('environment has neither YAML nor direct Conda create: '+env)
-            # Upstream direct `conda create` uses Miniconda's defaults; do not
-            # silently substitute conda-forge.
-            conda_resolve(str(resolver),pool,'env-'+env,direct,channels=default_channels)
-            conda_transaction_plan[env]=['env-'+env]
+            if conda_transaction_plan[env]!=['env-'+env]:
+                raise RuntimeError('direct Conda environment has unexpected locked transactions: '+env)
         for dep in pips:
             if not dep or dep.startswith('#'):continue
             if vcs_reference(dep):
@@ -2444,7 +2502,8 @@ def main(argv=None):
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
         pool.issue('APT','signed Kali closure unavailable: '+str(exc))
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
-                    conda_transactions=conda_transaction_plan)
+                    conda_transactions=conda_transaction_plan,
+                    conda_lock_sha256=conda_lock_sha256)
 
 
 if __name__=='__main__':

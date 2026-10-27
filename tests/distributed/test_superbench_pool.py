@@ -75,34 +75,27 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertEqual(len({row['repo'] for row in contract['tasks'].values()}), 11)
         self.assertEqual(set(pool.PYTHONS), {'3.8','3.9','3.10','3.11','3.12'})
 
-    def test_pandas_meson_ninja_extra_is_normalized_for_conda_solver(self):
-        contract = json.loads(
-            (ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes()
-        )
+    def test_conda_recipe_fingerprint_changes_with_recipe_bytes(self):
+        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
         script = contract['environments']['0bb835c6e5fbdbe6998741']['original_script']
-        content = pool.conda_yaml(script)
-        self.assertIsNotNone(content)
-        trimmed, _ = pool.conda_pip_split(content)
-        normalized = pool.conda_solver_yaml(trimmed)
-        self.assertNotIn('meson[ninja]', normalized)
-        self.assertIn('  - meson=1.2.1\n', normalized)
-        self.assertIn('  - ninja\n', normalized)
-        self.assertIn('  - meson-python=0.13.1\n', normalized)
+        original = pool.conda_recipe_fingerprint(script)
+        changed = list(script);changed[-1] = changed[-1] + ' '
+        self.assertRegex(original, r'^[0-9a-f]{64}$')
+        self.assertNotEqual(original, pool.conda_recipe_fingerprint(changed))
 
-    def test_failed_captured_command_logs_solver_stdout(self):
+    def test_failed_captured_command_logs_stdout(self):
         failure = subprocess.CalledProcessError(
             1,
-            ['micromamba'],
-            output='{"success":false,"solver_problems":["unsupported request"]}\n',
+            ['fixture-tool'],
+            output='{"success":false,"problems":["unsupported request"]}\n',
         )
         captured = io.StringIO()
         with patch.object(pool.subprocess, 'run', side_effect=failure), \
              contextlib.redirect_stderr(captured), \
              self.assertRaises(subprocess.CalledProcessError):
-            pool.invoke(['micromamba', '--json'], capture=True)
+            pool.invoke(['fixture-tool', '--json'], capture=True)
         self.assertIn('failed command captured stdout', captured.getvalue())
         self.assertIn('unsupported request', captured.getvalue())
-
 
     def test_dvc_file_backed_tests_extra_and_target_python_append_are_static(self):
         setup = """from pathlib import Path
@@ -490,19 +483,33 @@ setup(version=dynamic_version(), **setup_args)
         self.assertIn('child.wait(timeout=24 * 3600)',physical)
         self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
 
-    def test_conda_link_solution_not_just_fetch(self):
-        records=[{'fn':'a.tar.bz2','url':'https://x/a.tar.bz2','sha256':'a'*64},
-                 {'fn':'b.tar.bz2','url':'https://x/b.tar.bz2','sha256':'b'*64}]
-        operations=[]
-        class Candidate:
-            stage=Path('/tmp')
-            def download(self,*args,**kwargs):operations.append(kwargs['sha'])
-        original_write=pool.write_new
-        with patch.object(pool,'invoke',return_value=json.dumps({'success':True,
-             'actions':{'LINK':records,'FETCH':records[:1]}})),patch.object(pool,'write_new'):
-            pool.conda_resolve('fake',Candidate(),'test',['python=3.10'])
-        self.assertEqual(operations,['a'*64,'b'*64])
-
+    def test_conda_lock_downloads_each_sha_once_and_materializes_transactions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp)
+            for name in ('objects','downloads','metadata'):(stage/name).mkdir()
+            candidate=pool.Pool(stage)
+            one=b'archive-one';two=b'archive-two'
+            sha1=hashlib.sha256(one).hexdigest();sha2=hashlib.sha256(two).hexdigest()
+            lock={'artifacts':{
+                sha1:{'name':'python','version':'3.10.1','build':'x','url':'https://conda.anaconda.org/conda-forge/linux-64/python-3.10.1-x.conda','sha256':sha1,'channel':'https://conda.anaconda.org/conda-forge/linux-64','subdir':'linux-64'},
+                sha2:{'name':'pip','version':'24.0','build':'y','url':'https://conda.anaconda.org/conda-forge/noarch/pip-24.0-y.conda','sha256':sha2,'channel':'https://conda.anaconda.org/conda-forge/noarch','subdir':'noarch'}},
+                'environments':{
+                    'a':{'transactions':[{'key':'env-a','python':'3.10','packages':[sha1,sha2]}]},
+                    'b':{'transactions':[{'key':'env-b','python':'3.10','packages':[sha1]}]}}}
+            payload={lock['artifacts'][sha1]['url']:one,lock['artifacts'][sha2]['url']:two}
+            calls=[]
+            def network(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+                calls.append(url);Path(path).write_bytes(payload[url])
+                actual=hashlib.sha256(payload[url]).hexdigest()
+                self.assertEqual(actual,sha);return actual
+            with patch.object(pool,'fetch',side_effect=network):
+                plans,base=pool.acquire_locked_conda(candidate,lock)
+            self.assertEqual(set(calls),set(payload));self.assertEqual(len(calls),2)
+            self.assertEqual(plans,{'a':['env-a'],'b':['env-b']})
+            self.assertEqual(base,{'a':'3.10','b':'3.10'})
+            self.assertTrue((stage/'metadata/conda-env-a.json').is_file())
+            self.assertTrue((stage/'metadata/conda-env-b.json').is_file())
+            self.assertEqual(set(candidate.provenance['conda']),{'env-a','env-b'})
 
 class TestContractClosureRegressionV4(unittest.TestCase):
     def test_contract_direct_conda_create_covers_all_five_non_yaml_envs(self):
@@ -530,8 +537,24 @@ class TestContractClosureRegressionV4(unittest.TestCase):
         self.assertEqual(sorted(value[0][0] for value in post.values()),
                          ['python=3.10','python=3.9','python=3.9','python=3.9','python=3.9'])
 
+    def test_committed_conda_lock_covers_all_25_envs_and_30_transactions(self):
+        adapter=ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
+        pins=json.loads((adapter/'pins.json').read_bytes())
+        contract=json.loads((adapter/'contract.json').read_bytes())
+        lock,lock_sha=pool.load_conda_lock(adapter,pins,contract)
+        self.assertRegex(lock_sha,r'^[0-9a-f]{64}$')
+        self.assertEqual(len(lock['environments']),25)
+        self.assertEqual(sum(len(row['transactions']) for row in lock['environments'].values()),30)
+        self.assertEqual(set(row['transactions'][-1]['python'] for row in lock['environments'].values()),set(pool.PYTHONS))
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertNotIn('micromamba',source.lower())
+        self.assertNotIn('def conda_resolve(',source)
+
     def test_contract_environment_pip_phase_precedes_python_override(self):
-        contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        adapter=ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
+        contract = json.loads((adapter/'contract.json').read_bytes())
+        pins = json.loads((adapter/'pins.json').read_bytes())
+        lock,_ = pool.load_conda_lock(adapter,pins,contract)
         phased=[]
         for env,entry in contract['environments'].items():
             content=pool.conda_yaml(entry['original_script'])
@@ -540,10 +563,12 @@ class TestContractClosureRegressionV4(unittest.TestCase):
             post=pool.conda_post_install_specs(entry['original_script'])
             if pips and post: phased.append((env,pips,post))
         self.assertEqual(len(phased),5)
-        self.assertTrue(all(rows and post for _,rows,post in phased))
+        for env,rows,post in phased:
+            self.assertTrue(rows and post)
+            self.assertEqual(len(lock['environments'][env]['transactions']),2)
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertIn('environment_pip_python',source)
-        self.assertIn('base_python=conda_solution_python(base_solution)',source)
+        self.assertIn('environment_pip_python[env]=locked_base_python[env]',source)
+        self.assertIn('acquire_locked_conda(pool,conda_lock)',source)
         self.assertIn("bucket='environment'",source)
 
     def test_poetry_isort_optional_dependencies_do_not_become_invalid_pip_specs(self):

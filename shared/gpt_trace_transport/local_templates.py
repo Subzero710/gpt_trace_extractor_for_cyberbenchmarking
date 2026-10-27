@@ -461,6 +461,10 @@ def pool_contract(source_root=ROOT):
         raise RuntimeError("unsupported pinned Lite contract")
     if digest(source_root / RUNTIME / "contract.json") != pins["contract_sha256"]:
         raise RuntimeError("SWE-Gym Lite source contract differs")
+    lock = source_root / RUNTIME / "conda-lock.json"
+    if lock.is_symlink() or not lock.is_file():
+        raise RuntimeError("missing SWE-Gym Lite Conda lock")
     return {"fetch_kind": "download-only-pool-v2", "pool_schema": 2,
             "pins": pins, "platform": "linux-x86_64",
+            "conda_lock_sha256": digest(lock),
             "fetcher_sha256": digest(source_root / "scripts/superbench_pool.py")}

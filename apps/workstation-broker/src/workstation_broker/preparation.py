@@ -34,6 +34,7 @@ FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
 )
@@ -730,6 +731,7 @@ def _prepare(manager, state):
             or inventory.get("tasks") != 230 or inventory.get("repos") != 11
              or inventory.get("conda_recipes") != 25
             or inventory.get("operation_id") != state["operation_id"]
+             or inventory.get("conda_lock_sha256") != state["compatibility"].get("conda_lock_sha256")
              or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
              or inventory.get("issues") or not isinstance(inventory.get("files"),list)
              or not isinstance(inventory.get("task_plan"),dict)
