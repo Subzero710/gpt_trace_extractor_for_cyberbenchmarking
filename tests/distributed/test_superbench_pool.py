@@ -259,7 +259,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 _,selected,_=pool._select_source_release(candidate,'demo>1,<2','3.10')
         self.assertEqual(selected,'1.9')
 
-    def test_source_range_without_cache_selects_lowest_compatible_not_latest(self):
+    def test_source_range_without_cache_selects_latest_compatible(self):
         def release(version):
             return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
                      'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
@@ -270,7 +270,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(candidate,'demo>1.4,<2','3.10')
-        self.assertEqual(selected,'1.5')
+        self.assertEqual(selected,'1.9')
 
     def test_source_greater_equal_uses_exact_lower_release_when_available(self):
         def release(version):
@@ -283,6 +283,62 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(candidate,'demo>=5.1','3.10')
+        self.assertEqual(selected,'5.1')
+
+    def test_source_greater_equal_does_not_float_when_lower_release_is_missing(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'5.2':release('5.2'),'6.0':release('6.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=project), self.assertRaisesRegex(
+                    RuntimeError,'requires exact release 5.1'):
+                pool._select_source_release(candidate,'demo>=5.1','3.10')
+
+    def test_source_greater_equal_prefers_compatible_cached_version_over_lower_pin(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'5.1':release('5.1'),'5.2':release('5.2'),'6.0':release('6.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=pool.Pool(stage)
+            shared=stage/'wheels/shared';shared.mkdir(parents=True)
+            (shared/'demo-6.0-py3-none-any.whl').write_bytes(b'cached')
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1','3.10')
+        self.assertEqual(selected,'6.0')
+
+    def test_source_bounded_greater_equal_is_range_and_uses_latest_without_cache(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'5.1':release('5.1'),'5.2':release('5.2'),
+                             '6.0':release('6.0'),'6.1':release('6.1')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1,<6.1','3.10')
+        self.assertEqual(selected,'6.0')
+
+    def test_constraint_only_greater_equal_without_cache_is_exact_lower_bound(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'5.1':release('5.1'),'5.2':release('5.2'),'6.0':release('6.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(
+                    candidate,'demo','3.10',constraints={'demo>=5.1'})
         self.assertEqual(selected,'5.1')
 
     def test_apt_key_uses_downloaded_content_address(self):

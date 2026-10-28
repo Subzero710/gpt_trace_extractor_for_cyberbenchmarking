@@ -1678,7 +1678,7 @@ def _constraint_specifiers(name, constraints, python_version):
     return result
 
 
-# GPT_TRACE_SWEGYM_CONSERVATIVE_VERSION_POLICY_V1
+# GPT_TRACE_SWEGYM_CONSERVATIVE_VERSION_POLICY_V2
 def normalize_legacy_source_requirement(value):
     """Normalize only the historical ``>=N.*`` metadata defect, conservatively.
 
@@ -1782,16 +1782,45 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
             candidates.append((version,text,source[0][2]))
     if not candidates:
         raise RuntimeError('no compatible signed source distribution: '+requirement)
-    # Compatibility ranges are deliberately conservative.  Reuse an already
-    # acquired compatible version first.  Otherwise choose the LOWEST concrete
-    # release satisfying the full requirement/constraint/Python intersection;
-    # never jump to a newer release merely because the metadata used >=.
+    # Pool reuse has priority over choosing another version. Candidate rows
+    # already satisfy the complete requirement/constraint/target-Python
+    # intersection. If several compatible versions are cached, reuse the newest
+    # cached one deterministically.
     candidates.sort(key=lambda row:row[0])
     cached_versions=set()
     for text in _cached_python_versions(pool,req.name):
         try:cached_versions.add(Version(text))
         except InvalidVersion:continue
-    selected=next((row for row in candidates if row[0] in cached_versions),candidates[0])
+    cached=[row for row in candidates if row[0] in cached_versions]
+    if cached:
+        selected=cached[-1]
+    else:
+        # One effective inclusive lower bound is an exact compatibility pin for
+        # this frozen benchmark. "Effective" includes active pip constraints:
+        # requirement ``demo`` + constraint ``demo>=5.1`` follows the same rule
+        # as requirement ``demo>=5.1``.
+        effective=[]
+        effective.extend(list(req.specifier))
+        for specifier_set in constraint_specs:
+            effective.extend(list(specifier_set))
+        unique={(specifier.operator,specifier.version):specifier for specifier in effective}
+        specifiers=list(unique.values())
+        lone_lower=(specifiers[0] if len(specifiers)==1
+                    and specifiers[0].operator=='>='
+                    and '*' not in specifiers[0].version else None)
+        if lone_lower is not None:
+            try:lower=Version(lone_lower.version)
+            except InvalidVersion as exc:
+                raise RuntimeError('invalid inclusive lower-bound source requirement: '+requirement) from exc
+            selected=next((row for row in candidates if row[0]==lower),None)
+            if selected is None:
+                raise RuntimeError(
+                    'inclusive lower-bound source requirement requires exact release '
+                    +lone_lower.version+': '+requirement)
+        else:
+            # Genuine ranges use the newest compatible release only when no
+            # compatible version already exists in the pool.
+            selected=candidates[-1]
     _,version_text,item=selected
     return req,version_text,item
 
