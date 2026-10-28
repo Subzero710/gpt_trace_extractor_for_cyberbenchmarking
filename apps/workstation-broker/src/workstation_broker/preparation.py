@@ -68,12 +68,12 @@ def trusted_fetch_python():
     return interpreter
 
 
-def stage_fetch_sources(manager, pool_root):
-    """Copy the finite audited fetch inputs out of the private repository tree."""
+def stage_fetch_sources(manager, pool_root, operation_id, attempt):
+    """Copy exact worker inputs into a unique per-attempt readonly snapshot."""
     repository = manager.source_root.resolve(strict=True)
-    snapshot = pool_root / "source"
+    snapshot = pool_root / ("source-"+identifier(operation_id)+"-"+str(attempt))
     if snapshot.exists() or snapshot.is_symlink():
-        raise RuntimeError("interrupted fetch source snapshot exists; zombie preserved: " + str(snapshot))
+        raise RuntimeError("per-attempt source snapshot already exists; refusing overwrite: " + str(snapshot))
     snapshot.mkdir(mode=0o755)
     for relative in FETCH_SOURCE_FILES:
         source = manager.source_root / relative
@@ -443,13 +443,13 @@ class PreparationManager:
                     previous = self._verify_ready(previous)
                 if previous["phase"] == "ready" or previous["phase"] not in TERMINAL:
                     return self._public(previous)
-                # The historical pre-download crash used the broker venv after
-                # dropping to gpttrace-fetch. It failed in execve before the
-                # downloader could create a stage or write any pool bytes. A
-                # user-explicit fetch may retry exactly that proved-empty case.
-                if not (payload["retry"] and pre_download_fetch_retryable(previous, self.base)):
-                    raise RuntimeError("fetch interrupted/failed; pool zombie preserved; "
-                                       "an explicit privileged maintenance action is required")
+                # An explicit operator retry is safe only after _reconcile
+                # verified the previous worker and all descendants are absent.
+                if not (payload['retry'] and previous['phase'] in {'failed','interrupted'}
+                        and previous.get('result') is None
+                        and previous.get('publication_verified') is None
+                        and not (self.base.parent/'dependency-pool'/'ready').exists()):
+                    raise RuntimeError('explicit retry of failed/unpublished preparation required')
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")
             elif payload["retry"]:
@@ -644,6 +644,47 @@ class PreparationManager:
         return {"thrown": True, "template_namespace": str(namespace)}
 
 
+
+# GPT_TRACE_SWEGYM_VERIFIED_RESUME_V1
+# Select only a terminal, cryptographically compatible predecessor. Neither
+# state nor original stage is removed; the new worker verifies reused bytes.
+def retained_dependency_stage(manager, pool_root, state, account):
+    wanted={k:v for k,v in state['compatibility'].items() if k!='fetcher_sha256'}
+    candidates=[]
+    for entry in manager.root.iterdir():
+        if not entry.is_dir() or entry.is_symlink() or SHA.fullmatch(entry.name) is None:
+            continue
+        previous=manager._read(entry.name)
+        if (previous is None or previous['phase'] not in TERMINAL or
+                previous.get('result') is not None or previous.get('publication_verified') or
+                {k:v for k,v in previous['compatibility'].items() if k!='fetcher_sha256'}!=wanted):
+            continue
+        # No process/cgroup/source container from a past operation may write
+        # into the stage while it is read for recovery.
+        if JobScope.members(previous) or manager._containers(previous):
+            raise RuntimeError('retained dependency stage has active owners')
+        candidates.append((previous,pool_root/'incoming'))
+        for attempt in range(1,previous['attempt']+1):
+            candidates.append((previous,pool_root/('incoming-'+entry.name+'-'+str(attempt))))
+    matches=[]
+    for previous,path in candidates:
+        if path.is_symlink():raise RuntimeError('unsafe retained dependency stage symlink')
+        if not path.exists():continue
+        info=path.stat()
+        if (not path.is_dir() or info.st_uid!=account.pw_uid or info.st_mode & 0o077 or
+                (path/'STAGING').is_symlink() or not (path/'STAGING').is_file()):
+            raise RuntimeError('untrusted retained dependency stage')
+        if path.name=='incoming':
+            # The legacy stage has no recorded ID. A surviving source snapshot
+            # ties it to the verified old fetcher hash where available.
+            snapshot=pool_root/'source'/'scripts'/'superbench_pool.py'
+            if snapshot.is_file() and not snapshot.is_symlink():
+                if hashlib.sha256(snapshot.read_bytes()).hexdigest()!=previous['compatibility']['fetcher_sha256']:
+                    continue
+        matches.append(path)
+    if not matches:return None
+    return max(set(matches),key=lambda p:(p.stat().st_mtime_ns,str(p)))
+
 def _prepare(manager, state):
     # Download on the execution host without guest VMs or persistent deletion capabilities.
     import pwd
@@ -669,23 +710,24 @@ def _prepare(manager, state):
     # delete/replace root-owned sealed pool files from a previous fetch.
     root.chmod(0o1770)
     ready = root / "ready"
-    stage = root / "incoming"
+    stage = root / ('incoming-'+state['operation_id']+'-'+str(state['attempt']))
     if ready.exists() or ready.is_symlink():
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
-        raise RuntimeError("interrupted pool stage exists; zombie preserved: " + str(stage))
+        raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
+    reuse = retained_dependency_stage(manager,root,state,account)
     source_program = manager.source_root / "scripts/superbench_pool.py"
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
     interpreter = trusted_fetch_python()
-    source_root, program = stage_fetch_sources(manager, root)
+    source_root, program = stage_fetch_sources(manager, root, state['operation_id'], state['attempt'])
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
     # unprivileged downloader or any of its subprocesses. No proxy/auth env.
     env = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": str(root),
-        "XDG_CACHE_HOME": str(root / "incoming" / "metadata"),
+        "XDG_CACHE_HOME": str(stage / "metadata"),
         "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -707,7 +749,8 @@ def _prepare(manager, state):
     # No shell, no template builder, no qemu, no guest execution.
     child = subprocess.Popen([str(interpreter), "-I", "-B", str(program), "--repo-root",
                     str(source_root), "--stage", str(stage),
-                    "--operation-id", state["operation_id"]],
+                    "--operation-id", state["operation_id"],
+                    *(["--reuse-from",str(reuse)] if reuse is not None else [])],
                    cwd=source_root, env=env, preexec_fn=drop_privileges,
                    stdin=subprocess.DEVNULL, start_new_session=True)
     try:

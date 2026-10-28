@@ -483,10 +483,10 @@ def preparation_fetch(cfg):
                             "no mutation was blindly retried")
                     raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
                 error = status.get("error")
-                retryable_preflight_failure = (
-                    phase in {"failed", "interrupted"}
-                    and retryable_preparation_error(error)
-                )
+                # Only an explicit new make superbench-fetch invocation retries
+                # a terminal failed job; the broker verifies process/cgroup
+                # absence and preserves all old bytes before admitting it.
+                retryable_preflight_failure = phase in {"failed", "interrupted"}
                 if phase != "not_started" and not retryable_preflight_failure:
                     raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
                                        str(error) + "; administrative cleanup required")

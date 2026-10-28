@@ -243,20 +243,32 @@ def mirror_commits(root, repo, commits, *, label='git'):
         raise RuntimeError('untrusted Git repo/commit')
     folder=root/label/(repo.replace('/','_')+'.git')
     folder.parent.mkdir(exist_ok=True)
-    invoke(['git','init','--bare',folder])
-    # Shallow exact-commit fetch avoids the unbounded history of --mirror.
-    # All 230 task base commits are explicitly represented by the contract.
-    cmd=['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch','--no-tags',
-         '--depth=1','https://github.com/'+repo+'.git',*sorted(commits)]
-    invoke(cmd)
-    if repo in {'bokeh/bokeh', 'pandas-dev/pandas'} and label == 'git':
-        # Their real setup/commands require the upstream tags. Retain annotated
-        # tag objects and their references, without fetching all branch history.
-        invoke(['git', '-c', 'protocol.file.allow=never', '--git-dir', folder,
-                'fetch', '--depth=1', '--no-recurse-submodules',
-                'https://github.com/'+repo+'.git', '+refs/tags/*:refs/tags/*'])
-        tags = invoke(['git','--git-dir',folder,'tag','--list'],capture=True).splitlines()
-        if repo == 'bokeh/bokeh' and len(tags) < 5:
+    # Reuse only actual pinned commits already present in the copied mirror.
+    # A stale/incomplete Git directory is never accepted as proof of a commit.
+    retained_mirror=folder.exists()
+    if retained_mirror:
+        if folder.is_symlink() or not folder.is_dir():
+            raise RuntimeError('unsafe retained Git mirror')
+        if invoke(['git','--git-dir',folder,'rev-parse','--is-bare-repository'],capture=True).strip()!='true':
+            raise RuntimeError('retained Git repository is not bare')
+        missing=[commit for commit in sorted(commits) if subprocess.run(
+            ['git','--git-dir',str(folder),'cat-file','-e',commit+'^{commit}'],
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode]
+    else:
+        invoke(['git','init','--bare',folder])
+        missing=sorted(commits)
+    if missing:
+        # Fetch missing pinned commits only; never follow a moving branch.
+        invoke(['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch','--no-tags',
+                '--depth=1','https://github.com/'+repo+'.git',*missing])
+    if repo in {'bokeh/bokeh','pandas-dev/pandas'} and label=='git':
+        tags=invoke(['git','--git-dir',folder,'tag','--list'],capture=True).splitlines()
+        if not retained_mirror or not tags or (repo=='bokeh/bokeh' and len(tags)<5):
+            invoke(['git','-c','protocol.file.allow=never','--git-dir',folder,
+                    'fetch','--depth=1','--no-recurse-submodules',
+                    'https://github.com/'+repo+'.git','+refs/tags/*:refs/tags/*'])
+            tags=invoke(['git','--git-dir',folder,'tag','--list'],capture=True).splitlines()
+        if repo=='bokeh/bokeh' and len(tags)<5:
             raise RuntimeError('Bokeh build requires at least five Git tags')
     for commit in commits:
         invoke(['git','--git-dir',folder,'cat-file','-e',commit+'^{commit}'])
@@ -1160,14 +1172,15 @@ class Pool:
     def __init__(self, stage):
         self.stage = Path(stage)
         self.objects = self.stage / 'objects' / 'sha256'
-        self.objects.mkdir(parents=True)
+        self.objects.mkdir(parents=True,exist_ok=True)
         self.links = {}
         self.provenance = {}
         self.issues = []
-        # In-memory indexes for this single, non-resumable acquisition job.
+        # Per-attempt indexes are rebuilt from verified retained content.
         self.by_url = {}
         self.by_sri = {}
         self.sri_verified = set()
+        self.verified_objects = set()  # SHA-256 verified at acquisition or recovery
 
     def reference(self, sha, category, identity, size):
         target = self.objects / sha[:2] / sha
@@ -1199,6 +1212,7 @@ class Pool:
             os.link(path, target)
         elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
             raise RuntimeError('content-addressed pool collision/changed object')
+        self.verified_objects.add(sha)
         return self.reference(sha, category, identity, size)
 
     def coalesce_stage_file(self, path, sha):
@@ -1244,6 +1258,11 @@ class Pool:
         if cached is None:
             cached = self.by_url.get(url)
         if cached is not None:
+            target = self.objects / cached[:2] / cached
+            if (target.is_symlink() or not target.is_file()
+                    or cached not in self.verified_objects and digest(target)!=cached):
+                raise RuntimeError('retained CAS bytes fail SHA-256 verification: '+cached)
+            self.verified_objects.add(cached)
             if sha is not None and cached != sha:
                 raise RuntimeError('conflicting expected checksum for existing download URL/SRI')
             target = self.objects / cached[:2] / cached
@@ -1261,7 +1280,26 @@ class Pool:
         raw = self.stage / 'downloads' / hashlib.sha256(url.encode()).hexdigest()
         raw.parent.mkdir(exist_ok=True)
         known_hashes = {}
-        actual = fetch(url, raw, sha=sha, sri=sri, integrity_digests=known_hashes)
+        # A URL-based old download can be reused ONLY when an independent
+        # pinned digest/SRI verifies it. Unpinned bytes are fetched anew.
+        actual = None
+        if raw.exists() or raw.is_symlink():
+            if raw.is_symlink() or not raw.is_file():
+                raise RuntimeError('unsafe retained URL download')
+            if sha is not None or sri is not None:
+                candidate = digest(raw)
+                try:
+                    if (sha is not None and sha != candidate):
+                        raise ValueError('retained checksum mismatch')
+                    if sri is not None: verify_sri(raw,sri)
+                except (ValueError,RuntimeError):
+                    raw.unlink()  # Only our new, private candidate stage.
+                else:
+                    actual = candidate
+            else:
+                raw.unlink()
+        if actual is None:
+            actual = fetch(url, raw, sha=sha, sri=sri, integrity_digests=known_hashes)
         self.put(raw, category, identity, verified_sha=actual)
         self.coalesce_stage_file(raw, actual)
         self.by_url[url] = actual
@@ -1280,6 +1318,71 @@ class Pool:
 
     def issue(self, where, description):
         self.issues.append(f'{where}: {description}')
+
+
+# GPT_TRACE_SWEGYM_VERIFIED_RESUME_V1
+# Copy a FAILED stage into a fresh candidate. Never modify the original.
+def salvage_verified_stage(old, new):
+    old, new = Path(old), Path(new)
+    if (old.resolve()==new.resolve() or new.resolve().is_relative_to(old.resolve())
+            or old.resolve().is_relative_to(new.resolve())):
+        raise RuntimeError('source and candidate recovery stages must be distinct')
+    if old.is_symlink() or not old.is_dir() or new.is_symlink():
+        raise RuntimeError('unsafe interrupted dependency pool')
+    if not (old/'STAGING').is_file() or (old/'STAGING').is_symlink():
+        raise RuntimeError('unidentified interrupted dependency pool')
+    # Check all paths before copying, including files we do not plan to reuse.
+    # A mount/symlink/device may not redirect the trusted downloader elsewhere.
+    for path in old.rglob('*'):
+        if path.is_symlink() or path.is_mount() or not (path.is_dir() or path.is_file()):
+            raise RuntimeError('unsafe retained dependency entry: '+str(path))
+    old_cas=old/'objects'/'sha256'
+    good={}
+    count=0
+    if old_cas.is_dir():
+        for obj in old_cas.glob('*/*'):
+            sha=obj.name
+            if (not SHA.fullmatch(sha) or obj.parent.name!=sha[:2]
+                    or not obj.is_file()):
+                raise RuntimeError('invalid retained CAS object path')
+            if digest(obj)!=sha:
+                print('[pool] skipping corrupt retained CAS object '+sha,flush=True)
+                continue
+            target=new/'objects'/'sha256'/sha[:2]/sha
+            target.parent.mkdir(parents=True,exist_ok=True)
+            os.link(obj,target)  # Verified immutable bytes, zero-copy reuse.
+            good[(obj.stat().st_dev,obj.stat().st_ino)]=(sha,target)
+            count+=1
+    # Git refs/packed objects can be mutated by a later fetch: COPY them, never
+    # hardlink mutable Git objects to the failed stage.
+    for kind in ('git','git-extra'):
+        source=old/kind
+        if source.is_dir():
+            shutil.copytree(source,new/kind,dirs_exist_ok=True,copy_function=shutil.copy2)
+    # Retain only files already hardlinked to a SHA-verified old CAS object.
+    # Partial HTTP transfers, unconstrained downloads and pip scratch files
+    # are deliberately excluded.
+    for kind in ('downloads','wheels/shared'):
+        source=old/kind
+        if not source.is_dir():continue
+        for file in source.rglob('*'):
+            if not file.is_file():continue
+            identity=(file.stat().st_dev,file.stat().st_ino)
+            if identity not in good:continue
+            dest=new/kind/file.relative_to(source)
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            os.link(good[identity][1],dest)
+    # APT will verify these archives again against signed Kali indexes.
+    # They are writable APT cache entries, so COPY instead of hardlinking them.
+    old_debs=old/'apt'/'archives'
+    if old_debs.is_dir():
+        for deb in old_debs.glob('*.deb'):
+            if (deb.stat().st_dev,deb.stat().st_ino) not in good:continue
+            dest=new/'apt'/'archives'/deb.name
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copy2(deb,dest)
+    print('[pool] verified resume: '+str(count)+' CAS artifacts and retained Git mirrors',flush=True)
+    return {value[0] for value in good.values()}
 
 
 # GPT_TRACE_SWEGYM_CONDA_LOCK_V1
@@ -1450,9 +1553,9 @@ def conda_solution_python(resolved):
 def apt_closure(pool,packages):
     """Signed Kali APT metadata; isolated empty package-status DB; download-only."""
     stage=pool.stage;apt=stage/'apt';apt.mkdir(exist_ok=True)
-    for name in ('lists','archives','partial','sourceparts'):(apt/name).mkdir()
-    (apt/'lists'/'partial').mkdir()
-    (apt/'archives'/'partial').mkdir()
+    for name in ('lists','archives','partial','sourceparts'):(apt/name).mkdir(exist_ok=True)
+    (apt/'lists'/'partial').mkdir(exist_ok=True)
+    (apt/'archives'/'partial').mkdir(exist_ok=True)
     key_sha = pool.download('https://archive.kali.org/archive-key.asc','apt','signing-key')
     key_path = pool.objects / key_sha[:2] / key_sha
     imported=invoke(['gpg','--show-keys','--with-colons',key_path],capture=True)
@@ -1947,6 +2050,8 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
             seen_inodes[identity]=row['sha256']
         files.append(row)
 
+    file_digests={entry['path']:entry['sha256'] for entry in files}
+
     def reject(label,detail):
         pool.issue('inventory:'+label,detail)
 
@@ -1962,7 +2067,8 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         expected='objects/sha256/'+sha[:2]+'/'+sha
         target=stage/expected
         if (row.get('path')!=expected or not target.is_file() or target.is_symlink()
-                or type(row.get('size')) is not int or target.stat().st_size!=row['size']):
+                or type(row.get('size')) is not int or target.stat().st_size!=row['size']
+                or file_digests.get(expected)!=sha):
             reject('CAS','missing/bad object '+sha)
     for category,groups_ in pool.provenance.items():
         for identity,digests in groups_.items():
@@ -2122,7 +2228,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
     write_new(stage/'inventory.json',json.dumps(summary,sort_keys=True,indent=2)+'\n')
     print('[pool] objects=',len(pool.links),'files=',len(files),'issues=',len(issues),flush=True)
     if issues:raise RuntimeError('incomplete dependency closure: '+issues[0]+
-                                 '; inspect inventory.json, manual zombie cleanup required')
+                                 '; inspect inventory.json; a later explicit fetch can reuse verified artifacts')
     return summary
 
 
@@ -2131,10 +2237,11 @@ def main(argv=None):
     p.add_argument('--repo-root',required=True,type=Path)
     p.add_argument('--stage',required=True,type=Path)
     p.add_argument('--operation-id',required=True)
+    p.add_argument('--reuse-from',type=Path)
     args=p.parse_args(argv)
     if os.geteuid()==0:raise RuntimeError('refusing privileged fetch account')
     if not SHA.fullmatch(args.operation_id):raise RuntimeError('invalid operation ID')
-    if args.stage.exists() or args.stage.is_symlink():raise RuntimeError('zombie or existing pool stage')
+    if args.stage.exists() or args.stage.is_symlink():raise RuntimeError('candidate stage already exists; refusing overwrite')
     repo_root=args.repo_root.resolve(strict=True)
     adapter=repo_root/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
     pins=json.loads((adapter/'pins.json').read_bytes())
@@ -2149,8 +2256,12 @@ def main(argv=None):
     stage.mkdir(mode=0o700)
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
-    write_new(stage/'STAGING','Uncommitted, non-resumable dependency acquisition.\n')
+    write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
+    verified=set()
+    if args.reuse_from is not None:
+        verified=salvage_verified_stage(args.reuse_from,stage)
     pool=Pool(stage)
+    pool.verified_objects.update(verified)
     grouped=defaultdict(set)
     for task in tasks.values():grouped[task['repo']].add(task['base_commit'])
     mirrors={};gitplan={}

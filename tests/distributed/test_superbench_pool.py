@@ -359,6 +359,114 @@ class TestDeduplication(unittest.TestCase):
             self.assertEqual(set(acquired.provenance['python']), {'task-a','task-b','task-c'})
 
 
+class TestVerifiedPoolResume(unittest.TestCase):
+    def test_cas_reuse_is_hardlinked_verified_and_no_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);old=root/'old';new=root/'fresh'
+            (old/'objects'/'sha256').mkdir(parents=True)
+            (old/'STAGING').write_text('legacy stage')
+            data=b'locked conda payload';sha=hashlib.sha256(data).hexdigest()
+            obj=old/'objects'/'sha256'/sha[:2]/sha
+            obj.parent.mkdir();obj.write_bytes(data)
+            (old/'downloads').mkdir()
+            raw=old/'downloads'/hashlib.sha256(b'https://example.test/pkg').hexdigest()
+            os.link(obj,raw)
+            new.mkdir()
+            for name in ('objects','downloads'):(new/name).mkdir()
+            verified=pool.salvage_verified_stage(old,new)
+            self.assertEqual(verified,{sha})
+            copy=new/'objects'/'sha256'/sha[:2]/sha
+            self.assertTrue(obj.samefile(copy))
+            candidate=pool.Pool(new);candidate.verified_objects.update(verified)
+            with patch.object(pool,'fetch',side_effect=AssertionError('network forbidden')):
+                self.assertEqual(candidate.download('https://example.test/pkg','conda','env',sha=sha),sha)
+
+    def test_corrupt_old_object_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old=Path(tmp)/'old';new=Path(tmp)/'new'
+            (old/'objects'/'sha256').mkdir(parents=True)
+            (old/'STAGING').write_text('legacy')
+            sha='a'*64
+            item=old/'objects'/'sha256'/sha[:2]/sha
+            item.parent.mkdir();item.write_bytes(b'corrupt')
+            new.mkdir();(new/'objects').mkdir()
+            self.assertEqual(pool.salvage_verified_stage(old,new),set())
+            self.assertFalse((new/'objects'/'sha256'/sha[:2]/sha).exists())
+            self.assertEqual(item.read_bytes(),b'corrupt')
+
+    def test_retained_partial_or_unpinned_download_is_discarded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);artifact=pool.Pool(stage)
+            url='https://example.test/unpinned';raw=stage/'downloads'/hashlib.sha256(url.encode()).hexdigest()
+            raw.parent.mkdir(exist_ok=True);raw.write_bytes(b'partial')
+            full=b'complete';calls=[]
+            def fake_fetch(u,p,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+                calls.append(u);Path(p).write_bytes(full);return hashlib.sha256(full).hexdigest()
+            with patch.object(pool,'fetch',side_effect=fake_fetch):
+                artifact.download(url,'test','identity')
+            self.assertEqual(calls,[url]);self.assertEqual(raw.read_bytes(),full)
+
+    def test_git_mirror_with_exact_pinned_commit_avoids_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);repo='test/example';commit='a'*40
+            folder=root/'git'/'test_example.git'
+            folder.mkdir(parents=True)
+            def command(argv,*,cwd=None,capture=False,env=None,timeout=3600):
+                if 'rev-parse' in argv:return 'true'
+                if 'cat-file' in argv:return ''
+                raise AssertionError('network or git init forbidden: '+repr(argv))
+            with patch.object(pool,'invoke',side_effect=command),patch.object(
+                    pool.subprocess,'run',return_value=type('Result',(),{'returncode':0})()):
+                self.assertEqual(pool.mirror_commits(root,repo,{commit}),folder)
+
+    def test_broker_selects_only_a_quiescent_matching_legacy_stage(self):
+        import ast
+        import re
+        import types
+        source=(ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
+        tree=ast.parse(source)
+        method=next(x for x in tree.body if isinstance(x,ast.FunctionDef)
+                    and x.name=='retained_dependency_stage')
+        class Scope:
+            members=staticmethod(lambda state: [])
+        namespace={'Path':Path,'SHA':re.compile(r'[0-9a-f]{64}\Z'),
+                   'TERMINAL':{'interrupted','canceled','failed','ready'},
+                   'JobScope':Scope,'hashlib':hashlib,'RuntimeError':RuntimeError}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method],type_ignores=[])),
+                     '<retained-stage>', 'exec'),namespace)
+        select=namespace['retained_dependency_stage']
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);poolroot=root/'pool';poolroot.mkdir()
+            legacy=poolroot/'incoming';legacy.mkdir(mode=0o700)
+            (legacy/'STAGING').write_text('legacy')
+            jobs=root/'preparations';jobs.mkdir()
+            operation='1'*64;(jobs/operation).mkdir()
+            previous={'phase':'interrupted','compatibility':{
+                'pins':{'same':True},'conda_lock_sha256':'c'*64,'fetcher_sha256':'a'*64},
+                'operation_id':operation,'attempt':1,'result':None}
+            active={'compatibility':{**previous['compatibility'],'fetcher_sha256':'b'*64}}
+            class Manager:
+                root=jobs
+                def _read(self,op):return previous
+                def _containers(self,state):return []
+            account=types.SimpleNamespace(pw_uid=os.getuid())
+            self.assertEqual(select(Manager(),poolroot,active,account),legacy)
+            previous['phase']='running'
+            self.assertIsNone(select(Manager(),poolroot,active,account))
+            previous['phase']='interrupted'
+            previous['compatibility']['pins']={'same':False}
+            self.assertIsNone(select(Manager(),poolroot,active,account))
+
+    def test_retained_symlink_is_rejected_without_modification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old=Path(tmp)/'old';new=Path(tmp)/'new'
+            old.mkdir();new.mkdir();(old/'STAGING').write_text('legacy')
+            (old/'bad').symlink_to('/etc')
+            with self.assertRaisesRegex(RuntimeError,'unsafe retained'):
+                pool.salvage_verified_stage(old,new)
+            self.assertTrue((old/'bad').is_symlink())
+
+
 class TestPublicationRecovery(unittest.TestCase):
     def test_published_verified_pool_is_reconciled_without_rehash_or_retry(self):
         import ast
