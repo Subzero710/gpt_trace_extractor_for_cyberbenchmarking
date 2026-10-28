@@ -26,6 +26,43 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertEqual(requirements, {'requests>=2', 'boto3>=1.9'})
         self.assertEqual(issues, [])
 
+    def test_dask_conditional_setup_requires_keeps_both_literal_cases(self):
+        # The 13 historical pinned Dask setup.py files switch on sys.argv.
+        source = ("""import sys
+from setuptools import setup
+install_requires = ["pyyaml"]
+if {"pytest", "test", "ptr"}.intersection(sys.argv):
+    setup_requires = ["pytest-runner"]
+else:
+    setup_requires = []
+setup(install_requires=install_requires, setup_requires=setup_requires)
+""")
+        requirements, issues = pool.setup_static(source, python_version='3.8')
+        self.assertEqual(issues, [])
+        self.assertEqual(requirements, {'pyyaml', 'pytest-runner'})
+
+    def test_unknown_conditional_dynamic_requirement_is_rejected(self):
+        source = ("""if unknown_condition():
+    setup_requires = unknown_package_list()
+else:
+    setup_requires = []
+setup(setup_requires=setup_requires)
+""")
+        requirements, issues = pool.setup_static(source)
+        self.assertEqual(requirements, set())
+        self.assertTrue(any('setup_requires' in issue for issue in issues))
+
+    def test_conditional_install_requires_union_is_lossless(self):
+        source = ("""if unknown_condition():
+    install_requires = ["alpha>=1", "shared"]
+else:
+    install_requires = ["beta>=2", "shared"]
+setup(install_requires=install_requires)
+""")
+        requirements, issues = pool.setup_static(source)
+        self.assertEqual(issues, [])
+        self.assertEqual(requirements, {'alpha>=1', 'beta>=2', 'shared'})
+
     def test_dynamic_setup_metadata_is_not_silently_ignored(self):
         requirements, issues = pool.setup_static('setup(install_requires=dynamic())')
         self.assertFalse(requirements)

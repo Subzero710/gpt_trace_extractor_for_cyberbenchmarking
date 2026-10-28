@@ -641,6 +641,47 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             if isinstance(op,ast.GtE): return left>=right
         raise ValueError('dynamic setup.py condition')
 
+    # GPT_TRACE_STATIC_DEPENDENCY_BRANCH_MERGE_V1
+    def merge_static_dependency_branches(node):
+        """Conservatively include every literal dependency from either branch.
+
+        Only accept complete if/else branches consisting entirely of safe
+        assignments to the same setuptools requirement fields. Never execute
+        upstream code and never guess the value of a dynamic expression.
+        """
+        allowed = {'install_requires', 'setup_requires'}
+
+        def assignments(statements):
+            values = {}
+            if not statements:
+                return None
+            for statement in statements:
+                if (not isinstance(statement, ast.Assign)
+                        or len(statement.targets) != 1
+                        or not isinstance(statement.targets[0], ast.Name)):
+                    return None
+                name = statement.targets[0].id
+                if name not in allowed or name in values:
+                    return None
+                try:
+                    requirements = evaluate(statement.value)
+                except (TypeError, ValueError, KeyError, IndexError):
+                    return None
+                if (not isinstance(requirements, (list, tuple))
+                        or not all(isinstance(req, str) for req in requirements)):
+                    return None
+                values[name] = requirements
+            return values
+
+        true_branch = assignments(node.body)
+        false_branch = assignments(node.orelse)
+        if (true_branch is None or false_branch is None
+                or true_branch.keys() != false_branch.keys()):
+            return False
+        for name in true_branch:
+            env[name] = list(dict.fromkeys((*true_branch[name], *false_branch[name])))
+        return True
+
     def apply_statement(node):
         if isinstance(node,ast.Assign):
             try:value=evaluate(node.value)
@@ -670,6 +711,9 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
         if isinstance(node,ast.If):
             try:selected=node.body if condition(node.test) else node.orelse
             except (TypeError,ValueError,KeyError,IndexError):
+                # A finite literal dependency choice has a safe conservative union.
+                if merge_static_dependency_branches(node):
+                    return
                 # Only variables mutated by an unresolved branch become unsafe.
                 names=set()
                 for child in ast.walk(node):
