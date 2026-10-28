@@ -204,9 +204,11 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                  patch.object(pool, 'acquire_source_distribution', return_value=source) as acquire:
                 pool.pip_closure(candidate, '3.10', {'collective.checkdocs'}, 'plan-key')
             plan = json.loads((Path(tmp) / 'metadata/pip-plan-plan-key.json').read_text())
+            self.assertEqual(plan['artifact_model'], pool.PIP_ARTIFACT_MODEL)
             self.assertEqual(plan['source_archives'], [source])
             self.assertEqual(plan['files'], [])
             self.assertEqual(len(calls), 2)
+            self.assertNotIn('--no-cache-dir', calls[0])
             acquire.assert_called_once_with(candidate, 'collective.checkdocs', 'plan-key', '3.10', constraints=())
 
     def test_apt_key_uses_downloaded_content_address(self):
@@ -235,6 +237,150 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                  patch.object(pool.subprocess, 'check_output', side_effect=dpkg):
                 pool.apt_closure(candidate, {'testpkg'})
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
+
+
+# GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1
+class TestGlobalPipArtifactPool(unittest.TestCase):
+    def make_pool(self, root):
+        root = Path(root)
+        for name in ('metadata','wheels','downloads'):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        return pool.Pool(root)
+
+    def test_group_identity_is_not_task_or_optionality_scoped(self):
+        one = pool.pip_group_key('3.10', {'pillow', 'pandas'}, {'numpy<2'}, False)
+        two = pool.pip_group_key('3.10', {'pandas', 'pillow'}, {'numpy<2'}, False)
+        self.assertEqual(one, two)
+        self.assertEqual(
+            one,
+            hashlib.sha256(json.dumps(
+                ['3.10', ['pandas','pillow'], ['numpy<2'], False, False],
+                sort_keys=True).encode()).hexdigest()[:20],
+        )
+
+    def test_failed_resolver_attempt_promotes_finished_wheel_before_retry(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=self.make_pool(stage)
+            payload=b'shared wheel bytes'
+            filename='sharedpkg-1.0-py3-none-any.whl'
+            calls=[]
+            def pipeline(argv, **kwargs):
+                calls.append((list(argv), kwargs))
+                dest=Path(argv[argv.index('--dest')+1])
+                if len(calls)==1:
+                    (dest/filename).write_bytes(payload)
+                    return subprocess.CompletedProcess(argv,1,stdout=(
+                        'ERROR: Could not find a version that satisfies the requirement '
+                        'collective.checkdocs (from versions: none)\n'))
+                shared=stage/'wheels'/'shared'/filename
+                self.assertTrue(shared.is_file())
+                os.link(shared,dest/filename)
+                return subprocess.CompletedProcess(argv,0,stdout='')
+            source={'name':'collective.checkdocs','version':'0.2.1',
+                    'requested':'collective.checkdocs','filename':'collective.checkdocs-0.2.1.tar.gz',
+                    'sha256':'1'*64,'requirements':['setuptools'],'provides_extra':[]}
+            with patch.object(pool.subprocess,'run',side_effect=pipeline), \
+                 patch.object(pool,'acquire_source_distribution',return_value=source):
+                pool.pip_closure(candidate,'3.10',{'sharedpkg','collective.checkdocs'},'group')
+            sha=hashlib.sha256(payload).hexdigest()
+            cas=candidate.objects/sha[:2]/sha
+            shared=stage/'wheels'/'shared'/filename
+            self.assertTrue(cas.is_file())
+            self.assertTrue(shared.samefile(cas))
+            self.assertFalse((stage/'wheels'/'group').exists())
+            self.assertEqual(len(candidate.links),1)
+            self.assertNotIn('PIP_NO_CACHE_DIR',calls[0][1]['env'])
+            self.assertEqual(calls[0][1]['env']['PIP_CACHE_DIR'],str(candidate.pip_cache))
+            plan=json.loads((stage/'metadata/pip-plan-group.json').read_text())
+            self.assertEqual(plan['files'],[{'filename':filename,'sha256':sha}])
+
+    def test_different_logical_closures_share_one_physical_wheel(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=self.make_pool(stage)
+            payload=b'one universal wheel'
+            filename='demo-1.0-py3-none-any.whl'
+            def pipeline(argv, **kwargs):
+                dest=Path(argv[argv.index('--dest')+1])
+                shared=stage/'wheels'/'shared'/filename
+                if shared.exists(): os.link(shared,dest/filename)
+                else: (dest/filename).write_bytes(payload)
+                return subprocess.CompletedProcess(argv,0,stdout='')
+            with patch.object(pool.subprocess,'run',side_effect=pipeline):
+                pool.pip_closure(candidate,'3.8',{'demo==1.0'},'first')
+                pool.pip_closure(candidate,'3.10',{'demo==1.0'},'second')
+            sha=hashlib.sha256(payload).hexdigest()
+            self.assertEqual(set(candidate.links),{sha})
+            self.assertEqual(set(candidate.provenance['python']),{'first','second'})
+            self.assertTrue((stage/'wheels/shared'/filename).samefile(candidate.objects/sha[:2]/sha))
+            self.assertFalse((stage/'wheels/first').exists())
+            self.assertFalse((stage/'wheels/second').exists())
+
+    def test_verified_completed_plan_reuses_cas_without_pip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=self.make_pool(stage)
+            payload=b'already acquired';sha=hashlib.sha256(payload).hexdigest()
+            target=candidate.objects/sha[:2]/sha
+            target.parent.mkdir(parents=True);target.write_bytes(payload)
+            candidate.verified_objects.add(sha)
+            key=pool.pip_group_key('3.10',{'demo==1'})
+            plan={'artifact_model':pool.PIP_ARTIFACT_MODEL,'python':'3.10',
+                  'requested':['demo==1'],'constraints':[],'no_deps':False,
+                  'files':[{'filename':'demo-1-py3-none-any.whl','sha256':sha}],
+                  'source_archives':[]}
+            (stage/'metadata'/('pip-plan-'+key+'.json')).write_text(json.dumps(plan))
+            with patch.object(pool.subprocess,'run',side_effect=AssertionError('pip must not run')):
+                self.assertTrue(pool.reuse_pip_plan(candidate,'3.10',{'demo==1'},key))
+            self.assertEqual(set(candidate.links),{sha})
+            self.assertTrue((stage/'wheels/shared/demo-1-py3-none-any.whl').samefile(target))
+
+    def test_resume_upgrades_only_verified_successful_legacy_plans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);old=root/'old';new=root/'new'
+            (old/'objects/sha256').mkdir(parents=True)
+            (old/'metadata').mkdir();(old/'wheels/shared').mkdir(parents=True)
+            (old/'STAGING').write_text('legacy')
+            payload=b'legacy wheel';sha=hashlib.sha256(payload).hexdigest()
+            obj=old/'objects/sha256'/sha[:2]/sha
+            obj.parent.mkdir();obj.write_bytes(payload)
+            os.link(obj,old/'wheels/shared/demo.whl')
+            key=pool.pip_group_key('3.10',{'demo==1'})
+            legacy={'python':'3.10','requested':['demo==1'],'constraints':[],
+                    'no_deps':False,'files':[{'filename':'demo.whl','sha256':sha}],
+                    'source_archives':[]}
+            (old/'metadata'/('pip-plan-'+key+'.json')).write_text(json.dumps(legacy))
+            failed={**legacy,'optional_failed':'old failure','files':[]}
+            (old/'metadata/pip-plan-optional.json').write_text(json.dumps(failed))
+            new.mkdir()
+            for name in ('objects','metadata','wheels','downloads'):(new/name).mkdir(exist_ok=True)
+            verified=pool.salvage_verified_stage(old,new)
+            self.assertEqual(verified,{sha})
+            adopted=json.loads((new/'metadata'/('pip-plan-'+key+'.json')).read_text())
+            self.assertEqual(adopted['artifact_model'],pool.PIP_ARTIFACT_MODEL)
+            self.assertFalse((new/'metadata/pip-plan-optional.json').exists())
+
+    def test_required_group_failure_stops_before_later_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            groups={
+                'a':{'version':'3.10','requirements':['broken'], 'constraints':[],
+                     'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
+                'b':{'version':'3.10','requirements':['later'], 'constraints':[],
+                     'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
+            }
+            with patch.object(pool,'pip_closure',side_effect=[RuntimeError('boom'),AssertionError('continued')]) as solve:
+                with self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):
+                    pool.acquire_pip_groups(candidate,groups)
+            self.assertEqual(solve.call_count,1)
+
+    def test_required_network_acquisition_is_never_issue_accumulation(self):
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertNotIn("pool.issue('pip:'",source)
+        self.assertNotIn("pool.issue('APT'",source)
+        self.assertNotIn("pool.issue('npm-global'",source)
+        self.assertIn("raise RuntimeError('required VCS closure failed",source)
+        self.assertIn('PIP_ARTIFACT_MODEL',source)
 
 
 class TestNetworkRetries(unittest.TestCase):

@@ -8,6 +8,7 @@ starts a VM, invokes a task script, installs software or deletes persisted data.
 from __future__ import annotations
 import argparse
 import concurrent.futures
+import functools
 import base64
 import configparser
 import hashlib
@@ -42,6 +43,8 @@ GOLDEN_SYSTEM_PYTHON = '3.13'  # Kali 2026.2 pinned by infra/workstation/image/b
 DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
 DOWNLOAD_RETRY_BACKOFF = (1, 2, 4, 8)
+# GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1
+PIP_ARTIFACT_MODEL = 'global-content-addressed-pip-v1'
 
 
 def digest(path):
@@ -1181,6 +1184,11 @@ class Pool:
         self.by_sri = {}
         self.sri_verified = set()
         self.verified_objects = set()  # SHA-256 verified at acquisition or recovery
+        # One ephemeral pip HTTP cache for the whole worker. It is deliberately
+        # outside the staged pool and therefore can never become a published
+        # dependency. Cross-group artifact reuse itself is handled by the CAS.
+        self._pip_cache_context = tempfile.TemporaryDirectory(prefix='swegym-pip-cache-')
+        self.pip_cache = Path(self._pip_cache_context.name)
 
     def reference(self, sha, category, identity, size):
         target = self.objects / sha[:2] / sha
@@ -1372,6 +1380,32 @@ def salvage_verified_stage(old, new):
             dest=new/kind/file.relative_to(source)
             dest.parent.mkdir(parents=True,exist_ok=True)
             os.link(good[identity][1],dest)
+    # Reuse completed pip plans only when every referenced artifact survived
+    # SHA-256 validation above. Legacy successful plans are upgraded to the
+    # global-CAS schema in the fresh stage; optional failure markers are retried.
+    good_shas={value[0] for value in good.values()}
+    old_metadata=old/'metadata'
+    if old_metadata.is_dir():
+        for plan_path in sorted(old_metadata.glob('pip-plan-*.json')):
+            if plan_path.is_symlink() or not plan_path.is_file() or plan_path.stat().st_size>4*1024*1024:
+                continue
+            try:
+                plan=json.loads(plan_path.read_bytes())
+                if plan.get('optional_failed'):
+                    continue
+                artifact_shas=set(_pip_plan_artifact_shas(plan))
+                if not artifact_shas or not artifact_shas<=good_shas:
+                    continue
+                normalized={
+                    'artifact_model':PIP_ARTIFACT_MODEL,
+                    'python':plan['python'],'requested':plan['requested'],
+                    'constraints':plan.get('constraints',[]),'no_deps':bool(plan.get('no_deps',False)),
+                    'files':plan['files'],'source_archives':plan['source_archives'],
+                }
+                write_new(new/'metadata'/plan_path.name,json.dumps(normalized,sort_keys=True))
+            except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError):
+                continue
+
     # APT will verify these archives again against signed Kali indexes.
     # They are writable APT cache entries, so COPY instead of hardlinking them.
     old_debs=old/'apt'/'archives'
@@ -1621,6 +1655,7 @@ def _target_marker_environment(python_version):
     return env
 
 
+@functools.lru_cache(maxsize=2048)
 def _pypi_json(url, *, limit=16*1024*1024):
     raw=_read_https(url,timeout=90,limit=limit,user_agent='gpt-trace-dependency-pool/3',
                     expected_host='pypi.org')
@@ -1817,6 +1852,111 @@ def _pip_missing_requirement(output):
     return None
 
 
+def pip_group_key(version, reqs, constraints=(), no_deps=False):
+    """Identity of one logical pip solve, independent of task/optionality.
+
+    The final constant ``False`` preserves the deployed key of required groups
+    from the previous schema while removing optional/required status from the
+    identity. Consumer semantics must never duplicate a physical dependency
+    closure.
+    """
+    return hashlib.sha256(json.dumps(
+        [version, sorted(set(reqs)), sorted(set(constraints)), bool(no_deps), False],
+        sort_keys=True).encode()).hexdigest()[:20]
+
+
+def _pip_plan_artifact_shas(plan):
+    if not isinstance(plan, dict) or plan.get('optional_failed'):
+        raise ValueError('pip plan is not a successful reusable closure')
+    files=plan.get('files');sources=plan.get('source_archives')
+    if not isinstance(files,list) or not isinstance(sources,list) or not files and not sources:
+        raise ValueError('pip plan has no artifacts')
+    shas=[]
+    for row in files:
+        if (not isinstance(row,dict) or set(row)!={'filename','sha256'}
+                or not isinstance(row.get('filename'),str)
+                or Path(row['filename']).name!=row['filename']
+                or not SHA.fullmatch(str(row.get('sha256')))):
+            raise ValueError('invalid pip wheel plan row')
+        shas.append(row['sha256'])
+    for row in sources:
+        if not isinstance(row,dict) or not SHA.fullmatch(str(row.get('sha256'))):
+            raise ValueError('invalid pip source plan row')
+        shas.append(row['sha256'])
+    return shas
+
+
+def _promote_pip_artifacts(pool, dest, shared, key, *, stub_names=()):
+    """Move every completed pip output into the global CAS immediately.
+
+    This is called after *every* pip invocation, including failed resolver
+    attempts. A later retry therefore consumes already-downloaded wheels from
+    ``wheels/shared`` instead of downloading them again. Per-group directories
+    are only disposable resolver scratch; physical artifacts live in the CAS.
+    """
+    rows=[];stub_names=set(stub_names)
+    for file in sorted(Path(dest).iterdir()):
+        if not file.is_file() or file.is_symlink():
+            raise RuntimeError('unsafe pip closure artifact')
+        if file.name in stub_names:
+            file.unlink()
+            continue
+        sha=pool.put(file,'python',key)
+        pool.coalesce_stage_file(file,sha)
+        target=pool.objects/sha[:2]/sha
+        common=Path(shared)/file.name
+        if common.exists():
+            if common.is_symlink() or not common.is_file():
+                raise RuntimeError('unsafe wheelhouse entry')
+            if not common.samefile(target):
+                raise RuntimeError('same wheel filename resolved to different bytes: '+file.name)
+        else:
+            os.link(target,common)
+        rows.append({'filename':file.name,'sha256':sha})
+    return rows
+
+
+def reuse_pip_plan(pool, version, reqs, key, *, constraints=(), no_deps=False):
+    """Reuse a verified completed logical plan without invoking pip or network."""
+    path=pool.stage/'metadata'/('pip-plan-'+key+'.json')
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        plan=json.loads(path.read_bytes())
+        if (plan.get('artifact_model')!=PIP_ARTIFACT_MODEL
+                or plan.get('python')!=version
+                or plan.get('requested')!=sorted(reqs)
+                or plan.get('constraints')!=sorted(constraints)
+                or plan.get('no_deps') is not bool(no_deps)):
+            return False
+        _pip_plan_artifact_shas(plan)
+        shared=pool.stage/'wheels'/'shared';shared.mkdir(exist_ok=True)
+        for row in plan['files']:
+            sha=row['sha256'];target=pool.objects/sha[:2]/sha
+            if (target.is_symlink() or not target.is_file()
+                    or sha not in pool.verified_objects and digest(target)!=sha):
+                return False
+            pool.verified_objects.add(sha)
+            pool.reference(sha,'python',key,target.stat().st_size)
+            common=shared/row['filename']
+            if common.exists():
+                if common.is_symlink() or not common.is_file() or not common.samefile(target):
+                    raise RuntimeError('reused pip filename conflicts with verified CAS: '+row['filename'])
+            else:
+                os.link(target,common)
+        for row in plan['source_archives']:
+            sha=row['sha256'];target=pool.objects/sha[:2]/sha
+            if (target.is_symlink() or not target.is_file()
+                    or sha not in pool.verified_objects and digest(target)!=sha):
+                return False
+            pool.verified_objects.add(sha)
+            pool.reference(sha,'python-source',key,target.stat().st_size)
+    except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError):
+        return False
+    print('[pool] reused verified pip closure '+key,flush=True)
+    return True
+
+
 def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
     if not reqs:return
     stage=pool.stage
@@ -1826,27 +1966,39 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
     if constraints:write_new(constraint_file,'\n'.join(sorted(constraints))+'\n')
     shared=stage/'wheels'/'shared';shared.mkdir(exist_ok=True)
     dest=stage/'wheels'/key;dest.mkdir()
-    sources={};attempt=0
+    sources={};attempt=0;names=[]
+    pip_env=dict(os.environ)
+    # The broker starts with PIP_NO_CACHE_DIR=1. Override that only for this
+    # isolated worker and keep the cache ephemeral/outside the published pool.
+    pip_env.pop('PIP_NO_CACHE_DIR',None)
+    pip_env['PIP_CACHE_DIR']=str(pool.pip_cache)
     with tempfile.TemporaryDirectory(prefix='swegym-pip-stubs-') as stub_tmp:
         stubdir=Path(stub_tmp);stub_names=set()
         while True:
             attempt+=1
             if attempt>33:raise RuntimeError('pip source fallback exceeded finite bound')
             for existing in list(dest.iterdir()):
-                if existing.is_file() or existing.is_symlink():existing.unlink()
-                elif existing.exists():raise RuntimeError('unexpected directory in pip destination')
+                if existing.is_file() and not existing.is_symlink():existing.unlink()
+                elif existing.exists():raise RuntimeError('unexpected entry in pip destination')
             needed_file=stage/'metadata'/('binary-'+key+'-'+str(attempt)+'.txt')
             write_new(needed_file,'\n'.join(sorted(reqs))+'\n')
             command=[sys.executable,'-m','pip','download','--disable-pip-version-check',
-                     '--no-cache-dir','--only-binary=:all:','--implementation','cp',
+                     '--only-binary=:all:','--implementation','cp',
                      '--python-version',version,'--abi','cp'+version.replace('.',''),
                      '--platform','manylinux2014_x86_64','--find-links',str(shared),
                      '--find-links',str(stubdir),'--dest',str(dest),'-r',str(needed_file),
                      *(['--no-deps'] if no_deps else []),
                      *(['--constraint',str(constraint_file)] if constraints else [])]
             print('[pool]',' '.join(command),flush=True)
-            result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
-            if result.returncode==0:break
+            result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                                  env=pip_env)
+            # Persist every valid wheel pip managed to finish before it failed.
+            # This turns source-discovery retries into local resolver retries,
+            # never repeated network downloads of the same wheel bytes.
+            attempt_rows=_promote_pip_artifacts(pool,dest,shared,key,stub_names=stub_names)
+            if result.returncode==0:
+                names=attempt_rows
+                break
             output=result.stdout or ''
             missing=_pip_missing_requirement(output)
             if not missing:
@@ -1864,24 +2016,48 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
             stub=_write_resolver_stub(stubdir,source)
             stub_names.add(stub.name);sources[normalized]=source
 
-        names=[]
-        for file in sorted(dest.iterdir()):
-            if file.name in stub_names:
-                file.unlink();continue
-            if not file.is_file() or file.is_symlink():raise RuntimeError('unsafe pip closure artifact')
-            sha=pool.put(file,'python',key);pool.coalesce_stage_file(file,sha)
-            common=shared/file.name
-            if common.exists():
-                if common.is_symlink() or not common.is_file():raise RuntimeError('unsafe wheelhouse entry')
-                if not common.samefile(pool.objects/sha[:2]/sha):
-                    raise RuntimeError('same wheel filename resolved to different bytes: '+file.name)
-            else:os.link(pool.objects/sha[:2]/sha,common)
-            names.append({'filename':file.name,'sha256':sha})
     source_rows=sorted(sources.values(),key=lambda row:(_normalized_package_name(row['name']),row['version']))
     if not names and not source_rows:raise RuntimeError('pip closure has no downloadable packages')
     write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
+        'artifact_model':PIP_ARTIFACT_MODEL,
         'python':version,'requested':sorted(reqs),'constraints':sorted(constraints),
         'no_deps':no_deps,'files':names,'source_archives':source_rows},sort_keys=True))
+    # Group-local wheel paths are resolver scratch only. The durable bytes are
+    # the global CAS plus filename hardlinks in wheels/shared for later solves.
+    for existing in list(dest.iterdir()):
+        if existing.is_file() and not existing.is_symlink():existing.unlink()
+        elif existing.exists():raise RuntimeError('unexpected entry in completed pip destination')
+    dest.rmdir()
+
+
+def acquire_pip_group(pool, key, group):
+    """Acquire one deduplicated logical closure; required failures are fatal."""
+    if reuse_pip_plan(pool,group['version'],group['requirements'],key,
+                      constraints=group['constraints'],no_deps=group['no_deps']):
+        return 'reused'
+    try:
+        pip_closure(pool,group['version'],group['requirements'],key,
+                    constraints=group['constraints'],no_deps=group['no_deps'])
+        return 'acquired'
+    except (subprocess.CalledProcessError,RuntimeError) as exc:
+        if not group['required']:
+            write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
+                'artifact_model':PIP_ARTIFACT_MODEL,
+                'python':group['version'],'requested':group['requirements'],
+                'constraints':group['constraints'],'no_deps':group['no_deps'],
+                'optional_failed':str(exc),'files':[],'source_archives':[]},sort_keys=True))
+            return 'optional-failed'
+        raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
+
+
+def acquire_pip_groups(pool, groups):
+    """Acquire all unique logical closures in deterministic fail-fast order."""
+    total=len(groups)
+    for index,(key,group) in enumerate(sorted(groups.items()),1):
+        print(f"[pool] Pip closure {index}/{total}: Python {group['version']}, "
+              f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
+        acquire_pip_group(pool,key,group)
+
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):
     """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""
@@ -2087,6 +2263,8 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
             return
         try:
             closure=json.loads(metadata.read_bytes())
+            if closure.get('artifact_model')!=PIP_ARTIFACT_MODEL:
+                raise ValueError('pip closure does not use the global content-addressed artifact model')
             failed=closure.get('optional_failed')
             if failed:
                 if not optional or not isinstance(failed,str):
@@ -2375,12 +2553,11 @@ def main(argv=None):
                      resolver_version=None, bucket='task'):
             if not req:return None
             selected_version=resolver_version or version
-            key=hashlib.sha256(json.dumps(
-                [selected_version,sorted(req),sorted(constraints),no_deps,optional],
-                sort_keys=True).encode()).hexdigest()[:20]
+            key=pip_group_key(selected_version,req,constraints,no_deps)
             group=groups.setdefault(key,{'version':selected_version,'requirements':sorted(req),
                                           'constraints':sorted(constraints),'no_deps':no_deps,
-                                          'optional':optional,'tasks':[],'steps':[]})
+                                          'required':not optional,'tasks':[],'steps':[]})
+            if not optional:group['required']=True
             if logical not in group['tasks']:group['tasks'].append(logical)
             group['steps'].append(name)
             if optional:optional_steps.append(key)
@@ -2485,18 +2662,7 @@ def main(argv=None):
     if pool.issues:
         write_new(stage/'metadata'/'static-errors.json', json.dumps(sorted(set(pool.issues)), indent=2))
         raise RuntimeError('static dependency closure rejected before network resolution: '+pool.issues[0])
-    for key,group in sorted(groups.items()):
-        try:
-            pip_closure(pool,group['version'],group['requirements'],key,
-                        constraints=group['constraints'],no_deps=group['no_deps'])
-        except (subprocess.CalledProcessError,RuntimeError) as exc:
-            if group['optional']:
-                write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
-                    'python':group['version'],'requested':group['requirements'],
-                    'constraints':group['constraints'],'no_deps':group['no_deps'],
-                    'optional_failed':str(exc),'files':[],'source_archives':[]},sort_keys=True))
-            else:
-                pool.issue('pip:'+key,'dependency solve unavailable: '+str(exc))
+    acquire_pip_groups(pool,groups)
     # Pin VCS inputs, resolve metadata from pyproject/setup.cfg/setup.py, and
     # propagate nested VCS references only to tasks that depend on them.
     vcs_frozen={};vcs_optional_failures={}
@@ -2512,8 +2678,9 @@ def main(argv=None):
         if value in vcs_frozen:continue
         required=bool(vcs_required_tasks[value])
         def vcs_failure(detail):
-            if required:pool.issue('VCS:'+value,detail)
-            else:vcs_optional_failures[value]=detail
+            if required:
+                raise RuntimeError('required VCS closure failed for '+value+': '+detail)
+            vcs_optional_failures[value]=detail
         canonical=vcs_reference(value)
         if canonical is None:
             vcs_failure('unrecognized Git reference');continue
@@ -2590,14 +2757,15 @@ def main(argv=None):
                     if normalized not in vcs_frozen:pending.add(normalized)
             for target_version,deps in sorted(deps_by_version.items()):
                 if not deps:continue
-                key=hashlib.sha256((value+target_version).encode()).hexdigest()[:20]
-                try:pip_closure(pool,target_version,deps,key)
-                except (RuntimeError,subprocess.CalledProcessError) as exc:
-                    required_for_version=any(target_version in ref_versions(item,value)
-                                             for item in required_dependants)
-                    if required_for_version:
-                        raise RuntimeError('VCS transitive solve: '+str(exc)) from exc
-                    vcs_optional_failures[value]='optional VCS transitive solve unavailable: '+str(exc)
+                key=pip_group_key(target_version,deps)
+                required_for_version=any(target_version in ref_versions(item,value)
+                                         for item in required_dependants)
+                outcome=acquire_pip_group(pool,key,{
+                    'version':target_version,'requirements':sorted(deps),'constraints':[],
+                    'no_deps':False,'required':required_for_version,
+                    'tasks':sorted(required_dependants|optional_dependants),'steps':['VCS '+value]})
+                if outcome=='optional-failed':
+                    vcs_optional_failures[value]='optional VCS transitive solve unavailable'
             setup_source=git_file(folder,pinned,'setup.py') or ''
             if re.search(r'check_call\(\s*\[\s*["\']npm["\']\s*,\s*["\']install["\']',setup_source):
                 try:npm_package_json_closure(pool,folder,pinned,repo_ref,value)
@@ -2629,7 +2797,7 @@ def main(argv=None):
                 source=git_file(mirrors[repo],commit,filename)
                 if not source:continue
                 try:lock=json.loads(source)
-                except ValueError:pool.issue(repo,'invalid npm lockfile');continue
+                except ValueError as exc:raise RuntimeError('invalid npm lockfile for '+repo+': '+filename) from exc
                 def workspace(url, *, _repo=repo, _commit=commit, _filename=filename):
                     if (not isinstance(url,str) or Path(url).is_absolute()
                             or '..' in Path(url).parts or '\\' in url):
@@ -2639,9 +2807,7 @@ def main(argv=None):
                                 _commit,'--',directory],capture=True).strip()
                     if not re.fullmatch(r'040000 tree [a-f0-9]{40}\t.+',row):
                         raise RuntimeError('npm workspace missing from pinned Git source: '+directory)
-                try:found=npm_lock_urls(lock,repo+':'+filename,workspace_checker=workspace)
-                except RuntimeError as exc:
-                    pool.issue(repo,str(exc));continue
+                found=npm_lock_urls(lock,repo+':'+filename,workspace_checker=workspace)
                 for url,integ in found.items():
                     if url in npm_urls and npm_urls[url]!=integ:
                         raise RuntimeError('conflicting npm lockfile integrity for '+url)
@@ -2654,7 +2820,7 @@ def main(argv=None):
            for task in tasks.values() for cmd in task['repo_script_list']):
         try: npm_global_bootstrap(pool)
         except (RuntimeError,OSError,ValueError) as exc:
-            pool.issue('npm-global', 'npm CLI acquisition failed: ' + str(exc))
+            raise RuntimeError('required npm CLI acquisition failed: '+str(exc)) from exc
     # Signed APT download-only resolution against Kali, never the Ubuntu host.
     os_source=adapter/'os_packages.py'
     import ast
@@ -2666,7 +2832,7 @@ def main(argv=None):
     apt_requested.update(('openjdk-17-jdk','openjdk-17-jre'))
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
-        pool.issue('APT','signed Kali closure unavailable: '+str(exc))
+        raise RuntimeError('required signed Kali closure unavailable: '+str(exc)) from exc
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
                     conda_lock_sha256=conda_lock_sha256)
