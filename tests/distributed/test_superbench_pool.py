@@ -211,6 +211,53 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             self.assertNotIn('--no-cache-dir', calls[0])
             acquire.assert_called_once_with(candidate, 'collective.checkdocs', 'plan-key', '3.10', constraints=())
 
+    def test_source_stub_is_forced_by_direct_constraint_after_invalid_index_metadata(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=pool.Pool(stage)
+            (stage/'metadata').mkdir();(stage/'wheels').mkdir()
+            calls=[]
+            source={'name':'omegaconf','version':'2.1.0.dev26',
+                    'requested':'omegaconf==2.1.0.dev26',
+                    'filename':'omegaconf-2.1.0.dev26.tar.gz','sha256':'1'*64,
+                    'requirements':['PyYAML==5.1'],'provides_extra':[]}
+            def pipeline(argv, **kwargs):
+                calls.append(list(argv))
+                if len(calls)==1:
+                    return subprocess.CompletedProcess(argv,1,stdout=(
+                        'Requested omegaconf==2.1.0.dev26 has invalid metadata: '
+                        '.* suffix can only be used with `==` or `!=` operators\n'
+                        'PyYAML (>=5.1.*)\n'
+                        'ERROR: Could not find a version that satisfies the requirement '
+                        'omegaconf==2.1.0.dev26 (from versions: 2.1.0.dev26)\n'
+                        'ERROR: No matching distribution found for omegaconf==2.1.0.dev26\n'))
+                constraint_paths=[Path(argv[i+1]) for i,value in enumerate(argv[:-1])
+                                  if value=='--constraint']
+                self.assertEqual(len(constraint_paths),1)
+                rows=constraint_paths[0].read_text().splitlines()
+                self.assertEqual(len(rows),1)
+                self.assertRegex(rows[0],r'^omegaconf @ file:///.+omegaconf-2\.1\.0\.dev26-py3-none-any\.whl$')
+                return subprocess.CompletedProcess(argv,0,stdout='')
+            with patch.object(pool.subprocess,'run',side_effect=pipeline), \
+                 patch.object(pool,'acquire_source_distribution',return_value=source) as acquire:
+                pool.pip_closure(candidate,'3.8',{'omegaconf==2.1.0.dev26'},'group')
+            self.assertEqual(len(calls),2)
+            acquire.assert_called_once_with(candidate,'omegaconf==2.1.0.dev26','group','3.8',constraints=())
+            plan=json.loads((stage/'metadata/pip-plan-group.json').read_text())
+            self.assertEqual(plan['source_archives'],[source])
+            self.assertEqual(plan['files'],[])
+
+    def test_resolver_stub_constraint_rejects_untrusted_name_and_missing_stub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);stub=root/'demo-1-py3-none-any.whl';stub.write_bytes(b'x')
+            row=pool._resolver_stub_constraint({'name':'demo'},stub)
+            self.assertTrue(row.startswith('demo @ file:///'))
+            with self.assertRaisesRegex(RuntimeError,'invalid resolver stub package name'):
+                pool._resolver_stub_constraint({'name':'demo @ https://evil.invalid/x'},stub)
+            stub.unlink()
+            with self.assertRaisesRegex(RuntimeError,'missing resolver stub wheel'):
+                pool._resolver_stub_constraint({'name':'demo'},stub)
+
     def test_historical_pypi_inclusive_wildcard_metadata_is_pinned_to_lower_bound(self):
         Requirement,_,_,_,_=pool._packaging_symbols()
         requirement=Requirement('omegaconf==2.0.6')

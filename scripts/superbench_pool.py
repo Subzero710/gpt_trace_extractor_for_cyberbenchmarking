@@ -1940,6 +1940,18 @@ def _write_resolver_stub(directory, source):
     return path
 
 
+# GPT_TRACE_SWEGYM_DIRECT_SOURCE_STUB_CONSTRAINT_V1
+def _resolver_stub_constraint(source, stub):
+    """Force pip to use our audited metadata stub for one broken/source-only release."""
+    name=str(source.get('name',''))
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+',name):
+        raise RuntimeError('invalid resolver stub package name')
+    path=Path(stub)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing resolver stub wheel')
+    return name+' @ '+path.resolve().as_uri()
+
+
 def _pip_missing_requirement(output):
     patterns=(r'No matching distribution found for\s+([^\r\n]+)',
               r'Could not find a version that satisfies the requirement\s+(.+?)(?:\s+\(from versions:|\r?$)')
@@ -2073,7 +2085,7 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
     pip_env.pop('PIP_NO_CACHE_DIR',None)
     pip_env['PIP_CACHE_DIR']=str(pool.pip_cache)
     with tempfile.TemporaryDirectory(prefix='swegym-pip-stubs-') as stub_tmp:
-        stubdir=Path(stub_tmp);stub_names=set()
+        stubdir=Path(stub_tmp);stub_names=set();source_stubs={}
         while True:
             attempt+=1
             if attempt>33:raise RuntimeError('pip source fallback exceeded finite bound')
@@ -2082,13 +2094,25 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
                 elif existing.exists():raise RuntimeError('unexpected entry in pip destination')
             needed_file=stage/'metadata'/('binary-'+key+'-'+str(attempt)+'.txt')
             write_new(needed_file,'\n'.join(sorted(reqs))+'\n')
+            stub_constraint_file=None
+            if source_stubs:
+                # ``--find-links`` alone does NOT override an index candidate with
+                # the same name/version. pip>=24.1 may therefore keep selecting a
+                # wheel whose legacy metadata it has already rejected. A direct
+                # local constraint makes the audited stub the candidate while the
+                # original requirement still supplies extras/specifier semantics.
+                stub_constraint_file=stubdir/('constraints-'+str(attempt)+'.txt')
+                rows=[_resolver_stub_constraint(sources[name],source_stubs[name])
+                      for name in sorted(source_stubs)]
+                write_new(stub_constraint_file,'\n'.join(rows)+'\n')
             command=[sys.executable,'-m','pip','download','--disable-pip-version-check',
                      '--only-binary=:all:','--implementation','cp',
                      '--python-version',version,'--abi','cp'+version.replace('.',''),
                      '--platform','manylinux2014_x86_64','--find-links',str(shared),
                      '--find-links',str(stubdir),'--dest',str(dest),'-r',str(needed_file),
                      *(['--no-deps'] if no_deps else []),
-                     *(['--constraint',str(constraint_file)] if constraints else [])]
+                     *(['--constraint',str(constraint_file)] if constraints else []),
+                     *(['--constraint',str(stub_constraint_file)] if stub_constraint_file else [])]
             print('[pool]',' '.join(command),flush=True)
             result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
                                   env=pip_env)
@@ -2114,7 +2138,7 @@ def pip_closure(pool, version, reqs, key, *, constraints=(), no_deps=False):
                 raise RuntimeError('pip still rejects statically stubbed source '+missing+': '+tail[:1200])
             source=acquire_source_distribution(pool,missing,key,version,constraints=constraints)
             stub=_write_resolver_stub(stubdir,source)
-            stub_names.add(stub.name);sources[normalized]=source
+            stub_names.add(stub.name);sources[normalized]=source;source_stubs[normalized]=stub
 
     source_rows=sorted(sources.values(),key=lambda row:(_normalized_package_name(row['name']),row['version']))
     if not names and not source_rows:raise RuntimeError('pip closure has no downloadable packages')
