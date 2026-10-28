@@ -1678,9 +1678,73 @@ def _constraint_specifiers(name, constraints, python_version):
     return result
 
 
-def _select_source_release(requirement, python_version, constraints=()):
+# GPT_TRACE_SWEGYM_CONSERVATIVE_VERSION_POLICY_V1
+def normalize_legacy_source_requirement(value):
+    """Normalize only the historical ``>=N.*`` metadata defect, conservatively.
+
+    ``>=N.*`` is invalid modern PEP 440.  For the frozen benchmark we interpret
+    that specific historical spelling as the exact lower-bound release ``==N``.
+    Other invalid wildcard operators stay fatal instead of being guessed.
+    """
+    if not isinstance(value,str):
+        raise RuntimeError('non-string source dependency metadata')
+    Requirement,_,_,_,_=_packaging_symbols()
+    try:
+        return str(Requirement(value))
+    except Exception as original:
+        head,separator,marker=value.partition(';')
+        rewritten=re.sub(
+            r'(?<![=!<>~])>=\s*([0-9]+(?:\.[0-9]+)*)\.\*(?=\s*(?:[,)]|$))',
+            lambda match: '=='+match.group(1),
+            head,
+        )
+        if rewritten==head:
+            raise RuntimeError('invalid source dependency metadata: '+value) from original
+        candidate=rewritten+(separator+marker if separator else '')
+        try:
+            return str(Requirement(candidate))
+        except Exception as exc:
+            raise RuntimeError('invalid source dependency metadata: '+value) from exc
+
+
+def _parse_wheel_filename(value):
+    try:
+        from packaging.utils import parse_wheel_filename
+    except ImportError:
+        from pip._vendor.packaging.utils import parse_wheel_filename
+    return parse_wheel_filename(value)
+
+
+def _cached_python_versions(pool, name):
+    """Return exact Python-package versions already represented by the pip pool."""
+    normalized=_normalized_package_name(name);found=set()
+    shared=pool.stage/'wheels'/'shared'
+    if shared.is_dir():
+        for wheel in shared.glob('*.whl'):
+            if wheel.is_symlink() or not wheel.is_file():continue
+            try:wheel_name,version,_,_=_parse_wheel_filename(wheel.name)
+            except Exception:continue
+            if _normalized_package_name(wheel_name)==normalized:found.add(str(version))
+    metadata=pool.stage/'metadata'
+    if metadata.is_dir():
+        for path in metadata.glob('pip-plan-*.json'):
+            if path.is_symlink() or not path.is_file():continue
+            try:plan=json.loads(path.read_bytes())
+            except (OSError,ValueError,TypeError):continue
+            for row in plan.get('source_archives',[]) if isinstance(plan,dict) else ():
+                if (not isinstance(row,dict) or _normalized_package_name(row.get('name',''))!=normalized
+                        or not isinstance(row.get('version'),str)
+                        or not SHA.fullmatch(str(row.get('sha256','')))):
+                    continue
+                target=pool.objects/row['sha256'][:2]/row['sha256']
+                if target.is_file() and not target.is_symlink():found.add(row['version'])
+    return found
+
+
+def _select_source_release(pool, requirement, python_version, constraints=()):
     Requirement,SpecifierSet,Version,InvalidVersion,_=_packaging_symbols()
-    try:req=Requirement(requirement)
+    normalized_requirement=normalize_legacy_source_requirement(requirement)
+    try:req=Requirement(normalized_requirement)
     except Exception as exc:raise RuntimeError('invalid source fallback requirement: '+requirement) from exc
     if req.url:raise RuntimeError('source fallback does not accept URL requirements')
     env=_target_marker_environment(python_version)
@@ -1718,8 +1782,17 @@ def _select_source_release(requirement, python_version, constraints=()):
             candidates.append((version,text,source[0][2]))
     if not candidates:
         raise RuntimeError('no compatible signed source distribution: '+requirement)
-    candidates.sort(key=lambda row:row[0],reverse=True)
-    _,version_text,item=candidates[0]
+    # Compatibility ranges are deliberately conservative.  Reuse an already
+    # acquired compatible version first.  Otherwise choose the LOWEST concrete
+    # release satisfying the full requirement/constraint/Python intersection;
+    # never jump to a newer release merely because the metadata used >=.
+    candidates.sort(key=lambda row:row[0])
+    cached_versions=set()
+    for text in _cached_python_versions(pool,req.name):
+        try:cached_versions.add(Version(text))
+        except InvalidVersion:continue
+    selected=next((row for row in candidates if row[0] in cached_versions),candidates[0])
+    _,version_text,item=selected
     return req,version_text,item
 
 
@@ -1754,7 +1827,7 @@ def _source_archive_files(path, filename):
 def acquire_source_distribution(pool, requirement, plan_key, python_version, *, constraints=()):
     """Acquire one compatible PyPI sdist by SHA and inspect metadata statically."""
     import email.parser
-    req,selected,item=_select_source_release(requirement,python_version,constraints)
+    req,selected,item=_select_source_release(pool,requirement,python_version,constraints)
     version_url='https://pypi.org/pypi/'+urllib.parse.quote(req.name,safe='')+'/'+urllib.parse.quote(selected,safe='')+'/json'
     metadata=_pypi_json(version_url)
     urls=metadata.get('urls') or []
@@ -1795,13 +1868,11 @@ def acquire_source_distribution(pool, requirement, plan_key, python_version, *, 
         if remote:raise RuntimeError('sdist pyproject contains VCS dependency: '+requirement)
         if issues:raise RuntimeError('dynamic source build requirements: '+repr(issues))
         requirements.update(deps)
-    Requirement,_,_,_,_=_packaging_symbols()
-    clean=[]
+    clean=set()
     for row in sorted(requirements):
         if not isinstance(row,str):raise RuntimeError('non-string source dependency: '+requirement)
-        try:Requirement(row)
-        except Exception as exc:raise RuntimeError('invalid source dependency metadata: '+row) from exc
-        clean.append(row)
+        clean.add(normalize_legacy_source_requirement(row))
+    clean=sorted(clean)
     extras=sorted(x for x in provides_extra|set(req.extras) if isinstance(x,str) and re.fullmatch(r'[A-Za-z0-9_.-]+',x))
     if not clean and not ({'setup.py','PKG-INFO','setup.cfg','pyproject.toml'}&text_files.keys()):
         raise RuntimeError('source archive has no inspectable dependency metadata')

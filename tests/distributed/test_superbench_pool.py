@@ -211,6 +211,80 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             self.assertNotIn('--no-cache-dir', calls[0])
             acquire.assert_called_once_with(candidate, 'collective.checkdocs', 'plan-key', '3.10', constraints=())
 
+    def test_historical_pypi_inclusive_wildcard_metadata_is_pinned_to_lower_bound(self):
+        Requirement,_,_,_,_=pool._packaging_symbols()
+        requirement=Requirement('omegaconf==2.0.6')
+        sha='a'*64
+        selected={'packagetype':'sdist','filename':'omegaconf-2.0.6.tar.gz',
+                  'url':'https://files.pythonhosted.org/packages/omegaconf-2.0.6.tar.gz',
+                  'digests':{'sha256':sha}}
+        metadata={'urls':[selected],
+                  'info':{'name':'omegaconf','requires_dist':['PyYAML (>=5.1.*)']}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_select_source_release',return_value=(requirement,'2.0.6',selected)), \
+                 patch.object(pool,'_pypi_json',return_value=metadata), \
+                 patch.object(candidate,'download',return_value=sha), \
+                 patch.object(pool,'_source_archive_files',return_value={}):
+                target=candidate.objects/sha[:2]/sha
+                target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(b'source')
+                result=pool.acquire_source_distribution(candidate,'omegaconf==2.0.6','plan','3.8')
+        self.assertEqual(result['requirements'],['PyYAML==5.1'])
+        Requirement(result['requirements'][0])
+
+    def test_legacy_metadata_compatibility_is_narrow_and_exact(self):
+        self.assertEqual(pool.normalize_legacy_source_requirement('PyYAML (>=5.1.*)'),
+                         'PyYAML==5.1')
+        self.assertEqual(pool.normalize_legacy_source_requirement(
+            'demo (>=1.2.*); python_version < "3.9"'),
+            'demo==1.2; python_version < "3.9"')
+        for value in ('PyYAML (>5.1.*)','PyYAML (<=5.1.*)','PyYAML (~=5.1.*)',
+                      'PyYAML (>=banana.*)'):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    RuntimeError,'invalid source dependency metadata'):
+                pool.normalize_legacy_source_requirement(value)
+
+    def test_source_range_prefers_cached_compatible_version(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'1.4':release('1.4'),'1.5':release('1.5'),'1.9':release('1.9'),'2.0':release('2.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=pool.Pool(stage)
+            shared=stage/'wheels/shared';shared.mkdir(parents=True)
+            (shared/'demo-1.9-py3-none-any.whl').write_bytes(b'cached')
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(candidate,'demo>1,<2','3.10')
+        self.assertEqual(selected,'1.9')
+
+    def test_source_range_without_cache_selects_lowest_compatible_not_latest(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'1.4':release('1.4'),'1.5':release('1.5'),'1.9':release('1.9'),'2.0':release('2.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(candidate,'demo>1.4,<2','3.10')
+        self.assertEqual(selected,'1.5')
+
+    def test_source_greater_equal_uses_exact_lower_release_when_available(self):
+        def release(version):
+            return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
+                     'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
+                     'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                     'requires_python':'>=3.8'}]
+        project={'releases':{'5.1':release('5.1'),'5.2':release('5.2'),'6.0':release('6.0')}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1','3.10')
+        self.assertEqual(selected,'5.1')
+
     def test_apt_key_uses_downloaded_content_address(self):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
