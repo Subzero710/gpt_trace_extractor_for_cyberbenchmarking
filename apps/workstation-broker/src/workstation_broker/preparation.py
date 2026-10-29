@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,7 +31,6 @@ from workstation_broker.preparation_resources import JobScope, source_containers
 TERMINAL = frozenset({"ready", "failed", "interrupted", "canceled"})
 PHASES = TERMINAL | {"starting", "running", "validating"}
 
-FETCH_PYTHON = Path("/usr/bin/python3")
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
@@ -37,12 +38,49 @@ FETCH_SOURCE_FILES = (
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
 )
+
+
+def locked_python_minors(source_root):
+    lock = Path(source_root) / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json"
+    payload = json.loads(lock.read_bytes())
+    values = sorted({".".join(str(item["version"]).split(".")[:2])
+                     for item in payload.get("artifacts", {}).values()
+                     if item.get("name") == "python"})
+    if not values:
+        raise RuntimeError("pinned Conda lock has no Python identities")
+    return values
+
+
+def contract_counts(source_root):
+    contract = json.loads((Path(source_root) / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json").read_bytes())
+    tasks = contract.get("tasks", {})
+    repos = {row.get("repo") for row in tasks.values()}
+    environments = contract.get("environments", {})
+    if not tasks or not repos or not environments:
+        raise RuntimeError("pinned benchmark contract is empty")
+    return len(tasks), len(repos), len(environments)
+
+
+def acquisition_job_timeout_seconds(source_root):
+    path = Path(source_root) / "config/preparation.toml"
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("missing versioned preparation controls")
+    with path.open("rb") as stream:
+        payload = tomllib.load(stream)
+    hours = (payload.get("acquisition") or {}).get("job_timeout_hours")
+    if type(hours) is not int or hours <= 0:
+        raise RuntimeError("invalid acquisition job timeout control")
+    return hours * 3600
 
 
 def trusted_fetch_python():
     """Return the root-owned system interpreter used after dropping privileges."""
-    interpreter = FETCH_PYTHON.resolve(strict=True)
+    executable = shutil.which("python3", path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    if not executable:
+        raise RuntimeError("trusted system Python for dependency fetch is unavailable")
+    interpreter = Path(executable).resolve(strict=True)
     info = interpreter.stat()
     if (not interpreter.is_file() or not info.st_mode & 0o111 or info.st_uid != 0
             or info.st_mode & 0o022):
@@ -68,10 +106,13 @@ def trusted_fetch_python():
     return interpreter
 
 
-def stage_fetch_sources(manager, pool_root, operation_id, attempt):
+def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None):
     """Copy exact worker inputs into a unique per-attempt readonly snapshot."""
     repository = manager.source_root.resolve(strict=True)
-    snapshot = pool_root / ("source-"+identifier(operation_id)+"-"+str(attempt))
+    if operation_id is None or attempt is None:
+        snapshot = pool_root / "source"
+    else:
+        snapshot = pool_root / ("source-"+identifier(operation_id)+"-"+str(attempt))
     if snapshot.exists() or snapshot.is_symlink():
         raise RuntimeError("per-attempt source snapshot already exists; refusing overwrite: " + str(snapshot))
     snapshot.mkdir(mode=0o755)
@@ -382,14 +423,22 @@ class PreparationManager:
                 safe(ready, immutable=True, directory=True)
                 inventory_path = safe(ready / 'inventory.json', immutable=True)
                 inventory = json.loads(inventory_path.read_bytes())
+                pending_integration = proof.get('runtime_integrated') != True
                 if (proof.get('kind') != 'download-only-pool' or proof.get('complete') is not True
                         or proof.get('pool_directory') != str(ready)
                         or inventory.get('operation_id') != state['operation_id']
                         or inventory.get('complete') is not True
                         or inventory.get('tasks') != proof.get('tasks')
                         or inventory.get('repos') != proof.get('repos')
-                        or inventory.get('conda_recipes') != proof.get('conda_recipes')):
-                    raise RuntimeError('published pool does not match the durable verified publication record')
+                        or inventory.get('conda_recipes') != proof.get('conda_recipes')
+                        or (not pending_integration and proof.get('runtime_integrated') is not True)
+                        or proof.get('offline_replay') is not True
+                        or not isinstance(proof.get('generation'), str)):
+                    if not pending_integration:
+                        raise RuntimeError('published pool does not match the durable verified publication record')
+                    state = {**state, 'phase': 'interrupted', 'error': 'runtime integration remains incomplete; sealed pool retained'}
+                    self._write(state)
+                    return state
                 state = {**state, 'phase': 'ready', 'result': proof, 'error': None}
                 self._write(state)
         if state['phase'] not in TERMINAL:
@@ -404,10 +453,14 @@ class PreparationManager:
     def _verify_ready(self, state):
         """No rehash after the pool was verified and sealed at publication."""
         result = state.get("result")
+        task_count, repo_count, env_count = contract_counts(self.source_root)
         if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
-                or result.get("complete") is not True or result.get("tasks") != 230
-                or result.get("repos") != 11 or result.get("conda_recipes") != 25
-                or result.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
+                or result.get("complete") is not True or result.get("tasks") != task_count
+                or result.get("repos") != repo_count or result.get("conda_recipes") != env_count
+                or result.get("python_versions") != locked_python_minors(self.source_root)
+                or result.get("runtime_integrated") is not True
+                or result.get("offline_replay") is not True
+                or not isinstance(result.get("generation"), str)
                 or state.get("compatibility") != self.expected()):
             self._write({**state, "phase": "failed", "error": "invalid pool publication record"})
             return {**state, "phase": "failed", "error": "invalid pool publication record"}
@@ -445,10 +498,13 @@ class PreparationManager:
                     return self._public(previous)
                 # An explicit operator retry is safe only after _reconcile
                 # verified the previous worker and all descendants are absent.
+                pending_integration = (isinstance(previous.get('publication_verified'), dict)
+                    and previous['publication_verified'].get('runtime_integrated') != True
+                    and (self.base.parent/'dependency-pool'/'ready').is_dir())
                 if not (payload['retry'] and previous['phase'] in {'failed','interrupted'}
                         and previous.get('result') is None
-                        and previous.get('publication_verified') is None
-                        and not (self.base.parent/'dependency-pool'/'ready').exists()):
+                        and (previous.get('publication_verified') is None or pending_integration)
+                        and (pending_integration or not (self.base.parent/'dependency-pool'/'ready').exists())):
                     raise RuntimeError('explicit retry of failed/unpublished preparation required')
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")
@@ -685,6 +741,28 @@ def retained_dependency_stage(manager, pool_root, state, account):
     if not matches:return None
     return max(set(matches),key=lambda p:(p.stat().st_mtime_ns,str(p)))
 
+def _integrate_published_pool(manager, state, ready, result):
+    """Build/validate templates from an already sealed pool after a crash."""
+    builder_path = manager.source_root / "scripts/build_local_templates.py"
+    spec = importlib.util.spec_from_file_location("swegym_integrated_builder", builder_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("integrated template builder is unavailable")
+    builder = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = builder
+    spec.loader.exec_module(builder)
+    args = types.SimpleNamespace(
+        operation_id=state["operation_id"], virtual_gib=builder.VIRTUAL_GIB,
+        free_space_gib=builder.FREE_SPACE_GIB, build_timeout_hours=builder.BUILD_TIMEOUT_HOURS,
+    )
+    final = builder.build(args)
+    generation = Path(final).name
+    integrated = {**result, "runtime_integrated": True, "generation": generation,
+                  "offline_replay": True, "pool_directory": str(ready)}
+    manager._write({**state, "phase": "validating", "publication_verified": integrated,
+                    "built_generation": generation})
+    return integrated
+
+
 def _prepare(manager, state):
     # Download on the execution host without guest VMs or persistent deletion capabilities.
     import pwd
@@ -712,6 +790,13 @@ def _prepare(manager, state):
     ready = root / "ready"
     stage = root / ('incoming-'+state['operation_id']+'-'+str(state['attempt']))
     if ready.exists() or ready.is_symlink():
+        pending = state.get("publication_verified")
+        if isinstance(pending, dict) and pending.get("runtime_integrated") != True:
+            safe(ready, immutable=True, directory=True)
+            inventory = json.loads(safe(ready / "inventory.json", immutable=True).read_bytes())
+            if inventory.get("operation_id") != state["operation_id"] or inventory.get("complete") is not True:
+                raise RuntimeError("published dependency pool cannot be resumed safely")
+            return _integrate_published_pool(manager, state, ready, pending)
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
         raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
@@ -720,6 +805,8 @@ def _prepare(manager, state):
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
     interpreter = trusted_fetch_python()
+    # The legacy call shape ``stage_fetch_sources(manager, root)`` remains a
+    # documented read-only fixture; production passes the durable identity.
     source_root, program = stage_fetch_sources(manager, root, state['operation_id'], state['attempt'])
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
@@ -753,15 +840,16 @@ def _prepare(manager, state):
                     *(["--reuse-from",str(reuse)] if reuse is not None else [])],
                    cwd=source_root, env=env, preexec_fn=drop_privileges,
                    stdin=subprocess.DEVNULL, start_new_session=True)
+    acquisition_timeout = acquisition_job_timeout_seconds(manager.source_root)
     try:
-        exitcode = child.wait(timeout=24 * 3600)
+        exitcode = child.wait(timeout=acquisition_timeout)
     except subprocess.TimeoutExpired as exc:
         # Only the private process group created above may be terminated.
         # Never kill a guessed PID or an unrelated service.
         try: os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError: pass
         child.wait()
-        raise RuntimeError("download worker exceeded its 24-hour deadline; zombie preserved") from exc
+        raise RuntimeError("download worker exceeded configured acquisition deadline; zombie preserved") from exc
     if exitcode != 0:
         raise subprocess.CalledProcessError(exitcode, child.args)
     remove_fetch_sources(source_root)
@@ -770,15 +858,16 @@ def _prepare(manager, state):
         raise RuntimeError("download worker returned no pool inventory")
     raw = inventory_path.read_bytes()
     inventory = json.loads(raw)
+    task_count, repo_count, env_count = contract_counts(manager.source_root)
     if (inventory.get("schema") != 2 or inventory.get("complete") is not True
-            or inventory.get("tasks") != 230 or inventory.get("repos") != 11
-             or inventory.get("conda_recipes") != 25
+            or inventory.get("tasks") != task_count or inventory.get("repos") != repo_count
+             or inventory.get("conda_recipes") != env_count
             or inventory.get("operation_id") != state["operation_id"]
              or inventory.get("conda_lock_sha256") != state["compatibility"].get("conda_lock_sha256")
-             or inventory.get("python_versions") != ["3.8","3.9","3.10","3.11","3.12"]
+             or inventory.get("python_versions") != locked_python_minors(manager.source_root)
              or inventory.get("issues") or not isinstance(inventory.get("files"),list)
              or not isinstance(inventory.get("task_plan"),dict)
-             or len(inventory["task_plan"]) != 230
+             or len(inventory["task_plan"]) != task_count
              or not isinstance(inventory.get("objects"),dict)):
         raise RuntimeError("incomplete/unverified downloaded dependency pool")
     expected = set()
@@ -852,17 +941,20 @@ def _prepare(manager, state):
     # If the process dies after rename, reconciliation can acknowledge the
     # ALREADY VERIFIED immutable result without retrying or rehashing files.
     result = {"kind": "download-only-pool", "complete": True,
-              "tasks": 230, "repos": 11, "conda_recipes": 25,
+              "tasks": task_count, "repos": repo_count, "conda_recipes": env_count,
               "python_versions": inventory["python_versions"],
               "file_count": len(inventory["files"]),
               "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-              "pool_directory": str(ready), "runtime_integrated": False}
+              "pool_directory": str(ready), "runtime_integrated": "pending"}
     manager._write({**state, "phase": "validating", "publication_verified": result})
     os.rename(stage, ready)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try: os.fsync(descriptor)
     finally: os.close(descriptor)
-    return result
+    # A dependency pool is an internal checkpoint, never a user-visible READY
+    # state. Continue in the same authenticated job through template creation
+    # and fresh offline replay before returning success.
+    return _integrate_published_pool(manager, state, ready, result)
 
 
 def worker(operation_id, slot_fd):

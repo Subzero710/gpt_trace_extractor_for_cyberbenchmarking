@@ -1,6 +1,8 @@
 {
+  "conda_platform": "linux-x86_64",
   "contract_sha256": "fbb8b762277d09b6732a9697735889f761cf5d1920df0cafb5320809f834f38f",
   "dataset_revision": "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0",
+  "evaluation_image_prefix": "xingyaoww/sweb.eval.x86_64.",
   "harness_commit": "16dd480cce9b27bf111a362d280881c6def5d2a7",
   "parquet_sha256": "f3a7cd934e8cc523b6053298d0abb2c82fd7db2b83f9f2ccba5944545aaa4eb1",
   "recipe_version": 2,

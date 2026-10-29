@@ -117,11 +117,22 @@ def fixture(parent, *, activate=True, label="repo"):
         (parent / "kali-packages.txt").write_bytes(b"synthetic-os-inventory\n")
         (parent / "kali-python-packages.txt").write_bytes(b"synthetic-python-inventory\n")
         golden = local.golden_builder(ROOT)
+        markers={"implementation_name":"cpython","implementation_version":"3.13.7",
+            "os_name":"posix","platform_machine":"x86_64","platform_release":"fixture-kernel",
+            "platform_system":"Linux","platform_version":"fixture-platform",
+            "python_full_version":"3.13.7","python_version":"3.13",
+            "platform_python_implementation":"CPython","sys_platform":"linux"}
+        tags=["cp313-cp313-manylinux_2_28_x86_64","py3-none-manylinux_2_28_x86_64"]
+        target={"schema":2,"markers":markers,"tags":tags,"implementation":"cpython",
+            "abi":"cp313","architecture":"x86_64","source":"verified-target-interpreter",
+            "interpreter_sha256":"0"*64,"python_artifact_sha256":None}
         provenance = {"source": golden.SOURCE + golden.ARCHIVE, "source_sha256": golden.ARCHIVE_SHA256,
             "base_sha256": local.digest(base), "build_input_sha256": golden.golden_build_input_sha256(),
             "python_lock_sha256": local.digest(ROOT / "infra/workstation/image/requirements.lock"),
             "apt_package_manifest_sha256": local.digest(parent / "kali-packages.txt"),
-            "python_package_manifest_sha256": local.digest(parent / "kali-python-packages.txt")}
+            "python_package_manifest_sha256": local.digest(parent / "kali-python-packages.txt"),
+            "target_environment":target,"platform_tags":tags,"architecture":"x86_64",
+            "system_python":{"full_version":"3.13.7"},"npm":{"version":"fixture-npm"}}
         local.atomic_json(base.with_suffix(".provenance.json"), provenance)
         for path in (base, parent / "kali-packages.txt", parent / "kali-python-packages.txt"): path.chmod(0o444)
     expected = local.compatibility(base, ROOT)
@@ -196,8 +207,10 @@ def fixture(parent, *, activate=True, label="repo"):
             ("task-inventories.json", "task_inventories_sha256"), ("vcs-provenance.json", "vcs_provenance_sha256"))}}
     generation = hashlib.sha256(local.canonical(resolved)).hexdigest()
     local.atomic_json(folder / "resolved-inputs.json", resolved)
+    coverage={"tasks":len(contract["tasks"]),"repos":len({row["repo"] for row in contract["tasks"].values()}),
+              "env_hashes":len(contract["environments"])}
     manifest = {**resolved, "generation": generation, "resolved_inputs_sha256": local.digest(folder / "resolved-inputs.json"),
-        "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0},
+        "invariants": {**coverage, "unmapped_tasks": 0, "missing_base_commits": 0},
         "env_mapping": {key: row["stored_name"] for key, row in contract["environments"].items()}}
     local.atomic_json(folder / "manifest.json", manifest)
     local.seal_validation(folder, expected)

@@ -25,13 +25,9 @@ BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
 TASK_RUNTIME_SCHEMA = 2
-# Stable trust anchors for already-installed immutable Kali goldens. New
-# upstream goldens append a tuple here; old tuples stay forever so unrelated
-# checkout changes never invalidate bytes that were already built and sealed.
-GOLDEN_SOURCE_PINS = frozenset({
-    ("https://cdimage.kali.org/kali-2026.2/kali-linux-2026.2-qemu-amd64.7z",
-     "c7c35588d05277c482c908bf7a136d348f76ffa68700b04ff53c0b217e6bd071"),
-})
+def golden_source_pins(source_root=ROOT):
+    builder = golden_builder(source_root)
+    return frozenset({(builder.SOURCE + builder.ARCHIVE, builder.ARCHIVE_SHA256)})
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -174,7 +170,14 @@ def source_contract(source_root=ROOT):
     return {**stable, "builder_sha256": digest(source_root / BUILDER),
         "golden_build_input_sha256": golden_builder(source_root).golden_build_input_sha256(),
         "runtime_sources": {name: digest(source_root / RUNTIME / name)
-            for name in ("guest_runtime.py", "task_sources.py", "os_packages.py")}}
+            for name in ("guest_runtime.py", "task_sources.py", "os_packages.py", "target_environment.py")}}
+
+
+def contract_coverage(source_root=ROOT):
+    contract = json.loads((Path(source_root) / RUNTIME / "contract.json").read_bytes())
+    tasks = contract.get("tasks", {}); environments = contract.get("environments", {})
+    return {"tasks": len(tasks), "repos": len({row["repo"] for row in tasks.values()}),
+            "env_hashes": len(environments), "unmapped_tasks": 0, "missing_base_commits": 0}
 
 
 def normalized_template_compatibility(value):
@@ -205,10 +208,11 @@ def compatibility(base, source_root=ROOT, *, hasher=digest):
     provenance = json.loads(provenance_path.read_bytes())
     required = {"source", "source_sha256", "base_sha256", "build_input_sha256",
                 "python_lock_sha256", "apt_package_manifest_sha256",
-                "python_package_manifest_sha256"}
+                "python_package_manifest_sha256", "target_environment", "platform_tags",
+                "architecture", "system_python", "npm"}
     if not isinstance(provenance, dict) or not required <= set(provenance):
         raise ValueError("installed Kali golden provenance is incomplete")
-    if (provenance.get("source"), provenance.get("source_sha256")) not in GOLDEN_SOURCE_PINS:
+    if (provenance.get("source"), provenance.get("source_sha256")) not in golden_source_pins(source_root):
         raise ValueError("installed Kali golden source provenance is not a trusted immutable pin")
     for key in ("source_sha256", "base_sha256", "build_input_sha256", "python_lock_sha256",
                 "apt_package_manifest_sha256", "python_package_manifest_sha256"):
@@ -218,10 +222,31 @@ def compatibility(base, source_root=ROOT, *, hasher=digest):
                       ("kali-python-packages.txt", "python_package_manifest_sha256")):
         if hasher(safe(base.parent / name, immutable=True)) != provenance.get(key):
             raise ValueError("installed Kali package provenance differs: " + name)
+    target_path = source_root / RUNTIME / "target_environment.py"
+    spec = importlib.util.spec_from_file_location("gpt_trace_target_environment", target_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("target environment model is unavailable")
+    target_module = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules[spec.name] = target_module
+    spec.loader.exec_module(target_module)
+    target = target_module.TargetEnvironment.from_dict(provenance["target_environment"])
+    if target.source != "verified-target-interpreter" or provenance.get("platform_tags") != list(target.tags):
+        raise ValueError("installed Kali target environment provenance differs")
+    if provenance.get("architecture") != target.architecture:
+        raise ValueError("installed Kali target architecture provenance differs")
+    system_python=provenance.get("system_python")
+    if (not isinstance(system_python,dict)
+            or re.fullmatch(r'\d+\.\d+\.\d+',str(system_python.get("full_version",""))) is None
+            or SHA.fullmatch(str(system_python.get("interpreter_sha256",""))) is None
+            or not isinstance(system_python.get("executable"),str) or not system_python["executable"].startswith('/')):
+        raise ValueError("installed Kali system Python provenance differs")
+    if not isinstance(provenance.get("npm", {}).get("version"), str) or not provenance["npm"]["version"]:
+        raise ValueError("installed Kali npm provenance is missing")
     sha = hasher(safe(base, immutable=True))
     if provenance.get("base_sha256") != sha:
         raise ValueError("installed Kali golden SHA-256 differs")
-    return {**recipe, "architecture": "x86_64", "golden_sha256": sha,
+    return {**recipe, "architecture": target.architecture, "golden_sha256": sha,
             "golden_provenance_sha256": hasher(provenance_path), "golden_provenance": provenance}
 
 
@@ -330,7 +355,7 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     generation = hashlib.sha256(canonical(resolved)).hexdigest()
     if manifest.get("generation") != generation or manifest.get("resolved_inputs_sha256") != digest(resolved_path):
         raise ValueError("resolved template generation/input SHA-256 mismatch")
-    for key in ("schema_version", "recipe_version", "task_runtime_schema", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation"):
+    for key in ("schema_version", "recipe_version", "task_runtime_schema", "pins", "source_fingerprint", "security", "templates", "artifacts", "task_artifacts", "isolation_validation", "dependency_pool"):
         if manifest.get(key) != resolved.get(key): raise ValueError("manifest/resolved input mismatch: " + key)
     if manifest.get("wheel_cas", {}) != resolved.get("wheel_cas", {}):
         raise ValueError("manifest/resolved input mismatch: wheel_cas")
@@ -342,7 +367,8 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
         if manifest.get(key) != expected[key]: raise ValueError("template recipe/security compatibility mismatch: " + key)
     if resolved.get("golden", {}).get("sha256") != expected["golden_sha256"]:
         raise ValueError("template uses another Kali golden")
-    if manifest.get("invariants") != {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0} or len(manifest.get("templates", {})) != 11 or len(manifest.get("task_artifacts", {})) != 230 or len(manifest.get("env_mapping", {})) != 25:
+    coverage = contract_coverage(source_root)
+    if manifest.get("invariants") != coverage or len(manifest.get("templates", {})) != coverage["repos"] or len(manifest.get("task_artifacts", {})) != coverage["tasks"] or len(manifest.get("env_mapping", {})) != coverage["env_hashes"]:
         raise ValueError("local Lite coverage changed")
     proof = json.loads((folder / "audit/offline-setups.json").read_bytes())
     if digest(folder / "audit/offline-setups.json") != resolved.get("offline_setups_sha256") or set(proof) != set(manifest["task_artifacts"]) or any(not isinstance(x, dict) or x.get("offline") is not True for x in proof.values()):
@@ -410,7 +436,7 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     if set(inventories) != set(contract["tasks"]) or set(vcs) != set(contract["tasks"]):
         raise ValueError("local per-task package/VCS inventory coverage differs")
     caches = resolved.get("cache_provenance")
-    if not isinstance(caches, dict) or len(caches) != 230:
+    if not isinstance(caches, dict) or len(caches) != coverage["tasks"]:
         raise ValueError("local setup-cache download coverage differs")
     for name, sha in caches.items():
         relative(name)
@@ -459,12 +485,29 @@ def pool_contract(source_root=ROOT):
     pins = json.loads((source_root / PINS).read_bytes())
     if pins.get("schema_version") != 2 or pins.get("recipe_version") != 2:
         raise RuntimeError("unsupported pinned Lite contract")
-    if digest(source_root / RUNTIME / "contract.json") != pins["contract_sha256"]:
+    contract_path=source_root / RUNTIME / "contract.json"
+    if digest(contract_path) != pins["contract_sha256"]:
         raise RuntimeError("SWE-Gym Lite source contract differs")
+    try:
+        contract=json.loads(contract_path.read_bytes())
+        tasks=contract["tasks"];environments=contract["environments"]
+        coverage={"tasks":len(tasks),"repos":len({row["repo"] for row in tasks.values()}),
+                  "conda_recipes":len(environments)}
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        raise RuntimeError("invalid SWE-Gym Lite source contract") from exc
+    if not all(type(value) is int and value>0 for value in coverage.values()):
+        raise RuntimeError("empty SWE-Gym Lite source contract")
     lock = source_root / RUNTIME / "conda-lock.json"
     if lock.is_symlink() or not lock.is_file():
         raise RuntimeError("missing SWE-Gym Lite Conda lock")
-    return {"fetch_kind": "download-only-pool-v2", "pool_schema": 2,
-            "pins": pins, "platform": "linux-x86_64",
+    try:
+        lock_payload = json.loads(lock.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("invalid SWE-Gym Lite Conda lock") from exc
+    platform = lock_payload.get("platform")
+    if not isinstance(platform, str) or not platform:
+        raise RuntimeError("SWE-Gym Lite Conda lock has no target platform identity")
+    return {"fetch_kind": "download-only-pool-v3", "pool_schema": 3,
+            "pins": pins, "platform": platform, "coverage": coverage,
             "conda_lock_sha256": digest(lock),
             "fetcher_sha256": digest(source_root / "scripts/superbench_pool.py")}

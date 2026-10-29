@@ -2,10 +2,11 @@
 
 This project runs benchmarks through the ChatGPT web UI, captures tool trajectories, and stores every exportable trajectory in one canonical Parquet corpus. The teacher browser and storage/control services run in Docker. A trusted host broker creates one disposable KVM/QEMU Kali workstation per model attempt. The single local MCP App is `kali-workstation` 3.0.0.
 
-SWE-Gym Lite uses pinned 230-task sources and a host-only dependency pool.
-`superbench-fetch` downloads and seals package/source artifacts on `execution`;
-it does not construct VM templates. The existing runtime still expects legacy
-templates and has not yet been connected to the new pool. See [the local preparation and recovery guide](docs/swe-gym-lite.md).
+SWE-Gym Lite uses its pinned benchmark contract, target-environment identities,
+and one verified content-addressed dependency pool. `superbench-fetch` acquires
+the pool, builds immutable templates, and validates a fresh network-disabled
+replay before returning. `make run ADAPTER=swe-gym-lite` consumes that published
+generation directly. See [the local preparation and recovery guide](docs/swe-gym-lite.md).
 
 ## Workflow
 
@@ -45,7 +46,7 @@ make superbench-fetch ADAPTER=swe-gym-lite
 make run ADAPTER=swe-gym-lite LIMIT=1
 ```
 
-Fetch validates the pinned public 230-task dataset on `control`, then invokes a finite download-only worker on `execution`. This worker downloads five Python versions, the 25 Conda recipes, exact Git sources and required dependency archives into an append-only stage. The privileged broker verifies the complete staging inventory before publication, merges identical bytes and publishes a root-owned read-only pool. A durable publication proof is recorded before the atomic rename, allowing a verified publication to be acknowledged after a crash without repeating any acquisition or hashing. Published files are never rehashed on fetch status/reuse. Failure leaves an explicit non-resumable zombie for separate administrative cleanup. No KVM/VM-template build runs during fetch. The legacy `run`/`resume` runtime is not yet integrated with the pool.
+Fetch validates the pinned public dataset on `control`, then invokes a finite acquisition and integration worker on `execution`. The worker derives target identities from the Conda lock and verified Kali provenance, resolves dependencies in disposable environments, stores exact bytes in one global CAS, reconstructs locked environments, builds immutable templates, and performs a fresh offline replay for every contract task. The privileged broker verifies the complete inventory before atomic publication. A durable publication proof distinguishes reusable CAS bytes from resolver plans, build checkpoints, and final generations, so interruption can resume without silently reusing incompatible semantics. Fetch returns only after the generation is immediately consumable by `run`.
 
 ## Manual Kali lifecycle
 

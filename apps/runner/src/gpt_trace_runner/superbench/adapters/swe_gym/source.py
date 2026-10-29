@@ -11,10 +11,6 @@ from pathlib import Path
 
 from .harness import ROOT, PINS, load
 
-COUNTS = {"getmoto/moto": 59, "python/mypy": 40, "iterative/dvc": 36,
-          "Project-MONAI/MONAI": 27, "pydantic/pydantic": 20, "dask/dask": 14,
-          "conan-io/conan": 12, "facebookresearch/hydra": 11,
-          "pandas-dev/pandas": 5, "modin-project/modin": 5, "bokeh/bokeh": 1}
 PARQUET = "train-00000-of-00001.parquet"
 
 
@@ -35,11 +31,14 @@ def contract():
     if digest(path) != PINS["contract_sha256"]:
         raise RuntimeError("SWE-Gym Lite recipe contract changed")
     data = json.loads(path.read_text())
-    if len(data["tasks"]) != 230 or len(data["environments"]) != 25:
+    if not data["tasks"] or not data["environments"]:
         raise RuntimeError("SWE-Gym Lite task/environment contract changed")
-    if Counter(item["repo"] for item in data["tasks"].values()) != COUNTS:
-        raise RuntimeError("SWE-Gym Lite repository distribution changed")
     return data
+
+
+def repository_counts(data=None):
+    data = contract() if data is None else data
+    return dict(Counter(item["repo"] for item in data["tasks"].values()))
 
 
 def harness(data=None):
@@ -55,9 +54,10 @@ def harness(data=None):
 
 def validate_rows(rows):
     data = contract()
-    if len(rows) != 230 or Counter(row["repo"] for row in rows) != COUNTS:
-        raise RuntimeError("expected exactly 230 SWE-Gym Lite tasks across 11 repositories")
-    if len({row["instance_id"] for row in rows}) != 230:
+    expected = repository_counts(data)
+    if len(rows) != len(data["tasks"]) or Counter(row["repo"] for row in rows) != expected:
+        raise RuntimeError("SWE-Gym Lite task distribution differs from the pinned contract")
+    if len({row["instance_id"] for row in rows}) != len(data["tasks"]):
         raise RuntimeError("duplicate Lite instance IDs")
     official = harness(data)
     seen = set()
@@ -86,8 +86,8 @@ def validate_rows(rows):
         if not row["FAIL_TO_PASS"] or not row["test_patch"] or not row["problem_statement"].strip():
             raise RuntimeError("incomplete Lite task")
         seen.add(env_hash)
-    if len(seen) != 25:
-        raise RuntimeError("expected exactly 25 official Lite environment hashes")
+    if len(seen) != len(data["environments"]):
+        raise RuntimeError("official Lite environment hash coverage changed")
     return data
 
 

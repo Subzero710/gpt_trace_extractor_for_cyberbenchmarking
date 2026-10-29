@@ -19,6 +19,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
+
+def _preparation_build_controls():
+    path = ROOT / "config/preparation.toml"
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("missing versioned preparation controls")
+    with path.open("rb") as stream:
+        payload = tomllib.load(stream)
+    build = payload.get("build")
+    required = {"virtual_disk_gib", "root_min_gib", "golden_provision_timeout_hours"}
+    if (not isinstance(build, dict) or not required <= set(build)
+            or any(type(build[name]) is not int or build[name] <= 0 for name in required)):
+        raise RuntimeError("invalid golden-image preparation controls")
+    return build
+
+_BUILD_CONTROLS = _preparation_build_controls()
 SOURCE = "https://cdimage.kali.org/kali-2026.2/"
 ARCHIVE = "kali-linux-2026.2-qemu-amd64.7z"
 ARCHIVE_SHA256 = "c7c35588d05277c482c908bf7a136d348f76ffa68700b04ff53c0b217e6bd071"
@@ -37,8 +52,9 @@ def configured_base_image():
 DEST = configured_base_image()
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
-PROVISION_TIMEOUT_SECONDS = 7200
-VIRTUAL_DISK_GIB = 512
+PROVISION_TIMEOUT_SECONDS = int(_BUILD_CONTROLS["golden_provision_timeout_hours"]) * 3600
+VIRTUAL_DISK_GIB = int(_BUILD_CONTROLS["virtual_disk_gib"])
+ROOT_MIN_GIB = int(_BUILD_CONTROLS["root_min_gib"])
 BUILD_LOG = None
 
 GUEST_PACKAGES = (
@@ -61,7 +77,7 @@ GUEST_PACKAGES = (
     "tcpdump",
     "nmap",
     "util-linux",
-    "cloud-guest-utils",  # growpart for the 512-GiB ext4 root volume
+    "cloud-guest-utils",  # growpart for the configured ext4 root volume
 )
 
 
@@ -229,6 +245,7 @@ def cached_archive() -> Path:
 
 def firstboot_script() -> str:
     packages = " ".join(GUEST_PACKAGES)
+    root_min_gib = ROOT_MIN_GIB
     return f"""#!/bin/bash
 set -Eeuo pipefail
 
@@ -279,7 +296,7 @@ partition_number="$(lsblk -n -o PARTN "$root_device")"
 test -n "$parent_device" && test -n "$partition_number"
 growpart "/dev/$parent_device" "$partition_number"
 resize2fs "$root_device"
-test "$(df -B1 --output=size / | tail -n 1)" -ge $((480 * 1024 * 1024 * 1024))
+test "$(df -B1 --output=size / | tail -n 1)" -ge $(({root_min_gib} * 1024 * 1024 * 1024))
 
 python3 -m venv /opt/gpt-trace/venv
 /opt/gpt-trace/venv/bin/pip install \
@@ -313,6 +330,39 @@ systemctl enable lightdm qemu-guest-agent gpt-trace-workstation-agent
 
 dpkg-query -W -f='${{Package}} ${{Version}}\\n' > /etc/gpt-trace-packages.txt
 /opt/gpt-trace/venv/bin/pip freeze --all > /etc/gpt-trace-python-packages.txt
+
+# Measured inside the verified target guest; acquisition must not infer these
+# marker/tag values from the host Python.
+/opt/gpt-trace/venv/bin/python - <<'PY_TARGET'
+import hashlib, json, platform, shutil, subprocess, sys
+from pathlib import Path
+from packaging.markers import default_environment
+from packaging.tags import sys_tags
+path = Path(sys.executable).resolve()
+h = hashlib.sha256(path.read_bytes()).hexdigest()
+env = {{key: str(value) for key, value in default_environment().items()}}
+full = platform.python_version()
+env.update(python_full_version=full, python_version='.'.join(full.split('.')[:2]), platform_machine=platform.machine(), platform_system=platform.system(), sys_platform=sys.platform, platform_python_implementation=platform.python_implementation(), implementation_name=sys.implementation.name)
+tags = list(dict.fromkeys(str(tag) for tag in sys_tags()))
+if not tags:
+    raise SystemExit('target interpreter emitted no wheel tags')
+first = tags[0].split('-', 2)
+if len(first) != 3 or not first[1]:
+    raise SystemExit('target interpreter emitted an invalid wheel tag')
+payload = {{'schema': 2, 'markers': {{k: str(env[k]) for k in ('implementation_name','implementation_version','os_name','platform_machine','platform_release','platform_system','platform_version','python_full_version','python_version','platform_python_implementation','sys_platform')}}, 'tags': tags, 'implementation': sys.implementation.name, 'abi': first[1], 'architecture': platform.machine(), 'source': 'verified-target-interpreter', 'interpreter_sha256': h, 'python_artifact_sha256': None}}
+Path('/etc/gpt-trace-target-environment.json').write_text(json.dumps(payload, sort_keys=True) + '\n')
+system_executable = shutil.which('python3')
+if not system_executable:
+    raise SystemExit('Kali system Python is unavailable')
+system_path = Path(system_executable).resolve(strict=True)
+system_full = subprocess.check_output([str(system_path), '-c', 'import platform; print(platform.python_version())'], text=True).strip()
+system_payload = {{'full_version': system_full, 'executable': str(system_path),
+                  'interpreter_sha256': hashlib.sha256(system_path.read_bytes()).hexdigest()}}
+Path('/etc/gpt-trace-system-python.json').write_text(json.dumps(system_payload, sort_keys=True) + '\n')
+npm_executable = shutil.which('npm')
+if npm_executable:
+    Path('/etc/gpt-trace-npm-version.txt').write_text(subprocess.check_output([npm_executable, '--version'], text=True).strip() + '\n')
+PY_TARGET
 
 printf 'ok\\n' > "$COMPLETE"
 rm -f "$FAILED"
@@ -509,6 +559,9 @@ def build() -> None:
                 provision_in_real_guest(image)
                 packages = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-packages.txt"])
                 python_packages = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-python-packages.txt"])
+                target_environment = json.loads(subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-target-environment.json"]))
+                system_python = json.loads(subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-system-python.json"]))
+                npm_version = subprocess.check_output(["virt-cat", "-a", str(image), "/etc/gpt-trace-npm-version.txt"], text=True).strip()
                 (stage / "kali-packages.txt").write_bytes(packages)
                 (stage / "kali-python-packages.txt").write_bytes(python_packages)
                 metadata = {"source": SOURCE + ARCHIVE, "source_sha256": ARCHIVE_SHA256,
@@ -517,6 +570,11 @@ def build() -> None:
                     "guest_agent_version": "3.0.0", "browser_runtime": "CloakBrowser 0.4.8 / 146.0.7680.177.5",
                     "apt_suite": "kali-last-snapshot", "apt_package_manifest_sha256": hashlib.sha256(packages).hexdigest(),
                     "python_package_manifest_sha256": hashlib.sha256(python_packages).hexdigest(),
+                    "target_environment": target_environment,
+                    "platform_tags": target_environment.get("tags"),
+                    "architecture": target_environment.get("architecture"),
+                    "system_python": system_python,
+                    "npm": {"version": npm_version},
                     "python_lock_sha256": digest(ROOT / "infra/workstation/image/requirements.lock"),
                     "build_utc": datetime.now(timezone.utc).isoformat(), "provisioning_network": "qemu-user-firstboot"}
                 image.with_suffix(".provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -585,7 +643,7 @@ def verify(base: Path | None = None) -> None:
     if info.get("format") != "qcow2" or info.get("backing-filename"):
         raise RuntimeError("base is not an independent qcow2")
     if info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3:
-        raise RuntimeError("Kali base does not provide the configured 512-GiB virtual disk")
+        raise RuntimeError(f"Kali base does not provide the configured {VIRTUAL_DISK_GIB}-GiB virtual disk")
     physical = base.stat().st_blocks * 512
     print(
         "Kali image:", base,

@@ -25,10 +25,18 @@ import urllib.request
 from pathlib import Path
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
-PYTHONS = ("3.8", "3.9", "3.10", "3.11", "3.12")
-IMAGE_PREFIX = "xingyaoww/sweb.eval.x86_64."
 ALLOWED_HOSTS = frozenset({"conda.anaconda.org", "repo.anaconda.com"})
 ADAPTER = Path("apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym")
+
+
+def pinned_target():
+    pins=json.loads((ADAPTER / "pins.json").read_bytes())
+    image_prefix=pins.get("evaluation_image_prefix")
+    platform=pins.get("conda_platform")
+    if (not isinstance(image_prefix,str) or not image_prefix
+            or not isinstance(platform,str) or not platform):
+        raise RuntimeError("pinned evaluation target identity is missing")
+    return image_prefix,platform
 
 
 def digest(path):
@@ -45,10 +53,24 @@ def fingerprint(value):
 
 
 def python_version(script):
-    values = re.findall(r"\bpython\s*[= ]\s*(3\.(?:8|9|10|11|12))(?!\d)", "\n".join(script))
+    values = re.findall(
+        r"(?<![A-Za-z0-9_.-])python\s*=\s*(\d+\.\d+)(?:\.\*)?(?![A-Za-z0-9_.-])",
+        "\n".join(script))
     if not values:
         raise RuntimeError("Conda environment has no Python constraint")
     return values[-1]
+
+
+def contract_python_minors():
+    contract = json.loads((ADAPTER / "contract.json").read_bytes())
+    values = sorted({python_version(row["original_script"])
+                     for row in contract.get("environments", {}).values()})
+    if not values:
+        raise RuntimeError("SWE-Gym contract has no Python identities")
+    return tuple(values)
+
+
+PYTHONS = contract_python_minors()
 
 
 def shell_segments(line):
@@ -114,7 +136,8 @@ def transaction_keys(env_hash, script):
 def image_name(instance_id):
     if not isinstance(instance_id, str) or not instance_id or "\0" in instance_id:
         raise RuntimeError("invalid instance ID")
-    return IMAGE_PREFIX + instance_id.replace("__", "_s_")
+    image_prefix,_platform=pinned_target()
+    return image_prefix + instance_id.replace("__", "_s_")
 
 
 def docker_command():
@@ -330,10 +353,10 @@ def main(argv=None):
         raise RuntimeError("pinned SWE-Gym contract changed")
     tasks=contract.get("tasks")
     environments=contract.get("environments")
-    if not isinstance(tasks,dict) or not isinstance(environments,dict) or len(tasks)!=230 or len(environments)!=25:
+    if not isinstance(tasks,dict) or not isinstance(environments,dict) or not tasks or not environments:
         raise RuntimeError("unexpected SWE-Gym Lite contract coverage")
     # Conda mutations after environment creation would make an image-derived
-    # environment lock ambiguous. The pinned 230 task setup recipes currently
+    # environment lock ambiguous. The pinned task setup recipes currently
     # contain none; fail closed if that ever changes.
     for logical,task in tasks.items():
         for command_text in task.get("repo_script_list",[]):
@@ -358,7 +381,7 @@ def main(argv=None):
         expected_keys=transaction_keys(env_hash,script)
         instance_id,image=choose_image(docker,task_ids[env_hash])
         existed=image_exists_locally(docker,image)
-        print(f"[conda-lock] {index}/25 {env_hash} <- {instance_id}",flush=True)
+        print(f"[conda-lock] {index}/{len(environments)} {env_hash} <- {instance_id}",flush=True)
         try:
             command(docker,"pull",image,timeout=7200)
             immutable=image_digest(docker,image)
@@ -421,12 +444,13 @@ def main(argv=None):
     referenced={sha for row in locked_envs.values() for tx in row["transactions"] for sha in tx["packages"]}
     if referenced!=set(artifacts):
         raise RuntimeError("Conda lock contains unreferenced or missing artifact records")
+    image_prefix,target_platform=pinned_target()
     lock={
         "schema":1,
         "kind":"swe-gym-lite-conda-image-lock",
-        "platform":"linux-x86_64",
+        "platform":target_platform,
         "contract_sha256":contract_sha,
-        "image_prefix":IMAGE_PREFIX,
+        "image_prefix":image_prefix,
         "artifacts":{key:artifacts[key] for key in sorted(artifacts)},
         "environments":{key:locked_envs[key] for key in sorted(locked_envs)},
     }

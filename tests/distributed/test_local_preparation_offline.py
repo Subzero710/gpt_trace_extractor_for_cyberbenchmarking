@@ -467,16 +467,17 @@ def physical_boundary(manager,state):
     pool.mkdir(exist_ok=True)
     ready = pool / 'ready'
     ready.mkdir()
+    coverage = COVERAGE
     record = {'schema': 2, 'operation_id': state['operation_id'],
-              'complete': True, 'tasks': 230, 'repos': 11, 'conda_recipes': 25}
+              'complete': True, **coverage}
     (ready/'inventory.json').write_text(json.dumps(record))
     (ready/'inventory.json').chmod(0o444)
     ready.chmod(0o555)
-    result = {'kind': 'download-only-pool', 'complete': True, 'tasks': 230,
-              'repos': 11, 'conda_recipes': 25,
-              'python_versions': ['3.8','3.9','3.10','3.11','3.12'],
+    result = {'kind': 'download-only-pool', 'complete': True, **coverage,
+              'python_versions': LOCKED_PYTHONS,
               'file_count': 0, 'manifest_sha256': 'a' * 64,
-              'pool_directory': str(ready), 'runtime_integrated': False}
+              'pool_directory': str(ready), 'runtime_integrated': True,
+              'offline_replay': True, 'generation': GENERATION}
     return result
 jobs._prepare = physical_boundary
 try:
@@ -486,6 +487,12 @@ finally:
 # The parent removes synthetic /proc records only after observing actual exit.
 '''
         body = body.replace('INPUT_PATHS', repr([str(ROOT / "shared"), str(ROOT / "apps/workstation-broker/src")]))
+        recipe = local.pool_contract(ROOT)
+        body = body.replace('COVERAGE', repr(recipe['coverage']))
+        lock = json.loads((ROOT / local.RUNTIME / 'conda-lock.json').read_bytes())
+        locked_pythons = sorted({'.'.join(str(row['version']).split('.')[:2])
+                                 for row in lock['artifacts'].values() if row.get('name') == 'python'})
+        body = body.replace('LOCKED_PYTHONS', repr(locked_pythons))
         body = body.replace('BASE_PATH', 'Path(' + repr(str(self.files.base)) + ')')
         body = body.replace('FIXTURE_HELPERS', repr(str(ROOT / 'tests/distributed')))
         body = body.replace('SCOPE_PATH', 'Path(' + repr(str(self.scope_model.mount)) + ')')
@@ -772,9 +779,9 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 if action == "prepare_templates": return {"phase": "starting"}
                 phase = next(phases)
                 return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": phase,
-                    "result": {"kind": "download-only-pool", "complete": True,
-                        "tasks": 230, "repos": 11, "conda_recipes": 25,
-                        "runtime_integrated": False}}
+                    "result": {"kind": "download-only-pool", "complete": True, **recipe["coverage"],
+                        "runtime_integrated": True, "offline_replay": True,
+                        "generation": "a" * 64}}
             with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "pool_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
                 self.dispatch.preparation_fetch(cfg)
             self.assertEqual(calls.count("prepare_templates"), 1)

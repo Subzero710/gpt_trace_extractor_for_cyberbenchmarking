@@ -82,7 +82,7 @@ class SWEGymLiteAdapter(BenchmarkAdapter):
         rows = self.rows()
         data = source.contract()
         groups = {repo: sorted((row for row in rows.values() if row["repo"] == repo), key=lambda row: row["instance_id"])
-                  for repo in sorted(source.COUNTS)}
+                  for repo in sorted(source.repository_counts(data))}
         ordered = []
         while any(groups.values()):
             for group in groups.values():

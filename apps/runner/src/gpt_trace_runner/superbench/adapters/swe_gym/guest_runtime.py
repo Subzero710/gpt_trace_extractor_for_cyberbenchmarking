@@ -124,76 +124,55 @@ def stream_digest(path):
 # Build-only environment transformation: pinned official inputs stay byte-for-byte
 # unchanged, while Python's final version is constrained before the first solve.
 # Reproducibility records BOTH scripts and the solver policy in the guest image.
-def optimized_build_script(env_hash, record):
-    original = record["stored_script"]
-    if not isinstance(original, list) or any(not isinstance(x, str) for x in original):
-        raise RuntimeError("invalid pinned SWE-Gym environment recipe")
-    name = record["stored_name"]
-    if name != "swegym_" + env_hash:
-        raise RuntimeError("environment recipe identity changed")
-    commands = list(original)
-    migration = []
-    for i, command in enumerate(commands):
-        if "conda install python=" not in command:
-            continue
-        match = re.fullmatch(
-            r"conda activate (swegym_[0-9a-f]{22}) && conda install python=(\d+\.\d+) -y",
-            command)
-        if match is None or match.group(1) != name:
-            raise RuntimeError("unknown post-create Python downgrade; refusing unsafe optimization")
-        migration.append((i, match.group(2)))
-    if len(migration) > 1:
-        raise RuntimeError("multiple post-create Python downgrades")
-    python_version = None
-    if migration:
-        command_i, python_version = migration[0]
-        create = [i for i, text in enumerate(commands) if text == "conda env create --file environment.yml"]
-        yaml_indices = [i for i, text in enumerate(commands) if text.startswith("cat <<'") and " > environment.yml\n" in text]
-        if len(create) != 1 or len(yaml_indices) != 1 or not yaml_indices[0] < create[0] < command_i:
-            raise RuntimeError("unexpected upstream YAML/create/downgrade structure")
-        yaml_i = yaml_indices[0]
-        first, sep, rest = commands[yaml_i].partition("\n")
-        header = re.fullmatch(r"cat <<'([A-Za-z0-9_]+)' > environment\.yml", first)
-        if not sep or header is None:
-            raise RuntimeError("unrecognized upstream environment YAML heredoc")
-        delimiter = "\n" + header.group(1)
-        body, sep, tail = rest.rpartition(delimiter)
-        if not sep or tail.strip():
-            raise RuntimeError("unexpected upstream environment YAML termination")
-        if len(re.findall(r"^name: ", body, re.M)) != 1 or "name: " + name + "\n" not in body + "\n":
-            raise RuntimeError("official stored environment name differs")
-        py_specs = re.findall(r"^\s*-\s*python(?=[=<>!~\s])([^\n]*)$", body, re.M)
-        if len(py_specs) > 1:
-            raise RuntimeError("multiple upstream Python constraints")
-        if py_specs:
-            # E.g. Bokeh already specifies the target Python=3.10: no YAML edit.
-            if re.fullmatch(r"=\s*" + re.escape(python_version) + r"\s*(?:#.*)?", py_specs[0]) is None:
-                raise RuntimeError("upstream Python constraint conflicts with final version")
-        else:
-            if body.count("\ndependencies:\n") != 1:
-                raise RuntimeError("unexpected upstream YAML dependencies field")
-            body = body.replace("\ndependencies:\n", "\ndependencies:\n  - python=" + python_version + "\n", 1)
-        commands[yaml_i] = first + "\n" + body + delimiter + tail
-        # The official last command also activates the newly prepared env.
-        commands[command_i] = "conda activate " + name
-    if any("conda install python=" in text for text in commands):
-        raise RuntimeError("late Python version change remains in optimized recipe")
-    fingerprint = lambda values: hashlib.sha256(json.dumps(
-        values, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    return commands, {"official_script_sha256": fingerprint(original),
-                      "effective_script_sha256": fingerprint(commands),
-                      "single_solve_python": python_version,
-                      "solver": "libmamba", "channel_priority": "strict"}
+def locked_environment_script(env_hash, record, lock):
+    """Construct an environment only from exact lock transaction archives."""
+    if not isinstance(record, dict) or record.get("stored_name") != "swegym_" + env_hash:
+        raise RuntimeError("environment identity differs from the pinned contract")
+    row = lock.get("environments", {}).get(env_hash)
+    if not isinstance(row, dict) or row.get("recipe_sha256") != hashlib.sha256(
+            json.dumps(record.get("original_script"), sort_keys=True, separators=(",", ":")).encode()).hexdigest():
+        raise RuntimeError("Conda lock recipe identity differs")
+    transactions = row.get("transactions")
+    if not isinstance(transactions, list) or not transactions:
+        raise RuntimeError("Conda lock has no transactions for " + env_hash)
+    final = transactions[-1]
+    if final.get("python") != python_version_from_recipe(record.get("original_script", [])):
+        raise RuntimeError("Conda lock final Python differs from recipe")
+    package_files = []
+    for package_sha in final.get("packages", []):
+        artifact = lock.get("artifacts", {}).get(package_sha)
+        if not isinstance(artifact, dict) or artifact.get("sha256") != package_sha:
+            raise RuntimeError("Conda lock references an unknown archive")
+        filename = str(artifact.get("url", "")).rsplit("/", 1)[-1]
+        package_files.append("/opt/swe-gym-lock/" + package_sha + "/" + filename)
+    if not package_files:
+        raise RuntimeError("Conda lock transaction is empty")
+    prefix = "/opt/miniconda3/envs/" + record["stored_name"]
+    explicit = "/opt/swe-gym-lock/" + env_hash + ".explicit"
+    lines = ["rm -rf " + shlex.quote(prefix), "mkdir -p /opt/swe-gym-lock"]
+    lines += ["test -f " + shlex.quote(path) for path in package_files]
+    lines += ["printf '%s\\n' '@EXPLICIT' " + " ".join(shlex.quote('file://' + path) for path in package_files) + " > " + shlex.quote(explicit),
+              "/opt/miniconda3/bin/conda create --offline --yes --prefix " + shlex.quote(prefix) + " --file " + shlex.quote(explicit)]
+    return lines
 
+
+def python_version_from_recipe(script):
+    # Match the Conda package named exactly ``python``; package names such as
+    # ``meson-python`` must never be interpreted as interpreter constraints.
+    values = re.findall(
+        r"(?<![A-Za-z0-9_.-])python\s*=\s*(\d+\.\d+)(?:\.\*)?(?![A-Za-z0-9_.-])",
+        "\n".join(script))
+    if not values:
+        raise RuntimeError("Conda recipe has no Python identity")
+    return values[-1]
 
 def build_limits(env=None):
     """Use all four preparation vCPUs while keeping builders bounded."""
     result = dict(os.environ if env is None else env)
     workers = max(1, min(4, os.cpu_count() or 1))
-    # The pinned Miniconda already ships libmamba. Strict channel priority
-    # avoids exploring conflicting defaults/conda-forge variants.
-    result.update(CONDA_SOLVER="libmamba", CONDA_CHANNEL_PRIORITY="strict",
-                  CONDA_REMOTE_MAX_RETRIES="10", CONDA_REMOTE_BACKOFF_FACTOR="2",
+    # Exact lock reconstruction has no live solver policy. These are only
+    # transport/resource limits for commands that execute build recipes.
+    result.update(CONDA_REMOTE_MAX_RETRIES="10", CONDA_REMOTE_BACKOFF_FACTOR="2",
                   CONDA_REMOTE_CONNECT_TIMEOUT_SECS="30", CONDA_REMOTE_READ_TIMEOUT_SECS="180",
                   PIP_RETRIES="10", PIP_TIMEOUT="180",
                   MAKEFLAGS="-j" + str(workers),
@@ -273,28 +252,53 @@ def clean_checkout(item, artifact, destination):
 
 
 def setup_commands(item, destination, prefix):
-    commands = list(item["repo_script_list"])
-    # Clone/reset/removal has been replaced by a validated single-commit source.
-    if len(commands) < 9 or not commands[0].startswith("git clone -o origin "):
-        raise RuntimeError("pinned upstream repo setup contract changed")
-    commands = commands[5:]
-    # Pandas may fetch only this checkout's single-commit object store, which
-    # has no tags or descendants. Never fetch a full benchmark mirror/network.
-    commands = [line.replace("https://github.com/" + item["repo"] + ".git", str(destination)) for line in commands]
-    commands = [line.replace("apt-get -y update && apt-get -y upgrade &&", "apt-get -y update &&") for line in commands]
-    # pipx/PDM are permanent build-time tools. Upstream installs them before
-    # every instance; make that prerequisite idempotent once it is frozen.
-    adapted = []
+    """Adapt official setup semantics to an already-validated pinned checkout."""
+    commands=[]
+    saw={"clone":False,"chmod":False,"cd":False,"reset":False,"remote":False}
+    for line in item["repo_script_list"]:
+        try:tokens=shlex.split(line,posix=True)
+        except ValueError as exc:raise RuntimeError("unparseable pinned repo setup command") from exc
+        # The source artifact already materializes the exact base commit at cwd.
+        if (len(tokens)>=5 and tokens[:4]==["git","clone","-o","origin"]
+                and tokens[-1]=="/testbed"):
+            saw["clone"]=True;continue
+        if tokens==["chmod","-R","777","/testbed"]:
+            saw["chmod"]=True;continue
+        if tokens==["cd","/testbed"]:
+            saw["cd"]=True;continue
+        if tokens==["git","reset","--hard",item["base_commit"]]:
+            saw["reset"]=True;continue
+        if tokens==["git","remote","remove","origin"]:
+            saw["remote"]=True;continue
+
+        if "apt-get" in tokens:
+            # Suppress only the explicit blanket upgrade against the immutable
+            # golden. Explicit installs remain in the official command stream.
+            for index in range(len(tokens)-7):
+                if tokens[index:index+8]==["apt-get","-y","update","&&","apt-get","-y","upgrade","&&"]:
+                    del tokens[index+5:index+8]
+                    line=shlex.join(tokens)
+                    break
+        commands.append(line)
+    if not all(saw.values()):
+        missing=','.join(sorted(key for key,value in saw.items() if not value))
+        raise RuntimeError("pinned upstream checkout prelude changed: "+missing)
+
+    # pipx/PDM are permanent build-time tools. Make repeated official install
+    # requests idempotent; interpreter compatibility is proven by the golden.
+    adapted=[]
     for line in commands:
         if line.startswith("pipx install pdm"):
-            frozen_python = Path("/opt/miniconda3/envs") / ("swegym_" + item["env_hash"]) / "bin/python"
-            line = "test -x /root/.local/bin/pdm || pipx install pdm --python " + shlex.quote(str(frozen_python))
+            system_python=shutil.which("python3")
+            if system_python is None:
+                raise RuntimeError("golden system Python executable is unavailable")
+            line=("test -x /root/.local/bin/pdm || pipx install pdm --python "
+                  +shlex.quote(system_python))
         adapted.append(line)
-    commands = adapted
-    commands.append("git remote | xargs -r -n1 git remote remove")
-    commands.append("test \"$(git rev-parse HEAD)\" = " + shlex.quote(item["base_commit"]))
-    commands.append("test \"$CONDA_PREFIX\" = " + shlex.quote(str(prefix)))
-    return commands
+    adapted.append("git remote | xargs -r -n1 git remote remove")
+    adapted.append("test \"$(git rev-parse HEAD)\" = " + shlex.quote(item["base_commit"]))
+    adapted.append("test \"$CONDA_PREFIX\" = " + shlex.quote(str(prefix)))
+    return adapted
 
 
 def runtime_environment(item, *, offline):
@@ -757,8 +761,15 @@ def build_common(inputs):
     install_offline_apt_guard()
     if not CONDA.is_file():
         raise RuntimeError("pinned Miniconda installer did not complete")
+    lock_path = ROOT / "conda-lock.json"
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise RuntimeError("pinned Conda lock is missing from the common build payload")
+    lock = json.loads(lock_path.read_bytes())
+    if lock.get("schema") != 1 or lock.get("kind") != "swe-gym-lite-conda-image-lock":
+        raise RuntimeError("unsupported pinned Conda lock")
     for env_hash, record in sorted(inputs["environments"].items()):
-        commands, recipe_proof = optimized_build_script(env_hash, record)
+        commands = locked_environment_script(env_hash, record, lock)
+        recipe_proof = {"lock_sha256": stream_digest(lock_path), "transactions": len(lock["environments"][env_hash]["transactions"])}
         prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
         inventory_file = ROOT / "environments" / (env_hash + ".json")
         recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
@@ -777,9 +788,7 @@ def build_common(inputs):
         if prefix.exists() or inventory_file.exists() or recipe_file.exists():
             raise RuntimeError("existing Conda environment/checkpoint is not verified; preserving "
                                + str(prefix) + "; inspect or migrate explicitly")
-        print("SWE-Gym environment " + env_hash + ": python=" +
-              str(recipe_proof["single_solve_python"] or "upstream") +
-              ", solver=libmamba, channels=strict", flush=True)
+        print("SWE-Gym environment " + env_hash + ": exact Conda lock transaction replay", flush=True)
         env = build_limits({**os.environ, "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]})
         log = ROOT / "logs" / (env_hash + ".build.log")
         for attempt in range(1, 11):

@@ -465,13 +465,16 @@ def preparation_fetch(cfg):
                 last_phase = phase
             if phase == "ready":
                 result = status.get("result")
+                coverage=recipe.get("coverage") or {}
                 if (not isinstance(result,dict) or result.get("kind") != "download-only-pool"
-                        or result.get("complete") is not True or result.get("tasks") != 230
-                        or result.get("repos") != 11 or result.get("conda_recipes") != 25
-                        or result.get("runtime_integrated") is not False):
-                    raise RuntimeError("broker reported no validated dependency pool")
+                        or result.get("complete") is not True
+                        or any(result.get(key)!=coverage.get(key) for key in ("tasks","repos","conda_recipes"))
+                        or result.get("runtime_integrated") is not True
+                        or result.get("offline_replay") is not True
+                        or not isinstance(result.get("generation"), str)):
+                    raise RuntimeError("broker reported no fully integrated offline SWE-Gym generation")
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
-                print("SWE-Gym Lite dependency downloads READY; runtime integration pending", flush=True)
+                print("SWE-Gym Lite immutable generation READY for offline runtime", flush=True)
                 return result
             if phase in {"not_started", "failed", "interrupted", "canceled"}:
                 if started:

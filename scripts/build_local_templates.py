@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urlparse, quote
 
 ROOT = Path(__file__).resolve().parents[1]
+SHA = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def configured_base_image():
@@ -39,11 +40,52 @@ BASE = configured_base_image()
 TEMPLATES = BASE.parent / "templates"
 GUEST = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py"
 PINS = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json"
-MINICONDA = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"
-MINICONDA_SHA256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c"
-VIRTUAL_GIB = 512
-FREE_SPACE_GIB = 64
-BUILD_TIMEOUT_HOURS = 96
+
+
+def _preparation_controls():
+    path = ROOT / "config/preparation.toml"
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("missing versioned preparation controls")
+    with path.open("rb") as stream:
+        payload = tomllib.load(stream)
+    build = payload.get("build")
+    required = {"virtual_disk_gib", "memory_reserve_mb", "memory_min_mb", "memory_cap_mb", "vcpu_cap", "swap_gib", "free_space_gib", "root_min_gib", "timeout_hours", "golden_provision_timeout_hours"}
+    if not isinstance(build, dict) or set(build) != required:
+        raise RuntimeError("preparation controls have missing or unknown fields")
+    if any(type(build[name]) is not int or build[name] <= 0 for name in required):
+        raise RuntimeError("preparation controls must be positive integers")
+    bootstrap=payload.get("bootstrap")
+    if (not isinstance(bootstrap,dict) or set(bootstrap)!={"miniconda_archive","miniconda_sha256"}
+            or not isinstance(bootstrap["miniconda_archive"],str) or not bootstrap["miniconda_archive"]
+            or SHA.fullmatch(str(bootstrap["miniconda_sha256"])) is None):
+        raise RuntimeError("preparation bootstrap pins are invalid")
+    return build,bootstrap
+
+
+_CONTROLS,_BOOTSTRAP = _preparation_controls()
+MINICONDA=_BOOTSTRAP["miniconda_archive"]
+MINICONDA_SHA256=_BOOTSTRAP["miniconda_sha256"]
+VIRTUAL_GIB = int(_CONTROLS["virtual_disk_gib"])
+MEMORY_RESERVE_MB = int(_CONTROLS["memory_reserve_mb"])
+MEMORY_MIN_MB = int(_CONTROLS["memory_min_mb"])
+MEMORY_CAP_MB = int(_CONTROLS["memory_cap_mb"])
+VCPU_CAP = int(_CONTROLS["vcpu_cap"])
+SWAP_GIB = int(_CONTROLS["swap_gib"])
+FREE_SPACE_GIB = int(_CONTROLS["free_space_gib"])
+ROOT_MIN_GIB = int(_CONTROLS["root_min_gib"])
+BUILD_TIMEOUT_HOURS = int(_CONTROLS["timeout_hours"])
+
+
+def qemu_system_binary():
+    provenance=BASE.with_suffix(".provenance.json")
+    if provenance.is_symlink() or not provenance.is_file():
+        raise RuntimeError("verified Kali golden provenance is required")
+    value=json.loads(provenance.read_bytes()).get("architecture")
+    mapping={"x86_64":"qemu-system-x86_64","aarch64":"qemu-system-aarch64"}
+    executable=mapping.get(value)
+    if executable is None:
+        raise RuntimeError("unsupported verified Kali architecture: "+str(value))
+    return executable
 
 
 COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
@@ -214,14 +256,15 @@ def _adopt_resumable_stage(target_root, staged, identity):
 
 def guest_resources():
     total_mib = (os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")) // (1024 * 1024)
-    reserve_mib = max(2048, total_mib // 5)
-    memory_mib = ((total_mib - reserve_mib) // 256) * 256
-    if memory_mib < 4096:
-        raise RuntimeError("execution host needs at least 6 GiB RAM for local SWE-Gym preparation")
-    # QEMU vCPUs are scheduled normally by the host; reserving a whole logical
-    # CPU only slows sequential package builds without providing isolation.
+    available = total_mib - MEMORY_RESERVE_MB
+    memory_mib = (min(MEMORY_CAP_MB, available) // 256) * 256
+    if memory_mib < MEMORY_MIN_MB:
+        raise RuntimeError(
+            "execution host RAM is below configured SWE-Gym preparation minimum "
+            f"({MEMORY_MIN_MB} MiB guest + {MEMORY_RESERVE_MB} MiB host reserve)"
+        )
     cpus = os.cpu_count() or 1
-    vcpus = max(1, min(8, cpus))
+    vcpus = max(1, min(VCPU_CAP, cpus))
     return memory_mib, vcpus
 
 
@@ -352,10 +395,11 @@ def capture(*args):
 
 
 def verify_sources(inputs, mirrors):
-    if len(inputs["tasks"]) != 230 or len(inputs["environments"]) != 25:
+    task_count = len(inputs["tasks"]); env_count = len(inputs["environments"])
+    if task_count == 0 or env_count == 0:
         raise RuntimeError("Lite task/environment invariants changed")
     repos = {item["repo"] for item in inputs["tasks"].values()}
-    if len(repos) != 11:
+    if not repos:
         raise RuntimeError("Lite repository invariant changed")
     missing = []
     for item in inputs["tasks"].values():
@@ -379,11 +423,11 @@ def verify_sources(inputs, mirrors):
                 raise RuntimeError("pinned upstream path selection changed")
         elif result.returncode or result.stdout.decode("utf-8") != snapshot["text"]:
             raise RuntimeError("environment content at exact base_commit changed")
-    print("source validation: tasks=230 repos=11 env_hashes=25 unmapped=0 missing_base_commits=0", flush=True)
+    print(f"source validation: tasks={task_count} repos={len(repos)} env_hashes={env_count} unmapped=0 missing_base_commits=0", flush=True)
 
 
 def firstboot(body, *, trim=True, shared_warm_cache=False):
-    # Disposable, fixed 8-GiB swap inside the QCOW2 overlay prevents guest OOM.
+    # Disposable configured swap inside the QCOW2 overlay prevents guest OOM.
     # Task scratch overlays are truncated/recreated between tasks, so fstrim on
     # every warm/replay only burns HDD time; permanent common/repo images still trim.
     trim_step = r'''
@@ -413,7 +457,7 @@ fi
 test "$(cat "$marker")" = gpt-trace-swe-gym-warm-cache-v1
 export GPT_TRACE_SHARED_WARM_CACHE="$WARM_CACHE_MOUNT"
 ''' if shared_warm_cache else ""
-    return """#!/bin/bash
+    script = """#!/bin/bash
 set -eo pipefail
 exec >> /var/log/swe-gym-lite-builder.log 2>&1
 rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
@@ -452,15 +496,16 @@ test ! -L "$SWAP_FILE"
 if test -e "$SWAP_FILE"; then
     test -f "$SWAP_FILE"
     test "$(stat -c %u:%a "$SWAP_FILE")" = "0:600"
-    test "$(stat -c %s "$SWAP_FILE")" = "8589934592"
+    test "$(stat -c %s "$SWAP_FILE")" = "__SWAP_BYTES__"
 else
-    fallocate -l 8G "$SWAP_FILE"
+    fallocate -l __SWAP_GIB__G "$SWAP_FILE"
     chmod 600 "$SWAP_FILE"
     mkswap "$SWAP_FILE"
 fi
 swapon "$SWAP_FILE"
-echo 'temporary guest build swap enabled: 8 GiB'
+echo 'temporary guest build swap enabled: __SWAP_GIB__ GiB'
 """ + cache_setup + body + "\n"
+    return script.replace("__SWAP_BYTES__", str(SWAP_GIB * 1024**3)).replace("__SWAP_GIB__", str(SWAP_GIB))
 
 def root_growth():
     # cloud-guest-utils comes from the verified, locally staged .deb closure.
@@ -576,18 +621,33 @@ def build(args):
         raise RuntimeError("local preparation requires the execution host root execution broker")
     from workstation_broker.preparation import verify_worker_claim
     job = verify_worker_claim(args.operation_id)
+    pool_compatibility = job["compatibility"]
+    dependency_pool = BASE.parent / "dependency-pool" / "ready"
+    if dependency_pool.is_symlink() or not dependency_pool.is_dir():
+        raise RuntimeError("verified dependency pool is required before template construction")
+    pool_inventory = dependency_pool / "inventory.json"
+    if pool_inventory.is_symlink() or not pool_inventory.is_file():
+        raise RuntimeError("verified dependency pool inventory is missing")
+    pool_record = json.loads(pool_inventory.read_bytes())
+    if pool_record.get("complete") is not True:
+        raise RuntimeError("dependency pool is not complete")
     from workstation_broker.preparation_resources import source_container_arguments
     if (args.virtual_gib, args.free_space_gib, args.build_timeout_hours) != (VIRTUAL_GIB, FREE_SPACE_GIB, BUILD_TIMEOUT_HOURS):
         raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
-    for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", "qemu-system-x86_64", "dpkg-deb"):
+    for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", qemu_system_binary(), "dpkg-deb"):
         if shutil.which(executable) is None:
             raise RuntimeError("missing host build executable: " + executable)
     golden = load_module("swe_gym_kali_builder", ROOT / "infra/workstation/image/build.py")
     golden.require_host_build_runtime()
     from gpt_trace_transport.local_templates import compatibility, compatible_template_identity
     installed = compatibility(BASE, ROOT)
-    if not compatible_template_identity(installed, job["compatibility"]):
-        raise RuntimeError("installed Kali/template compatibility changed; persistent template storage preserved")
+    # The fetch operation is identified by the dependency-pool contract. The
+    # template generation has a separate immutable golden/source identity.
+    # Both are recorded in the final manifest; neither may be confused with
+    # the other during resume.
+    if not isinstance(pool_compatibility, dict) or pool_compatibility.get("pool_schema") != 3:
+        raise RuntimeError("preparation job lacks the verified dependency-pool contract")
+    job = {**job, "compatibility": installed, "pool_compatibility": pool_compatibility}
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
     os_tools = load_module("swe_gym_os_packages", GUEST.with_name("os_packages.py"))
     target_root = TEMPLATES / "swe-gym-lite"
@@ -725,6 +785,7 @@ def build(args):
                 "--upload", str(GUEST) + ":/opt/swe-gym-lite/runtime.py",
                 "--upload", str(GUEST.with_name("task_sources.py")) + ":/opt/swe-gym-lite/task_sources.py",
                 "--upload", str(GUEST.with_name("os_packages.py")) + ":/opt/swe-gym-lite/os_packages.py",
+                "--upload", str(GUEST.with_name("target_environment.py")) + ":/opt/swe-gym-lite/target_environment.py",
             ]
 
         def provision(image, boot, payload=None, *, network, completion=None,
@@ -739,7 +800,7 @@ def build(args):
             cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
-            argv = ["qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
+            argv = [qemu_system_binary(), "-machine", "accel=kvm", "-cpu", "host",
                     "-m", str(memory_mb), "-smp", str(vcpus),
                     "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
             if cache_disk is not None:
@@ -803,7 +864,7 @@ def build(args):
             key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
             path = cache_root / key
             # Exact pinned commit already present: no need to re-fetch the entire
-            # upstream mirror for each of the 230 task source archives.
+            # upstream mirror for each contract task source archive.
             if path.is_dir() and not path.is_symlink() and path.stat().st_uid == 0:
                 probe = subprocess.run(
                     ["git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}"],
@@ -1120,9 +1181,26 @@ def build(args):
             payload = staged / "swe-gym-build"
             _discard(payload)
             payload.mkdir()
-            for name in ("runtime.py", "task_sources.py", "os_packages.py"):
+            for name in ("runtime.py", "task_sources.py", "os_packages.py", "target_environment.py"):
                 shutil.copyfile(GUEST if name == "runtime.py" else GUEST.with_name(name), payload / name)
             (payload / "environments.json").write_text(json.dumps({"environments": inputs["environments"]}, sort_keys=True))
+            lock_source = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json"
+            if lock_source.is_symlink() or not lock_source.is_file():
+                raise RuntimeError("pinned Conda lock is missing from the build source")
+            shutil.copyfile(lock_source, payload / "conda-lock.json")
+            locked_pool = BASE.parent / "dependency-pool" / "ready" / "objects" / "sha256"
+            lock_payload = json.loads(lock_source.read_bytes())
+            conda_root = payload / "conda-artifacts"
+            conda_root.mkdir()
+            for sha, artifact in sorted(lock_payload.get("artifacts", {}).items()):
+                source = locked_pool / sha[:2] / sha
+                filename = Path(str(artifact.get("url", ""))).name
+                if (not SHA.fullmatch(sha) or source.is_symlink() or not source.is_file()
+                        or digest(source) != sha or not filename or "/" in filename):
+                    raise RuntimeError("locked Conda archive is missing from the verified dependency pool")
+                target = conda_root / sha / filename
+                target.parent.mkdir(parents=True)
+                os.link(source, target)
             shutil.copytree(os_folder, payload / "os-artifacts")
             installer = payload / "miniconda.sh"
             cache_installer = cache_root / ("miniconda-" + MINICONDA_SHA256 + ".sh")
@@ -1159,8 +1237,11 @@ def build(args):
             marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
             boot = r'''
 mkdir -p /opt/swe-gym-lite
-cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym-build/os_packages.py /opt/swe-gym-lite/
+cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym-build/os_packages.py /opt/swe-gym-build/target_environment.py /opt/swe-gym-lite/
 cp /opt/swe-gym-build/environments.json /opt/swe-gym-lite/build-environments.json
+cp /opt/swe-gym-build/conda-lock.json /opt/swe-gym-lite/conda-lock.json
+mkdir -p /opt/swe-gym-lock
+cp -a /opt/swe-gym-build/conda-artifacts/. /opt/swe-gym-lock/
 cp /opt/swe-gym-build/os-artifacts/manifest.json /opt/swe-gym-lite/os-manifest.json
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
@@ -1257,7 +1338,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             if common_validation != {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}:
                 raise RuntimeError("common image leaked source state")
 
-            # One pair of scratch QCOW2s is reused across all 230 tasks and across
+            # One pair of scratch QCOW2s is reused across all contract tasks and across
             # retries.  They live outside the staged generation, so a successful
             # publication never needs to delete a volume.  Migrate the historical
             # in-stage scratch pair once if an interrupted old builder left it there.
@@ -1619,7 +1700,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             for logical, item in inputs["tasks"].items():
                 record = artifacts[mapping[logical]["task_source"]]
                 tools.validate_artifact(item, staged / record["path"], record)
-            if len(mapping) != 230 or len(templates) != 11 or len(environments) != 25 or len(offline_proofs) != 230:
+            expected_tasks = len(inputs["tasks"]); expected_repos = len(repos_set); expected_envs = len(inputs["environments"])
+            if len(mapping) != expected_tasks or len(templates) != expected_repos or len(environments) != expected_envs or len(offline_proofs) != expected_tasks:
                 raise RuntimeError("final task/template/environment/replay coverage changed")
 
             referenced_wheels = {}
@@ -1659,6 +1741,9 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 "miniconda": {"installer": MINICONDA, "sha256": MINICONDA_SHA256},
                 "capacity": {"virtual_gib": args.virtual_gib, "free_space_gib": args.free_space_gib},
                 "resolved_os": os_manifest, "environments": environments,
+                "dependency_pool": {"inventory_sha256": digest(pool_inventory),
+                                     "operation_id": pool_record.get("operation_id"),
+                                     "objects": len(pool_record.get("objects", {}))},
                 "environment_downloads_sha256": digest(audit / 'environment-downloads.json'),
                 "task_inventories_sha256": digest(audit / 'task-inventories.json'),
                 "vcs_provenance_sha256": digest(audit / 'vcs-provenance.json'),
@@ -1687,9 +1772,10 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 "generation": generation, "source_fingerprint": inputs["source_fingerprint"],
                 "pins": pins, "security": SECURITY_CONTRACT,
                 "resolved_inputs_sha256": digest(staged / 'resolved-inputs.json'),
-                "invariants": {"tasks": 230, "repos": 11, "env_hashes": 25, "unmapped_tasks": 0, "missing_base_commits": 0},
+                "invariants": {"tasks": len(inputs["tasks"]), "repos": len(repos_set), "env_hashes": len(inputs["environments"]), "unmapped_tasks": 0, "missing_base_commits": 0},
                 "env_mapping": {key: value['stored_name'] for key, value in inputs['environments'].items()},
                 "templates": templates, "artifacts": artifacts, "task_artifacts": mapping,
+                "dependency_pool": resolved["dependency_pool"],
                 "wheel_cas": wheel_cas_manifest, "sizes": sizes,
                 "isolation_validation": isolations, "allocation": summary}
 

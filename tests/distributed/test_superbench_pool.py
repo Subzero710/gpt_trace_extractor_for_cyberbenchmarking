@@ -19,6 +19,29 @@ pool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pool)
 
 
+def fixture_target(full_version="3.10.14", *, platform_tag="manylinux_2_17_x86_64"):
+    model=pool._target_environment_module()
+    major,minor,_=full_version.split(".")
+    base=model.TargetEnvironment(
+        markers={
+            "implementation_name":"cpython", "implementation_version":"3.13.0",
+            "os_name":"posix", "platform_machine":"x86_64",
+            "platform_release":"fixture-kernel", "platform_system":"Linux",
+            "platform_version":"fixture-kernel-version",
+            "python_full_version":"3.13.0", "python_version":"3.13",
+            "platform_python_implementation":"CPython", "sys_platform":"linux",
+        },
+        tags=("cp313-cp313-"+platform_tag, "py3-none-any"),
+        implementation="cpython", abi="cp313", architecture="x86_64",
+        source="verified-target-interpreter", interpreter_sha256="f"*64,
+    )
+    return model.conda_target(
+        full_version=full_version, base_target=base,
+        python_artifact_sha256=hashlib.sha256(full_version.encode()).hexdigest(),
+        source="test-locked-conda:"+major+"."+minor,
+    )
+
+
 class TestStaticDependencyResolution(unittest.TestCase):
     def test_moto_named_install_requires(self):
         source = '''from setuptools import setup\ninstall_requires = ["requests>=2", "boto3>=1.9"]\nsetup(install_requires=install_requires)\n'''
@@ -184,79 +207,55 @@ dev=["dvc[azure,tests]"]
 
 
 class TestAcquisitionFallbacks(unittest.TestCase):
-    def test_non_exact_source_only_requirement_uses_static_resolver_stub(self):
-        import subprocess
+    def test_source_only_package_is_resolved_from_static_metadata_without_host_execution(self):
+        target=fixture_target("3.10.14")
+        sha="1"*64
+        source={"name":"collective.checkdocs","version":"0.2.1",
+                "requested":"collective.checkdocs==0.2.1",
+                "filename":"collective.checkdocs-0.2.1.tar.gz",
+                "url":"https://files.pythonhosted.org/packages/collective.checkdocs-0.2.1.tar.gz",
+                "sha256":sha,"requirements":[],"provides_extra":[]}
+        project={"releases":{"0.2.1":[{"packagetype":"sdist",
+            "filename":source["filename"],"url":source["url"],
+            "digests":{"sha256":sha},"requires_python":">=3.8"}]}}
         with tempfile.TemporaryDirectory() as tmp:
-            candidate = pool.Pool(Path(tmp))
-            (Path(tmp) / 'metadata').mkdir()
-            (Path(tmp) / 'wheels').mkdir()
-            calls = []
-            def pipeline(argv, **kwargs):
-                calls.append(argv)
-                if len(calls) == 1:
-                    return subprocess.CompletedProcess(argv, 1,
-                        stdout='ERROR: Could not find a version that satisfies the requirement collective.checkdocs (from versions: none)\n')
-                return subprocess.CompletedProcess(argv, 0, stdout='')
-            source = {'name':'collective.checkdocs','version':'0.2.1',
-                      'requested':'collective.checkdocs','filename':'collective.checkdocs-0.2.1.tar.gz',
-                      'sha256':'1'*64,'requirements':['setuptools'],'provides_extra':[]}
-            with patch.object(pool.subprocess, 'run', side_effect=pipeline), \
-                 patch.object(pool, 'acquire_source_distribution', return_value=source) as acquire:
-                pool.pip_closure(candidate, '3.10', {'collective.checkdocs'}, 'plan-key')
-            plan = json.loads((Path(tmp) / 'metadata/pip-plan-plan-key.json').read_text())
-            self.assertEqual(plan['artifact_model'], pool.PIP_ARTIFACT_MODEL)
-            self.assertEqual(plan['source_archives'], [source])
-            self.assertEqual(plan['files'], [])
-            self.assertEqual(len(calls), 2)
-            self.assertNotIn('--no-cache-dir', calls[0])
-            acquire.assert_called_once_with(candidate, 'collective.checkdocs', 'plan-key', '3.10', constraints=())
+            stage=Path(tmp);candidate=pool.Pool(stage);(stage/"metadata").mkdir()
+            with patch.object(pool,"_pypi_json",return_value=project), \
+                 patch.object(pool,"acquire_source_distribution",return_value=source) as acquire, \
+                 patch.object(pool.subprocess,"run",side_effect=AssertionError("host package execution is forbidden")):
+                pool.pip_closure(candidate,target,{"collective.checkdocs==0.2.1"},"plan-key")
+            plan=json.loads((stage/"metadata/pip-plan-plan-key.json").read_text())
+        self.assertEqual(plan["plan_schema"],pool.PIP_PLAN_SCHEMA)
+        self.assertEqual(plan["target"],target.as_dict())
+        self.assertEqual(plan["source_archives"],[{k:source[k] for k in ("name","version","filename","url","sha256","requirements","provides_extra")}])
+        acquire.assert_called_once()
 
-    def test_source_stub_is_forced_by_direct_constraint_after_invalid_index_metadata(self):
-        import subprocess
-        with tempfile.TemporaryDirectory() as tmp:
-            stage=Path(tmp);candidate=pool.Pool(stage)
-            (stage/'metadata').mkdir();(stage/'wheels').mkdir()
-            calls=[]
-            source={'name':'omegaconf','version':'2.1.0.dev26',
-                    'requested':'omegaconf==2.1.0.dev26',
-                    'filename':'omegaconf-2.1.0.dev26.tar.gz','sha256':'1'*64,
-                    'requirements':['PyYAML==5.1'],'provides_extra':[]}
-            def pipeline(argv, **kwargs):
-                calls.append(list(argv))
-                if len(calls)==1:
-                    return subprocess.CompletedProcess(argv,1,stdout=(
-                        'Requested omegaconf==2.1.0.dev26 has invalid metadata: '
-                        '.* suffix can only be used with `==` or `!=` operators\n'
-                        'PyYAML (>=5.1.*)\n'
-                        'ERROR: Could not find a version that satisfies the requirement '
-                        'omegaconf==2.1.0.dev26 (from versions: 2.1.0.dev26)\n'
-                        'ERROR: No matching distribution found for omegaconf==2.1.0.dev26\n'))
-                constraint_paths=[Path(argv[i+1]) for i,value in enumerate(argv[:-1])
-                                  if value=='--constraint']
-                self.assertEqual(len(constraint_paths),1)
-                rows=constraint_paths[0].read_text().splitlines()
-                self.assertEqual(len(rows),1)
-                self.assertRegex(rows[0],r'^omegaconf @ file:///.+omegaconf-2\.1\.0\.dev26-py3-none-any\.whl$')
-                return subprocess.CompletedProcess(argv,0,stdout='')
-            with patch.object(pool.subprocess,'run',side_effect=pipeline), \
-                 patch.object(pool,'acquire_source_distribution',return_value=source) as acquire:
-                pool.pip_closure(candidate,'3.8',{'omegaconf==2.1.0.dev26'},'group')
-            self.assertEqual(len(calls),2)
-            acquire.assert_called_once_with(candidate,'omegaconf==2.1.0.dev26','group','3.8',constraints=())
-            plan=json.loads((stage/'metadata/pip-plan-group.json').read_text())
-            self.assertEqual(plan['source_archives'],[source])
-            self.assertEqual(plan['files'],[])
+    def test_invalid_legacy_metadata_is_normalized_without_synthetic_resolver_wheels(self):
+        self.assertFalse(hasattr(pool,"_write_resolver_stub"))
+        self.assertFalse(hasattr(pool,"_resolver_stub_constraint"))
+        self.assertEqual(pool.normalize_legacy_source_requirement("PyYAML (>=5.1.*)"),"PyYAML==5.1")
+        source=(ROOT/"scripts/superbench_pool.py").read_text()
+        self.assertNotIn("metadata-only wheel",source)
+        self.assertNotIn("swegym-static-source-resolver",source)
 
-    def test_resolver_stub_constraint_rejects_untrusted_name_and_missing_stub(self):
+    def test_dynamic_source_metadata_fails_closed_in_host_fetcher(self):
+        target=fixture_target("3.10.14")
+        sha="2"*64
+        requirement,_,_,_,_=pool._packaging_symbols()
+        selected={"packagetype":"sdist","filename":"demo-1.0.tar.gz",
+                  "url":"https://files.pythonhosted.org/packages/demo-1.0.tar.gz",
+                  "digests":{"sha256":sha}}
+        metadata={"urls":[selected],"info":{"name":"demo"}}
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp);stub=root/'demo-1-py3-none-any.whl';stub.write_bytes(b'x')
-            row=pool._resolver_stub_constraint({'name':'demo'},stub)
-            self.assertTrue(row.startswith('demo @ file:///'))
-            with self.assertRaisesRegex(RuntimeError,'invalid resolver stub package name'):
-                pool._resolver_stub_constraint({'name':'demo @ https://evil.invalid/x'},stub)
-            stub.unlink()
-            with self.assertRaisesRegex(RuntimeError,'missing resolver stub wheel'):
-                pool._resolver_stub_constraint({'name':'demo'},stub)
+            candidate=pool.Pool(Path(tmp));obj=candidate.objects/sha[:2]/sha
+            obj.parent.mkdir(parents=True);obj.write_bytes(b"source")
+            with patch.object(pool,"_select_source_release",return_value=(requirement("demo==1.0"),"1.0",selected)), \
+                 patch.object(pool,"_pypi_json",return_value=metadata), \
+                 patch.object(candidate,"download",return_value=sha), \
+                 patch.object(pool,"_source_archive_files",return_value={"setup.py":b"setup(install_requires=dynamic())"}), \
+                 patch.object(pool.subprocess,"run",side_effect=AssertionError("dynamic setup must not execute")):
+                with self.assertRaisesRegex(RuntimeError,"requires isolated target evaluation"):
+                    pool.acquire_source_distribution(candidate,"demo==1.0","plan",target)
 
     def test_historical_pypi_inclusive_wildcard_metadata_is_pinned_to_lower_bound(self):
         Requirement,_,_,_,_=pool._packaging_symbols()
@@ -275,7 +274,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                  patch.object(pool,'_source_archive_files',return_value={}):
                 target=candidate.objects/sha[:2]/sha
                 target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(b'source')
-                result=pool.acquire_source_distribution(candidate,'omegaconf==2.0.6','plan','3.8')
+                result=pool.acquire_source_distribution(candidate,'omegaconf==2.0.6','plan',fixture_target('3.8.20'))
         self.assertEqual(result['requirements'],['PyYAML==5.1'])
         Requirement(result['requirements'][0])
 
@@ -303,7 +302,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             shared=stage/'wheels/shared';shared.mkdir(parents=True)
             (shared/'demo-1.9-py3-none-any.whl').write_bytes(b'cached')
             with patch.object(pool,'_pypi_json',return_value=project):
-                _,selected,_=pool._select_source_release(candidate,'demo>1,<2','3.10')
+                _,selected,_=pool._select_source_release(candidate,'demo>1,<2',fixture_target('3.10.14'))
         self.assertEqual(selected,'1.9')
 
     def test_source_range_without_cache_selects_latest_compatible(self):
@@ -316,7 +315,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
-                _,selected,_=pool._select_source_release(candidate,'demo>1.4,<2','3.10')
+                _,selected,_=pool._select_source_release(candidate,'demo>1.4,<2',fixture_target('3.10.14'))
         self.assertEqual(selected,'1.9')
 
     def test_source_greater_equal_uses_exact_lower_release_when_available(self):
@@ -329,7 +328,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
-                _,selected,_=pool._select_source_release(candidate,'demo>=5.1','3.10')
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
         self.assertEqual(selected,'5.1')
 
     def test_source_greater_equal_does_not_float_when_lower_release_is_missing(self):
@@ -343,7 +342,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project), self.assertRaisesRegex(
                     RuntimeError,'requires exact release 5.1'):
-                pool._select_source_release(candidate,'demo>=5.1','3.10')
+                pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
 
     def test_source_greater_equal_prefers_compatible_cached_version_over_lower_pin(self):
         def release(version):
@@ -357,7 +356,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             shared=stage/'wheels/shared';shared.mkdir(parents=True)
             (shared/'demo-6.0-py3-none-any.whl').write_bytes(b'cached')
             with patch.object(pool,'_pypi_json',return_value=project):
-                _,selected,_=pool._select_source_release(candidate,'demo>=5.1','3.10')
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
         self.assertEqual(selected,'6.0')
 
     def test_source_bounded_greater_equal_is_range_and_uses_latest_without_cache(self):
@@ -371,7 +370,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
-                _,selected,_=pool._select_source_release(candidate,'demo>=5.1,<6.1','3.10')
+                _,selected,_=pool._select_source_release(candidate,'demo>=5.1,<6.1',fixture_target('3.10.14'))
         self.assertEqual(selected,'6.0')
 
     def test_constraint_only_greater_equal_without_cache_is_exact_lower_bound(self):
@@ -385,7 +384,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(
-                    candidate,'demo','3.10',constraints={'demo>=5.1'})
+                    candidate,'demo',fixture_target('3.10.14'),constraints={'demo>=5.1'})
         self.assertEqual(selected,'5.1')
 
     def test_apt_key_uses_downloaded_content_address(self):
@@ -411,7 +410,8 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
                  patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(['gpg'], 0)), \
-                 patch.object(pool.subprocess, 'check_output', side_effect=dpkg):
+                 patch.object(pool.subprocess, 'check_output', side_effect=dpkg), \
+                 patch.object(pool, '_target_debian_architecture', return_value='amd64'):
                 pool.apt_closure(candidate, {'testpkg'})
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
 
@@ -419,142 +419,125 @@ class TestAcquisitionFallbacks(unittest.TestCase):
 # GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1
 class TestGlobalPipArtifactPool(unittest.TestCase):
     def make_pool(self, root):
-        root = Path(root)
-        for name in ('metadata','wheels','downloads'):
-            (root / name).mkdir(parents=True, exist_ok=True)
+        root=Path(root)
+        for name in ('metadata','wheels','downloads'):(root/name).mkdir(parents=True,exist_ok=True)
         return pool.Pool(root)
 
-    def test_group_identity_is_not_task_or_optionality_scoped(self):
-        one = pool.pip_group_key('3.10', {'pillow', 'pandas'}, {'numpy<2'}, False)
-        two = pool.pip_group_key('3.10', {'pandas', 'pillow'}, {'numpy<2'}, False)
-        self.assertEqual(one, two)
-        self.assertEqual(
-            one,
-            hashlib.sha256(json.dumps(
-                ['3.10', ['pandas','pillow'], ['numpy<2'], False, False],
-                sort_keys=True).encode()).hexdigest()[:20],
-        )
+    @staticmethod
+    def wheel_bytes(name='demo',version='1.0',requires=()):
+        import zipfile
+        buffer=io.BytesIO();dist=name.replace('-','_')+'-'+version+'.dist-info'
+        metadata=['Metadata-Version: 2.1','Name: '+name,'Version: '+version]
+        metadata.extend('Requires-Dist: '+row for row in requires);metadata.extend(['',''])
+        with zipfile.ZipFile(buffer,'w') as archive:
+            archive.writestr(dist+'/METADATA','\n'.join(metadata))
+            archive.writestr(dist+'/WHEEL','Wheel-Version: 1.0\nTag: py3-none-any\n')
+            archive.writestr(dist+'/RECORD','')
+        return buffer.getvalue()
 
-    def test_failed_resolver_attempt_promotes_finished_wheel_before_retry(self):
-        import subprocess
+    def project(self,payload,*,name='demo',version='1.0'):
+        sha=hashlib.sha256(payload).hexdigest()
+        return {'releases':{version:[{'packagetype':'bdist_wheel',
+            'filename':f'{name}-{version}-py3-none-any.whl',
+            'url':f'https://files.pythonhosted.org/packages/{name}-{version}-py3-none-any.whl',
+            'digests':{'sha256':sha},'requires_python':'>=3.8'}]}},sha
+
+    def test_group_identity_is_order_independent_but_target_specific(self):
+        target=fixture_target('3.10.14')
+        one=pool.pip_group_key(target,{'pillow','pandas'},{'numpy<2'},False)
+        two=pool.pip_group_key(target,{'pandas','pillow'},{'numpy<2'},False)
+        other=pool.pip_group_key(fixture_target('3.10.15'),{'pandas','pillow'},{'numpy<2'},False)
+        self.assertEqual(one,two);self.assertNotEqual(one,other)
+
+    def test_static_registry_plan_uses_target_tags_without_spawning_pip(self):
+        target=fixture_target('3.10.14');payload=self.wheel_bytes();project,sha=self.project(payload)
         with tempfile.TemporaryDirectory() as tmp:
-            stage=Path(tmp);candidate=self.make_pool(stage)
-            payload=b'shared wheel bytes'
-            filename='sharedpkg-1.0-py3-none-any.whl'
-            calls=[]
-            def pipeline(argv, **kwargs):
-                calls.append((list(argv), kwargs))
-                dest=Path(argv[argv.index('--dest')+1])
-                if len(calls)==1:
-                    (dest/filename).write_bytes(payload)
-                    return subprocess.CompletedProcess(argv,1,stdout=(
-                        'ERROR: Could not find a version that satisfies the requirement '
-                        'collective.checkdocs (from versions: none)\n'))
-                shared=stage/'wheels'/'shared'/filename
-                self.assertTrue(shared.is_file())
-                os.link(shared,dest/filename)
-                return subprocess.CompletedProcess(argv,0,stdout='')
-            source={'name':'collective.checkdocs','version':'0.2.1',
-                    'requested':'collective.checkdocs','filename':'collective.checkdocs-0.2.1.tar.gz',
-                    'sha256':'1'*64,'requirements':['setuptools'],'provides_extra':[]}
-            with patch.object(pool.subprocess,'run',side_effect=pipeline), \
-                 patch.object(pool,'acquire_source_distribution',return_value=source):
-                pool.pip_closure(candidate,'3.10',{'sharedpkg','collective.checkdocs'},'group')
-            sha=hashlib.sha256(payload).hexdigest()
-            cas=candidate.objects/sha[:2]/sha
-            shared=stage/'wheels'/'shared'/filename
-            self.assertTrue(cas.is_file())
-            self.assertTrue(shared.samefile(cas))
-            self.assertFalse((stage/'wheels'/'group').exists())
-            self.assertEqual(len(candidate.links),1)
-            self.assertNotIn('PIP_NO_CACHE_DIR',calls[0][1]['env'])
-            self.assertEqual(calls[0][1]['env']['PIP_CACHE_DIR'],str(candidate.pip_cache))
+            stage=Path(tmp);candidate=self.make_pool(stage);calls=[]
+            def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+                calls.append(url);Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
+            with patch.object(pool,'_pypi_json',return_value=project), \
+                 patch.object(pool,'fetch',side_effect=fetch), \
+                 patch.object(pool.subprocess,'run',side_effect=AssertionError('pip/build execution is forbidden')):
+                pool.pip_closure(candidate,target,{'demo==1.0'},'group')
             plan=json.loads((stage/'metadata/pip-plan-group.json').read_text())
-            self.assertEqual(plan['files'],[{'filename':filename,'sha256':sha}])
+            self.assertEqual(plan['plan_schema'],pool.PIP_PLAN_SCHEMA)
+            self.assertEqual(plan['target'],target.as_dict())
+            self.assertEqual(plan['files'],[{'filename':'demo-1.0-py3-none-any.whl','sha256':sha}])
+            self.assertEqual(calls,['https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl'])
 
-    def test_different_logical_closures_share_one_physical_wheel(self):
-        import subprocess
+    def test_different_logical_plans_share_one_physical_cas_object(self):
+        payload=self.wheel_bytes();project,sha=self.project(payload)
         with tempfile.TemporaryDirectory() as tmp:
-            stage=Path(tmp);candidate=self.make_pool(stage)
-            payload=b'one universal wheel'
-            filename='demo-1.0-py3-none-any.whl'
-            def pipeline(argv, **kwargs):
-                dest=Path(argv[argv.index('--dest')+1])
-                shared=stage/'wheels'/'shared'/filename
-                if shared.exists(): os.link(shared,dest/filename)
-                else: (dest/filename).write_bytes(payload)
-                return subprocess.CompletedProcess(argv,0,stdout='')
-            with patch.object(pool.subprocess,'run',side_effect=pipeline):
-                pool.pip_closure(candidate,'3.8',{'demo==1.0'},'first')
-                pool.pip_closure(candidate,'3.10',{'demo==1.0'},'second')
-            sha=hashlib.sha256(payload).hexdigest()
+            stage=Path(tmp);candidate=self.make_pool(stage);calls=[]
+            def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+                calls.append(url);Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
+            with patch.object(pool,'_pypi_json',return_value=project),patch.object(pool,'fetch',side_effect=fetch):
+                pool.pip_closure(candidate,fixture_target('3.8.20'),{'demo==1.0'},'first')
+                pool.pip_closure(candidate,fixture_target('3.10.14'),{'demo==1.0'},'second')
             self.assertEqual(set(candidate.links),{sha})
             self.assertEqual(set(candidate.provenance['python']),{'first','second'})
-            self.assertTrue((stage/'wheels/shared'/filename).samefile(candidate.objects/sha[:2]/sha))
-            self.assertFalse((stage/'wheels/first').exists())
-            self.assertFalse((stage/'wheels/second').exists())
+            self.assertEqual(len(calls),1)
+            self.assertFalse((stage/'wheels/shared').exists())
 
-    def test_verified_completed_plan_reuses_cas_without_pip(self):
+    def test_verified_completed_plan_reuses_cas_without_resolver_or_network(self):
+        target_env=fixture_target('3.10.14')
         with tempfile.TemporaryDirectory() as tmp:
-            stage=Path(tmp);candidate=self.make_pool(stage)
-            payload=b'already acquired';sha=hashlib.sha256(payload).hexdigest()
-            target=candidate.objects/sha[:2]/sha
-            target.parent.mkdir(parents=True);target.write_bytes(payload)
-            candidate.verified_objects.add(sha)
-            key=pool.pip_group_key('3.10',{'demo==1'})
-            plan={'artifact_model':pool.PIP_ARTIFACT_MODEL,'python':'3.10',
-                  'requested':['demo==1'],'constraints':[],'no_deps':False,
-                  'files':[{'filename':'demo-1-py3-none-any.whl','sha256':sha}],
+            stage=Path(tmp);candidate=self.make_pool(stage);payload=self.wheel_bytes();sha=hashlib.sha256(payload).hexdigest()
+            artifact=candidate.objects/sha[:2]/sha;artifact.parent.mkdir(parents=True);artifact.write_bytes(payload)
+            candidate.verified_objects.add(sha);key=pool.pip_group_key(target_env,{'demo==1.0'})
+            package={'kind':'wheel','name':'demo','version':'1.0','filename':'demo-1.0-py3-none-any.whl',
+                     'sha256':sha,'url':'https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl',
+                     'requirements':[],'provides_extra':[]}
+            plan={'artifact_model':pool.PIP_ARTIFACT_MODEL,'plan_schema':pool.PIP_PLAN_SCHEMA,
+                  'target':target_env.as_dict(),'python':target_env.python_full_version,
+                  'requested':['demo==1.0'],'constraints':[],'no_deps':False,
+                  'packages':[package],'files':[{'filename':package['filename'],'sha256':sha}],
                   'source_archives':[]}
             (stage/'metadata'/('pip-plan-'+key+'.json')).write_text(json.dumps(plan))
-            with patch.object(pool.subprocess,'run',side_effect=AssertionError('pip must not run')):
-                self.assertTrue(pool.reuse_pip_plan(candidate,'3.10',{'demo==1'},key))
+            with patch.object(pool,'_resolve_registry_plan',side_effect=AssertionError('resolver must not run')):
+                self.assertTrue(pool.reuse_pip_plan(candidate,target_env,{'demo==1.0'},key))
             self.assertEqual(set(candidate.links),{sha})
-            self.assertTrue((stage/'wheels/shared/demo-1-py3-none-any.whl').samefile(target))
 
-    def test_resume_upgrades_only_verified_successful_legacy_plans(self):
+    def test_resume_reuses_verified_bytes_but_not_legacy_resolution_decisions(self):
+        target_env=fixture_target('3.10.14')
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);old=root/'old';new=root/'new'
-            (old/'objects/sha256').mkdir(parents=True)
-            (old/'metadata').mkdir();(old/'wheels/shared').mkdir(parents=True)
-            (old/'STAGING').write_text('legacy')
-            payload=b'legacy wheel';sha=hashlib.sha256(payload).hexdigest()
-            obj=old/'objects/sha256'/sha[:2]/sha
+            (old/'objects/sha256').mkdir(parents=True);(old/'metadata').mkdir();(old/'downloads').mkdir();(old/'STAGING').write_text('legacy')
+            payload=b'legacy bytes';sha=hashlib.sha256(payload).hexdigest();obj=old/'objects/sha256'/sha[:2]/sha
             obj.parent.mkdir();obj.write_bytes(payload)
-            os.link(obj,old/'wheels/shared/demo.whl')
-            key=pool.pip_group_key('3.10',{'demo==1'})
-            legacy={'python':'3.10','requested':['demo==1'],'constraints':[],
-                    'no_deps':False,'files':[{'filename':'demo.whl','sha256':sha}],
-                    'source_archives':[]}
+            key=pool.pip_group_key(target_env,{'demo==1.0'})
+            legacy={'python':'3.10','requested':['demo==1.0'],'constraints':[],'no_deps':False,
+                    'files':[{'filename':'demo.whl','sha256':sha}],'source_archives':[]}
             (old/'metadata'/('pip-plan-'+key+'.json')).write_text(json.dumps(legacy))
-            failed={**legacy,'optional_failed':'old failure','files':[]}
-            (old/'metadata/pip-plan-optional.json').write_text(json.dumps(failed))
-            new.mkdir()
-            for name in ('objects','metadata','wheels','downloads'):(new/name).mkdir(exist_ok=True)
+            new.mkdir();(new/'objects').mkdir();(new/'metadata').mkdir();(new/'downloads').mkdir()
             verified=pool.salvage_verified_stage(old,new)
             self.assertEqual(verified,{sha})
-            adopted=json.loads((new/'metadata'/('pip-plan-'+key+'.json')).read_text())
-            self.assertEqual(adopted['artifact_model'],pool.PIP_ARTIFACT_MODEL)
-            self.assertFalse((new/'metadata/pip-plan-optional.json').exists())
+            self.assertTrue((new/'objects/sha256'/sha[:2]/sha).is_file())
+            self.assertFalse((new/'metadata'/('pip-plan-'+key+'.json')).exists())
 
     def test_required_group_failure_stops_before_later_groups(self):
+        target_env=fixture_target('3.10.14').as_dict()
         with tempfile.TemporaryDirectory() as tmp:
-            candidate=self.make_pool(Path(tmp))
-            groups={
-                'a':{'version':'3.10','requirements':['broken'], 'constraints':[],
-                     'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
-                'b':{'version':'3.10','requirements':['later'], 'constraints':[],
-                     'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
+            candidate=self.make_pool(Path(tmp));groups={
+                'a':{'target':target_env,'requirements':['broken'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
+                'b':{'target':target_env,'requirements':['later'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
             }
             with patch.object(pool,'pip_closure',side_effect=[RuntimeError('boom'),AssertionError('continued')]) as solve:
-                with self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):
-                    pool.acquire_pip_groups(candidate,groups)
+                with self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):pool.acquire_pip_groups(candidate,groups)
             self.assertEqual(solve.call_count,1)
+
+    def test_same_filename_different_bytes_are_separate_cas_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp));first=Path(tmp)/'one.whl';second=Path(tmp)/'two.whl'
+            first.write_bytes(b'one');second.write_bytes(b'two')
+            one=candidate.put(first,'python','one');two=candidate.put(second,'python','two')
+            self.assertNotEqual(one,two)
+            self.assertTrue((candidate.objects/one[:2]/one).is_file())
+            self.assertTrue((candidate.objects/two[:2]/two).is_file())
 
     def test_required_network_acquisition_is_never_issue_accumulation(self):
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertNotIn("pool.issue('pip:'",source)
-        self.assertNotIn("pool.issue('APT'",source)
+        self.assertNotIn("pool.issue('pip:'",source);self.assertNotIn("pool.issue('APT'",source)
         self.assertNotIn("pool.issue('npm-global'",source)
         self.assertIn("raise RuntimeError('required VCS closure failed",source)
         self.assertIn('PIP_ARTIFACT_MODEL',source)
@@ -812,10 +795,14 @@ class TestPublicationRecovery(unittest.TestCase):
             base = Path(temp) / 'golden.qcow2'; base.write_bytes(b'unrelated')
             ready = base.parent / 'dependency-pool' / 'ready'; ready.mkdir(parents=True)
             operation = '7' * 64
-            record = {'operation_id': operation, 'complete': True, 'tasks':230, 'repos':11, 'conda_recipes':25}
+            contract=json.loads((ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+            coverage={'tasks':len(contract['tasks']),'repos':len({row['repo'] for row in contract['tasks'].values()}),
+                      'conda_recipes':len(contract['environments'])}
+            record = {'operation_id': operation, 'complete': True, **coverage}
             (ready/'inventory.json').write_text(json.dumps(record))
             expected = {'kind':'download-only-pool','complete':True,
-                        'pool_directory':str(ready),'tasks':230,'repos':11,'conda_recipes':25}
+                        'pool_directory':str(ready),**coverage,'runtime_integrated':True,
+                        'offline_replay':True,'generation':'8'*64}
             state = {'phase':'interrupted','operation_id':operation,
                      'publication_verified':expected, 'error':'worker died after rename'}
             class FakeManager:
@@ -868,7 +855,7 @@ setup(install_requires=project_requirements)
             lambda name, required=False:data[name], extras={'dev'})
         self.assertEqual(issues, [])
         self.assertEqual(remote, set())
-        self.assertEqual(deps, {'requests>=2','bottle==0.12','pytest>=6'})
+        self.assertEqual(deps, {'requests>=2','bottle==0.12'})
 
     def test_conan_legacy_single_runtime_file_without_execution(self):
         # Matches the older Conan layout used by eight pinned SWE-Gym commits.
@@ -941,15 +928,19 @@ setup(version=dynamic_version(), **setup_args)
         self.assertEqual(len(steps),1)
         self.assertTrue(steps[0]['no_deps'])
 
-    def test_bokeh_requires_pinned_tags_in_git_mirror(self):
+    def test_version_refs_are_derived_from_source_metadata_not_repository_name(self):
         calls=[]
         def fake(args,**kwargs):
             calls.append([str(x) for x in args])
-            if 'tag' in args: return 'v1\nv2\nv3\nv4\nv5\n'
+            if 'show-ref' in args:return ('a'*40)+' refs/tags/v1\n'
             return ''
-        with tempfile.TemporaryDirectory() as tmp,patch.object(pool,'invoke',side_effect=fake):
-            pool.mirror_commits(Path(tmp),'bokeh/bokeh',{'a'*40})
-        self.assertTrue(any('+refs/tags/*:refs/tags/*' in c for c in calls))
+        with patch.object(pool,'_source_requires_version_refs',return_value=True), \
+             patch.object(pool,'invoke',side_effect=fake):
+            refs=pool.ensure_version_refs(Path('/tmp/mirror'),'example/project',{'b'*40})
+        self.assertEqual(refs,{'refs/tags/v1':'a'*40})
+        self.assertTrue(any('+refs/tags/*:refs/tags/*' in row for row in calls))
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertNotIn("repo in {'bokeh/bokeh','pandas-dev/pandas'}",source)
 
     def test_published_contract_cannot_be_empty_cas(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1055,7 +1046,7 @@ class TestContractClosureRegressionV4(unittest.TestCase):
             self.assertTrue(rows and post)
             self.assertEqual(len(lock['environments'][env]['transactions']),2)
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertIn('environment_pip_python[env]=locked_base_python[env]',source)
+        self.assertIn("base_target_by_env[env]=transaction_targets[row['transactions'][0]['key']]",source)
         self.assertIn('acquire_locked_conda(pool,conda_lock)',source)
         self.assertIn("bucket='environment'",source)
 
@@ -1126,9 +1117,10 @@ setup(version=get_version(), **setup_args)
         self.assertEqual(deps, {'jupyter>=1.0.0','notebook>=6.0.3','ipywidgets>=7.0.0'})
 
     def test_mock_ssh_server_file_backed_requirements_are_static(self):
-        setup = """def read_requirements(): pass
+        setup = """def read_requirements():
+    with open("requirements.txt") as stream:
+        return stream.read().splitlines()
 setup(install_requires=read_requirements())
-# requirements.txt
 """
         files = {'requirements.txt':'paramiko>=2.1\ncryptography>=1.5\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(
@@ -1180,9 +1172,11 @@ def run_setup():
                                       'integrity':integrity}}}
                 (Path(cwd)/'package-lock.json').write_text(json.dumps(lock))
                 return ''
-            with patch.object(pool,'git_file',side_effect=git_source), \
+            with patch.object(pool,'git_files_named',return_value=['package.json']), \
+                 patch.object(pool,'git_file',side_effect=git_source), \
                  patch.object(pool,'_run_pinned_npm',side_effect=run), \
-                 patch.object(candidate,'download',return_value='a'*64):
+                 patch.object(candidate,'download',return_value='a'*64), \
+                 patch.object(pool,'_pinned_npm_version',return_value='10.9.9'):
                 artifacts=pool.npm_package_json_closure(
                     candidate,'mirror','b'*40,'owner/repo','identity')
             self.assertEqual(len(artifacts),1)
@@ -1200,18 +1194,24 @@ def run_setup():
         self.assertIn('npm', requirements)
 
 
-    def test_bokeh_npm_cli_is_pinned_to_node18_compatible_npm10(self):
-        self.assertEqual(pool.NPM_NODE18_VERSION, '10.9.9')
+    def test_npm_cli_version_is_derived_from_verified_golden_provenance(self):
+        with patch.object(pool,'_golden_provenance',return_value={'npm':{'version':'10.9.9'}}):
+            self.assertEqual(pool._pinned_npm_version(),'10.9.9')
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertIn("'https://registry.npmjs.org/npm/'+NPM_NODE18_VERSION", source)
-        self.assertNotIn("registry.npmjs.org/npm/latest", source)
-        self.assertIn("_run_pinned_npm(pool", source)
+        self.assertNotIn('NPM_NODE18_VERSION',source)
+        self.assertNotIn('registry.npmjs.org/npm/latest',source)
+        self.assertIn('_pinned_npm_version()',source)
 
-    def test_pipx_application_uses_pinned_kali_system_python_not_testbed_python(self):
-        self.assertEqual(pool.GOLDEN_SYSTEM_PYTHON, '3.13')
+    def test_pipx_application_uses_verified_golden_target_not_testbed_minor(self):
+        provenance={'system_python':{'full_version':'3.13.7'}}
+        with patch.object(pool,'_golden_provenance',return_value=provenance):
+            self.assertEqual(pool._golden_system_python(),'3.13.7')
         source=(ROOT/'scripts/superbench_pool.py').read_text()
-        self.assertIn("resolver_version=GOLDEN_SYSTEM_PYTHON", source)
-        self.assertIn("pipx creates its application venv from Kali's system Python", source)
+        self.assertNotIn('GOLDEN_SYSTEM_PYTHON',source)
+        self.assertIn('resolver_target=golden_target',source)
+        guest=(ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py').read_text()
+        self.assertNotIn('--python /usr/bin/python3',guest)
+        self.assertIn('shutil.which("python3")',guest)
 
 
 

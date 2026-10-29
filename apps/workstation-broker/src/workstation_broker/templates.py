@@ -148,7 +148,7 @@ class TemplateRegistry:
         if (hashlib.sha256(encoded).hexdigest() != generation or manifest_abi != resolved_abi or
                 any(manifest.get(key) != resolved.get(key) for key in
                     ("schema_version", "recipe_version", "task_runtime_schema", "pins", "source_fingerprint", "security",
-                     "templates", "artifacts", "task_artifacts", "isolation_validation")) or
+                     "templates", "artifacts", "task_artifacts", "isolation_validation", "dependency_pool")) or
                 manifest.get("wheel_cas", {}) != resolved.get("wheel_cas", {})):
             raise ValueError("template generation content identity mismatch")
         self.validate_generation(generation)

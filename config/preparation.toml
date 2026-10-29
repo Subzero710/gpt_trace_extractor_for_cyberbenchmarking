@@ -1,0 +1,25 @@
+# Operational controls; these are not benchmark dependency semantics.
+[build]
+virtual_disk_gib = 512
+memory_reserve_mb = 4096
+memory_min_mb = 4096
+memory_cap_mb = 16384
+vcpu_cap = 4
+swap_gib = 16
+free_space_gib = 64
+root_min_gib = 480
+timeout_hours = 96
+golden_provision_timeout_hours = 2
+
+[acquisition]
+# QEMU's restricted user network forwards only this explicit proxy endpoint.
+network = "10.0.2.0/24"
+service_address = "10.0.2.100"
+service_port = 3128
+timeout_seconds = 180
+job_timeout_hours = 24
+workers = 8
+
+[bootstrap]
+miniconda_archive = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"
+miniconda_sha256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c"
