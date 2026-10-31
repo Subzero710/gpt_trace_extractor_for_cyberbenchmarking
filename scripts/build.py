@@ -27,6 +27,20 @@ def build_host_broker(root: Path) -> None:
     run([str(python), "-m", "pip", "install", "--disable-pip-version-check",
          "-e", str(root / "shared"), "-e", str(root / "apps/workstation-broker") + "[test]"])
 
+    # Distributed execution tests cover golden-browser code too. Keep their
+    # dependencies out of the production broker interpreter and derive them
+    # from the maintained package manifests rather than duplicating pins here.
+    test_venv = root / ".venv-execution-tests"
+    test_python = test_venv / "bin/python"
+    if test_venv.exists():
+        shutil.rmtree(test_venv)
+    run([sys.executable, "-m", "venv", str(test_venv)])
+    run([str(test_python), "-m", "pip", "install", "--disable-pip-version-check",
+         "-e", str(root / "shared"),
+         "-e", str(root / "apps/workstation-broker") + "[test]",
+         "-e", str(root / "apps/kali-workstation") + "[test]"])
+    run([str(test_python), "-m", "pip", "check"])
+
 
 def compose_service_image(root: Path, service: str) -> str:
     rendered = run(["docker", "compose", "config", "--format", "json"], capture=True).stdout

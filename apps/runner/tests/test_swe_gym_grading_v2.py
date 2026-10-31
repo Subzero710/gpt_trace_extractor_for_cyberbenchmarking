@@ -70,6 +70,7 @@ def test_warming_freezes_repo_and_eval_install_inventories_separately(history, t
         (root / name).mkdir(parents=True)
     monkeypatch.setattr(guest, "ROOT", root)
     phase = {"inventory": {"pip_freeze": "repo-dependency==1"}}
+    monkeypatch.setattr(guest, "pristine_stored_env", lambda item: tmp_path / "stored-environment")
     monkeypatch.setattr(guest, "prepare", lambda *args, **kwargs: tmp_path / "environment")
     monkeypatch.setattr(guest, "env_inventory", lambda prefix: phase["inventory"])
     def eval_install(commands, **kwargs):

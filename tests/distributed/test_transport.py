@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -161,10 +162,17 @@ class TransportTests(unittest.TestCase):
 
     def test_expired_client_certificate_is_rejected_by_handshake(self):
         expired = self.directory / "expired.crt"
+        now = datetime.now(timezone.utc)
+        not_before = (now - timedelta(days=2)).strftime("%Y%m%d%H%M%SZ")
+        not_after = (now - timedelta(days=1)).strftime("%Y%m%d%H%M%SZ")
         subprocess.run(["openssl", "x509", "-req", "-in", str(self.authority / "admin.csr"),
             "-CA", str(self.authority / "ca.crt"), "-CAkey", str(self.authority / "ca.key"),
-            "-set_serial", "999", "-days", "-1", "-extfile", str(self.authority / "admin.ext"), "-out", str(expired)],
+            "-set_serial", "999", "-not_before", not_before, "-not_after", not_after,
+            "-sha256", "-extfile", str(self.authority / "admin.ext"), "-out", str(expired)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        validity = subprocess.run(["openssl", "x509", "-checkend", "0", "-noout", "-in", str(expired)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.assertNotEqual(validity.returncode, 0)
         with self.assertRaises(TransportFailure):
             WireClient(replace(self.endpoint, cert=expired)).exchange("POST", "/v1/probe", b"{}", "Bearer " + self.credential())
         self.assertEqual(self.backend.requests, [])

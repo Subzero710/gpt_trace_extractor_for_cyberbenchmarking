@@ -396,9 +396,15 @@ def doctor_tests(role):
                 "-p", "test_*.py", "-v")
         return
     if role == "execution":
-        python = ROOT / ".venv-workstation-broker/bin/python"
-        for suite in (ROOT / "apps/workstation-broker/tests", ROOT / "tests/distributed"):
-            run([python, "-B", "-m", "pytest", "-q", str(suite)], timeout=1800)
+        broker_python = ROOT / ".venv-workstation-broker/bin/python"
+        distributed_python = ROOT / ".venv-execution-tests/bin/python"
+        for python in (broker_python, distributed_python):
+            if not python.is_file():
+                raise RuntimeError("execution test environment is missing; run make build")
+        run([broker_python, "-B", "-m", "pytest", "-q",
+             str(ROOT / "apps/workstation-broker/tests")], timeout=1800)
+        run([distributed_python, "-B", "-m", "pytest", "-q",
+             str(ROOT / "tests/distributed")], timeout=1800)
         return
     raise ValueError("unknown doctor test role")
 

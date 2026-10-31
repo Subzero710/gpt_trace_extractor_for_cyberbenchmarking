@@ -133,8 +133,12 @@ class InterfaceAndShutdownTests(unittest.TestCase):
             "runner", "storage", "workstation-gateway",
             "kali-workstation-controller", "/opt/gpt-trace-browser/tests",
             "apps/workstation-broker/tests", "tests/distributed",
+            ".venv-workstation-broker", ".venv-execution-tests",
         ):
             self.assertIn(marker, doctor)
+        build = (ROOT / "scripts/build.py").read_text()
+        self.assertIn(".venv-execution-tests", build)
+        self.assertIn('str(root / "apps/kali-workstation") + "[test]"', build)
 
     def test_make_has_exactly_the_retained_historical_targets(self):
         make = (ROOT / "Makefile").read_text()

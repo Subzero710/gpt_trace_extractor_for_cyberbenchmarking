@@ -28,7 +28,7 @@ from gpt_trace_runner.workstation_provider import LibvirtWorkstationProvider
 def test_official_contract_230_11_25_and_complete_mapping():
     contract = source.contract()
     assert len(contract["tasks"]) == 230
-    assert {item["repo"] for item in contract["tasks"].values()} == set(source.COUNTS)
+    assert {item["repo"] for item in contract["tasks"].values()} == set(source.repository_counts(contract))
     assert len(contract["environments"]) == 25
     official = source.harness(contract)
     for item in contract["tasks"].values():
@@ -257,7 +257,7 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
         targets.append(runtime.purpose)
         if "proof = prepare_evaluator" in program:
             return {"stdout":json.dumps({"base_commit":item["base_commit"],"env_hash":item["env_hash"],"source_sha256":"a"*64})}
-        if "prepare(item, artifact=artifact, log=ROOT" in program:
+        if "workspace = Path('/home/kali/workspace')" in program:
             return {"stdout": json.dumps({"base_commit": item["base_commit"], "env_hash": item["env_hash"]})}
         return {"stdout": json.dumps({"test_exit_status": 0})}
     monkeypatch.setattr(module, "execute", execute)
