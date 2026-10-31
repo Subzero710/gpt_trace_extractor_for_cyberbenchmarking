@@ -920,11 +920,24 @@ def create_app(broker: Broker) -> Starlette:
     # process lifetime; a restarted process will refuse to infer any VM outcome.
     operations: dict[tuple[str, str], dict] = {}
 
+    async def reject_active_preparation_for_vm_creation() -> None:
+        manager = getattr(broker, "preparations", None)
+        if manager is not None and await asyncio.to_thread(manager.inventory):
+            raise RuntimeError("template preparation is active; workstation VM creation is blocked")
+
+    async def reject_runtime_for_template_preparation() -> None:
+        proof = await asyncio.to_thread(inventory, broker)
+        if any(proof[key] for key in ("domains", "networks", "firewall_tables", "states")):
+            raise RuntimeError("workstation VM resources are active; template preparation is blocked")
+        if any(record.get("state") == "pending" for record in operations.values()):
+            raise RuntimeError("workstation VM creation is pending; template preparation is blocked")
+
     async def execute_background(record: dict, operation: str, ident: dict, payload: dict) -> None:
         try:
             async with operation_lock:
                 if getattr(broker, "draining", False):
                     raise RuntimeError("broker draining; async creation rejected")
+                await reject_active_preparation_for_vm_creation()
                 if operation == "create_attempt":
                     result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
                 else:
@@ -984,42 +997,44 @@ def create_app(broker: Broker) -> Starlette:
                     response["detail"] = record["error"]
                 return JSONResponse(response)
             if action == "begin_async":
-                if getattr(broker, "draining", False):
-                    raise RuntimeError("broker is draining; creation blocked")
-                ident = identity(payload)
-                operation = payload.get("operation")
-                if operation not in {"create_attempt", "create_evaluator"} or payload.get("purpose") is not None:
-                    raise ValueError("invalid asynchronous operation or identity")
-                operation_id = payload.get("operation_id")
-                if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
-                    raise ValueError("invalid asynchronous operation ID")
-                allowed = {"operation", "operation_id", "task_id", "attempt", "environment_id", "fingerprint"}
-                if operation == "create_attempt":
-                    allowed |= {"template_id", "logical_task_id"}
-                else:
-                    allowed |= {"abandon_stale"}
-                    if type(payload.get("abandon_stale", False)) is not bool:
-                        raise ValueError("invalid evaluator recovery flag")
-                if set(payload) - allowed:
-                    raise ValueError("unknown asynchronous creation argument")
-                key = (operation, operation_id)
-                previous = operations.get(key)
-                if previous is not None:
-                    if previous["payload"] != payload:
-                        raise ValueError("attempt creation parameters changed; preserve existing operation")
+                async with operation_lock:
+                    if getattr(broker, "draining", False):
+                        raise RuntimeError("broker is draining; creation blocked")
+                    await reject_active_preparation_for_vm_creation()
+                    ident = identity(payload)
+                    operation = payload.get("operation")
+                    if operation not in {"create_attempt", "create_evaluator"} or payload.get("purpose") is not None:
+                        raise ValueError("invalid asynchronous operation or identity")
+                    operation_id = payload.get("operation_id")
+                    if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+                        raise ValueError("invalid asynchronous operation ID")
+                    allowed = {"operation", "operation_id", "task_id", "attempt", "environment_id", "fingerprint"}
+                    if operation == "create_attempt":
+                        allowed |= {"template_id", "logical_task_id"}
+                    else:
+                        allowed |= {"abandon_stale"}
+                        if type(payload.get("abandon_stale", False)) is not bool:
+                            raise ValueError("invalid evaluator recovery flag")
+                    if set(payload) - allowed:
+                        raise ValueError("unknown asynchronous creation argument")
+                    key = (operation, operation_id)
+                    previous = operations.get(key)
+                    if previous is not None:
+                        if previous["payload"] != payload:
+                            raise ValueError("attempt creation parameters changed; preserve existing operation")
+                        return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
+                    if len(operations) >= 10000:
+                        raise RuntimeError("broker operation registry capacity reached; preserve history")
+                    if any(op == operation and item["identity"] == ident and item["state"] == "pending"
+                           for (op, _), item in operations.items()):
+                        raise ValueError("creation already in progress for this identity; reconcile before retry")
+                    # In particular, never retry blindly after a broker restart.
+                    if operation == "create_attempt" and broker._paths(ident)[2].exists():
+                        raise ValueError("attempt resources already exist; reconcile existing VM explicitly")
+                    record = {"state": "pending", "payload": dict(payload), "identity": ident}
+                    operations[key] = record
+                    record["task"] = asyncio.create_task(execute_background(record, operation, ident, payload))
                     return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
-                if len(operations) >= 10000:
-                    raise RuntimeError("broker operation registry capacity reached; preserve history")
-                if any(op == operation and item["identity"] == ident and item["state"] == "pending"
-                       for (op, _), item in operations.items()):
-                    raise ValueError("creation already in progress for this identity; reconcile before retry")
-                # In particular, never retry blindly after a broker restart.
-                if operation == "create_attempt" and broker._paths(ident)[2].exists():
-                    raise ValueError("attempt resources already exist; reconcile existing VM explicitly")
-                record = {"state": "pending", "payload": dict(payload), "identity": ident}
-                operations[key] = record
-                record["task"] = asyncio.create_task(execute_background(record, operation, ident, payload))
-                return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
             async with operation_lock:
                 if action == "begin_shutdown":
                     if payload: raise ValueError("shutdown barrier takes no parameters")
@@ -1061,6 +1076,8 @@ def create_app(broker: Broker) -> Starlette:
                         if proof.get("absent") is not True:
                             raise RuntimeError("temporary execution resources remain; refusing persistent THROW")
                         return JSONResponse(await asyncio.to_thread(manager.throw_persistent_storage, payload))
+                    if action == "prepare_templates":
+                        await reject_runtime_for_template_preparation()
                     handler = {"template_preparation_probe": manager.probe,
                         "prepare_templates": manager.start, "template_preparation_status": manager.status}[action]
                     return JSONResponse(await asyncio.to_thread(handler, payload))
@@ -1081,10 +1098,12 @@ def create_app(broker: Broker) -> Starlette:
                 if action == "create_attempt":
                     if ident.get("purpose") is not None:
                         raise ValueError("isolated runtimes require create_evaluator")
+                    await reject_active_preparation_for_vm_creation()
                     result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
                 elif action == "create_evaluator":
                     if type(payload.get("abandon_stale", False)) is not bool:
                         raise ValueError("invalid evaluator recovery flag")
+                    await reject_active_preparation_for_vm_creation()
                     result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
                 elif action == "inspect_evaluators": result = broker.inspect_evaluators(ident)
                 elif action == "destroy_evaluator": result = broker.destroy_evaluator(ident, payload.get("evaluator_retry"))

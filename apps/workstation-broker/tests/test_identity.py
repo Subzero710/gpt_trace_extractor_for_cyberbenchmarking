@@ -99,3 +99,56 @@ def test_qemu_image_info_force_share_for_running_overlay(monkeypatch, tmp_path):
         "qemu-img", "info", "--force-share", "--output=json",
         str(tmp_path / "overlay.qcow2"),
     )]
+
+
+@pytest.mark.asyncio
+async def test_template_preparation_and_vm_creation_are_mutually_exclusive(tmp_path, monkeypatch):
+    class Preparations:
+        def __init__(self):
+            self.active = True
+            self.start_calls = 0
+
+        def inventory(self):
+            return [{"phase": "running"}] if self.active else []
+
+        def start(self, payload):
+            self.start_calls += 1
+            return {"phase": "starting"}
+
+    class FakeBroker:
+        admin_token = "a" * 40
+        controller_token = "c" * 40
+        draining = False
+
+        def __init__(self):
+            self.preparations = Preparations()
+            self.create_calls = 0
+
+        async def create(self, ident, template_id=None, logical_task_id=None):
+            self.create_calls += 1
+            return {"identity": ident}
+
+    broker = FakeBroker()
+    app = create_app(broker)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"authorization": "Bearer " + "a" * 40}
+    async with httpx.AsyncClient(transport=transport, base_url="http://broker") as client:
+        blocked_vm = await client.post("/v1/begin_async", json={
+            **IDENT, "operation": "create_attempt", "operation_id": "b" * 32
+        }, headers=headers)
+        assert blocked_vm.status_code == 409
+        assert "template preparation is active" in blocked_vm.json()["detail"]
+        assert broker.create_calls == 0
+
+        broker.preparations.active = False
+        monkeypatch.setattr("workstation_broker.server.inventory", lambda value: {
+            "project": "gpt-trace-extractor", "preparations": [],
+            "domains": ["gpt-trace-ws-live"], "networks": [],
+            "firewall_tables": [], "states": [{"key": "live"}], "absent": False,
+        })
+        blocked_preparation = await client.post("/v1/prepare_templates", json={
+            "operation_id": "c" * 64, "compatibility": {}, "retry": False
+        }, headers=headers)
+        assert blocked_preparation.status_code == 409
+        assert "workstation VM resources are active" in blocked_preparation.json()["detail"]
+        assert broker.preparations.start_calls == 0
