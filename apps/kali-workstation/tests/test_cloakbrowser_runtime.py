@@ -10,6 +10,7 @@ async def test_agent_launches_pinned_cloakbrowser_with_attempt_seed(tmp_path, mo
     binary.write_text('#!/bin/sh\n')
     binary.chmod(0o755)
     monkeypatch.setenv('CLOAKBROWSER_BINARY_PATH', str(binary))
+    monkeypatch.setattr(module.os, 'access', lambda path, mode: path == binary and mode == module.os.X_OK)
     monkeypatch.setattr(module, 'DOWNLOADS', tmp_path/'downloads')
     calls = []
     class Page:
