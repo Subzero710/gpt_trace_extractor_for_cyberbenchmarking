@@ -1167,6 +1167,20 @@ def make_commands(text, target, *, visiting=None):
     return commands+rows[target][1]
 
 
+def github_repository(url):
+    """Canonicalize the finite HTTPS GitHub repository URL forms accepted as inputs."""
+    if not isinstance(url,str):
+        raise ValueError('Git repository URL must be text')
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme!='https' or parsed.netloc!='github.com' or parsed.query or parsed.fragment:
+        raise ValueError('unsupported GitHub repository URL')
+    repository=parsed.path.removeprefix('/').removesuffix('/')
+    repository=repository.removesuffix('.git')
+    if not REPO.fullmatch(repository):
+        raise ValueError('unsupported GitHub repository path')
+    return repository
+
+
 def read_submodules(mirror, commit):
     conf=git_file(mirror,commit,'.gitmodules')
     if not conf:return []
@@ -1177,12 +1191,14 @@ def read_submodules(mirror, commit):
         path=parser.get(section,'path',fallback='')
         url=parser.get(section,'url',fallback='')
         if not path or url.startswith(('.', 'git@')):raise RuntimeError('relative/untrusted Git submodule URL')
-        match=re.fullmatch(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?',url)
-        if not match:raise RuntimeError('unsupported Git submodule URL: '+url)
+        try:
+            subrepo=github_repository(url)
+        except ValueError as exc:
+            raise RuntimeError('unsupported Git submodule URL: '+url) from exc
         row=invoke(['git','--git-dir',mirror,'ls-tree',commit,'--',path],capture=True).strip()
         m=re.fullmatch(r'160000 commit ([a-f0-9]{40})\t.+',row)
         if not m:raise RuntimeError('submodule Gitlink missing: '+path)
-        result.append((path,match.group(1),m.group(1)))
+        result.append((path,subrepo,m.group(1)))
     return result
 
 
