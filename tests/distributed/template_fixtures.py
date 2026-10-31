@@ -126,13 +126,20 @@ def fixture(parent, *, activate=True, label="repo"):
         target={"schema":2,"markers":markers,"tags":tags,"implementation":"cpython",
             "abi":"cp313","architecture":"x86_64","source":"verified-target-interpreter",
             "interpreter_sha256":"0"*64,"python_artifact_sha256":None}
-        provenance = {"source": golden.SOURCE + golden.ARCHIVE, "source_sha256": golden.ARCHIVE_SHA256,
+        provenance = {"schema": 2, "source": golden.SOURCE + golden.ARCHIVE, "source_sha256": golden.ARCHIVE_SHA256,
             "base_sha256": local.digest(base), "build_input_sha256": golden.golden_build_input_sha256(),
             "python_lock_sha256": local.digest(ROOT / "infra/workstation/image/requirements.lock"),
             "apt_package_manifest_sha256": local.digest(parent / "kali-packages.txt"),
             "python_package_manifest_sha256": local.digest(parent / "kali-python-packages.txt"),
             "target_environment":target,"platform_tags":tags,"architecture":"x86_64",
-            "system_python":{"full_version":"3.13.7"},"npm":{"version":"fixture-npm"}}
+            "system_python":{"full_version":"3.13.7", "executable":"/usr/bin/python3.13", "interpreter_sha256":"0"*64},
+            "npm":{"version":"10.9.9"}, "node":{"version":"v22.0.0", "executable":"/usr/bin/node", "sha256":"1"*64},
+            "repo_commit":"2"*40, "guest_agent_version":"3.0.0", "apt_suite":golden.APT_SUITE,
+            "build_utc":"2026-01-01T00:00:00+00:00", "provisioning_network":"qemu-user-firstboot-with-private-9p-cache",
+            "browser_runtime":{"artifact":{"wrapper":"0.4.8", "platform":"linux-x64", "version":"1.2.3.4",
+                "verification":"upstream-ed25519-and-sha256", "archive_sha256":"3"*64, "manifest_sha256":"4"*64,
+                "signature_sha256":"5"*64}, "binary_sha256":"6"*64, "executable_version":"synthetic-test-browser",
+                "files":{"chrome":{"sha256":"6"*64, "size":1, "mode":365}}}}
         local.atomic_json(base.with_suffix(".provenance.json"), provenance)
         for path in (base, parent / "kali-packages.txt", parent / "kali-python-packages.txt"): path.chmod(0o444)
     expected = local.compatibility(base, ROOT)

@@ -1,0 +1,48 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+LOG=/var/log/gpt-trace-image-build.log
+COMPLETE=/etc/gpt-trace-image-build-complete
+FAILED=/etc/gpt-trace-image-build-failed
+STEP=initialization
+mkdir -p /var/log
+exec > >(tee -a "$LOG") 2>&1
+shutdown_on_exit() {
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf 'phase=%s exit=%s command=%s\n' "$STEP" "$rc" "$BASH_COMMAND" > "$FAILED"
+        rm -f "$COMPLETE"
+    fi
+    sync
+    # Shutdown is the sole deliberately best-effort action.
+    systemctl poweroff --no-block || poweroff -f || true
+}
+trap shutdown_on_exit EXIT
+rm -f "$COMPLETE" "$FAILED"
+STEP=cache-mount
+mkdir -p @CACHE_MOUNT@
+if ! mountpoint -q @CACHE_MOUNT@; then
+    mount -t 9p -o trans=virtio,version=9p2000.L,nosuid,nodev,noexec @CACHE_TAG@ @CACHE_MOUNT@
+fi
+test "$(findmnt -n -o SOURCE --target @CACHE_MOUNT@)" = @CACHE_TAG@
+test "$(findmnt -n -o FSTYPE --target @CACHE_MOUNT@)" = 9p
+STEP=apt
+python3 /opt/gpt-trace/bundle/guest_build.py apt
+STEP=filesystem
+python3 /opt/gpt-trace/bundle/guest_build.py filesystem
+STEP=python
+python3 /opt/gpt-trace/bundle/guest_build.py python
+export PYTHONPATH=/opt/gpt-trace/bundle/src
+STEP=browser
+/opt/gpt-trace/venv/bin/python /opt/gpt-trace/bundle/guest_build.py browser
+STEP=desktop
+mkdir -p /etc/lightdm/lightdm.conf.d
+printf '[Seat:*]\nautologin-user=kali\nautologin-user-timeout=0\n' > /etc/lightdm/lightdm.conf.d/50-gpt-trace.conf
+mkdir -p /home/kali/workspace /home/kali/Downloads
+chown -R kali:kali /home/kali/workspace /home/kali/Downloads
+systemctl enable lightdm qemu-guest-agent gpt-trace-workstation-agent
+STEP=manifests
+/opt/gpt-trace/venv/bin/python /opt/gpt-trace/bundle/guest_build.py metadata
+STEP=complete
+/opt/gpt-trace/venv/bin/python /opt/gpt-trace/bundle/guest_build.py complete
+sync

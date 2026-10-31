@@ -959,7 +959,12 @@ setup(version=dynamic_version(), **setup_args)
         self.assertNotIn('os.environ.copy()',physical)
         self.assertNotIn('dict(os.environ',physical)
         self.assertIn('PIP_CONFIG_FILE',physical)
-        self.assertIn('child.wait(timeout=24 * 3600)',physical)
+        self.assertIn('acquisition_timeout = acquisition_job_timeout_seconds(manager.source_root)',physical)
+        self.assertIn('child.wait(timeout=acquisition_timeout)',physical)
+        import tomllib
+        from workstation_broker.preparation import acquisition_job_timeout_seconds
+        controls = tomllib.loads((ROOT/'config/preparation.toml').read_text())
+        self.assertEqual(acquisition_job_timeout_seconds(ROOT), controls['acquisition']['job_timeout_hours'] * 3600)
         self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
 
     def test_conda_lock_downloads_each_sha_once_and_materializes_transactions(self):

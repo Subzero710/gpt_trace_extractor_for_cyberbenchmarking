@@ -75,7 +75,7 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         task_script = self.builder.firstboot("echo fixture", trim=False, shared_warm_cache=True)
         permanent_script = self.builder.firstboot("echo fixture", trim=True, shared_warm_cache=False)
         self.assertNotIn("fstrim -av", task_script)
-        self.assertIn("GPTTRACE_SHARED_WARM_CACHE", task_script)
+        self.assertIn("GPT_TRACE_SHARED_WARM_CACHE", task_script)
         self.assertIn("/dev/vdb", task_script)
         self.assertIn("fstrim -av", permanent_script)
         self.assertNotIn("GPT_TRACE_SHARED_WARM_CACHE", permanent_script)
@@ -580,15 +580,18 @@ finally:
         failed = self.wait_phase({"interrupted"})
         self.assertIn("synthetic build boundary failure", failed["error"])
         for process in self.children: process.wait(timeout=5)
-        with self.assertRaisesRegex(RuntimeError, "zombie"):
+        with self.assertRaisesRegex(RuntimeError, "explicit retry of failed/unpublished preparation required"):
             self.start()
         self.assertEqual(len(self.children), 1)
         self.assertEqual(self.files.registry_path.read_bytes(), before)
         self.assertTrue(list(self.manager.root.rglob("*.log")))
         self.mode = "success"
-        with self.assertRaisesRegex(RuntimeError, "zombie"):
-            self.start(retry=True)
-        self.assertEqual(len(self.children), 1)
+        self.start(retry=True)
+        ready = self.wait_phase({"ready"})
+        self.assertTrue(ready["result"]["offline_replay"])
+        self.assertEqual(len(self.children), 2)
+        self.assertEqual(self.count.read_bytes(), b"one\none\n")
+        self.assertEqual(self.files.registry_path.read_bytes(), before)
 
     def test_down_cancels_only_recorded_session_and_keeps_permanent_files(self):
         self.mode = "long"
@@ -636,7 +639,7 @@ finally:
         status = self.manager.status({'operation_id': self.operation_id})
         self.assertEqual(status['phase'], 'interrupted')
         self.assertIn('descendants', status['error'])
-        with self.assertRaisesRegex(RuntimeError, 'zombie'):
+        with self.assertRaisesRegex(RuntimeError, 'previous preparation process group remains; duplicate blocked'):
             self.start(retry=True)
         original_members = resources.JobScope.members
         def observed(state):
@@ -674,7 +677,7 @@ finally:
         value = self.wait_phase({'failed'})
         self.assertIn('spawn rejected', value['error'])
         with patch.object(jobs.subprocess, "Popen", side_effect=AssertionError("blind retry")):
-            with self.assertRaisesRegex(RuntimeError, "zombie"):
+            with self.assertRaisesRegex(RuntimeError, "explicit retry of failed/unpublished preparation required"):
                 self.start()
 
 
@@ -820,7 +823,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                     "deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"},
                     "broker_stopped": True, "broker_identity": stamp,
                     "inventory": {"project": "gpt-trace-extractor", "absent": True}}
-                with patch.dict(os.environ, {"WORKSTATION_BROKER_ADMIN_TOKEN_FILE": str(path)}):
+                with patch.dict(os.environ, {"WORKSTATION_BROKER_ADMIN_TOKEN": credential}):
                     responder = shutdown.Confirmation(value)
                 body = json.dumps({"shutdown_id": shutdown_id}).encode()
                 self.assertEqual(responder.exchange("POST", "/v1/shutdown_status", body, "Bearer " + credential)[0], 409)

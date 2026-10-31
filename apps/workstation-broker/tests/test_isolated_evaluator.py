@@ -72,7 +72,9 @@ async def test_evaluator_uses_original_immutable_backing_without_teacher_mutatio
     teacher = await broker.create(IDENT, ID, host.files.task1)
     Path(teacher["overlay"]).write_bytes(b"TEACHER CORRUPTION: conda gitconfig etc PATH background process")
     # A registry update must never redirect this evaluator to a newer template.
+    host.files.registry_path.chmod(0o644)
     host.files.registry_path.write_text(json.dumps({"schema_version":2,"generation":"f"*64}))
+    host.files.registry_path.chmod(0o444)
     evaluator = await broker.create_evaluator(IDENT)
     assert evaluator["template_generation"] == teacher["template_generation"]
     assert evaluator["backing_sha256"] == teacher["backing_sha256"]

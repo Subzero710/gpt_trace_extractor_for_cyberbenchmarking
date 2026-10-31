@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gpt-trace-broker-transport"
 version = "1.0.0"
 requires-python = ">=3.12"
+dependencies = ["packaging>=24.2,<27"]
 
 [tool.setuptools.packages.find]
 where = ["."]

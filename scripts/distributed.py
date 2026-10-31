@@ -837,10 +837,8 @@ def execution(cfg, action, args):
             raise RuntimeError("preserve existing attempts before installing broker/images")
         import build
         build.build_host_broker(ROOT)
-        if paths["base_image"].exists(): build.verify_workstation_image(ROOT)
-        else:
-            build.build_workstation_base_image(ROOT)
-            build.verify_workstation_image(ROOT)
+        build.build_workstation_base_image(ROOT)
+        build.verify_workstation_image(ROOT)
         install_unit(cfg)
         return
     if action == "serve":

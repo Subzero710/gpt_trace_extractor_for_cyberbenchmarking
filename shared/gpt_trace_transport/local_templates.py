@@ -206,6 +206,7 @@ def compatibility(base, source_root=ROOT, *, hasher=digest):
     recipe = template_contract(source_root)
     provenance_path = safe(base.with_suffix(".provenance.json"), immutable=True)
     provenance = json.loads(provenance_path.read_bytes())
+    golden_builder(source_root).validate_provenance_fields(provenance)
     required = {"source", "source_sha256", "base_sha256", "build_input_sha256",
                 "python_lock_sha256", "apt_package_manifest_sha256",
                 "python_package_manifest_sha256", "target_environment", "platform_tags",
