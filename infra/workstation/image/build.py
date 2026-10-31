@@ -55,7 +55,7 @@ def versioned_file(path):
 def _preparation_build_controls():
     path = versioned_file(ROOT / "config/preparation.toml")
     controls = tomllib.loads(path.read_text())["build"]
-    required = {"virtual_disk_gib", "root_min_gib", "golden_provision_timeout_hours", "memory_min_mb", "vcpu_cap"}
+    required = {"virtual_disk_gib", "root_min_gib", "golden_provision_timeout_hours", "golden_memory_mb", "golden_vcpus"}
     if not required <= set(controls) or any(type(controls[k]) is not int or controls[k] <= 0 for k in required):
         raise ValueError("golden preparation controls must be positive integers")
     if controls["root_min_gib"] >= controls["virtual_disk_gib"]:
@@ -457,7 +457,7 @@ def provision_in_real_guest(image):
     if any(ch in str(path) for path in (image, CACHE_DIR) for ch in (",", "\n", "\0")):
         raise ValueError("ambiguous QEMU storage path")
     run("qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
-        "-m", str(_BUILD_CONTROLS["memory_min_mb"]), "-smp", str(_BUILD_CONTROLS["vcpu_cap"]),
+        "-m", str(_BUILD_CONTROLS["golden_memory_mb"]), "-smp", str(_BUILD_CONTROLS["golden_vcpus"]),
         "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap",
         "-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0",
         "-device", "virtio-rng-pci", "-fsdev", f"local,id=goldencache,path={CACHE_DIR},security_model=none",

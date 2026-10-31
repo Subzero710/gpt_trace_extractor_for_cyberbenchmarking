@@ -2,3 +2,5 @@
 libguestfs-tools
 p7zip-full
 dpkg
+python3-packaging
+python3-cryptography

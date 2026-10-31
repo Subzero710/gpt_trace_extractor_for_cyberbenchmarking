@@ -8,8 +8,6 @@
 # golden-image installation, or host filesystem/firewall lifecycle.
 python3-venv
 python3-pip
-python3-packaging
-python3-cryptography
 openssl
 qemu-system-x86
 qemu-utils
