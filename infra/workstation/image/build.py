@@ -52,6 +52,26 @@ def versioned_file(path):
     return path
 
 
+def versioned_digest(path):
+    path = versioned_file(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("nonregular versioned golden input: " + str(path))
+        hasher = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        after = os.fstat(fd)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if identity(before) != identity(after):
+            raise ValueError("versioned golden input changed while hashing: " + str(path))
+        return hasher.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def _preparation_build_controls():
     path = versioned_file(ROOT / "config/preparation.toml")
     controls = tomllib.loads(path.read_text())["build"]
@@ -596,7 +616,7 @@ def provenance(image, stage, state):
         "python_package_manifest_sha256": digest(stage / "kali-python-packages.txt"),
         "target_environment": target, "platform_tags": target["tags"], "architecture": target["architecture"],
         "system_python": data["system_python"], "node": data["node"], "npm": {"version": data["npm"]},
-        "python_lock_sha256": digest(HERE / "requirements.lock"), "build_utc": datetime.now(timezone.utc).isoformat(),
+        "python_lock_sha256": versioned_digest(HERE / "requirements.lock"), "build_utc": datetime.now(timezone.utc).isoformat(),
         "provisioning_network": "qemu-user-firstboot-with-private-9p-cache"}
     validate_provenance_fields(metadata)
     atomic_json(image.with_suffix(".provenance.json"), metadata, 0o444)
@@ -613,7 +633,7 @@ def verify(base=None):
     if (metadata["source"] != SOURCE + ARCHIVE or metadata["source_sha256"] != ARCHIVE_SHA256
             or metadata["architecture"] != SOURCE_ARCHITECTURE
             or metadata["build_input_sha256"] != golden_build_input_sha256()
-            or metadata["python_lock_sha256"] != digest(HERE / "requirements.lock")):
+            or metadata["python_lock_sha256"] != versioned_digest(HERE / "requirements.lock")):
         raise ValueError("golden source/lock/input fingerprint incompatible; permanent bytes preserved")
     for path, key in ((base, "base_sha256"), (base.parent / "kali-packages.txt", "apt_package_manifest_sha256"),
                       (base.parent / "kali-python-packages.txt", "python_package_manifest_sha256")):
@@ -822,6 +842,9 @@ def build():
                 state = checkpoint(state, "prepared", {path.name: state["files"][path.name] for path in artifact_paths(image)})
             _commit_prepared(state)
     except BaseException as exc:
+        # The host log context is already closed here. Recovery validation must
+        # never pass that closed stream to qemu-img or any other subprocess.
+        BUILD_LOG = None
         if state is not None:
             path = DEST.parent / state["stage"] / "build-state.json"
             current = validate_state(read_json(path, private=True))

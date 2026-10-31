@@ -151,6 +151,44 @@ def test_generated_firstboot_and_every_separate_python_program_compile():
     b.preflight()
 
 
+def test_versioned_digest_does_not_require_runtime_artifact_ownership(monkeypatch):
+    b = load_builder()
+    lock = IMAGE / "requirements.lock"
+    expected = hashlib.sha256(lock.read_bytes()).hexdigest()
+    original = assets.safe
+
+    def reject_repository_input(path, **kwargs):
+        if Path(path).absolute() == lock.absolute():
+            raise AssertionError("repository inputs must not use runtime artifact ownership policy")
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(assets, "safe", reject_repository_input)
+    assert b.versioned_digest(lock) == expected
+
+
+def test_failure_revalidation_detaches_closed_host_log(vm, monkeypatch):
+    failed = False
+    original_validate = vm.b._validate_checkpoint
+
+    def fail_provenance(*args, **kwargs):
+        nonlocal failed
+        failed = True
+        raise RuntimeError("synthetic post-manifest failure")
+
+    def validate(state):
+        if failed:
+            assert vm.b.BUILD_LOG is None
+        return original_validate(state)
+
+    monkeypatch.setattr(vm.b, "provenance", fail_provenance)
+    monkeypatch.setattr(vm.b, "_validate_checkpoint", validate)
+    with pytest.raises(RuntimeError, match="synthetic post-manifest failure"):
+        vm.b.build()
+    state = vm.state()
+    assert state["phase"] == "manifests_collected"
+    assert "checkpoint_reusable=true" in state["error"]
+
+
 def test_runtime_imports_and_direct_packaging_dependency_are_locked(monkeypatch):
     b = load_builder()
     value = golden_lock.check()
