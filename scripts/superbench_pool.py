@@ -2287,7 +2287,7 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 3
+PIP_PLAN_SCHEMA = 4
 
 
 def _target_fingerprint(target):
@@ -2298,7 +2298,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-core-metadata-v1',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-core-metadata-v2-conflict-directed',
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2390,21 +2390,33 @@ def _release_artifacts(name,version,files,target):
                 for _,filename,item in sources])
 
 
-def _candidate_versions(pool,name,requirements,constraints,target):
-    Requirement,_,Version,InvalidVersion,_=_packaging_symbols()
+def _registry_release_candidates(name,target,cache=None):
+    """Cache target-compatible release artifacts independently of constraints."""
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    target=_coerce_target(target)
+    cache_key=(_normalized_package_name(name),_target_fingerprint(target))
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(name,safe='')+'/json')
     releases=project.get('releases')
     if not isinstance(releases,dict):raise RuntimeError('PyPI project has no releases: '+name)
-    candidates=[]
+    result=[]
     for text,files in releases.items():
         try:version=Version(text)
         except InvalidVersion:continue
-        if any(req.specifier and not req.specifier.contains(version,prereleases=None)
-               for req in [*requirements,*constraints]):continue
         artifacts=_release_artifacts(name,text,files,target)
-        if artifacts:candidates.append((version,artifacts[0]))
+        if artifacts:result.append((version,artifacts[0]))
+    result=tuple(sorted(result,key=lambda row:row[0]))
+    if cache is not None:cache[cache_key]=result
+    return result
+
+
+def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None):
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    candidates=[row for row in _registry_release_candidates(name,target,release_cache)
+                if all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
+                       for req in [*requirements,*constraints])]
     if not candidates:return []
-    candidates.sort(key=lambda row:row[0])
     cached=set()
     for text in _cached_python_versions(pool,name):
         try:cached.add(Version(text))
@@ -2423,11 +2435,15 @@ def _candidate_versions(pool,name,requirements,constraints,target):
     if lone_lower is not None:
         try:lower=Version(lone_lower.version)
         except InvalidVersion as exc:raise RuntimeError('invalid inclusive lower-bound requirement') from exc
-        exact=[row[1] for row in candidates if row[0]==lower]
+        exact=[row for row in candidates if row[0]==lower]
         if not exact:
             raise RuntimeError('inclusive lower-bound requirement requires exact release '
                                +lone_lower.version+': '+name)
-        return exact
+        # Keep the benchmark's historical lower-bound preference, but do not
+        # discard the rest of the legal domain. Later versions are deterministic
+        # conflict-recovery candidates instead of being silently unreachable.
+        later=[row for row in reversed(candidates) if row[0]!=lower]
+        return [row[1] for row in [*exact,*later]]
     return [row[1] for row in reversed(candidates)]
 
 
@@ -2449,8 +2465,16 @@ def _wheel_core_metadata(path):
 
 
 def _candidate_metadata(pool,candidate,key,target,cache):
-    identity=(candidate['kind'],_normalized_package_name(candidate['name']),candidate['version'],candidate['filename'])
-    if identity in cache:return cache[identity]
+    identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
+              candidate['version'],candidate['filename'])
+    if identity in cache:
+        record=cache[identity]
+        artifact=pool.objects/record['sha256'][:2]/record['sha256']
+        if artifact.is_symlink() or not artifact.is_file():
+            raise RuntimeError('cached resolver metadata lost its content-addressed artifact')
+        category='python-source' if record['kind']=='sdist' else 'python'
+        pool.reference(record['sha256'],category,key,artifact.stat().st_size)
+        return record
     item=candidate['item'];sha=str((item.get('digests') or {}).get('sha256',''));url=item.get('url')
     if candidate['kind']=='wheel':
         actual=pool.download(url,'python',key,sha=sha)
@@ -2477,76 +2501,163 @@ def _candidate_satisfies(candidate,requirements,constraints):
                for req in [*requirements,*constraints])
 
 
-def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False):
-    """Resolve PyPI using only signed index/core metadata and archive bytes.
+def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None):
+    """Resolve PyPI with propagation and conflict-directed backjumping.
 
-    No setup.py, PEP 517 backend, task script or package code executes on the
-    execution host.  Source distributions are inspected as data; genuinely
-    dynamic metadata fails closed for isolated target preparation instead of
-    being executed by the fetcher.
+    The solver never executes package code. Candidate metadata comes only from
+    compatible wheels or statically inspected source distributions. Requirements
+    carry the selected packages that caused them, allowing an impossible branch
+    to jump directly to a relevant decision instead of enumerating unrelated
+    version combinations.
     """
     target=_coerce_target(target);constraint_map=_constraint_map(constraints,target)
     roots=[]
     for raw in sorted(set(reqs)):
         req=_parse_registry_requirement(raw)
-        if _marker_active(req,target):roots.append(req)
+        if _marker_active(req,target):roots.append((req,frozenset()))
     if not roots:return []
-    metadata_cache={};candidate_cache={}
+    resolver_cache={} if resolver_cache is None else resolver_cache
+    metadata_cache=resolver_cache.setdefault('metadata',{})
+    release_cache=resolver_cache.setdefault('releases',{})
+    candidate_cache={};failed_states=set()
+    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0}
+    target_key=_target_fingerprint(target)
 
-    def search(entries,selected,expanded,seen_entries):
-        requirements_by_name=defaultdict(list);extras_by_name=defaultdict(set)
-        for req in entries:
-            name=_normalized_package_name(req.name)
-            requirements_by_name[name].append(req);extras_by_name[name].update(req.extras)
-        for name,record in selected.items():
-            if not _candidate_satisfies(record,requirements_by_name.get(name,[]),constraint_map.get(name,[])):
-                return None
-        # If a later requirement activates new extras on an already-selected
-        # package, expand its immutable core metadata before selecting anything else.
-        for name in sorted(selected):
-            active=frozenset(extras_by_name.get(name,set()))
-            if expanded.get(name)==active:continue
-            record=selected[name]
-            raw_dependencies=record['requirements'] if not no_deps else []
-            additions=[];new_seen=set(seen_entries)
-            for raw in raw_dependencies:
-                dep=_parse_registry_requirement(raw)
-                if not _marker_active(dep,target,active):continue
-                marker=(name,str(dep))
-                if marker in new_seen:continue
-                new_seen.add(marker);additions.append(dep)
-            next_expanded=dict(expanded);next_expanded[name]=active
-            return search([*entries,*additions],selected,next_expanded,new_seen)
-        unresolved=sorted(name for name in requirements_by_name if name not in selected)
-        if not unresolved:return selected
-        # Resolve the most constrained name first to reduce backtracking while
-        # keeping the order deterministic.
-        choices=[]
-        for name in unresolved:
-            cache_key=(name,tuple(sorted(str(req) for req in requirements_by_name[name])),
-                       tuple(sorted(str(req) for req in constraint_map.get(name,[]))),_target_fingerprint(target))
-            if cache_key not in candidate_cache:
-                candidate_cache[cache_key]=_candidate_versions(
-                    pool,name,requirements_by_name[name],constraint_map.get(name,[]),target)
-            choices.append((len(candidate_cache[cache_key]),name,cache_key))
-        _,name,cache_key=min(choices)
-        candidates=candidate_cache[cache_key]
-        if not candidates:return None
-        failures=[]
-        for candidate in candidates:
-            try:record=_candidate_metadata(pool,candidate,key,target,metadata_cache)
-            except RuntimeError as exc:
-                failures.append(str(exc));continue
-            next_selected=dict(selected);next_selected[name]=record
-            result=search(entries,next_selected,expanded,seen_entries)
-            if result is not None:return result
-        if failures and len(failures)==len(candidates):
-            raise RuntimeError('all compatible artifacts require unsupported dynamic metadata for '+name+': '+failures[0])
-        return None
+    def grouped(entries):
+        by_name=defaultdict(dict);extras=defaultdict(set)
+        for req,causes in entries:
+            name=_normalized_package_name(req.name);token=str(req)
+            previous=by_name[name].get(token)
+            combined=frozenset(causes if previous is None else previous[1]|causes)
+            by_name[name][token]=(req,combined);extras[name].update(req.extras)
+        rows={name:tuple(value for _,value in sorted(bucket.items()))
+              for name,bucket in by_name.items()}
+        return rows,extras
 
-    result=search(roots,{}, {}, set())
+    def causes(rows):
+        result=set()
+        for _req,origin in rows:result.update(origin)
+        return frozenset(result)
+
+    def state_key(requirements_by_name,selected,expanded):
+        requirements=tuple((name,tuple(str(row[0]) for row in rows))
+                           for name,rows in sorted(requirements_by_name.items()))
+        assignments=tuple((name,record['kind'],record['version'],record['filename'])
+                          for name,record in sorted(selected.items()))
+        extras=tuple((name,tuple(sorted(values))) for name,values in sorted(expanded.items()))
+        return requirements,assignments,extras
+
+    def domain(name,rows):
+        requirements=[row[0] for row in rows]
+        cache_key=(name,tuple(str(req) for req in requirements),
+                   tuple(sorted(str(req) for req in constraint_map.get(name,[]))),target_key)
+        if cache_key not in candidate_cache:
+            candidate_cache[cache_key]=_candidate_versions(
+                pool,name,requirements,constraint_map.get(name,[]),target,
+                release_cache=release_cache)
+        return candidate_cache[cache_key]
+
+    def search(entries,selected,expanded):
+        entries=tuple(entries);selected=dict(selected);expanded=dict(expanded)
+        while True:
+            requirements_by_name,extras_by_name=grouped(entries)
+            current_state=state_key(requirements_by_name,selected,expanded)
+            if current_state in failed_states:
+                stats['memo_hits']+=1
+                return None,frozenset(selected),'memoized unsatisfiable resolver state'
+
+            # Constraint propagation against assignments already made.
+            for name,record in sorted(selected.items()):
+                rows=requirements_by_name.get(name,())
+                requirements=[row[0] for row in rows]
+                if not _candidate_satisfies(record,requirements,constraint_map.get(name,[])):
+                    conflict=frozenset({name})|causes(rows)
+                    failed_states.add(current_state)
+                    detail=('selected '+name+'=='+record['version']+' violates requirements '
+                            +repr(sorted(str(req) for req in requirements))+' constraints '
+                            +repr(sorted(str(req) for req in constraint_map.get(name,[]))))
+                    return None,conflict,detail
+
+            # Expand every selected package whose active extras changed. Doing
+            # all deterministic propagation in one frame avoids recursive churn.
+            additions=[];next_expanded=dict(expanded)
+            for name in sorted(selected):
+                active=frozenset(extras_by_name.get(name,set()))
+                if expanded.get(name)==active:continue
+                rows=requirements_by_name.get(name,())
+                origin=frozenset({name})|causes(rows)
+                raw_dependencies=selected[name]['requirements'] if not no_deps else []
+                for raw in raw_dependencies:
+                    dep=_parse_registry_requirement(raw)
+                    if _marker_active(dep,target,active):additions.append((dep,origin))
+                next_expanded[name]=active
+            if additions or next_expanded!=expanded:
+                entries=(*entries,*additions);expanded=next_expanded
+                stats['propagations']+=len(additions)
+                continue
+
+            unresolved=sorted(name for name in requirements_by_name if name not in selected)
+            if not unresolved:return selected,frozenset(),None
+
+            choices=[]
+            for name in unresolved:
+                rows=requirements_by_name[name];candidates=domain(name,rows)
+                if not candidates:
+                    failed_states.add(current_state)
+                    conflict=causes(rows)
+                    detail=('no compatible release for '+name+' under requirements '
+                            +repr([str(row[0]) for row in rows])+' constraints '
+                            +repr(sorted(str(req) for req in constraint_map.get(name,[]))))
+                    return None,conflict,detail
+                choices.append((len(candidates),name,candidates,rows))
+            count,name,candidates,rows=min(choices,key=lambda row:(row[0],row[1]))
+
+            # A singleton domain is forced; propagate it without creating a
+            # branch level. This is the dependency-solver equivalent of unit
+            # propagation in a SAT solver.
+            if count==1:
+                try:record=_candidate_metadata(pool,candidates[0],key,target,metadata_cache)
+                except RuntimeError as exc:
+                    failed_states.add(current_state)
+                    raise RuntimeError('only compatible artifact for '+name+' has unusable metadata: '+str(exc)) from exc
+                selected[name]=record;stats['propagations']+=1
+                continue
+
+            branch_causes=causes(rows);combined_conflict=set();metadata_failures=[];last_detail=None
+            for index,candidate in enumerate(candidates,1):
+                stats['decisions']+=1
+                print(f"[pool] resolver {key}: decision {stats['decisions']} "
+                      f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
+                      f"selected={len(selected)}",flush=True)
+                try:record=_candidate_metadata(pool,candidate,key,target,metadata_cache)
+                except RuntimeError as exc:
+                    metadata_failures.append(str(exc));continue
+                next_selected=dict(selected);next_selected[name]=record
+                result,conflict,detail=search(entries,next_selected,expanded)
+                if result is not None:return result,frozenset(),None
+                last_detail=detail
+                if name not in conflict:
+                    stats['backjumps']+=1
+                    failed_states.add(current_state)
+                    return None,conflict,detail
+                combined_conflict.update(conflict-{name})
+            if metadata_failures and len(metadata_failures)==len(candidates):
+                raise RuntimeError('all compatible artifacts require unsupported dynamic metadata for '
+                                   +name+': '+metadata_failures[0])
+            conflict=frozenset(combined_conflict|set(branch_causes))
+            failed_states.add(current_state)
+            detail=(last_detail or ('all compatible candidates exhausted for '+name))
+            return None,conflict,detail
+
+    result,conflict,detail=search(roots,{}, {})
     if result is None:
-        raise RuntimeError('deterministic registry dependency resolution is unsatisfiable')
+        summary=(f"solver decisions={stats['decisions']} propagations={stats['propagations']} "
+                 f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}")
+        raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
+                           +(detail or 'root constraints conflict')+'; '+summary)
+    print(f"[pool] resolver {key}: solved {len(result)} packages; "
+          f"decisions={stats['decisions']} propagations={stats['propagations']} "
+          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}",flush=True)
     return [result[name] for name in sorted(result)]
 
 
@@ -2576,31 +2687,33 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
     print('[pool] reused verified pip closure '+key,flush=True);return True
 
 
-def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False):
+def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cache=None):
     if not reqs:return
     target=_coerce_target(target);stage=pool.stage
     write_new(stage/'metadata'/('pip-'+key+'.txt'),'\n'.join(sorted(set(reqs)))+'\n')
-    packages=_resolve_registry_plan(pool,target,reqs,constraints,key,no_deps=no_deps)
+    packages=_resolve_registry_plan(pool,target,reqs,constraints,key,no_deps=no_deps,
+                                    resolver_cache=resolver_cache)
     if not packages:raise RuntimeError('registry dependency plan is empty')
     files=[{'filename':row['filename'],'sha256':row['sha256']} for row in packages if row['kind']=='wheel']
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':1,'name':'static-pypi-core-metadata','target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':2,'name':'static-pypi-core-metadata-v2-conflict-directed','target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
     write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps(plan,sort_keys=True,separators=(',',':')))
 
 
-def acquire_pip_group(pool,key,group):
+def acquire_pip_group(pool,key,group,*,resolver_cache=None):
     """Acquire one deduplicated logical closure; required failures are fatal."""
     target=_coerce_target(group['target'])
     if reuse_pip_plan(pool,target,group['requirements'],key,
                       constraints=group['constraints'],no_deps=group['no_deps']):return 'reused'
     try:
         pip_closure(pool,target,group['requirements'],key,
-                    constraints=group['constraints'],no_deps=group['no_deps'])
+                    constraints=group['constraints'],no_deps=group['no_deps'],
+                    resolver_cache=resolver_cache)
         return 'acquired'
     except RuntimeError as exc:
         if not group['required']:
@@ -2615,13 +2728,13 @@ def acquire_pip_group(pool,key,group):
 
 
 def acquire_pip_groups(pool, groups):
-    """Acquire all unique logical closures in deterministic fail-fast order."""
-    total=len(groups)
+    """Acquire all unique logical closures with shared immutable resolver caches."""
+    total=len(groups);resolver_cache={'metadata':{},'releases':{}}
     for index,(key,group) in enumerate(sorted(groups.items()),1):
         target=_coerce_target(group['target'])
         print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
               f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
-        acquire_pip_group(pool,key,group)
+        acquire_pip_group(pool,key,group,resolver_cache=resolver_cache)
 
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):

@@ -465,6 +465,94 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             self.assertEqual(plan['files'],[{'filename':'demo-1.0-py3-none-any.whl','sha256':sha}])
             self.assertEqual(calls,['https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl'])
 
+    def test_registry_lower_bound_backtracks_to_later_compatible_release(self):
+        target=fixture_target('3.10.14')
+        payloads={
+            ('root','1.0'):self.wheel_bytes('root','1.0',requires=('dep<2',)),
+            ('root','2.0'):self.wheel_bytes('root','2.0',requires=('dep>=2',)),
+            ('dep','1.0'):self.wheel_bytes('dep','1.0'),
+            ('dep','2.0'):self.wheel_bytes('dep','2.0'),
+        }
+        projects={};downloads={}
+        for (name,version),payload in payloads.items():
+            sha=hashlib.sha256(payload).hexdigest()
+            url=f'https://files.pythonhosted.org/packages/{name}-{version}-py3-none-any.whl'
+            row={'packagetype':'bdist_wheel','filename':f'{name}-{version}-py3-none-any.whl',
+                 'url':url,'digests':{'sha256':sha},'requires_python':'>=3.8'}
+            projects.setdefault(name,{'releases':{}})['releases'][version]=[row]
+            downloads[url]=payload
+        def metadata(url,**_kwargs):
+            name=url.split('/pypi/',1)[1].split('/',1)[0]
+            return projects[name]
+        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            payload=downloads[url];Path(path).write_bytes(payload)
+            actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=self.make_pool(stage)
+            with patch.object(pool,'_pypi_json',side_effect=metadata),patch.object(pool,'fetch',side_effect=fetch):
+                pool.pip_closure(candidate,target,{'root>=1.0','dep>=2.0'},'lower-bound')
+            plan=json.loads((stage/'metadata/pip-plan-lower-bound.json').read_text())
+        selected={row['name']:row['version'] for row in plan['packages']}
+        self.assertEqual(selected,{'dep':'2.0','root':'2.0'})
+        self.assertEqual(plan['plan_schema'],4)
+        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-core-metadata-v2-conflict-directed')
+
+    def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
+        target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]
+        requirements={name+'>=1' for name in noise}|{'conflict>=1'}
+        calls=[]
+        def candidate(name,version):
+            return {'kind':'wheel','name':name,'version':str(version),
+                    'filename':f'{name}-{version}-py3-none-any.whl','item':{}}
+        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None):
+            if name=='conflict':return [candidate(name,index) for index in range(1,4)]
+            if name=='missing':return []
+            if name in noise:return [candidate(name,1),candidate(name,2)]
+            raise AssertionError('unexpected package '+name)
+        def metadata(_pool,item,_key,_target,_cache):
+            calls.append((item['name'],item['version']))
+            dependencies=['missing==1'] if item['name']=='conflict' else []
+            return {**item,'sha256':'a'*64,'url':'https://files.pythonhosted.org/fixture.whl',
+                    'requirements':dependencies,'provides_extra':[]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp))
+            with patch.object(pool,'_candidate_versions',side_effect=versions),                  patch.object(pool,'_candidate_metadata',side_effect=metadata),                  self.assertRaisesRegex(RuntimeError,'unsatisfiable'):
+                pool._resolve_registry_plan(candidate_pool,target,requirements,(),'backjump')
+        self.assertEqual(len(calls),len(noise)+3)
+        self.assertEqual(sum(name=='conflict' for name,_version in calls),3)
+        self.assertTrue(all(sum(name==noise_name for name,_version in calls)==1 for noise_name in noise))
+
+    def test_shared_resolver_cache_reuses_parsed_metadata_across_closures(self):
+        target=fixture_target('3.10.14')
+        payloads={
+            'root-a':self.wheel_bytes('root-a','1.0',requires=('shared==1.0',)),
+            'root-b':self.wheel_bytes('root-b','1.0',requires=('shared==1.0',)),
+            'shared':self.wheel_bytes('shared','1.0'),
+        }
+        projects={};downloads={}
+        for name,payload in payloads.items():
+            sha=hashlib.sha256(payload).hexdigest();filename=f"{name.replace('-', '_')}-1.0-py3-none-any.whl"
+            url=f'https://files.pythonhosted.org/packages/{filename}'
+            projects[name]={'releases':{'1.0':[{'packagetype':'bdist_wheel',
+                'filename':filename,'url':url,
+                'digests':{'sha256':sha},'requires_python':'>=3.8'}]}}
+            downloads[url]=payload
+        project_calls=[];metadata_reads=[];real_metadata=pool._wheel_core_metadata
+        def project(url,**_kwargs):
+            name=url.split('/pypi/',1)[1].split('/',1)[0];project_calls.append(name);return projects[name]
+        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            payload=downloads[url];Path(path).write_bytes(payload)
+            actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
+        def read_metadata(path):
+            metadata_reads.append(Path(path).name);return real_metadata(path)
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp));cache={'metadata':{},'releases':{}}
+            with patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
+                pool.pip_closure(candidate_pool,target,{'root-a==1.0'},'first',resolver_cache=cache)
+                pool.pip_closure(candidate_pool,target,{'root-b==1.0'},'second',resolver_cache=cache)
+        self.assertEqual(project_calls.count('shared'),1)
+        self.assertEqual(len(metadata_reads),3)
+
     def test_different_logical_plans_share_one_physical_cas_object(self):
         payload=self.wheel_bytes();project,sha=self.project(payload)
         with tempfile.TemporaryDirectory() as tmp:
