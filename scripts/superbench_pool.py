@@ -1430,6 +1430,45 @@ def _sed_substitution(expression, value, *, extended=False):
     raise RuntimeError('unsupported dependency-file sed expression: '+expression)
 
 
+def literal_echo_appends(command):
+    """Recognize only simple literal ``echo TEXT >> PATH`` shell commands.
+
+    POSIX-style shell separators must be tokenized before recognizing a
+    redirection. A regex over a whole compound recipe can otherwise join
+    distinct quoted arguments across ``; } >>`` and manufacture a dependency.
+    The non-POSIX lexer preserves quotes, distinguishing quoted control
+    operators (e.g. ``";"``) from actual shell syntax.
+    """
+    lexer=shlex.shlex(command,posix=False,punctuation_chars=';&|<>')
+    lexer.whitespace_split=True
+    lexer.commenters=''
+    try:tokens=list(lexer)
+    except ValueError as exc:
+        raise RuntimeError('invalid shell quoting in dependency-file recipe') from exc
+
+    separators={';','&&','||','|','&','|&','{','}'}
+    segment=[]
+    for token in [*tokens,';']:
+        if token not in separators:
+            segment.append(token)
+            continue
+        if len(segment)==4 and segment[0]=='echo' and segment[2]=='>>':
+            raw,raw_path=segment[1],segment[3]
+            if len(raw)>=2 and raw[0] in ('\"',"'") and raw[-1]==raw[0]:
+                if '\\' in raw:
+                    raise RuntimeError('escaped echo content cannot be resolved statically')
+                # Only literal, non-expanding shell strings are interpreted.
+                # Executing the recipe to evaluate expansions is forbidden.
+                if raw[0]=='\"' and any(char in raw for char in ('$', '`')):
+                    raise RuntimeError('dynamic echo content cannot be resolved statically')
+                parsed=shlex.split(raw,posix=True)
+                path_parts=shlex.split(raw_path,posix=True)
+                if len(parsed)!=1 or len(path_parts)!=1:
+                    raise RuntimeError('ambiguous literal echo append in dependency recipe')
+                yield parsed[0],path_parts[0]
+        segment=[]
+
+
 def transformed_source(repo, path, value, commands):
     """Apply literal recipe text edits generically, without repository branches.
 
@@ -1442,17 +1481,17 @@ def transformed_source(repo, path, value, commands):
     normalized=Path(path).as_posix().removeprefix('./')
     result=value
     sed_pattern=re.compile(r"\bsed\s+(?:(-E|--regexp-extended)\s+)?-i\s+(['\"])(.*?)\2\s+([^\s;]+)")
-    echo_pattern=re.compile(r"\becho\s+(['\"])(.*?)\1\s*>>\s*([^\s;]+)")
+
     for command in commands:
         for match in sed_pattern.finditer(command):
             target=Path(match.group(4)).as_posix().removeprefix('./')
             if target==normalized:
                 result=_sed_substitution(match.group(3),result,extended=bool(match.group(1)))
-        for match in echo_pattern.finditer(command):
-            target=Path(match.group(3)).as_posix().removeprefix('./')
+        for text,target_path in literal_echo_appends(command):
+            target=Path(target_path).as_posix().removeprefix('./')
             if target==normalized:
                 if result and not result.endswith('\n'):result+='\n'
-                result+=match.group(2)+'\n'
+                result+=text+'\n'
     return result
 
 

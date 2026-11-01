@@ -117,6 +117,51 @@ setup(install_requires=install_requires)
         self.assertEqual(constraints, set())
         self.assertEqual(vcs, {'git+https://github.com/timothycrosley/isort.git@c54b3dd#egg=isort'})
 
+    def test_compound_shell_echo_does_not_swallow_earlier_quote_or_group_redirection(self):
+        # Reproduce the exact recipe syntax retained in the pinned benchmark.
+        contract=json.loads((ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        commands={command for task in contract['tasks'].values()
+                  for command in task['repo_script_list']
+                  if '>> requirements/requirements.txt' in command and 'echo ' in command}
+        self.assertTrue(commands,'the real compound-shell fixture must be present')
+        original='omegaconf>=2.0\nantlr4-python3-runtime==4.8\n'
+        for command in commands:
+            with self.subTest(command=command):
+                transformed=pool.transformed_source('fixture','requirements/requirements.txt',
+                                                     original,[command])
+                self.assertEqual(transformed,original+'pip==24.0\n')
+                requirements,vcs,constraints=pool.parse_requirements(
+                    transformed,'requirements/requirements.txt',lambda _name,required=False: '')
+                self.assertEqual(requirements,{'omegaconf>=2.0',
+                                               'antlr4-python3-runtime==4.8','pip==24.0'})
+                self.assertFalse(vcs)
+                self.assertFalse(constraints)
+
+    def test_echo_append_shell_lexer_respects_quoted_operators_and_command_scope(self):
+        command=('echo ";" >> requirements.txt; '
+                 'echo "&&" >> requirements.txt; '
+                 '{ echo "ignored"; } >> requirements.txt; '
+                 'python -c \'print("echo fake >> requirements.txt")\'; '
+                 'echo "real" >> requirements.txt; '
+                 'echo "elsewhere" >> another.txt')
+        text=pool.transformed_source('fixture','requirements.txt','existing\n',[command])
+        self.assertEqual(text,'existing\n;\n&&\nreal\n')
+        another=pool.transformed_source('fixture','another.txt','',[command])
+        self.assertEqual(another,'elsewhere\n')
+
+    def test_echo_append_keeps_source_sed_transformation_independent(self):
+        command=('sed -i \'s|git://github.com|https://github.com|g\' requirements/dev.txt; '
+                 'echo "pip==24.0" >> requirements/requirements.txt')
+        self.assertEqual(pool.transformed_source('fixture','requirements/dev.txt',
+                         'git://github.com/example\n',[command]),'https://github.com/example\n')
+        self.assertEqual(pool.transformed_source('fixture','requirements/requirements.txt',
+                         'existing\n',[command]),'existing\npip==24.0\n')
+
+    def test_literal_echo_append_refuses_runtime_shell_expansion(self):
+        with self.assertRaisesRegex(RuntimeError,'dynamic echo content'):
+            pool.transformed_source('fixture','requirements.txt','',
+                                    ['echo "$DEPENDENCY" >> requirements.txt'])
+
     def test_pydantic_make_install_invocations_keep_order(self):
         commands = ['python -m pip install -U pip', 'pip install -r requirements/all.txt', 'pip install -e .']
         _, filenames, _, issues, _, _, steps = pool.pip_commands(commands)
