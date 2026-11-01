@@ -2722,7 +2722,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 9
+PIP_PLAN_SCHEMA = 10
+PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v8-pep592-historical-yank-when-no-active-candidates'
 
 
 def _pip_worker_controls():
@@ -2765,7 +2766,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':PIP_RESOLVER_POLICY,
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2857,11 +2858,15 @@ def _release_artifacts(name,version,files,target,*,allow_yanked=False):
                 for _,filename,item in sources])
 
 
-def _registry_release_candidates(name,target,cache=None):
-    """Cache target-compatible release artifacts independently of constraints."""
+def _registry_release_candidates(name,target,cache=None,*,allow_yanked=False):
+    """Cache target-compatible artifacts; distinguish active/yanked candidate sets.
+
+    Yanked versions are never considered while an active candidate meets the
+    actual target and constraints (PEP 592). Cache keys encode this policy.
+    """
     _,_,Version,InvalidVersion,_=_packaging_symbols()
     target=_coerce_target(target)
-    cache_key=(_normalized_package_name(name),_target_fingerprint(target))
+    cache_key=(_normalized_package_name(name),_target_fingerprint(target),bool(allow_yanked))
     def load():
         project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(name,safe='')+'/json')
         releases=project.get('releases')
@@ -2870,7 +2875,7 @@ def _registry_release_candidates(name,target,cache=None):
         for text,files in releases.items():
             try:version=Version(text)
             except InvalidVersion:continue
-            artifacts=_release_artifacts(name,text,files,target)
+            artifacts=_release_artifacts(name,text,files,target,allow_yanked=allow_yanked)
             if artifacts:result.append((version,artifacts[0]))
         return tuple(sorted(result,key=lambda row:row[0]))
     return _memo_get_or_compute(cache,cache_key,load)
@@ -2916,9 +2921,22 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
     exact=_exact_registry_pin(requirements,constraints)
     universe=(_registry_exact_release_candidate(name,exact,target,release_cache) if exact is not None
               else _registry_release_candidates(name,target,release_cache))
-    candidates=[row for row in universe
-                if all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
-                       for req in [*requirements,*constraints])]
+    def allowed(row):
+        return all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
+                   for req in [*requirements,*constraints])
+    candidates=[row for row in universe if allowed(row)]
+    if not candidates and exact is None:
+        # PEP 592 permits a historical yanked release *only if* no compatible
+        # active release satisfies these exact constraints and target tags.
+        # This is an explicit deterministic resolver policy, not a package-name
+        # exception, an unverified replacement dependency or a silent omission.
+        candidates=[row for row in _registry_release_candidates(
+            name,target,release_cache,allow_yanked=True)
+            if row[1]['item'].get('yanked') is True and allowed(row)]
+        if candidates:
+            print('[pool] WARNING: '+name+' has no compatible non-yanked PyPI release '
+                  'for this target and active constraints; selecting a withdrawn '
+                  'hash-addressed historical artifact (PEP 592)',flush=True)
     if not candidates:return []
     cached=set()
     preferred=(_cached_python_versions(pool,name) if preferred_versions is None
@@ -2992,6 +3010,16 @@ def _candidate_artifact_identity(candidate):
     return sha,url
 
 
+def _candidate_yank_provenance(candidate):
+    """Retain PyPI withdrawal status/reason in every immutable package plan."""
+    item=candidate['item']
+    if item.get('yanked') is not True:return {}
+    reason=item.get('yanked_reason')
+    if reason is not None and not isinstance(reason,str):
+        raise RuntimeError('invalid PyPI yanked reason metadata')
+    return {'yanked':True,'yanked_reason':reason or ''}
+
+
 def _materialize_candidate_metadata(pool,candidate,key,target,cache):
     """Download one chosen artifact and read its authoritative embedded metadata."""
     identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
@@ -3005,13 +3033,15 @@ def _materialize_candidate_metadata(pool,candidate,key,target,cache):
             return {'kind':'wheel','name':candidate['name'],'version':candidate['version'],
                     'filename':candidate['filename'],'sha256':actual,'url':url,
                     'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
-                    'provides_extra':sorted(set(extras))}
+                    'provides_extra':sorted(set(extras)),
+                    **_candidate_yank_provenance(candidate)}
         source=acquire_source_distribution(pool,candidate['name']+'=='+candidate['version'],key,target)
         if source['sha256']!=sha:
             raise RuntimeError('selected source distribution identity changed during resolution')
         return {'kind':'sdist','name':source['name'],'version':source['version'],
                 'filename':source['filename'],'sha256':source['sha256'],'url':source['url'],
-                'requirements':source['requirements'],'provides_extra':source['provides_extra']}
+                'requirements':source['requirements'],'provides_extra':source['provides_extra'],
+                **_candidate_yank_provenance(candidate)}
     record=_memo_get_or_compute(cache,identity,materialize)
     artifact=pool.objects/record['sha256'][:2]/record['sha256']
     if artifact.is_symlink() or not artifact.is_file():
@@ -3031,7 +3061,8 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
         if no_deps:
             return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
                     'filename':candidate['filename'],'sha256':sha,'url':url,
-                    'requirements':[],'provides_extra':[]}
+                    'requirements':[],'provides_extra':[],
+                    **_candidate_yank_provenance(candidate)}
         # PEP 658 metadata is artifact-specific and therefore authoritative for
         # the selected wheel. Exact-release JSON is only a compact fallback when
         # PyPI does not publish candidate-specific core metadata.
@@ -3074,7 +3105,8 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
         return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
                 'filename':candidate['filename'],'sha256':sha,'url':url,
                 'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
-                'provides_extra':sorted(set(extras or []))}
+                'provides_extra':sorted(set(extras or [])),
+                **_candidate_yank_provenance(candidate)}
     return _memo_get_or_compute(probe_cache,identity,probe)
 
 
@@ -3083,10 +3115,14 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None):
     def materialize(expected):
         candidate={'kind':expected['kind'],'name':expected['name'],'version':expected['version'],
                    'filename':expected['filename'],'item':{'url':expected['url'],
-                   'digests':{'sha256':expected['sha256']}}}
+                   'digests':{'sha256':expected['sha256']},
+                   'yanked':expected.get('yanked',False),
+                   'yanked_reason':expected.get('yanked_reason')}}
         actual=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
         if (sorted(actual['requirements'])!=sorted(expected['requirements'])
-                or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])):
+                or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])
+                or _candidate_yank_provenance(candidate)!={
+                    key:expected[key] for key in ('yanked','yanked_reason') if key in expected}):
             raise RuntimeError('PyPI release metadata differs from selected artifact metadata: '
                                +expected['name']+'=='+expected['version'])
         return actual
@@ -3398,7 +3434,7 @@ def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':7,'name':'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed','target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':8,'name':PIP_RESOLVER_POLICY,'target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}

@@ -611,6 +611,122 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         read.assert_called_once()
 
 
+
+    def test_yanked_only_historical_dependency_is_resolved_and_audited(self):
+        # An all-yanked project with no explicit pin is still reproducible;
+        # package names, artifact digests and versions are fixture-derived.
+        target=fixture_target('3.10.14')
+        payloads={v:self.wheel_bytes('historic-stubs',v) for v in ('1.0','1.1')}
+        releases={};downloads={}
+        for version,body in payloads.items():
+            sha=hashlib.sha256(body).hexdigest()
+            url=f'https://files.pythonhosted.org/packages/historic_stubs-{version}-py3-none-any.whl'
+            entry={'packagetype':'bdist_wheel',
+                   'filename':f'historic_stubs-{version}-py3-none-any.whl',
+                   'url':url,'digests':{'sha256':sha},
+                   'requires_python':'>=3.8','yanked':True,
+                   'yanked_reason':'upstream withdrew this historical stub'}
+            releases[version]=[entry];downloads[url]=body
+        def api(url,**_kwargs):
+            if url.endswith('/pypi/historic-stubs/json'):
+                return {'releases':releases}
+            version=url.split('/pypi/historic-stubs/',1)[1].removesuffix('/json')
+            return {'info':{'name':'historic-stubs','version':version,
+                            'requires_dist':[],'provides_extra':[]},
+                    'urls':releases[version]}
+        def fetch(url,path,*,sha=None,**kwargs):
+            body=downloads[url];self.assertEqual(hashlib.sha256(body).hexdigest(),sha)
+            Path(path).write_bytes(body);return hashlib.sha256(body).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);candidate=self.make_pool(root);output=io.StringIO()
+            with patch.object(pool,'_pypi_json',side_effect=api), \
+                 patch.object(pool,'fetch',side_effect=fetch), \
+                 contextlib.redirect_stdout(output):
+                pool.pip_closure(candidate,target,{'historic-stubs>=1'},'withdrawn')
+            plan=json.loads((root/'metadata/pip-plan-withdrawn.json').read_text())
+            self.assertEqual(plan['resolver_policy']['name'],pool.PIP_RESOLVER_POLICY)
+            self.assertEqual(plan['packages'][0]['version'],max(payloads,key=pool._packaging_symbols()[2]))
+            self.assertIs(plan['packages'][0]['yanked'],True)
+            self.assertEqual(plan['packages'][0]['yanked_reason'],
+                             'upstream withdrew this historical stub')
+            self.assertIn('WARNING',output.getvalue())
+
+    def test_active_release_wins_over_newer_yanked_version(self):
+        target=fixture_target('3.10.14')
+        project={};Requirement,_,_,_,_=pool._packaging_symbols()
+        for version,is_yanked in [('1.0',False),('2.0',True)]:
+            project[version]=[{'packagetype':'bdist_wheel',
+                'filename':f'example-{version}-py3-none-any.whl',
+                'url':f'https://files.pythonhosted.org/packages/example-{version}-py3-none-any.whl',
+                'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                'requires_python':'>=3.8','yanked':is_yanked}]
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value={'releases':project}):
+                result=pool._candidate_versions(candidate,'example',
+                    [Requirement('example>=1')],[],target)
+            self.assertEqual([r['version'] for r in result],['1.0'])
+
+    def test_yanked_candidate_requires_compatible_version_and_target(self):
+        target=fixture_target('3.10.14')
+        Requirement,_,_,_,_=pool._packaging_symbols()
+        row={'packagetype':'bdist_wheel','filename':'example-1.0-py3-none-any.whl',
+             'url':'https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl',
+             'digests':{'sha256':hashlib.sha256(b'candidate').hexdigest()},
+             'requires_python':'>=3.8','yanked':True}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value={'releases':{'1.0':[row]}}):
+                result=pool._candidate_versions(candidate,'example',
+                    [Requirement('example>=2')],[],target)
+            self.assertEqual(result,[])
+            incompatible={**row,'requires_python':'>=999'}
+            with patch.object(pool,'_pypi_json',return_value={'releases':{'1.0':[incompatible]}}):
+                result=pool._candidate_versions(candidate,'example',
+                    [Requirement('example>=1')],[],target)
+            self.assertEqual(result,[])
+
+    def test_new_resolver_policy_salvages_cas_without_reusing_stale_pip_decisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);old=root/'old';fresh=root/'fresh'
+            for stage in (old,fresh):
+                (stage/'objects/sha256').mkdir(parents=True)
+                (stage/'metadata').mkdir()
+                (stage/'STAGING').write_text('retained stage')
+            archive=b'completed Conda content from previous download'
+            sha=hashlib.sha256(archive).hexdigest()
+            file=old/'objects/sha256'/sha[:2]/sha
+            file.parent.mkdir(parents=True);file.write_bytes(archive)
+            previous_plan={'artifact_model':pool.PIP_ARTIFACT_MODEL,
+                'plan_schema':pool.PIP_PLAN_SCHEMA-1,
+                'packages':[{'kind':'wheel','name':'fixture','version':'1.0',
+                             'filename':'fixture-1.0-py3-none-any.whl','sha256':sha}]}
+            (old/'metadata/pip-plan-stale.json').write_text(json.dumps(previous_plan))
+            recovered=pool.salvage_verified_stage(old,fresh,conda_artifacts={sha:{}})
+            materialized=fresh/'objects/sha256'/sha[:2]/sha
+            self.assertIn(sha,recovered)
+            self.assertTrue(materialized.samefile(file))
+            self.assertEqual(materialized.read_bytes(),archive)
+            self.assertFalse((fresh/'metadata/pip-plan-stale.json').exists())
+            self.assertTrue((old/'metadata/pip-plan-stale.json').exists())
+
+    def test_yanked_range_can_resolve_only_when_active_version_violates_constraint(self):
+        target=fixture_target('3.10.14');Requirement,_,_,_,_=pool._packaging_symbols()
+        def entry(version,withdrawn):
+            return {'packagetype':'bdist_wheel',
+                'filename':f'example-{version}-py3-none-any.whl',
+                'url':f'https://files.pythonhosted.org/packages/example-{version}-py3-none-any.whl',
+                'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
+                'requires_python':'>=3.8','yanked':withdrawn}
+        projects={'releases':{'1.0':[entry('1.0',True)],'2.0':[entry('2.0',False)]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=projects):
+                chosen=pool._candidate_versions(candidate,'example',
+                    [Requirement('example>=1')],[Requirement('example<2')],target)
+            self.assertEqual([c['version'] for c in chosen],['1.0'])
+            self.assertIs(chosen[0]['item']['yanked'],True)
+
     def test_registry_lower_bound_prefers_latest_compatible_release(self):
         target=fixture_target('3.10.14')
         payloads={
@@ -652,8 +768,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',
             'https://files.pythonhosted.org/packages/dep-1.0-py3-none-any.whl'})
         self.assertEqual(len(calls),2)
-        self.assertEqual(plan['plan_schema'],9)
-        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed')
+        self.assertEqual(plan['plan_schema'],pool.PIP_PLAN_SCHEMA)
+        self.assertEqual(plan['resolver_policy']['name'],pool.PIP_RESOLVER_POLICY)
 
 
     def test_registry_lower_bound_skips_yanked_exact_release(self):
