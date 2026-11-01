@@ -1674,18 +1674,34 @@ setup(version=dynamic_version(), **setup_args)
         self.assertTrue(steps[0]['no_deps'])
 
     def test_version_refs_are_derived_from_source_metadata_not_repository_name(self):
-        calls=[]
+        mirror=Path('/tmp/mirror')
+        repo='example/project'
+        pinned='b'*40
         def fake(args,**kwargs):
-            calls.append([str(x) for x in args])
-            if 'show-ref' in args:return ('a'*40)+' refs/tags/v1\n'
-            return ''
-        with patch.object(pool,'_source_requires_version_refs',return_value=True), \
-             patch.object(pool,'invoke',side_effect=fake):
-            refs=pool.ensure_version_refs(Path('/tmp/mirror'),'example/project',{'b'*40})
+            if 'show-ref' not in args:
+                raise AssertionError('unexpected Git command '+str(args))
+            return ('a'*40)+' refs/tags/v1\n'
+        # Freeze tags through the actual _git_fetch entry point. Invoking a
+        # real Git subprocess against a fabricated mirror is not a unit test.
+        with patch.object(pool,'_source_requires_version_refs',return_value=True) as needs_refs, \
+             patch.object(pool,'_git_fetch') as fetch_tags, \
+             patch.object(pool,'invoke',side_effect=fake) as invoke_git:
+            refs=pool.ensure_version_refs(mirror,repo,{pinned})
         self.assertEqual(refs,{'refs/tags/v1':'a'*40})
-        self.assertTrue(any('+refs/tags/*:refs/tags/*' in row for row in calls))
+        needs_refs.assert_called_once_with(mirror,pinned)
+        fetch_tags.assert_called_once_with(
+            mirror,repo,['+refs/tags/*:refs/tags/*'],explicit_tags=True)
+        invoke_git.assert_called_once_with(
+            ['git','--git-dir',mirror,'show-ref','--tags','-d'],capture=True)
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertNotIn("repo in {'bokeh/bokeh','pandas-dev/pandas'}",source)
+
+    def test_version_refs_skip_git_network_when_source_does_not_need_tags(self):
+        with patch.object(pool,'_source_requires_version_refs',return_value=False), \
+             patch.object(pool,'_git_fetch',side_effect=AssertionError('unexpected Git network')), \
+             patch.object(pool,'invoke',side_effect=AssertionError('unexpected Git command')):
+            self.assertEqual(pool.ensure_version_refs(
+                Path('/tmp/mirror'),'example/project',{'b'*40}),{})
 
     def test_published_contract_cannot_be_empty_cas(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1945,7 +1961,16 @@ def run_setup():
             self.assertEqual(pool._pip_worker_controls(),(configured,configured))
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertIn("config/preparation.toml",source)
-        self.assertNotIn("os.sched_getaffinity(0)",source)
+        # HTTP acquisition capacity is configured independently from CPU affinity.
+        # Git mirror acquisition legitimately consults affinity for pack inflation,
+        # so a global source-string prohibition is incorrect.
+        import inspect
+        io_functions=(pool._acquisition_workers,pool._pip_worker_controls,
+                      pool._metadata_prefetch_width,pool.acquire_locked_conda,
+                      pool.acquire_pip_groups,pool._download_sri_closure)
+        for function in io_functions:
+            with self.subTest(function=function.__name__):
+                self.assertNotIn('sched_getaffinity',inspect.getsource(function))
         self.assertNotIn("CONDA_LOCK_WORKERS",source)
         self.assertIn("_download_sri_closure(pool,npm_urls,'npm')",source)
         self.assertIn("_acquire_git_mirrors(stage,submodule_commits,label='git-extra')",source)
