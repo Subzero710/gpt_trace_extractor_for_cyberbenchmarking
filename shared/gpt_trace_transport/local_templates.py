@@ -251,6 +251,31 @@ def compatibility(base, source_root=ROOT, *, hasher=digest):
             "golden_provenance_sha256": hasher(provenance_path), "golden_provenance": provenance}
 
 
+def golden_dependency_identity(base, source_root=ROOT):
+    """Return only immutable golden fields that affect dependency acquisition."""
+    base, source_root = Path(base), Path(source_root)
+    provenance_path = safe(base.with_suffix(".provenance.json"), immutable=True)
+    provenance = json.loads(provenance_path.read_bytes())
+    builder = golden_builder(source_root)
+    builder.validate_provenance_fields(provenance)
+    if (provenance.get("source"), provenance.get("source_sha256")) != (
+            builder.SOURCE + builder.ARCHIVE, builder.ARCHIVE_SHA256):
+        raise ValueError("installed Kali golden source provenance is not the trusted immutable pin")
+    target_path = source_root / RUNTIME / "target_environment.py"
+    spec = importlib.util.spec_from_file_location("gpt_trace_dependency_target_environment", target_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("target environment model is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    target = module.guest_target(provenance)
+    npm = provenance.get("npm")
+    if not isinstance(npm, dict) or not isinstance(npm.get("version"), str) or not npm["version"]:
+        raise ValueError("installed Kali npm provenance is missing")
+    return {"schema": 1, "target_environment": target.as_dict(), "npm_version": npm["version"]}
+
+
 def seal_validation(folder, expected):
     """Bind all actual built bytes to the verified local recipe before sealing."""
     folder = Path(folder)

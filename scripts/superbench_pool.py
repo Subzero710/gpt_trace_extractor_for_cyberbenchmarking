@@ -56,30 +56,36 @@ SHA = re.compile(r'[a-f0-9]{64}\Z')
 KALI_SIGNING_FPR = '827C8569F2518CC677FECA1AED65462EC8D5E4C5'
 MAX_SOURCE = 12 * 1024 * 1024
 MAX_VCS_CLOSURE = 256
-def _golden_provenance():
-    config = Path(__file__).resolve().parents[1] / 'config/distributed.toml'
+def _golden_dependency():
+    path = Path(__file__).resolve().parents[1] / 'golden-dependency.json'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('sealed Kali dependency identity is required for target dependency resolution')
     try:
-        import tomllib
-        payload = tomllib.loads(config.read_text(encoding='utf-8'))
-        base = Path(payload['paths']['base_image'])
-        provenance = base.with_suffix('.provenance.json')
-        return json.loads(provenance.read_bytes()) if provenance.is_file() else {}
-    except (OSError, KeyError, TypeError, ValueError):
-        return {}
+        value = json.loads(path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError('sealed Kali dependency identity is invalid') from exc
+    target = value.get('target_environment') if isinstance(value, dict) else None
+    if (not isinstance(value, dict)
+            or set(value) != {'schema', 'target_environment', 'npm_version'}
+            or value.get('schema') != 1 or not isinstance(target, dict)):
+        raise RuntimeError('sealed Kali dependency identity is invalid')
+    return value
 
 
 def _golden_system_python():
-    value = _golden_provenance().get('system_python')
-    if not isinstance(value, dict) or not re.fullmatch(r'\d+\.\d+\.\d+', str(value.get('full_version', ''))):
-        raise RuntimeError('verified Kali provenance lacks the full system Python identity')
-    return str(value['full_version'])
+    target = _golden_dependency()['target_environment']
+    markers = target.get('markers') if isinstance(target, dict) else None
+    value = markers.get('python_full_version') if isinstance(markers, dict) else None
+    if not isinstance(value, str) or not re.fullmatch(r'\d+\.\d+\.\d+', value):
+        raise RuntimeError('verified Kali dependency identity lacks the full system Python identity')
+    return value
 
 
 def _pinned_npm_version():
-    value = _golden_provenance().get('npm')
-    if not isinstance(value, dict) or not re.fullmatch(r'\d+\.\d+\.\d+', str(value.get('version', ''))):
-        raise RuntimeError('verified Kali provenance lacks the pinned npm tool identity')
-    return str(value['version'])
+    value = _golden_dependency().get('npm_version')
+    if not isinstance(value, str) or not re.fullmatch(r'v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?', value):
+        raise RuntimeError('verified Kali dependency identity lacks the pinned npm tool identity')
+    return value
 DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
 DOWNLOAD_RETRY_BACKOFF = (1, 2, 4, 8)
@@ -1930,12 +1936,15 @@ def _target_environment_module():
 
 @functools.lru_cache(maxsize=1)
 def _golden_target():
-    provenance=_golden_provenance()
-    if not provenance:
-        raise RuntimeError('verified Kali provenance is required for target dependency resolution')
-    try:return _target_environment_module().guest_target(provenance)
+    dependency=_golden_dependency()
+    try:
+        target=_target_environment_module().TargetEnvironment.from_dict(
+            dependency['target_environment'])
+        if target.source!='verified-target-interpreter':
+            raise ValueError('golden target source differs')
+        return target
     except (KeyError,TypeError,ValueError) as exc:
-        raise RuntimeError('verified Kali target environment provenance is invalid') from exc
+        raise RuntimeError('verified Kali target environment identity is invalid') from exc
 
 
 def _locked_target(lock, env_hash, transaction_key):
@@ -3049,6 +3058,11 @@ def main(argv=None):
         raise RuntimeError('pinned SWE-Gym Lite contract changed')
     contract=json.loads((adapter/'contract.json').read_bytes())
     conda_lock,conda_lock_sha256=load_conda_lock(adapter,pins,contract)
+    # Validate the sealed execution-host target identity before creating a stage
+    # or issuing any network request. Missing provenance can never waste a full
+    # Conda/Git acquisition again.
+    golden_target=_golden_target()
+    _pinned_npm_version()
     tasks=contract['tasks'];environments=contract['environments']
     if not tasks or not environments or not {r['repo'] for r in tasks.values()}:
         raise RuntimeError('unexpected SWE-Gym Lite coverage')
@@ -3085,7 +3099,7 @@ def main(argv=None):
     envplan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set);environment_pip_target={}
     conda_transaction_plan,_locked_base_python=acquire_locked_conda(pool,conda_lock)
-    target_model=_target_environment_module();golden_target=_golden_target()
+    target_model=_target_environment_module()
     transaction_targets=target_model.locked_conda_targets(conda_lock,base_target=golden_target)
     base_target_by_env={};final_target_by_env={}
     for env,row in conda_lock['environments'].items():

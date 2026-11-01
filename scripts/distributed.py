@@ -420,9 +420,26 @@ def preparation_fetch(cfg):
             or identified.get("deployment") != deployment or not isinstance(identified.get("compatibility"), dict)):
         raise RuntimeError("execution host preparation identity differs")
     recipe = pool_contract(ROOT)
-    if identified["compatibility"] != recipe:
+    compatibility = identified["compatibility"]
+    if (set(compatibility) != set(recipe) | {"golden_dependency"}
+            or any(compatibility.get(key) != value for key, value in recipe.items())):
         raise RuntimeError("execution host pool contract differs from control host")
-    if hashlib.sha256(json.dumps(identified["compatibility"], sort_keys=True, separators=(",", ":"),
+    golden_dependency = compatibility["golden_dependency"]
+    target = golden_dependency.get("target_environment") if isinstance(golden_dependency, dict) else None
+    markers = target.get("markers") if isinstance(target, dict) else None
+    if (not isinstance(golden_dependency, dict)
+            or set(golden_dependency) != {"schema", "target_environment", "npm_version"}
+            or golden_dependency.get("schema") != 1
+            or not isinstance(target, dict) or target.get("schema") != 2
+            or target.get("source") != "verified-target-interpreter"
+            or not isinstance(target.get("tags"), list) or not target["tags"]
+            or not isinstance(markers, dict)
+            or re.fullmatch(r"\d+\.\d+\.\d+", str(markers.get("python_full_version", ""))) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(target.get("interpreter_sha256", ""))) is None
+            or re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?",
+                            str(golden_dependency.get("npm_version", ""))) is None):
+        raise RuntimeError("execution host golden dependency identity is invalid")
+    if hashlib.sha256(json.dumps(compatibility, sort_keys=True, separators=(",", ":"),
             ensure_ascii=False, allow_nan=False).encode()).hexdigest() != operation_id:
         raise RuntimeError("execution host preparation content identity differs")
     directory = ROOT / "state/distributed"

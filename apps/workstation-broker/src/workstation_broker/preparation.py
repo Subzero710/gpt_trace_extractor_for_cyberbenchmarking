@@ -23,8 +23,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
-    compatibility, file_signature, safe, source_contract, verify_local_validation,
-    verify_manifest, activate)
+    compatibility, file_signature, golden_dependency_identity, safe, source_contract,
+    verify_local_validation, verify_manifest, activate)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
 
@@ -106,8 +106,8 @@ def trusted_fetch_python():
     return interpreter
 
 
-def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None):
-    """Copy exact worker inputs into a unique per-attempt readonly snapshot."""
+def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, golden_dependency=None):
+    """Copy exact worker inputs plus the verified dependency target into a sealed snapshot."""
     repository = manager.source_root.resolve(strict=True)
     if operation_id is None or attempt is None:
         snapshot = pool_root / "source"
@@ -128,6 +128,13 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None):
         target.write_bytes(source.read_bytes())
         os.chown(target, 0, 0)
         target.chmod(0o444)
+    dependency = golden_dependency_identity(manager.base, manager.source_root) if golden_dependency is None else golden_dependency
+    if dependency != golden_dependency_identity(manager.base, manager.source_root):
+        raise RuntimeError("golden dependency identity changed before fetch source staging")
+    target = snapshot / "golden-dependency.json"
+    target.write_bytes(canonical(dependency) + b"\n")
+    os.chown(target, 0, 0)
+    target.chmod(0o444)
     for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
                             key=lambda p: len(p.parts), reverse=True):
         os.chown(directory, 0, 0)
@@ -338,13 +345,17 @@ class PreparationManager:
         finally: os.close(fd)
 
     def expected(self):
-        # Different identity from legacy QCOW2 preparation. A prior template
-        # generation can NEVER be mistaken for a finished dependency pool.
+        # Control/execution agree on versioned acquisition sources. The execution
+        # host then binds the operation to the exact immutable golden target/npm
+        # identity that changes dependency resolution.
         from gpt_trace_transport.local_templates import pool_contract
-        return pool_contract(self.source_root)
+        return {**pool_contract(self.source_root),
+                "golden_dependency": golden_dependency_identity(self.base, self.source_root)}
 
     def probe(self, payload):
-        if set(payload) != {"source_contract"} or payload["source_contract"] != self.expected():
+        from gpt_trace_transport.local_templates import pool_contract
+        source_contract = pool_contract(self.source_root)
+        if set(payload) != {"source_contract"} or payload["source_contract"] != source_contract:
             raise ValueError("control/execution pinned preparation sources differ")
         expected = self.expected()
         return {"operation_id": hashlib.sha256(canonical(expected)).hexdigest(),
@@ -705,7 +716,14 @@ class PreparationManager:
 # Select only a terminal, cryptographically compatible predecessor. Neither
 # state nor original stage is removed; the new worker verifies reused bytes.
 def retained_dependency_stage(manager, pool_root, state, account):
-    wanted={k:v for k,v in state['compatibility'].items() if k!='fetcher_sha256'}
+    # Recovery copies only SHA-verified CAS bytes and mutable Git mirrors into a
+    # fresh stage. Target-specific logical plans are separately keyed by their
+    # exact serialized target, so old bytes remain safe to salvage when the
+    # fetcher or golden dependency identity changes.
+    def salvage_identity(value):
+        return {k:v for k,v in value.items()
+                if k not in {'fetcher_sha256', 'golden_dependency'}}
+    wanted=salvage_identity(state['compatibility'])
     candidates=[]
     for entry in manager.root.iterdir():
         if not entry.is_dir() or entry.is_symlink() or SHA.fullmatch(entry.name) is None:
@@ -713,7 +731,7 @@ def retained_dependency_stage(manager, pool_root, state, account):
         previous=manager._read(entry.name)
         if (previous is None or previous['phase'] not in TERMINAL or
                 previous.get('result') is not None or previous.get('publication_verified') or
-                {k:v for k,v in previous['compatibility'].items() if k!='fetcher_sha256'}!=wanted):
+                salvage_identity(previous['compatibility'])!=wanted):
             continue
         # No process/cgroup/source container from a past operation may write
         # into the stage while it is read for recovery.
@@ -805,9 +823,14 @@ def _prepare(manager, state):
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
     interpreter = trusted_fetch_python()
+    current = manager.expected()
+    if state['compatibility'] != current:
+        raise RuntimeError("preparation dependency identity changed after admission")
     # The legacy call shape ``stage_fetch_sources(manager, root)`` remains a
     # documented read-only fixture; production passes the durable identity.
-    source_root, program = stage_fetch_sources(manager, root, state['operation_id'], state['attempt'])
+    source_root, program = stage_fetch_sources(
+        manager, root, state['operation_id'], state['attempt'],
+        state['compatibility']['golden_dependency'])
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
     # unprivileged downloader or any of its subprocesses. No proxy/auth env.

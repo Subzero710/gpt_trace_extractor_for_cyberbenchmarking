@@ -49,7 +49,14 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
     _source_tree(private)
     pool = tmp_path / "dependency-pool"
     pool.mkdir()
-    source_root, program = jobs.stage_fetch_sources(SimpleNamespace(source_root=private), pool)
+    dependency = {"schema": 1, "target_environment": {"schema": 2}, "npm_version": "10.9.9"}
+    manager = SimpleNamespace(source_root=private, base=tmp_path / "golden.qcow2")
+    original_identity = jobs.golden_dependency_identity
+    jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
+    try:
+        source_root, program = jobs.stage_fetch_sources(manager, pool, golden_dependency=dependency)
+    finally:
+        jobs.golden_dependency_identity = original_identity
     assert source_root == pool / "source"
     assert program == source_root / "scripts/superbench_pool.py"
     for relative in jobs.FETCH_SOURCE_FILES:
@@ -58,6 +65,10 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
         assert staged.read_bytes() == original.read_bytes()
         assert staged.stat().st_uid == 0
         assert stat.S_IMODE(staged.stat().st_mode) == 0o444
+    staged_dependency = source_root / "golden-dependency.json"
+    assert staged_dependency.read_bytes() == jobs.canonical(dependency) + b"\n"
+    assert staged_dependency.stat().st_uid == 0
+    assert stat.S_IMODE(staged_dependency.stat().st_mode) == 0o444
     assert stat.S_IMODE(source_root.stat().st_mode) == 0o555
 
 
@@ -67,7 +78,7 @@ def test_fetch_worker_uses_system_python_not_broker_venv():
         "def worker(operation_id, slot_fd):", 1
     )[0]
     assert "trusted_fetch_python()" in physical
-    assert "stage_fetch_sources(manager, root)" in physical
+    assert "state['compatibility']['golden_dependency']" in physical
     assert 'subprocess.Popen([str(interpreter), "-I", "-B"' in physical
     assert "sys.executable" not in physical
     trusted = source.split("def trusted_fetch_python():", 1)[1].split(

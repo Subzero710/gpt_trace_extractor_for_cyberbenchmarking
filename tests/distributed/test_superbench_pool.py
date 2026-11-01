@@ -1199,17 +1199,21 @@ def run_setup():
         self.assertIn('npm', requirements)
 
 
-    def test_npm_cli_version_is_derived_from_verified_golden_provenance(self):
-        with patch.object(pool,'_golden_provenance',return_value={'npm':{'version':'10.9.9'}}):
+    def test_npm_cli_version_is_derived_from_verified_golden_dependency_identity(self):
+        dependency={'schema':1,'target_environment':{'schema':2},'npm_version':'10.9.9'}
+        with patch.object(pool,'_golden_dependency',return_value=dependency):
             self.assertEqual(pool._pinned_npm_version(),'10.9.9')
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertNotIn('NPM_NODE18_VERSION',source)
         self.assertNotIn('registry.npmjs.org/npm/latest',source)
+        self.assertNotIn('config/distributed.toml',source)
+        self.assertIn('golden-dependency.json',source)
         self.assertIn('_pinned_npm_version()',source)
 
     def test_pipx_application_uses_verified_golden_target_not_testbed_minor(self):
-        provenance={'system_python':{'full_version':'3.13.7'}}
-        with patch.object(pool,'_golden_provenance',return_value=provenance):
+        dependency={'schema':1,'target_environment':{
+            'schema':2,'markers':{'python_full_version':'3.13.7'}},'npm_version':'10.9.9'}
+        with patch.object(pool,'_golden_dependency',return_value=dependency):
             self.assertEqual(pool._golden_system_python(),'3.13.7')
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertNotIn('GOLDEN_SYSTEM_PYTHON',source)
