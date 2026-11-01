@@ -220,7 +220,14 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             "digests":{"sha256":sha},"requires_python":">=3.8"}]}}
         with tempfile.TemporaryDirectory() as tmp:
             stage=Path(tmp);candidate=pool.Pool(stage);(stage/"metadata").mkdir()
-            with patch.object(pool,"_pypi_json",return_value=project), \
+            def api(url,**_kwargs):
+                if url.endswith('/pypi/collective-checkdocs/json') or url.endswith('/pypi/collective.checkdocs/json'):return project
+                if url.endswith('/pypi/collective-checkdocs/0.2.1/json') or url.endswith('/pypi/collective.checkdocs/0.2.1/json'):
+                    return {'info':{'name':'collective.checkdocs','version':'0.2.1',
+                                    'requires_dist':[],'provides_extra':[]},
+                            'urls':project['releases']['0.2.1']}
+                raise AssertionError('unexpected PyPI endpoint '+url)
+            with patch.object(pool,"_pypi_json",side_effect=api), \
                  patch.object(pool,"acquire_source_distribution",return_value=source) as acquire, \
                  patch.object(pool.subprocess,"run",side_effect=AssertionError("host package execution is forbidden")):
                 pool.pip_closure(candidate,target,{"collective.checkdocs==0.2.1"},"plan-key")
@@ -455,7 +462,13 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             stage=Path(tmp);candidate=self.make_pool(stage);calls=[]
             def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
                 calls.append(url);Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
-            with patch.object(pool,'_pypi_json',return_value=project), \
+            def api(url,**_kwargs):
+                if url.endswith('/pypi/demo/json'):return project
+                if url.endswith('/pypi/demo/1.0/json'):
+                    return {'info':{'name':'demo','version':'1.0','requires_dist':[],
+                                    'provides_extra':[]},'urls':project['releases']['1.0']}
+                raise AssertionError('unexpected PyPI endpoint '+url)
+            with patch.object(pool,'_pypi_json',side_effect=api), \
                  patch.object(pool,'fetch',side_effect=fetch), \
                  patch.object(pool.subprocess,'run',side_effect=AssertionError('pip/build execution is forbidden')):
                 pool.pip_closure(candidate,target,{'demo==1.0'},'group')
@@ -481,11 +494,19 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                  'url':url,'digests':{'sha256':sha},'requires_python':'>=3.8'}
             projects.setdefault(name,{'releases':{}})['releases'][version]=[row]
             downloads[url]=payload
+        dependencies={('root','1.0'):['dep<2'],('root','2.0'):['dep>=2'],
+                      ('dep','1.0'):[],('dep','2.0'):[]}
         def metadata(url,**_kwargs):
-            name=url.split('/pypi/',1)[1].split('/',1)[0]
-            return projects[name]
+            tail=url.split('/pypi/',1)[1].removesuffix('/json').strip('/').split('/')
+            name=tail[0]
+            if len(tail)==1:return projects[name]
+            version=tail[1]
+            return {'info':{'name':name,'version':version,
+                            'requires_dist':dependencies[(name,version)],'provides_extra':[]},
+                    'urls':projects[name]['releases'][version]}
+        calls=[]
         def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
-            payload=downloads[url];Path(path).write_bytes(payload)
+            calls.append(url);payload=downloads[url];Path(path).write_bytes(payload)
             actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
         with tempfile.TemporaryDirectory() as tmp:
             stage=Path(tmp);candidate=self.make_pool(stage)
@@ -494,8 +515,12 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             plan=json.loads((stage/'metadata/pip-plan-lower-bound.json').read_text())
         selected={row['name']:row['version'] for row in plan['packages']}
         self.assertEqual(selected,{'dep':'2.0','root':'2.0'})
-        self.assertEqual(plan['plan_schema'],4)
-        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-core-metadata-v2-conflict-directed')
+        self.assertEqual(set(downloads)-set(calls),{
+            'https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',
+            'https://files.pythonhosted.org/packages/dep-1.0-py3-none-any.whl'})
+        self.assertEqual(len(calls),2)
+        self.assertEqual(plan['plan_schema'],5)
+        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v3-conflict-directed')
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
         target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]
@@ -509,14 +534,14 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             if name=='missing':return []
             if name in noise:return [candidate(name,1),candidate(name,2)]
             raise AssertionError('unexpected package '+name)
-        def metadata(_pool,item,_key,_target,_cache):
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
             calls.append((item['name'],item['version']))
             dependencies=['missing==1'] if item['name']=='conflict' else []
             return {**item,'sha256':'a'*64,'url':'https://files.pythonhosted.org/fixture.whl',
                     'requirements':dependencies,'provides_extra':[]}
         with tempfile.TemporaryDirectory() as tmp:
             candidate_pool=self.make_pool(Path(tmp))
-            with patch.object(pool,'_candidate_versions',side_effect=versions),                  patch.object(pool,'_candidate_metadata',side_effect=metadata),                  self.assertRaisesRegex(RuntimeError,'unsatisfiable'):
+            with patch.object(pool,'_candidate_versions',side_effect=versions),                  patch.object(pool,'_candidate_release_metadata',side_effect=metadata),                  self.assertRaisesRegex(RuntimeError,'unsatisfiable'):
                 pool._resolve_registry_plan(candidate_pool,target,requirements,(),'backjump')
         self.assertEqual(len(calls),len(noise)+3)
         self.assertEqual(sum(name=='conflict' for name,_version in calls),3)
@@ -537,21 +562,89 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 'filename':filename,'url':url,
                 'digests':{'sha256':sha},'requires_python':'>=3.8'}]}}
             downloads[url]=payload
-        project_calls=[];metadata_reads=[];real_metadata=pool._wheel_core_metadata
+        project_calls=[];release_calls=[];metadata_reads=[];real_metadata=pool._wheel_core_metadata
         def project(url,**_kwargs):
-            name=url.split('/pypi/',1)[1].split('/',1)[0];project_calls.append(name);return projects[name]
+            tail=url.split('/pypi/',1)[1].removesuffix('/json').strip('/').split('/')
+            name=tail[0]
+            if len(tail)==1:
+                project_calls.append(name);return projects[name]
+            version=tail[1];release_calls.append((name,version))
+            requirements={'root-a':['shared==1.0'],'root-b':['shared==1.0'],'shared':[]}[name]
+            return {'info':{'name':name,'version':version,'requires_dist':requirements,
+                            'provides_extra':[]},'urls':projects[name]['releases'][version]}
         def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
             payload=downloads[url];Path(path).write_bytes(payload)
             actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
         def read_metadata(path):
             metadata_reads.append(Path(path).name);return real_metadata(path)
         with tempfile.TemporaryDirectory() as tmp:
-            candidate_pool=self.make_pool(Path(tmp));cache={'metadata':{},'releases':{}}
+            candidate_pool=self.make_pool(Path(tmp));cache={'release_metadata':{},'artifact_metadata':{},'releases':{}}
             with patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
                 pool.pip_closure(candidate_pool,target,{'root-a==1.0'},'first',resolver_cache=cache)
                 pool.pip_closure(candidate_pool,target,{'root-b==1.0'},'second',resolver_cache=cache)
         self.assertEqual(project_calls.count('shared'),1)
+        self.assertEqual(release_calls.count(('shared','1.0')),1)
         self.assertEqual(len(metadata_reads),3)
+
+    def test_pep658_core_metadata_avoids_release_json_and_rejected_artifact_downloads(self):
+        target=fixture_target('3.10.14')
+        root1=self.wheel_bytes('root','1.0',requires=('dep<2',))
+        root2=self.wheel_bytes('root','2.0',requires=('dep>=2',))
+        dep2=self.wheel_bytes('dep','2.0')
+        payloads={('root','1.0'):root1,('root','2.0'):root2,('dep','2.0'):dep2}
+        metadata={
+            ('root','1.0'):b'Metadata-Version: 2.1\nName: root\nVersion: 1.0\nRequires-Dist: dep<2\n\n',
+            ('root','2.0'):b'Metadata-Version: 2.1\nName: root\nVersion: 2.0\nRequires-Dist: dep>=2\n\n',
+            ('dep','2.0'):b'Metadata-Version: 2.1\nName: dep\nVersion: 2.0\n\n',
+        }
+        projects={};downloads={};metadata_urls={}
+        for (name,version),payload in payloads.items():
+            sha=hashlib.sha256(payload).hexdigest();meta=metadata[(name,version)]
+            filename=f'{name}-{version}-py3-none-any.whl'
+            url=f'https://files.pythonhosted.org/packages/{filename}'
+            row={'packagetype':'bdist_wheel','filename':filename,'url':url,
+                 'digests':{'sha256':sha},'requires_python':'>=3.8',
+                 'core-metadata':{'sha256':hashlib.sha256(meta).hexdigest()}}
+            projects.setdefault(name,{'releases':{}})['releases'][version]=[row]
+            downloads[url]=payload;metadata_urls[url+'.metadata']=meta
+        calls=[];metadata_calls=[]
+        def api(url,**_kwargs):
+            tail=url.split('/pypi/',1)[1].removesuffix('/json').strip('/').split('/')
+            if len(tail)!=1:raise AssertionError('release JSON should not be needed with PEP 658')
+            return projects[tail[0]]
+        def read(url,**_kwargs):
+            metadata_calls.append(url);return metadata_urls[url]
+        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            calls.append(url);payload=downloads[url];Path(path).write_bytes(payload)
+            actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',side_effect=api), \
+                 patch.object(pool,'_read_https',side_effect=read), \
+                 patch.object(pool,'fetch',side_effect=fetch):
+                pool.pip_closure(candidate,target,{'root>=1.0','dep>=2.0'},'pep658')
+        self.assertIn('https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl.metadata',metadata_calls)
+        self.assertNotIn('https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',calls)
+        self.assertEqual(set(calls),{
+            'https://files.pythonhosted.org/packages/root-2.0-py3-none-any.whl',
+            'https://files.pythonhosted.org/packages/dep-2.0-py3-none-any.whl'})
+
+    def test_release_metadata_is_verified_against_winning_artifact(self):
+        target=fixture_target('3.10.14')
+        payload=self.wheel_bytes('demo','1.0',requires=('dep==1.0',));project,sha=self.project(payload)
+        def api(url,**_kwargs):
+            if url.endswith('/pypi/demo/json'):return project
+            if url.endswith('/pypi/demo/1.0/json'):
+                return {'info':{'name':'demo','version':'1.0','requires_dist':[],
+                                'provides_extra':[]},'urls':project['releases']['1.0']}
+            raise AssertionError('unexpected PyPI endpoint '+url)
+        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch), \
+                 self.assertRaisesRegex(RuntimeError,'release metadata differs from selected artifact'):
+                pool.pip_closure(candidate,target,{'demo==1.0'},'metadata-mismatch')
 
     def test_different_logical_plans_share_one_physical_cas_object(self):
         payload=self.wheel_bytes();project,sha=self.project(payload)
@@ -559,7 +652,13 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             stage=Path(tmp);candidate=self.make_pool(stage);calls=[]
             def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
                 calls.append(url);Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
-            with patch.object(pool,'_pypi_json',return_value=project),patch.object(pool,'fetch',side_effect=fetch):
+            def api(url,**_kwargs):
+                if url.endswith('/pypi/demo/json'):return project
+                if url.endswith('/pypi/demo/1.0/json'):
+                    return {'info':{'name':'demo','version':'1.0','requires_dist':[],
+                                    'provides_extra':[]},'urls':project['releases']['1.0']}
+                raise AssertionError('unexpected PyPI endpoint '+url)
+            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
                 pool.pip_closure(candidate,fixture_target('3.8.20'),{'demo==1.0'},'first')
                 pool.pip_closure(candidate,fixture_target('3.10.14'),{'demo==1.0'},'second')
             self.assertEqual(set(candidate.links),{sha})

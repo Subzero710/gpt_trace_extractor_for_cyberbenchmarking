@@ -2287,7 +2287,7 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 4
+PIP_PLAN_SCHEMA = 5
 
 
 def _target_fingerprint(target):
@@ -2298,7 +2298,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-core-metadata-v2-conflict-directed',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v3-conflict-directed',
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2447,8 +2447,18 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
     return [row[1] for row in reversed(candidates)]
 
 
-def _wheel_core_metadata(path):
+def _core_metadata_fields(raw):
     import email.parser
+    if not isinstance(raw,(bytes,bytearray)) or len(raw)>MAX_SOURCE:
+        raise RuntimeError('Python core metadata exceeds security limit')
+    parsed=email.parser.Parser().parsestr(bytes(raw).decode('utf-8',errors='replace'),headersonly=True)
+    name=parsed.get('Name');version=parsed.get('Version')
+    if not isinstance(name,str) or not name or not isinstance(version,str) or not version:
+        raise RuntimeError('Python core metadata lacks package identity')
+    return name,version,parsed.get_all('Requires-Dist') or [],parsed.get_all('Provides-Extra') or []
+
+
+def _wheel_core_metadata(path):
     import zipfile
     path=Path(path)
     try:
@@ -2457,14 +2467,42 @@ def _wheel_core_metadata(path):
                    if name.endswith('.dist-info/METADATA') and '..' not in Path(name).parts]
             if len(names)!=1:raise RuntimeError('wheel has no unique dist-info/METADATA')
             info=archive.getinfo(names[0])
-            if info.file_size>2*1024*1024:raise RuntimeError('wheel metadata exceeds security limit')
+            if info.file_size>MAX_SOURCE:raise RuntimeError('wheel metadata exceeds security limit')
             raw=archive.read(names[0])
     except zipfile.BadZipFile as exc:raise RuntimeError('invalid wheel archive') from exc
-    parsed=email.parser.Parser().parsestr(raw.decode('utf-8',errors='replace'),headersonly=True)
-    return parsed.get_all('Requires-Dist') or [],parsed.get_all('Provides-Extra') or []
+    _name,_version,requirements,extras=_core_metadata_fields(raw)
+    return requirements,extras
 
 
-def _candidate_metadata(pool,candidate,key,target,cache):
+def _pep658_candidate_metadata(candidate):
+    """Return hash-verified artifact-specific Core Metadata when PyPI publishes it."""
+    item=candidate['item'];descriptor=item.get('core-metadata')
+    if descriptor is False or descriptor is None:return None
+    if not isinstance(descriptor,dict) or not SHA.fullmatch(str(descriptor.get('sha256',''))):
+        raise RuntimeError('invalid PyPI core-metadata identity')
+    _artifact_sha,url=_candidate_artifact_identity(candidate)
+    raw=_read_https(url+'.metadata',timeout=90,limit=MAX_SOURCE,
+                    user_agent='gpt-trace-dependency-pool/4',expected_host='files.pythonhosted.org')
+    if hashlib.sha256(raw).hexdigest()!=descriptor['sha256']:
+        raise RuntimeError('PyPI core-metadata SHA-256 mismatch')
+    name,version,requirements,extras=_core_metadata_fields(raw)
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    try:same_version=Version(version)==Version(candidate['version'])
+    except InvalidVersion:same_version=False
+    if _normalized_package_name(name)!=_normalized_package_name(candidate['name']) or not same_version:
+        raise RuntimeError('PyPI core-metadata package identity differs')
+    return requirements,extras
+
+
+def _candidate_artifact_identity(candidate):
+    item=candidate['item'];sha=str((item.get('digests') or {}).get('sha256',''));url=item.get('url')
+    if not SHA.fullmatch(sha) or not isinstance(url,str):
+        raise RuntimeError('candidate artifact lacks immutable identity')
+    return sha,url
+
+
+def _materialize_candidate_metadata(pool,candidate,key,target,cache):
+    """Download one chosen artifact and read its authoritative embedded metadata."""
     identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
               candidate['version'],candidate['filename'])
     if identity in cache:
@@ -2475,7 +2513,7 @@ def _candidate_metadata(pool,candidate,key,target,cache):
         category='python-source' if record['kind']=='sdist' else 'python'
         pool.reference(record['sha256'],category,key,artifact.stat().st_size)
         return record
-    item=candidate['item'];sha=str((item.get('digests') or {}).get('sha256',''));url=item.get('url')
+    sha,url=_candidate_artifact_identity(candidate)
     if candidate['kind']=='wheel':
         actual=pool.download(url,'python',key,sha=sha)
         path=pool.objects/actual[:2]/actual
@@ -2493,6 +2531,85 @@ def _candidate_metadata(pool,candidate,key,target,cache):
                 'requirements':source['requirements'],'provides_extra':source['provides_extra']}
     cache[identity]=record
     return record
+
+
+def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,no_deps=False):
+    """Read lightweight release metadata without downloading rejected artifacts.
+
+    PyPI's immutable release JSON is used only as a solve-time index.  It is
+    bound to the exact candidate filename/URL/SHA and every package selected by
+    the solver is subsequently downloaded and checked against its embedded
+    wheel/static-sdist metadata before a plan can be published.
+    """
+    target=_coerce_target(target)
+    identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
+              candidate['version'],candidate['filename'])
+    if identity in probe_cache:return probe_cache[identity]
+    sha,url=_candidate_artifact_identity(candidate)
+    if no_deps:
+        record={'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
+                'filename':candidate['filename'],'sha256':sha,'url':url,
+                'requirements':[],'provides_extra':[]}
+        probe_cache[identity]=record;return record
+    core=_pep658_candidate_metadata(candidate)
+    if core is not None:
+        requirements,extras=core
+    else:
+        # Old files without PEP 658 metadata use the small release JSON as a
+        # speculative solve index. PyPI documents that upload metadata can differ
+        # from artifact content, so the winning artifact is always rechecked below.
+        endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
+                  +urllib.parse.quote(candidate['version'],safe='')+'/json')
+        payload=_pypi_json(endpoint)
+        info=payload.get('info');files=payload.get('urls')
+        if not isinstance(info,dict) or not isinstance(files,list):
+            raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
+        _,_,Version,InvalidVersion,_=_packaging_symbols()
+        try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
+        except InvalidVersion:same_version=False
+        if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
+                or not same_version):
+            raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
+        matched=False
+        for item in files:
+            if not isinstance(item,dict):continue
+            item_sha=str((item.get('digests') or {}).get('sha256',''))
+            if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
+                matched=True;break
+        if not matched:
+            raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
+        requirements=info.get('requires_dist');extras=info.get('provides_extra')
+        if requirements is None:
+            # A release whose index metadata cannot describe dependencies still
+            # falls back to authoritative archive inspection; only that candidate
+            # pays the full artifact cost.
+            record=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+            probe_cache[identity]=record;return record
+    if (not isinstance(requirements,list) or not all(isinstance(row,str) for row in requirements)
+            or extras is not None and (not isinstance(extras,list) or not all(isinstance(row,str) for row in extras))):
+        raise RuntimeError('invalid Python release dependency metadata for '+candidate['name']+'=='+candidate['version'])
+    record={'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
+            'filename':candidate['filename'],'sha256':sha,'url':url,
+            'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
+            'provides_extra':sorted(set(extras or []))}
+    probe_cache[identity]=record
+    return record
+
+
+def _materialize_solution(pool,records,key,target,artifact_cache):
+    """Acquire only the winning artifacts and verify solve-time metadata exactly."""
+    materialized=[]
+    for expected in records:
+        candidate={'kind':expected['kind'],'name':expected['name'],'version':expected['version'],
+                   'filename':expected['filename'],'item':{'url':expected['url'],
+                   'digests':{'sha256':expected['sha256']}}}
+        actual=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+        if (sorted(actual['requirements'])!=sorted(expected['requirements'])
+                or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])):
+            raise RuntimeError('PyPI release metadata differs from selected artifact metadata: '
+                               +expected['name']+'=='+expected['version'])
+        materialized.append(actual)
+    return materialized
 
 
 def _candidate_satisfies(candidate,requirements,constraints):
@@ -2517,7 +2634,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         if _marker_active(req,target):roots.append((req,frozenset()))
     if not roots:return []
     resolver_cache={} if resolver_cache is None else resolver_cache
-    metadata_cache=resolver_cache.setdefault('metadata',{})
+    probe_cache=resolver_cache.setdefault('release_metadata',{})
+    artifact_cache=resolver_cache.setdefault('artifact_metadata',{})
     release_cache=resolver_cache.setdefault('releases',{})
     candidate_cache={};failed_states=set()
     stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0}
@@ -2616,7 +2734,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
             # branch level. This is the dependency-solver equivalent of unit
             # propagation in a SAT solver.
             if count==1:
-                try:record=_candidate_metadata(pool,candidates[0],key,target,metadata_cache)
+                try:record=_candidate_release_metadata(pool,candidates[0],key,target,probe_cache,artifact_cache,no_deps=no_deps)
                 except RuntimeError as exc:
                     failed_states.add(current_state)
                     raise RuntimeError('only compatible artifact for '+name+' has unusable metadata: '+str(exc)) from exc
@@ -2629,7 +2747,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 print(f"[pool] resolver {key}: decision {stats['decisions']} "
                       f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
                       f"selected={len(selected)}",flush=True)
-                try:record=_candidate_metadata(pool,candidate,key,target,metadata_cache)
+                try:record=_candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
                 except RuntimeError as exc:
                     metadata_failures.append(str(exc));continue
                 next_selected=dict(selected);next_selected[name]=record
@@ -2655,10 +2773,12 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                  f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}")
         raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
                            +(detail or 'root constraints conflict')+'; '+summary)
-    print(f"[pool] resolver {key}: solved {len(result)} packages; "
+    solved=[result[name] for name in sorted(result)]
+    print(f"[pool] resolver {key}: solved {len(solved)} packages; "
           f"decisions={stats['decisions']} propagations={stats['propagations']} "
-          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}",flush=True)
-    return [result[name] for name in sorted(result)]
+          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}; "
+          f"materializing winning artifacts",flush=True)
+    return _materialize_solution(pool,solved,key,target,artifact_cache)
 
 
 def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
@@ -2698,7 +2818,7 @@ def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cac
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':2,'name':'static-pypi-core-metadata-v2-conflict-directed','target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':3,'name':'static-pypi-release-metadata-v3-conflict-directed','target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
@@ -2729,7 +2849,7 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
 
 def acquire_pip_groups(pool, groups):
     """Acquire all unique logical closures with shared immutable resolver caches."""
-    total=len(groups);resolver_cache={'metadata':{},'releases':{}}
+    total=len(groups);resolver_cache={'release_metadata':{},'artifact_metadata':{},'releases':{}}
     for index,(key,group) in enumerate(sorted(groups.items()),1):
         target=_coerce_target(group['target'])
         print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
