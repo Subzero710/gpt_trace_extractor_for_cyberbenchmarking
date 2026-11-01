@@ -340,18 +340,20 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 _,selected,_=pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
         self.assertEqual(selected,'5.1')
 
-    def test_source_greater_equal_does_not_float_when_lower_release_is_missing(self):
-        def release(version):
+    def test_source_greater_equal_uses_first_compatible_release_when_lower_is_missing(self):
+        def release(version, *, yanked=False):
             return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
                      'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
                      'digests':{'sha256':hashlib.sha256(version.encode()).hexdigest()},
-                     'requires_python':'>=3.8'}]
-        project={'releases':{'5.2':release('5.2'),'6.0':release('6.0')}}
+                     'requires_python':'>=3.8','yanked':yanked}]
+        project={'releases':{'5.1':release('5.1',yanked=True),
+                             '5.2':release('5.2'),'6.0':release('6.0')}}
         with tempfile.TemporaryDirectory() as tmp:
             candidate=pool.Pool(Path(tmp))
-            with patch.object(pool,'_pypi_json',return_value=project), self.assertRaisesRegex(
-                    RuntimeError,'requires exact release 5.1'):
-                pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
+            with patch.object(pool,'_pypi_json',return_value=project):
+                _,selected,_=pool._select_source_release(
+                    candidate,'demo>=5.1',fixture_target('3.10.14'))
+        self.assertEqual(selected,'5.2')
 
     def test_source_greater_equal_prefers_compatible_cached_version_over_lower_pin(self):
         def release(version):
@@ -521,8 +523,41 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',
             'https://files.pythonhosted.org/packages/dep-1.0-py3-none-any.whl'})
         self.assertEqual(len(calls),2)
-        self.assertEqual(plan['plan_schema'],6)
-        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v4-parallel-conflict-directed')
+        self.assertEqual(plan['plan_schema'],7)
+        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v5-parallel-conflict-directed')
+
+
+    def test_registry_lower_bound_skips_yanked_exact_release(self):
+        target=fixture_target('3.10.14')
+        def row(version, *, yanked=False):
+            payload=self.wheel_bytes('demo',version)
+            sha=hashlib.sha256(payload).hexdigest()
+            return payload,{'packagetype':'bdist_wheel',
+                'filename':f'demo-{version}-py3-none-any.whl',
+                'url':f'https://files.pythonhosted.org/packages/demo-{version}-py3-none-any.whl',
+                'digests':{'sha256':sha},'requires_python':'>=3.8','yanked':yanked}
+        payload_200,r200=row('2.0.0',yanked=True)
+        payload_201,r201=row('2.0.1')
+        payload_202,r202=row('2.0.2')
+        project={'releases':{'2.0.0':[r200],'2.0.1':[r201],'2.0.2':[r202]}}
+        payloads={r201['url']:payload_201,r202['url']:payload_202}
+        def api(url,**_kwargs):
+            if url.endswith('/pypi/demo/json'):return project
+            version=url.split('/pypi/demo/',1)[1].removesuffix('/json')
+            selected={'2.0.1':r201,'2.0.2':r202}[version]
+            return {'info':{'name':'demo','version':version,'requires_dist':[],
+                            'provides_extra':[]},'urls':[selected]}
+        calls=[]
+        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            calls.append(url);payload=payloads[url];Path(path).write_bytes(payload)
+            actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
+        with tempfile.TemporaryDirectory() as tmp:
+            stage=Path(tmp);candidate=self.make_pool(stage)
+            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
+                pool.pip_closure(candidate,target,{'demo>=2'},'missing-lower')
+            plan=json.loads((stage/'metadata/pip-plan-missing-lower.json').read_text())
+        self.assertEqual([(row['name'],row['version']) for row in plan['packages']],[('demo','2.0.1')])
+        self.assertEqual(calls,[r201['url']])
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
         target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]

@@ -2294,14 +2294,13 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
                     and specifiers[0].operator=='>='
                     and '*' not in specifiers[0].version else None)
         if lone_lower is not None:
-            try:lower=Version(lone_lower.version)
+            try:Version(lone_lower.version)
             except InvalidVersion as exc:
                 raise RuntimeError('invalid inclusive lower-bound source requirement: '+requirement) from exc
-            selected=next((row for row in candidates if row[0]==lower),None)
-            if selected is None:
-                raise RuntimeError(
-                    'inclusive lower-bound source requirement requires exact release '
-                    +lone_lower.version+': '+requirement)
+            # Match normal PEP 440 range semantics: ``>=X`` remains satisfiable
+            # when X itself is absent/yanked/incompatible.  Prefer the oldest
+            # compatible non-yanked source to preserve benchmark stability.
+            selected=candidates[0]
         else:
             # Genuine ranges use the newest compatible release only when no
             # compatible version already exists in the pool.
@@ -2439,7 +2438,7 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 6
+PIP_PLAN_SCHEMA = 7
 
 
 def _pip_worker_controls():
@@ -2472,7 +2471,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v4-parallel-conflict-directed',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v5-parallel-conflict-directed',
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2607,17 +2606,13 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
     lone_lower=(specifiers[0] if len(specifiers)==1 and specifiers[0].operator=='>='
                 and '*' not in specifiers[0].version else None)
     if lone_lower is not None:
-        try:lower=Version(lone_lower.version)
+        try:Version(lone_lower.version)
         except InvalidVersion as exc:raise RuntimeError('invalid inclusive lower-bound requirement') from exc
-        exact=[row for row in candidates if row[0]==lower]
-        if not exact:
-            raise RuntimeError('inclusive lower-bound requirement requires exact release '
-                               +lone_lower.version+': '+name)
-        # Keep the benchmark's historical lower-bound preference, but do not
-        # discard the rest of the legal domain. Later versions are deterministic
-        # conflict-recovery candidates instead of being silently unreachable.
-        later=[row for row in reversed(candidates) if row[0]!=lower]
-        return [row[1] for row in [*exact,*later]]
+        # ``>=X`` is a lower bound, not an exact pin.  The exact X release may
+        # be absent, yanked, or incompatible with the target interpreter. Keep
+        # the historical minimum-version preference by trying the lowest
+        # compatible non-yanked release first, then advance monotonically.
+        return [row[1] for row in candidates]
     return [row[1] for row in reversed(candidates)]
 
 
@@ -2991,7 +2986,7 @@ def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cac
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':4,'name':'static-pypi-release-metadata-v4-parallel-conflict-directed','target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':5,'name':'static-pypi-release-metadata-v5-parallel-conflict-directed','target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
