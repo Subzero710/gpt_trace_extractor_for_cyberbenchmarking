@@ -398,6 +398,52 @@ def git_files_named(mirror, commit, basename, *, limit=64):
             if len(rows)>limit:raise RuntimeError('Git basename search exceeds finite bound: '+basename)
     return sorted(set(rows))
 
+def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600):
+    """Fetch immutable GitHub refs quietly with bounded in-process retries.
+
+    A failed network transfer is retried inside the same preparation so a transient
+    GitHub/DNS/TLS failure cannot force an operator to restart the whole acquisition.
+    The caller still verifies every requested commit/ref after the fetch.
+    """
+    if not REPO.fullmatch(repo):
+        raise RuntimeError('untrusted Git repo')
+    refs=tuple(str(value) for value in refspecs)
+    if not refs or any(not value or '\x00' in value or '\n' in value or '\r' in value for value in refs):
+        raise RuntimeError('invalid Git fetch refspec')
+    command=['git','-c','protocol.file.allow=never','--git-dir',str(folder),'fetch',
+             '--quiet','--no-recurse-submodules','--no-auto-maintenance','--no-write-fetch-head',
+             '--depth=1']
+    if not explicit_tags:command.append('--no-tags')
+    command.extend(['https://github.com/'+repo+'.git',*refs])
+    last_detail='unknown git fetch failure'
+    for attempt in range(1,DOWNLOAD_ATTEMPTS+1):
+        try:
+            result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                  timeout=timeout)
+            if result.returncode==0:
+                return
+            last_detail=(result.stderr or result.stdout or ('exit status '+str(result.returncode))).strip()
+        except subprocess.TimeoutExpired as exc:
+            last_detail='timeout after '+str(timeout)+'s'
+            if exc.stderr:
+                last_detail+=': '+str(exc.stderr)[-500:]
+        last_detail=last_detail[-500:]
+        if attempt<DOWNLOAD_ATTEMPTS:
+            delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
+            print(f'[pool] git fetch retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s: {repo}: {last_detail}',
+                  file=sys.stderr,flush=True)
+            time.sleep(delay)
+    raise RuntimeError('Git fetch failed after '+str(DOWNLOAD_ATTEMPTS)+' attempts for '+repo+': '+last_detail)
+
+
+def _git_has_commit(folder, commit):
+    if not COMMIT.fullmatch(str(commit)):
+        raise RuntimeError('invalid pinned Git commit')
+    return subprocess.run(
+        ['git','--git-dir',str(folder),'cat-file','-e',str(commit)+'^{commit}'],
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+
+
 def mirror_commits(root, repo, commits, *, label='git'):
     if not REPO.fullmatch(repo) or not commits or any(not COMMIT.fullmatch(x) for x in commits):
         raise RuntimeError('untrusted Git repo/commit')
@@ -411,18 +457,16 @@ def mirror_commits(root, repo, commits, *, label='git'):
             raise RuntimeError('unsafe retained Git mirror')
         if invoke(['git','--git-dir',folder,'rev-parse','--is-bare-repository'],capture=True).strip()!='true':
             raise RuntimeError('retained Git repository is not bare')
-        missing=[commit for commit in sorted(commits) if subprocess.run(
-            ['git','--git-dir',str(folder),'cat-file','-e',commit+'^{commit}'],
-            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode]
+        missing=[commit for commit in sorted(commits) if not _git_has_commit(folder,commit)]
     else:
-        invoke(['git','init','--bare',folder])
+        invoke(['git','init','--bare','--quiet',folder])
         missing=sorted(commits)
     if missing:
         # Fetch missing pinned commits only; never follow a moving branch.
-        invoke(['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch','--no-tags',
-                '--depth=1','https://github.com/'+repo+'.git',*missing])
+        _git_fetch(folder,repo,missing)
     for commit in commits:
-        invoke(['git','--git-dir',folder,'cat-file','-e',commit+'^{commit}'])
+        if not _git_has_commit(folder,commit):
+            raise RuntimeError('Git fetch completed without pinned commit '+commit+': '+repo)
     return folder
 
 
@@ -441,9 +485,7 @@ def ensure_version_refs(folder, repo, commits):
     """Freeze tag refs only for sources whose build metadata consumes Git refs."""
     if not any(_source_requires_version_refs(folder,commit) for commit in commits):
         return {}
-    invoke(['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch','--depth=1',
-            '--no-recurse-submodules','https://github.com/'+repo+'.git',
-            '+refs/tags/*:refs/tags/*'])
+    _git_fetch(folder,repo,['+refs/tags/*:refs/tags/*'],explicit_tags=True)
     raw=invoke(['git','--git-dir',folder,'show-ref','--tags','-d'],capture=True)
     refs={}
     for line in raw.splitlines():
@@ -457,7 +499,15 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
     """Fetch independent repositories concurrently within the acquisition I/O budget."""
     ordered=[(repo,tuple(sorted(commits))) for repo,commits in sorted(repositories.items()) if commits]
     if not ordered:return {},{}
-    workers=min(_acquisition_workers(),len(ordered))
+    try:
+        cpu_capacity=len(os.sched_getaffinity(0))
+    except OSError as exc:
+        raise RuntimeError('CPU affinity is unavailable for Git acquisition') from exc
+    if cpu_capacity<1:
+        raise RuntimeError('CPU affinity is empty for Git acquisition')
+    # Git fetch performs pack inflation/indexing and filesystem writes, unlike the
+    # metadata-only HTTP resolver. Bound Git concurrency by actual CPU capacity.
+    workers=min(_acquisition_workers(),cpu_capacity,len(ordered))
     print(f'[pool] {label} mirrors: {len(ordered)} repositories with {workers} workers',flush=True)
     def acquire(repo,commits):
         mirror=mirror_commits(stage,repo,set(commits),label=label)
@@ -481,12 +531,10 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
 def ensure_commit(stage,repo,commit,*,label='git-extra'):
     folder=stage/label/(repo.replace('/','_')+'.git')
     if not folder.exists():return mirror_commits(stage,repo,{commit},label=label)
-    probe=subprocess.run(['git','--git-dir',str(folder),'cat-file','-e',commit+'^{commit}'],
-                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    if probe.returncode:
-        invoke(['git','-c','protocol.file.allow=never','--git-dir',folder,'fetch',
-                '--no-tags','--depth=1','https://github.com/'+repo+'.git',commit])
-    invoke(['git','--git-dir',folder,'cat-file','-e',commit+'^{commit}'])
+    if not _git_has_commit(folder,commit):
+        _git_fetch(folder,repo,[commit])
+    if not _git_has_commit(folder,commit):
+        raise RuntimeError('Git fetch completed without pinned commit '+commit+': '+repo)
     return folder
 
 

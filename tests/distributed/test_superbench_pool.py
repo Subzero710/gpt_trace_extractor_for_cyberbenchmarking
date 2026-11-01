@@ -1111,21 +1111,45 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertEqual([row['name'] for row in result],['alpha','beta'])
 
 
-    def test_git_mirrors_use_versioned_parallel_io_capacity(self):
+    def test_git_mirrors_bound_pack_work_by_cpu_affinity(self):
         barrier=__import__('threading').Barrier(2);calls=[];lock=__import__('threading').Lock()
         def mirror(_stage,repo,commits,*,label='git'):
             with lock:calls.append((repo,tuple(sorted(commits)),label))
             barrier.wait(timeout=5)
             return Path('/tmp')/(repo.replace('/','_')+'.git')
-        with patch.object(pool,'_acquisition_workers',return_value=2), \
+        repositories={'one/repo':{'a'*40},'two/repo':{'b'*40}}
+        with patch.object(pool,'_acquisition_workers',return_value=8), \
+             patch.object(pool.os,'sched_getaffinity',return_value={0,1}), \
              patch.object(pool,'mirror_commits',side_effect=mirror), \
              patch.object(pool,'ensure_version_refs',return_value={}):
             mirrors,refs=pool._acquire_git_mirrors(
-                Path('/tmp'),{'one/repo':{'a'*40},'two/repo':{'b'*40}},
-                freeze_version_refs=True)
-        self.assertEqual(set(mirrors),{'one/repo','two/repo'})
-        self.assertEqual(refs,{'one/repo':{},'two/repo':{}})
+                Path('/tmp'),repositories,freeze_version_refs=True)
+        self.assertEqual(set(mirrors),set(repositories))
+        self.assertEqual(refs,{repo:{} for repo in repositories})
         self.assertEqual(len(calls),2)
+
+    def test_git_fetch_retries_quietly_inside_same_preparation(self):
+        failure=subprocess.CompletedProcess(['git'],128,stdout='',stderr='RPC failed; curl 92 HTTP/2 stream closed')
+        success=subprocess.CompletedProcess(['git'],0,stdout='',stderr='')
+        with patch.object(pool.subprocess,'run',side_effect=[failure,success]) as runner, \
+             patch.object(pool.time,'sleep') as sleeper:
+            pool._git_fetch(Path('/tmp/mirror.git'),'modin-project/modin',['a'*40])
+        self.assertEqual(runner.call_count,2)
+        sleeper.assert_called_once_with(1)
+        command=runner.call_args_list[0].args[0]
+        self.assertIn('--quiet',command)
+        self.assertIn('--no-recurse-submodules',command)
+        self.assertIn('--no-auto-maintenance',command)
+        self.assertIn('--no-tags',command)
+
+    def test_git_fetch_exhaustion_reports_bounded_stderr(self):
+        failure=subprocess.CompletedProcess(['git'],128,stdout='',stderr='fatal: '+('x'*5000))
+        with patch.object(pool.subprocess,'run',return_value=failure) as runner, \
+             patch.object(pool.time,'sleep'):
+            with self.assertRaisesRegex(RuntimeError,'Git fetch failed after 5 attempts for modin-project/modin') as raised:
+                pool._git_fetch(Path('/tmp/mirror.git'),'modin-project/modin',['a'*40])
+        self.assertEqual(runner.call_count,pool.DOWNLOAD_ATTEMPTS)
+        self.assertLess(len(str(raised.exception)),800)
 
     def test_same_filename_different_bytes_are_separate_cas_objects(self):
         with tempfile.TemporaryDirectory() as tmp:
