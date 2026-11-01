@@ -331,7 +331,7 @@ def _read_https(url, *, timeout, limit, user_agent, expected_host=None, accept=N
     return _network_retry(label, read_once)
 
 
-def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None):
+def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None, on_block=None):
     parsed=urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise RuntimeError('untrusted download endpoint: '+str(url))
@@ -352,6 +352,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None)
                     size+=len(block)
                     if size>limit: raise RuntimeError('download exceeds limit; partial retained')
                     stream.write(block); h.update(block)
+                    if on_block is not None: on_block(len(block))
                     for other in other_hashes.values(): other.update(block)
                     for sri_hash,_ in checks: sri_hash.update(block)
                 stream.flush(); os.fsync(stream.fileno())
@@ -1634,7 +1635,7 @@ class Pool:
                 refs.append(sha)
             return sha
 
-    def put(self, path, category, identity, *, verified_sha=None):
+    def put(self, path, category, identity, *, verified_sha=None, durable=False):
         """Register one immutable artifact with a content-addressed hardlink.
 
         A digest is computed here only for third-party tools' output. Direct
@@ -1654,6 +1655,12 @@ class Pool:
                 os.link(path, target)
             elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
                 raise RuntimeError('content-addressed pool collision/changed object')
+            if durable:
+                # Persist the CAS hardlink before deleting its staging source.
+                # Completed bytes survive ordinary worker/process failures.
+                descriptor=os.open(target.parent,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:os.fsync(descriptor)
+                finally:os.close(descriptor)
             self.verified_objects.add(sha)
             return self.reference(sha, category, identity, size)
 
@@ -1775,7 +1782,7 @@ class Pool:
 
 # GPT_TRACE_SWEGYM_VERIFIED_RESUME_V1
 # Copy a FAILED stage into a fresh candidate. Never modify the original.
-def salvage_verified_stage(old, new):
+def salvage_verified_stage(old, new, *, conda_artifacts=None):
     old, new = Path(old), Path(new)
     if (old.resolve()==new.resolve() or new.resolve().is_relative_to(old.resolve())
             or old.resolve().is_relative_to(new.resolve())):
@@ -1806,6 +1813,31 @@ def salvage_verified_stage(old, new):
             os.link(obj,target)  # Verified immutable bytes, zero-copy reuse.
             good[(obj.stat().st_dev,obj.stat().st_ino)]=(sha,target)
             count+=1
+    # Old workers (before per-completion CAS registration) left SHA-verified
+    # Conda downloads in downloads/ but never inserted them into objects/.
+    # Hash these files against the CURRENT validated lock before reuse. Partial
+    # transfers or archives from another lock are not copied.
+    conda_artifacts={} if conda_artifacts is None else conda_artifacts
+    conda_recovered=0
+    downloads=old/'downloads'
+    if downloads.is_dir():
+        for raw in downloads.iterdir():
+            match=re.fullmatch(r'conda-([0-9a-f]{64})',raw.name)
+            if match is None or not raw.is_file():continue
+            sha=match.group(1)
+            if sha not in conda_artifacts:continue
+            if digest(raw)!=sha:
+                print('[pool] skipping incomplete retained Conda archive '+sha,flush=True)
+                continue
+            target=new/'objects'/'sha256'/sha[:2]/sha
+            if not target.exists():
+                target.parent.mkdir(parents=True,exist_ok=True)
+                os.link(raw,target)
+                descriptor=os.open(target.parent,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:os.fsync(descriptor)
+                finally:os.close(descriptor)
+                conda_recovered+=1
+            good[(raw.stat().st_dev,raw.stat().st_ino)]=(sha,target)
     # Git refs/packed objects can be mutated by a later fetch: COPY them, never
     # hardlink mutable Git objects to the failed stage.
     for kind in ('git','git-extra'):
@@ -1856,7 +1888,7 @@ def salvage_verified_stage(old, new):
             dest=new/'apt'/'archives'/deb.name
             dest.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(deb,dest)
-    print('[pool] verified resume: '+str(count)+' CAS artifacts and retained Git mirrors',flush=True)
+    print('[pool] verified resume: '+str(count)+' CAS artifacts, '+str(conda_recovered)+' legacy Conda archives and retained Git mirrors',flush=True)
     return {value[0] for value in good.values()}
 
 
@@ -1879,6 +1911,17 @@ def _acquisition_workers():
     if type(workers) is not int or workers<1:
         raise RuntimeError('invalid acquisition worker control')
     return workers
+
+
+def _conda_progress_interval():
+    path=Path(__file__).resolve().parents[1]/'config/preparation.toml'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing staged preparation controls')
+    with path.open('rb') as stream:payload=tomllib.load(stream)
+    seconds=(payload.get('acquisition') or {}).get('progress_interval_seconds')
+    if type(seconds) is not int or seconds<1:
+        raise RuntimeError('invalid acquisition progress interval')
+    return seconds
 
 
 def conda_recipe_fingerprint(script):
@@ -1992,8 +2035,50 @@ def load_conda_lock(adapter,pins,contract):
     return {**lock,'artifacts':checked,'environments':normalized_envs},lock_sha
 
 
+class _CondaTransferProgress:
+    """Thread-safe completed-artifact and real network-byte counters."""
+    def __init__(self,total,reused,interval):
+        self.lock=threading.Lock()
+        self.total=total
+        self.completed=reused
+        self.failed=0
+        self.active=0
+        self.network_bytes=0
+        self.started=time.monotonic()
+        self.last_time=self.started
+        self.last_bytes=0
+        self.interval=interval
+
+    def start(self):
+        with self.lock:self.active+=1
+
+    def bytes(self,count):
+        with self.lock:self.network_bytes+=count
+
+    def finish(self,success):
+        with self.lock:
+            self.active-=1
+            if success:self.completed+=1
+            else:self.failed+=1
+
+    def report(self,*,force=False):
+        with self.lock:
+            now=time.monotonic()
+            elapsed=now-self.last_time
+            if not force and elapsed<self.interval:return
+            rate=(self.network_bytes-self.last_bytes)/elapsed if elapsed>0 else 0
+            total_rate=self.network_bytes/(now-self.started) if now>self.started else 0
+            print(f'[pool] Conda progress: {self.completed}/{self.total} verified, '
+                  f'{self.failed} failed, {self.active} active, '
+                  f'{self.network_bytes/1048576:.1f} MiB transferred, '
+                  f'{rate/1048576:.2f} MiB/s interval, '
+                  f'{total_rate/1048576:.2f} MiB/s average',flush=True)
+            self.last_time=now
+            self.last_bytes=self.network_bytes
+
+
 def acquire_locked_conda(pool,lock):
-    """Acquire each immutable Conda archive once, then materialize transaction snapshots."""
+    """Download and DURABLY publish each verified Conda artifact immediately."""
     artifacts=lock['artifacts'];references=defaultdict(set)
     for env,row in lock['environments'].items():
         for transaction in row['transactions']:
@@ -2003,28 +2088,50 @@ def acquire_locked_conda(pool,lock):
     print('[pool] Conda lock: '+str(len(lock['environments']))+' environments, '
           +str(sum(len(row['transactions']) for row in lock['environments'].values()))
           +' transactions, '+str(len(references))+' unique archives',flush=True)
-    downloaded={}
+    progress=_CondaTransferProgress(len(references),len(references)-len(missing),
+                                    _conda_progress_interval())
+    progress.report(force=True)
     def transfer(sha):
-        raw=pool.stage/'downloads'/('conda-'+sha)
-        actual=fetch(artifacts[sha]['url'],raw,sha=sha)
-        if actual!=sha:raise RuntimeError('Conda lock download identity changed')
-        return sha,raw
+        progress.start()
+        try:
+            raw=pool.stage/'downloads'/('conda-'+sha)
+            actual=fetch(artifacts[sha]['url'],raw,sha=sha,on_block=progress.bytes)
+            if actual!=sha:raise RuntimeError('Conda lock download identity changed')
+            # Registration MUST precede raw.unlink() and completion accounting.
+            # No other download needs to succeed for these bytes to be reusable.
+            pool.put(raw,'conda',sorted(references[sha])[0],verified_sha=sha,durable=True)
+            raw.unlink()
+        except BaseException:
+            progress.finish(False)
+            raise
+        progress.finish(True)
+        return sha
     if missing:
         workers=min(_acquisition_workers(),len(missing))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                                                    thread_name_prefix='conda-lock') as executor:
-            futures={executor.submit(transfer,sha):sha for sha in missing}
-            for future in concurrent.futures.as_completed(futures):
-                sha,raw=future.result();downloaded[sha]=raw
-    # Pool's provenance dictionaries remain single-threaded. Only byte transfer
-    # occurs concurrently; CAS registration and reference sharing are serialized.
+            pending={executor.submit(transfer,sha) for sha in missing}
+            first_error=None
+            while pending:
+                finished,pending=concurrent.futures.wait(
+                    pending,timeout=progress.interval,return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in finished:
+                    if future.cancelled():continue
+                    try:future.result()
+                    except BaseException as exc:
+                        if first_error is None:first_error=exc
+                if first_error is not None:
+                    for future in pending:future.cancel()
+                progress.report()
+            progress.report(force=True)
+            if first_error is not None:raise first_error
+    else:
+        progress.report(force=True)
+    # Only provenance bookkeeping remains; every archive is already in verified
+    # CAS and is reusable even if a later stage of the fetch fails.
     for sha in sorted(references):
-        item=artifacts[sha];identities=sorted(references[sha])
-        if sha in downloaded:
-            raw=downloaded[sha]
-            pool.put(raw,'conda',identities[0],verified_sha=sha)
-            raw.unlink()
-        for identity in identities:
+        item=artifacts[sha]
+        for identity in sorted(references[sha]):
             pool.download(item['url'],'conda',identity,sha=sha)
     plans={};base_python={}
     for env,row in sorted(lock['environments'].items()):
@@ -3927,7 +4034,7 @@ def main(argv=None):
     write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
     verified=set()
     if args.reuse_from is not None:
-        verified=salvage_verified_stage(args.reuse_from,stage)
+        verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
     pool=Pool(stage)
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)

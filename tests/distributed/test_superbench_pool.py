@@ -1727,8 +1727,9 @@ setup(version=dynamic_version(), **setup_args)
                     'b':{'transactions':[{'key':'env-b','python':'3.10','packages':[sha1]}]}}}
             payload={lock['artifacts'][sha1]['url']:one,lock['artifacts'][sha2]['url']:two}
             calls=[]
-            def network(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+            def network(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None,on_block=None):
                 calls.append(url);Path(path).write_bytes(payload[url])
+                if on_block is not None:on_block(len(payload[url]))
                 actual=hashlib.sha256(payload[url]).hexdigest()
                 self.assertEqual(actual,sha);return actual
             with patch.object(pool,'fetch',side_effect=network):
