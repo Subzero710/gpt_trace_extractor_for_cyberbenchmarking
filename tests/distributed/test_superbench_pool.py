@@ -1057,9 +1057,19 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                      'sha256':hashlib.sha256(key.encode()).hexdigest(),
                      'url':'https://files.pythonhosted.org/'+key+'.whl',
                      'requirements':[],'provides_extra':[]}]
+        def materialize(_pool,records,*_args,**_kwargs):
+            for row in records:
+                payload=row['url'].rsplit('/',1)[-1].removesuffix('.whl').encode()
+                self.assertEqual(hashlib.sha256(payload).hexdigest(),row['sha256'])
+                path=_pool.objects/row['sha256'][:2]/row['sha256']
+                path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_bytes(payload)
+            return records
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  patch.object(pool,'_materialize_solution',side_effect=lambda _pool,records,*_args,**_kwargs:records):
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                 patch.object(pool,'_resolve_registry_plan',side_effect=resolve), \
+                 patch.object(pool,'_materialize_solution',side_effect=materialize):
                 pool.acquire_pip_groups(candidate,groups)
         self.assertEqual(maximum,2)
 
@@ -1080,30 +1090,95 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  self.assertRaisesRegex(RuntimeError,'required pip closure a failed: boom'):
                 pool.acquire_pip_groups(candidate,groups)
 
-    def test_batch_resolves_all_groups_before_full_artifact_materialization(self):
+    def test_each_completed_closure_checkpoints_before_another_closure_fails(self):
         target_env=fixture_target('3.10.14').as_dict()
         groups={name:{'target':target_env,'requirements':[name+'==1.0'],
                       'constraints':[],'no_deps':False,'required':True,
                       'tasks':['task-'+name],'steps':['install']}
                 for name in ('alpha','beta')}
-        lock=__import__('threading').Lock();resolved=set();materialized=[]
-        def resolve(_pool,_target,reqs,_constraints,key,**_kwargs):
-            name=reqs[0].split('==',1)[0]
-            with lock:resolved.add(name)
-            return [{'kind':'wheel','name':name,'version':'1.0','filename':name+'.whl',
-                     'sha256':hashlib.sha256(name.encode()).hexdigest(),
-                     'url':'https://files.pythonhosted.org/'+name+'.whl',
+        threading=__import__('threading')
+        persisted=threading.Event()
+        original_write=pool._write_pip_plan
+
+        def resolve(_pool,_target,_reqs,_constraints,key,**_kwargs):
+            if key=='beta':
+                self.assertTrue(persisted.wait(timeout=5),
+                                'other closure must become durable before this failure')
+                raise RuntimeError('planned sibling failure')
+            return [{'kind':'wheel','name':'alpha','version':'1.0',
+                     'filename':'alpha-1.0-py3-none-any.whl',
+                     'sha256':hashlib.sha256(b'alpha').hexdigest(),
+                     'url':'https://files.pythonhosted.org/alpha.whl',
                      'requirements':[],'provides_extra':[]}]
+
         def materialize(_pool,records,*_args,**_kwargs):
-            with lock:
-                self.assertEqual(resolved,{'alpha','beta'})
-                materialized.append(records[0]['name'])
+            for row in records:
+                payload=row['url'].rsplit('/',1)[-1].removesuffix('.whl').encode()
+                self.assertEqual(hashlib.sha256(payload).hexdigest(),row['sha256'])
+                path=_pool.objects/row['sha256'][:2]/row['sha256']
+                path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_bytes(payload)
             return records
+
+        def checkpoint(*args,**kwargs):
+            result=original_write(*args,**kwargs)
+            persisted.set()
+            return result
+
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  patch.object(pool,'_materialize_solution',side_effect=materialize):
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                 patch.object(pool,'_resolve_registry_plan',side_effect=resolve), \
+                 patch.object(pool,'_materialize_solution',side_effect=materialize), \
+                 patch.object(pool,'_write_pip_plan',side_effect=checkpoint), \
+                 self.assertRaisesRegex(RuntimeError,'required pip closure beta failed: planned sibling failure'):
                 pool.acquire_pip_groups(candidate,groups)
-        self.assertEqual(set(materialized),{'alpha','beta'})
+            self.assertTrue(persisted.is_set())
+            plan=json.loads((Path(tmp)/'metadata/pip-plan-alpha.json').read_text())
+            self.assertEqual(plan['requested'],['alpha==1.0'])
+            self.assertEqual(plan['packages'][0]['name'],'alpha')
+
+    def test_cached_dependency_compatibility_prevents_pairwise_version_explosion(self):
+        target=fixture_target('3.10.14')
+        _,_,Version,_,_=pool._packaging_symbols()
+        versions=range(1,41)
+        def candidate(name,version):
+            value=str(version)
+            return {'kind':'wheel','name':name,'version':value,
+                    'filename':f'{name}-{value}-py3-none-any.whl',
+                    'item':{'url':f'https://files.pythonhosted.org/{name}-{value}.whl',
+                            'digests':{'sha256':hashlib.sha256(f'{name}-{value}'.encode()).hexdigest()}}}
+        universes={name:tuple((Version(str(v)),candidate(name,v)) for v in versions)
+                   for name in ('awscli','boto3','botocore')}
+        def release(name,_target,_cache=None,**_kwargs):return universes[name]
+        def exact(name,version,_target,_cache=None):
+            return tuple(row for row in universes[name] if row[0]==Version(version))
+        def metadata(_pool,item,_key,_target,_probe,_artifact,**_kwargs):
+            def compute():
+                deps=(['botocore=='+item['version']] if item['name']=='awscli'
+                      else ['botocore==1'] if item['name']=='boto3' else [])
+                return {**item,'sha256':item['item']['digests']['sha256'],
+                        'url':item['item']['url'],'requirements':deps,'provides_extra':[]}
+            identity=pool._candidate_probe_identity(item,_target,False)
+            return pool._memo_get_or_compute(_probe,identity,compute)
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp));output=io.StringIO()
+            with patch.object(pool,'_registry_release_candidates',side_effect=release), \
+                 patch.object(pool,'_registry_exact_release_candidate',side_effect=exact), \
+                 patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
+                 contextlib.redirect_stdout(output):
+                result=pool._resolve_registry_plan(candidate_pool,target,
+                    {'awscli>=1','boto3>=1'},(),'aws-pair-regression',materialize=False)
+            chosen={row['name']:row['version'] for row in result}
+            self.assertEqual(chosen['awscli'],'1')
+            self.assertEqual(chosen['botocore'],'1')
+            self.assertIn(chosen['boto3'],{str(v) for v in versions})
+            summary=output.getvalue()
+            import re
+            decisions=int(re.search(r'decisions=(\d+)',summary).group(1))
+            pruning=int(re.search(r'forward_prunes=(\d+)',summary).group(1))
+            self.assertLess(decisions,len(versions)*3,summary)
+            self.assertGreater(pruning,0,summary)
 
     def test_adaptive_prefetch_expands_as_resolvers_finish(self):
         activity=pool._ResolverActivity(8)

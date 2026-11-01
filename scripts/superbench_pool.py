@@ -2298,6 +2298,11 @@ class _SingleFlightCache:
         self._values={}
         self._pending={}
 
+    def peek(self,key):
+        """Read only completed immutable metadata, never wait for network work."""
+        with self._lock:
+            return self._values.get(key)
+
     def get_or_compute(self,key,producer):
         with self._lock:
             if key in self._values:return self._values[key]
@@ -2722,8 +2727,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 10
-PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v8-pep592-historical-yank-when-no-active-candidates'
+PIP_PLAN_SCHEMA = 11
+PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v9-forward-checking-conflict-cache-per-closure-checkpoint'
 
 
 def _pip_worker_controls():
@@ -3051,11 +3056,16 @@ def _materialize_candidate_metadata(pool,candidate,key,target,cache):
     return record
 
 
+def _candidate_probe_identity(candidate,target,no_deps):
+    """One identity for release metadata and read-only compatibility probes."""
+    return (_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
+            candidate['version'],candidate['filename'],bool(no_deps))
+
+
 def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,no_deps=False):
     """Read lightweight release metadata without downloading rejected artifacts."""
     target=_coerce_target(target)
-    identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
-              candidate['version'],candidate['filename'],bool(no_deps))
+    identity=_candidate_probe_identity(candidate,target,no_deps)
     def probe():
         sha,url=_candidate_artifact_identity(candidate)
         if no_deps:
@@ -3157,6 +3167,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         req=_parse_registry_requirement(raw)
         if _marker_active(req,target):roots.append((req,frozenset()))
     if not roots:return []
+    root_names=frozenset(_normalized_package_name(req.name) for req,_causes in roots)
     resolver_cache={} if resolver_cache is None else resolver_cache
     probe_cache=resolver_cache.setdefault('release_metadata',_SingleFlightCache())
     artifact_cache=resolver_cache.setdefault('artifact_metadata',_SingleFlightCache())
@@ -3167,7 +3178,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     prefetch_controller=resolver_cache.get('prefetch_controller')
     candidate_cache={};failed_states=set();learned_nogoods=defaultdict(set)
     decision_packages=defaultdict(int)
-    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0,'learned_skips':0}
+    observed_metadata=set();observed_metadata_lock=threading.Lock()
+    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0,'learned_skips':0,'forward_prunes':0}
     target_key=_target_fingerprint(target)
 
     def grouped(entries):
@@ -3205,8 +3217,73 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         return candidate_cache[cache_key]
 
     def candidate_record(candidate):
-        return _candidate_release_metadata(
+        record=_candidate_release_metadata(
             pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
+        with observed_metadata_lock:
+            observed_metadata.add(_normalized_package_name(candidate['name']))
+        return record
+
+    def compatibility_conflict(name,record,rows,requirements_by_name,selected,extras_by_name):
+        """Prove a candidate impossible against requirements already in this state.
+
+        Never infer constraints from a different release. Unprobed candidate metadata
+        stays eligible, and the full registry domain is checked when a yanked
+        historical release could satisfy an otherwise empty intersection.
+        """
+        if no_deps:return None
+        active_extras=frozenset(extras_by_name.get(name,set()))
+        for raw in record['requirements']:
+            dep=_parse_registry_requirement(raw)
+            if not _marker_active(dep,target,active_extras):continue
+            dep_name=_normalized_package_name(dep.name)
+            if dep_name==name:
+                if not _candidate_satisfies(record,[dep],constraint_map.get(name,[])):
+                    return frozenset({name})|causes(rows),dep_name
+                continue
+            if dep_name in selected:
+                if not _candidate_satisfies(selected[dep_name],[dep],constraint_map.get(dep_name,[])):
+                    return (frozenset({name,dep_name})|causes(rows)
+                            |causes(requirements_by_name.get(dep_name,()))),dep_name
+                continue
+            if dep_name not in requirements_by_name:continue
+            prior=requirements_by_name[dep_name]
+            # The exact domain, including historical yanks permitted by policy,
+            # is computed using the new requirement, never guessed from the old
+            # active-only candidate set.
+            extended=(*prior,(dep,frozenset({name})|causes(rows)))
+            if not domain(dep_name,extended):
+                return (frozenset({name})|causes(rows)|causes(prior)),dep_name
+        return None
+
+    def cached_compatible(name,candidates,rows,requirements_by_name,selected,extras_by_name):
+        """Reuse discovered incompatibilities across independent version choices.
+
+        An earlier branch may already have fetched all releases of a second
+        package. Checking their immutable metadata against the current constraints
+        eliminates the cross-product without another network request or decision.
+        Unknown candidate metadata is never excluded.
+        """
+        with observed_metadata_lock:
+            if no_deps or name not in observed_metadata:
+                return candidates,frozenset(),None
+        survivors=[];conflict_names=set();first_detail=None
+        for candidate in candidates:
+            identity=_candidate_probe_identity(candidate,target,no_deps)
+            record=(probe_cache.peek(identity) if isinstance(probe_cache,_SingleFlightCache)
+                    else probe_cache.get(identity))
+            if record is None:
+                survivors.append(candidate)
+                continue
+            conflict=compatibility_conflict(
+                name,record,rows,requirements_by_name,selected,extras_by_name)
+            if conflict is None:
+                survivors.append(candidate)
+                continue
+            involved,dep_name=conflict
+            conflict_names.update(involved)
+            if first_detail is None:first_detail=dep_name
+            stats['forward_prunes']+=1
+        return survivors,frozenset(conflict_names),first_detail
 
     def nogood_key_for(name,candidate,rows,active_extras):
         return (name,candidate['kind'],candidate['version'],candidate['filename'],
@@ -3290,8 +3367,18 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                             +repr([str(row[0]) for row in rows])+' constraints '
                             +repr(sorted(str(req) for req in constraint_map.get(name,[]))))
                     return None,conflict,detail
-                choices.append((len(candidates),name,candidates,rows))
-            count,name,candidates,rows=min(choices,key=lambda row:(row[0],row[1]))
+                survivors,known_conflict,conflicting_dep=cached_compatible(
+                    name,candidates,rows,requirements_by_name,selected,extras_by_name)
+                if not survivors:
+                    for pending in domain_futures.values():pending.cancel()
+                    failed_states.add(current_state)
+                    return (None,known_conflict,
+                            'all cached compatible releases of '+name+' conflict with '+str(conflicting_dep))
+                choices.append((len(survivors),name,survivors,rows))
+            # MRV remains the primary criterion. At equal domain sizes, choose a
+            # direct requirement before an inferred transitive dependency.
+            count,name,candidates,rows=min(choices,key=lambda row:(
+                row[0],row[1] not in root_names,row[1]))
 
             # A singleton domain is forced; propagate it without creating a
             # branch level. This is the dependency-solver equivalent of unit
@@ -3342,21 +3429,13 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 # dependencies contradicts an assignment already made. This is
                 # the same conflict recursion would discover after expansion,
                 # but avoids constructing and memoizing a redundant child state.
-                immediate=set()
-                if not no_deps:
-                    for raw in record['requirements']:
-                        dep=_parse_registry_requirement(raw)
-                        if not _marker_active(dep,target,active_extras):continue
-                        dep_name=_normalized_package_name(dep.name)
-                        assigned=selected.get(dep_name)
-                        if assigned is None:continue
-                        if not _candidate_satisfies(assigned,[dep],constraint_map.get(dep_name,[])):
-                            immediate.update((name,dep_name));immediate.update(branch_causes)
-                            immediate.update(causes(requirements_by_name.get(dep_name,())))
-                if immediate:
-                    conflict=frozenset(immediate)
-                    detail=('candidate '+name+'=='+record['version']+' conflicts with selected '+
-                            ','.join(sorted(immediate-{name})))
+                lookahead=compatibility_conflict(
+                    name,record,rows,requirements_by_name,selected,extras_by_name)
+                if lookahead is not None:
+                    conflict,conflicting_dep=lookahead
+                    stats['forward_prunes']+=1
+                    detail=('candidate '+name+'=='+record['version']+
+                            ' leaves incompatible requirements for '+conflicting_dep)
                     result=None
                 else:
                     next_selected=dict(selected);next_selected[name]=record
@@ -3388,15 +3467,18 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     if result is None:
         summary=(f"solver decisions={stats['decisions']} propagations={stats['propagations']} "
                  f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
-                 f"learned_skips={stats['learned_skips']} hottest={hottest[0]}:{hottest[1]}")
+                 f"learned_skips={stats['learned_skips']} forward_prunes={stats['forward_prunes']} "
+                 f"hottest={hottest[0]}:{hottest[1]}")
         raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
                            +(detail or 'root constraints conflict')+'; '+summary)
     solved=[result[name] for name in sorted(result)]
     print(f"[pool] resolver {key}: solved {len(solved)} packages; "
           f"decisions={stats['decisions']} propagations={stats['propagations']} "
           f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
-          f"learned_skips={stats['learned_skips']} hottest={hottest[0]}:{hottest[1]}; "
-          f"materializing winning artifacts",flush=True)
+          f"learned_skips={stats['learned_skips']} forward_prunes={stats['forward_prunes']} "
+          f"hottest={hottest[0]}:{hottest[1]}; "
+          +( "materializing winning artifacts" if materialize
+             else "solution ready for verified artifact checkpoint"),flush=True)
     return (_materialize_solution(pool,solved,key,target,artifact_cache,executor=metadata_executor)
             if materialize else solved)
 
@@ -3434,11 +3516,20 @@ def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':8,'name':PIP_RESOLVER_POLICY,'target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':9,'name':PIP_RESOLVER_POLICY,'target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
+    # A completed checkpoint is durable only after its CAS links and metadata
+    # directory entries have been synchronized, not merely their file contents.
+    for directory in sorted({(pool.objects/row['sha256'][:2]) for row in packages}):
+        fd=os.open(directory,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:os.fsync(fd)
+        finally:os.close(fd)
     write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps(plan,sort_keys=True,separators=(',',':')))
+    fd=os.open(stage/'metadata',os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
 
 
 def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cache=None):
@@ -3473,7 +3564,12 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
 
 
 def acquire_pip_groups(pool, groups):
-    """Resolve every closure first, then acquire winning artifacts in one bounded phase."""
+    """Acquire and checkpoint each closure independently as soon as it solves.
+
+    Resolvers and artifact transfers share the same versioned closure worker
+    capacity, so a slow/broken closure cannot discard other completed work.
+    Every completed plan references only SHA-256 verified artifacts in the CAS.
+    """
     ordered=sorted(groups.items());total=len(ordered)
     if not ordered:return
     configured_closures,configured_metadata=_pip_worker_controls()
@@ -3490,12 +3586,7 @@ def acquire_pip_groups(pool, groups):
     }
     started=time.monotonic()
     print(f"[pool] Pip resolver batch: {total} closures, {closure_workers} closure workers, "
-          f"{metadata_workers} metadata workers, adaptive candidate prefetch",flush=True)
-    metadata_executor=concurrent.futures.ThreadPoolExecutor(
-        max_workers=metadata_workers,thread_name_prefix='pip-metadata')
-    resolver_cache['metadata_executor']=metadata_executor
-    closure_executor=concurrent.futures.ThreadPoolExecutor(
-        max_workers=closure_workers,thread_name_prefix='pip-closure')
+          f"{metadata_workers} metadata workers, incremental verified checkpoints",flush=True)
 
     def optional_failure(key,group,target,exc):
         write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
@@ -3506,13 +3597,13 @@ def acquire_pip_groups(pool, groups):
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
 
-    def resolve(index,key,group):
+    def acquire(index,key,group):
         target=_coerce_target(group['target'])
         print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
               f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
         if reuse_pip_plan(pool,target,group['requirements'],key,
                           constraints=group['constraints'],no_deps=group['no_deps']):
-            return ('reused',target,None)
+            return 'reused'
         write_new(pool.stage/'metadata'/('pip-'+key+'.txt'),
                   '\n'.join(sorted(set(group['requirements'])))+'\n')
         activity.enter()
@@ -3522,84 +3613,53 @@ def acquire_pip_groups(pool, groups):
                 no_deps=group['no_deps'],resolver_cache=resolver_cache,materialize=False)
         except RuntimeError as exc:
             if not group['required']:
-                return (optional_failure(key,group,target,exc),target,None)
+                return optional_failure(key,group,target,exc)
             raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
         finally:
             activity.leave()
         if not records:
             exc=RuntimeError('registry dependency plan is empty')
             if not group['required']:
-                return (optional_failure(key,group,target,exc),target,None)
+                return optional_failure(key,group,target,exc)
             raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
-        return ('resolved',target,records)
+        try:
+            packages=_materialize_solution(
+                pool,records,key,target,resolver_cache['artifact_metadata'],executor=None)
+            _write_pip_plan(pool,target,group['requirements'],key,packages,
+                            constraints=group['constraints'],no_deps=group['no_deps'])
+            print(f'[pool] checkpointed verified pip closure {key}: '
+                  f'{len(packages)} package artifacts',flush=True)
+            return 'acquired'
+        except RuntimeError as exc:
+            if not group['required']:
+                return optional_failure(key,group,target,exc)
+            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
 
-    resolve_futures=[]
-    results={}
-    try:
-        resolve_futures=[closure_executor.submit(resolve,index,key,group)
-                         for index,(key,group) in enumerate(ordered,1)]
-        done,pending=concurrent.futures.wait(
-            resolve_futures,return_when=concurrent.futures.FIRST_EXCEPTION)
-        failures=[future for future in done if not future.cancelled() and future.exception() is not None]
-        if failures:
-            for future in pending:future.cancel()
-            concurrent.futures.wait(resolve_futures)
-            ordered_failures=[]
-            for index,(future,(key,_group)) in enumerate(zip(resolve_futures,ordered),1):
-                if future.cancelled():continue
-                exc=future.exception()
-                if exc is not None:ordered_failures.append((index,key,exc))
-            _index,_key,exc=min(ordered_failures,key=lambda row:row[0])
-            raise exc
-        concurrent.futures.wait(resolve_futures)
-        for future,(key,_group) in zip(resolve_futures,ordered):
-            if future.cancelled():continue
-            results[key]=future.result()
-
-        resolved=[(key,group,results[key][1],results[key][2])
-                  for key,group in ordered if results[key][0]=='resolved']
-        resolution_elapsed=time.monotonic()-started
-        print(f"[pool] Pip resolution complete: {len(resolved)} new closures, "
-              f"{total-len(resolved)} reused/optional in {resolution_elapsed:.2f}s; "
-              f"materializing winning artifacts",flush=True)
-
-        # Full wheel/sdist bytes never compete with resolver metadata.  This phase
-        # begins only after every new logical closure has a deterministic solution.
-        def materialize_group(key,group,target,records):
-            try:
-                packages=_materialize_solution(
-                    pool,records,key,target,resolver_cache['artifact_metadata'],executor=None)
-                _write_pip_plan(pool,target,group['requirements'],key,packages,
-                                constraints=group['constraints'],no_deps=group['no_deps'])
-                return 'acquired'
-            except RuntimeError as exc:
-                if not group['required']:
-                    return optional_failure(key,group,target,exc)
-                raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
-
-        materialize_futures=[closure_executor.submit(materialize_group,key,group,target,records)
-                             for key,group,target,records in resolved]
-        done,pending=concurrent.futures.wait(
-            materialize_futures,return_when=concurrent.futures.FIRST_EXCEPTION)
-        failures=[future for future in done if not future.cancelled() and future.exception() is not None]
-        if failures:
-            for future in pending:future.cancel()
-            concurrent.futures.wait(materialize_futures)
-            failure_rows=[]
-            for position,future in enumerate(materialize_futures):
-                if future.cancelled():continue
-                exc=future.exception()
-                if exc is not None:failure_rows.append((position,exc))
-            raise min(failure_rows,key=lambda row:row[0])[1]
-        concurrent.futures.wait(materialize_futures)
-    finally:
-        closure_executor.shutdown(wait=True,cancel_futures=True)
-        metadata_executor.shutdown(wait=True,cancel_futures=True)
-
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=metadata_workers,thread_name_prefix='pip-metadata') as metadata_executor:
+        resolver_cache['metadata_executor']=metadata_executor
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=closure_workers,thread_name_prefix='pip-closure') as closure_executor:
+            futures=[closure_executor.submit(acquire,index,key,group)
+                     for index,(key,group) in enumerate(ordered,1)]
+            done,pending=concurrent.futures.wait(
+                futures,return_when=concurrent.futures.FIRST_EXCEPTION)
+            failures=[future for future in done if not future.cancelled() and future.exception() is not None]
+            if failures:
+                for future in pending:future.cancel()
+                concurrent.futures.wait(futures)
+                ordered_failures=[]
+                for index,(future,(key,_group)) in enumerate(zip(futures,ordered),1):
+                    if future.cancelled():continue
+                    exc=future.exception()
+                    if exc is not None:ordered_failures.append((index,key,exc))
+                _index,_key,exc=min(ordered_failures,key=lambda row:row[0])
+                raise exc
+            concurrent.futures.wait(futures)
+            for future in futures:future.result()
     elapsed=time.monotonic()-started
     print(f"[pool] Pip closures complete {total}/{total} in {elapsed:.2f}s "
           f"with {closure_workers} closure workers and {metadata_workers} metadata workers",flush=True)
-
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):
     """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""
