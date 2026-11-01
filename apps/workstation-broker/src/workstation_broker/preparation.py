@@ -33,6 +33,7 @@ PHASES = TERMINAL | {"starting", "running", "validating"}
 
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
+    "config/preparation.toml",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",

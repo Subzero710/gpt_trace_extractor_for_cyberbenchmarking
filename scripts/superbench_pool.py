@@ -22,6 +22,7 @@ import shlex
 import shutil
 import stat
 import tempfile
+import threading
 import subprocess
 import sys
 import time
@@ -217,18 +218,79 @@ def _network_retry(label, operation, *, cleanup=None):
     raise AssertionError('unreachable network retry loop')
 
 
+_HTTPS_CONNECTIONS=threading.local()
+
+
+def _drop_expected_https_connection(host):
+    connections=getattr(_HTTPS_CONNECTIONS,'connections',None)
+    if not connections:return
+    connection=connections.pop(host,None)
+    if connection is not None:
+        try:connection.close()
+        except OSError:pass
+
+
+def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.hostname!=expected_host:
+        raise RuntimeError('untrusted HTTPS endpoint host')
+    connections=getattr(_HTTPS_CONNECTIONS,'connections',None)
+    if connections is None:
+        connections={}
+        _HTTPS_CONNECTIONS.connections=connections
+    connection=connections.get(expected_host)
+    if connection is None:
+        connection=http.client.HTTPSConnection(expected_host,timeout=timeout)
+        connections[expected_host]=connection
+    elif connection.sock is not None:
+        connection.sock.settimeout(timeout)
+    path=urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
+    try:
+        connection.request('GET',path,headers={'User-Agent':user_agent,'Accept-Encoding':'identity'})
+        response=connection.getresponse()
+        length=response.getheader('Content-Length','')
+        if length.isdigit() and int(length)>limit:
+            response.read()
+            raise RuntimeError('HTTPS response exceeds limit')
+        if 300 <= response.status < 400:
+            # Metadata endpoints are expected to be canonical. Preserve the
+            # previous redirect validation path if an upstream starts redirecting.
+            response.read()
+            _drop_expected_https_connection(expected_host)
+            request=urllib.request.Request(url,headers={'User-Agent':user_agent})
+            with urllib.request.urlopen(request,timeout=timeout) as redirected_response:
+                redirected=urllib.parse.urlsplit(redirected_response.url)
+                if redirected.scheme!='https' or redirected.hostname!=expected_host:
+                    raise RuntimeError('untrusted HTTPS redirect host')
+                redirected_length=redirected_response.headers.get('Content-Length','')
+                if redirected_length.isdigit() and int(redirected_length)>limit:
+                    raise RuntimeError('HTTPS response exceeds limit')
+                raw=redirected_response.read(limit+1)
+        elif not 200 <= response.status < 300:
+            body=response.read(limit+1)
+            raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,io.BytesIO(body))
+        else:
+            raw=response.read(limit+1)
+    except BaseException:
+        _drop_expected_https_connection(expected_host)
+        raise
+    if len(raw)>limit:raise RuntimeError('HTTPS response exceeds limit')
+    return raw
+
+
 def _read_https(url, *, timeout, limit, user_agent, expected_host=None):
     parsed=urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise RuntimeError('untrusted HTTPS endpoint: '+str(url))
     label=(parsed.hostname or '')+parsed.path
     def read_once():
+        if expected_host is not None:
+            return _read_expected_https_once(
+                url,timeout=timeout,limit=limit,user_agent=user_agent,expected_host=expected_host)
         request=urllib.request.Request(url, headers={'User-Agent':user_agent})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             redirected=urllib.parse.urlsplit(response.url)
             if redirected.scheme != 'https': raise RuntimeError('untrusted HTTPS redirect')
-            if expected_host is not None and redirected.hostname != expected_host:
-                raise RuntimeError('untrusted HTTPS redirect host')
             length=response.headers.get('Content-Length','')
             if length.isdigit() and int(length)>limit: raise RuntimeError('HTTPS response exceeds limit')
             raw=response.read(limit+1)
@@ -1445,6 +1507,10 @@ class Pool:
         self.by_sri = {}
         self.sri_verified = set()
         self.verified_objects = set()  # SHA-256 verified at acquisition or recovery
+        # Pip closures run concurrently. Mutable provenance/CAS indexes remain
+        # process-local and are protected independently from network transfer.
+        self._state_lock = threading.RLock()
+        self._download_locks = {}
         # One ephemeral pip HTTP cache for the whole worker. It is deliberately
         # outside the staged pool and therefore can never become a published
         # dependency. Cross-group artifact reuse itself is handled by the CAS.
@@ -1452,15 +1518,16 @@ class Pool:
         self.pip_cache = Path(self._pip_cache_context.name)
 
     def reference(self, sha, category, identity, size):
-        target = self.objects / sha[:2] / sha
-        if not target.is_file() or target.is_symlink() or target.stat().st_size != size:
-            raise RuntimeError('missing/invalid content-addressed dependency')
-        self.links.setdefault(sha, {'path': target.relative_to(self.stage).as_posix(),
-                                    'size': size, 'sha256': sha})
-        refs = self.provenance.setdefault(category, {}).setdefault(identity, [])
-        if sha not in refs:
-            refs.append(sha)
-        return sha
+        with self._state_lock:
+            target = self.objects / sha[:2] / sha
+            if not target.is_file() or target.is_symlink() or target.stat().st_size != size:
+                raise RuntimeError('missing/invalid content-addressed dependency')
+            self.links.setdefault(sha, {'path': target.relative_to(self.stage).as_posix(),
+                                        'size': size, 'sha256': sha})
+            refs = self.provenance.setdefault(category, {}).setdefault(identity, [])
+            if sha not in refs:
+                refs.append(sha)
+            return sha
 
     def put(self, path, category, identity, *, verified_sha=None):
         """Register one immutable artifact with a content-addressed hardlink.
@@ -1475,14 +1542,15 @@ class Pool:
         if not SHA.fullmatch(sha):
             raise RuntimeError('invalid artifact SHA-256')
         size = path.stat().st_size
-        target = self.objects / sha[:2] / sha
-        target.parent.mkdir(exist_ok=True)
-        if not target.exists():
-            os.link(path, target)
-        elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
-            raise RuntimeError('content-addressed pool collision/changed object')
-        self.verified_objects.add(sha)
-        return self.reference(sha, category, identity, size)
+        with self._state_lock:
+            target = self.objects / sha[:2] / sha
+            target.parent.mkdir(exist_ok=True)
+            if not target.exists():
+                os.link(path, target)
+            elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
+                raise RuntimeError('content-addressed pool collision/changed object')
+            self.verified_objects.add(sha)
+            return self.reference(sha, category, identity, size)
 
     def coalesce_stage_file(self, path, sha):
         """Coalesce completed, disposable acquisition files immediately.
@@ -1504,6 +1572,13 @@ class Pool:
                 temporary.unlink()
 
     def download(self, url, category, identity, *, sha=None, sri=None):
+        """Download distinct URLs concurrently while serializing one URL identity."""
+        with self._state_lock:
+            transfer_lock = self._download_locks.setdefault(url, threading.Lock())
+        with transfer_lock:
+            return self._download_url_locked(url, category, identity, sha=sha, sri=sri)
+
+    def _download_url_locked(self, url, category, identity, *, sha=None, sri=None):
         """Download once by SHA-256, SRI or URL, then share by reference.
 
         Trust a known digest before fetching bytes. If a URL is requested again
@@ -1513,36 +1588,39 @@ class Pool:
         if sha is not None and not SHA.fullmatch(str(sha)):
             raise RuntimeError('invalid expected artifact SHA-256')
         sri_value = tuple(sri_parts(sri) or ())
-        cached = None
-        if sha is not None and (self.objects / sha[:2] / sha).is_file():
-            cached = sha
-        elif sri_value:
-            for item in sri_value:
-                if item in self.by_sri:
-                    cached = self.by_sri[item]
-                    break
-        elif url in self.by_url:
-            cached = self.by_url[url]
-        # Even when the known digest is new, a previously fetched URL may exist.
-        if cached is None:
-            cached = self.by_url.get(url)
+        with self._state_lock:
+            cached = None
+            if sha is not None and (self.objects / sha[:2] / sha).is_file():
+                cached = sha
+            elif sri_value:
+                for item in sri_value:
+                    if item in self.by_sri:
+                        cached = self.by_sri[item]
+                        break
+            elif url in self.by_url:
+                cached = self.by_url[url]
+            # Even when the known digest is new, a previously fetched URL may exist.
+            if cached is None:
+                cached = self.by_url.get(url)
         if cached is not None:
             target = self.objects / cached[:2] / cached
             if (target.is_symlink() or not target.is_file()
                     or cached not in self.verified_objects and digest(target)!=cached):
                 raise RuntimeError('retained CAS bytes fail SHA-256 verification: '+cached)
-            self.verified_objects.add(cached)
             if sha is not None and cached != sha:
                 raise RuntimeError('conflicting expected checksum for existing download URL/SRI')
             target = self.objects / cached[:2] / cached
             if sri_value and not any((cached, part) in self.sri_verified for part in sri_value):
                 verify_sri(target, sri)
-                self.sri_verified.update((cached, part) for part in sri_value)
-            self.by_url[url] = cached
-            for part in sri_value:
-                existing = self.by_sri.setdefault(part, cached)
-                if existing != cached:
-                    raise RuntimeError('conflicting SRI artifact identity')
+            with self._state_lock:
+                self.verified_objects.add(cached)
+                if sri_value:
+                    self.sri_verified.update((cached, part) for part in sri_value)
+                self.by_url[url] = cached
+                for part in sri_value:
+                    existing = self.by_sri.setdefault(part, cached)
+                    if existing != cached:
+                        raise RuntimeError('conflicting SRI artifact identity')
             return self.reference(cached, category, identity, target.stat().st_size)
 
         # Independent of task/category: one stable URL gets one acquisition path.
@@ -1571,18 +1649,19 @@ class Pool:
             actual = fetch(url, raw, sha=sha, sri=sri, integrity_digests=known_hashes)
         self.put(raw, category, identity, verified_sha=actual)
         self.coalesce_stage_file(raw, actual)
-        self.by_url[url] = actual
-        for algo, binary in [('sha256', bytes.fromhex(actual)), *known_hashes.items()]:
-            token = (algo, binary)
-            existing = self.by_sri.setdefault(token, actual)
-            if existing != actual:
-                raise RuntimeError('conflicting content-addressed identity')
-            self.sri_verified.add((actual, token))
-        for part in sri_value:
-            existing = self.by_sri.setdefault(part, actual)
-            if existing != actual:
-                raise RuntimeError('conflicting SRI artifact identity')
-            self.sri_verified.add((actual, part))
+        with self._state_lock:
+            self.by_url[url] = actual
+            for algo, binary in [('sha256', bytes.fromhex(actual)), *known_hashes.items()]:
+                token = (algo, binary)
+                existing = self.by_sri.setdefault(token, actual)
+                if existing != actual:
+                    raise RuntimeError('conflicting content-addressed identity')
+                self.sri_verified.add((actual, token))
+            for part in sri_value:
+                existing = self.by_sri.setdefault(part, actual)
+                if existing != actual:
+                    raise RuntimeError('conflicting SRI artifact identity')
+                self.sri_verified.add((actual, part))
         return actual
 
     def issue(self, where, description):
@@ -1986,12 +2065,53 @@ def _target_marker_environment(value):
     return _coerce_target(value).markers
 
 
-@functools.lru_cache(maxsize=2048)
+class _SingleFlightCache:
+    """Deduplicate concurrent immutable metadata work without serializing unrelated keys."""
+    def __init__(self):
+        self._lock=threading.Lock()
+        self._values={}
+        self._pending={}
+
+    def get_or_compute(self,key,producer):
+        with self._lock:
+            if key in self._values:return self._values[key]
+            future=self._pending.get(key)
+            owner=future is None
+            if owner:
+                future=concurrent.futures.Future()
+                self._pending[key]=future
+        if not owner:return future.result()
+        try:
+            value=producer()
+        except BaseException as exc:
+            with self._lock:
+                self._pending.pop(key,None)
+                future.set_exception(exc)
+            raise
+        with self._lock:
+            self._values[key]=value
+            self._pending.pop(key,None)
+            future.set_result(value)
+        return value
+
+
+def _memo_get_or_compute(cache,key,producer):
+    if cache is None:return producer()
+    if isinstance(cache,_SingleFlightCache):return cache.get_or_compute(key,producer)
+    if key not in cache:cache[key]=producer()
+    return cache[key]
+
+
+_PYPI_JSON_CACHE=_SingleFlightCache()
+
+
 def _pypi_json(url, *, limit=16*1024*1024):
-    raw=_read_https(url,timeout=90,limit=limit,user_agent='gpt-trace-dependency-pool/3',
-                    expected_host='pypi.org')
-    try:return json.loads(raw)
-    except ValueError as exc:raise RuntimeError('invalid PyPI metadata JSON') from exc
+    def load():
+        raw=_read_https(url,timeout=90,limit=limit,user_agent='gpt-trace-dependency-pool/3',
+                        expected_host='pypi.org')
+        try:return json.loads(raw)
+        except ValueError as exc:raise RuntimeError('invalid PyPI metadata JSON') from exc
+    return _PYPI_JSON_CACHE.get_or_compute((url,limit),load)
 
 
 def _constraint_specifiers(name, constraints, python_version):
@@ -2072,6 +2192,38 @@ def _cached_python_versions(pool, name):
                 target=pool.objects/row['sha256'][:2]/row['sha256']
                 if target.is_file() and not target.is_symlink():found.add(row['version'])
     return found
+
+
+def _cached_python_versions_snapshot(pool):
+    """Freeze reusable package-version preferences before concurrent closure solving."""
+    result=defaultdict(set)
+    shared=pool.stage/'wheels'/'shared'
+    if shared.is_dir():
+        for wheel in shared.glob('*.whl'):
+            if wheel.is_symlink() or not wheel.is_file():continue
+            try:wheel_name,version,_,_=_parse_wheel_filename(wheel.name)
+            except Exception:continue
+            result[_normalized_package_name(wheel_name)].add(str(version))
+    metadata=pool.stage/'metadata'
+    if metadata.is_dir():
+        for path in metadata.glob('pip-plan-*.json'):
+            if path.is_symlink() or not path.is_file():continue
+            try:plan=json.loads(path.read_bytes())
+            except (OSError,ValueError,TypeError):continue
+            if (not isinstance(plan,dict) or plan.get('optional_failed')
+                    or plan.get('plan_schema')!=PIP_PLAN_SCHEMA):
+                continue
+            rows=plan.get('packages',[])
+            if not isinstance(rows,list):continue
+            for row in rows:
+                if (not isinstance(row,dict) or not isinstance(row.get('name'),str)
+                        or not isinstance(row.get('version'),str)
+                        or not SHA.fullmatch(str(row.get('sha256','')))):
+                    continue
+                target=pool.objects/row['sha256'][:2]/row['sha256']
+                if target.is_file() and not target.is_symlink():
+                    result[_normalized_package_name(row['name'])].add(row['version'])
+    return {name:frozenset(versions) for name,versions in result.items()}
 
 
 def _select_source_release(pool, requirement, python_version, constraints=()):
@@ -2287,7 +2439,29 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 5
+PIP_PLAN_SCHEMA = 6
+
+
+def _pip_worker_controls():
+    """Derive Pip concurrency from host CPU affinity and versioned acquisition capacity."""
+    path=Path(__file__).resolve().parents[1]/'config/preparation.toml'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing staged preparation controls')
+    try:
+        with path.open('rb') as stream:payload=tomllib.load(stream)
+    except (OSError,tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError('invalid staged preparation controls') from exc
+    acquisition=payload.get('acquisition') or {}
+    metadata_workers=acquisition.get('workers')
+    if type(metadata_workers) is not int or metadata_workers<1:
+        raise RuntimeError('invalid acquisition worker control')
+    try:
+        available_cpus=len(os.sched_getaffinity(0))
+    except (AttributeError,OSError) as exc:
+        raise RuntimeError('execution-host CPU affinity is unavailable') from exc
+    if available_cpus<1:
+        raise RuntimeError('execution-host CPU affinity is empty')
+    return min(available_cpus,metadata_workers),metadata_workers
 
 
 def _target_fingerprint(target):
@@ -2298,7 +2472,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v3-conflict-directed',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v4-parallel-conflict-directed',
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2395,30 +2569,30 @@ def _registry_release_candidates(name,target,cache=None):
     _,_,Version,InvalidVersion,_=_packaging_symbols()
     target=_coerce_target(target)
     cache_key=(_normalized_package_name(name),_target_fingerprint(target))
-    if cache is not None and cache_key in cache:
-        return cache[cache_key]
-    project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(name,safe='')+'/json')
-    releases=project.get('releases')
-    if not isinstance(releases,dict):raise RuntimeError('PyPI project has no releases: '+name)
-    result=[]
-    for text,files in releases.items():
-        try:version=Version(text)
-        except InvalidVersion:continue
-        artifacts=_release_artifacts(name,text,files,target)
-        if artifacts:result.append((version,artifacts[0]))
-    result=tuple(sorted(result,key=lambda row:row[0]))
-    if cache is not None:cache[cache_key]=result
-    return result
+    def load():
+        project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(name,safe='')+'/json')
+        releases=project.get('releases')
+        if not isinstance(releases,dict):raise RuntimeError('PyPI project has no releases: '+name)
+        result=[]
+        for text,files in releases.items():
+            try:version=Version(text)
+            except InvalidVersion:continue
+            artifacts=_release_artifacts(name,text,files,target)
+            if artifacts:result.append((version,artifacts[0]))
+        return tuple(sorted(result,key=lambda row:row[0]))
+    return _memo_get_or_compute(cache,cache_key,load)
 
 
-def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None):
+def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
     _,_,Version,InvalidVersion,_=_packaging_symbols()
     candidates=[row for row in _registry_release_candidates(name,target,release_cache)
                 if all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
                        for req in [*requirements,*constraints])]
     if not candidates:return []
     cached=set()
-    for text in _cached_python_versions(pool,name):
+    preferred=(_cached_python_versions(pool,name) if preferred_versions is None
+               else preferred_versions.get(_normalized_package_name(name),()))
+    for text in preferred:
         try:cached.add(Version(text))
         except InvalidVersion:continue
     reused=[row for row in candidates if row[0] in cached]
@@ -2505,95 +2679,77 @@ def _materialize_candidate_metadata(pool,candidate,key,target,cache):
     """Download one chosen artifact and read its authoritative embedded metadata."""
     identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
               candidate['version'],candidate['filename'])
-    if identity in cache:
-        record=cache[identity]
-        artifact=pool.objects/record['sha256'][:2]/record['sha256']
-        if artifact.is_symlink() or not artifact.is_file():
-            raise RuntimeError('cached resolver metadata lost its content-addressed artifact')
-        category='python-source' if record['kind']=='sdist' else 'python'
-        pool.reference(record['sha256'],category,key,artifact.stat().st_size)
-        return record
-    sha,url=_candidate_artifact_identity(candidate)
-    if candidate['kind']=='wheel':
-        actual=pool.download(url,'python',key,sha=sha)
-        path=pool.objects/actual[:2]/actual
-        requirements,extras=_wheel_core_metadata(path)
-        record={'kind':'wheel','name':candidate['name'],'version':candidate['version'],
-                'filename':candidate['filename'],'sha256':actual,'url':url,
-                'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
-                'provides_extra':sorted(set(extras))}
-    else:
+    def materialize():
+        sha,url=_candidate_artifact_identity(candidate)
+        if candidate['kind']=='wheel':
+            actual=pool.download(url,'python',key,sha=sha)
+            path=pool.objects/actual[:2]/actual
+            requirements,extras=_wheel_core_metadata(path)
+            return {'kind':'wheel','name':candidate['name'],'version':candidate['version'],
+                    'filename':candidate['filename'],'sha256':actual,'url':url,
+                    'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
+                    'provides_extra':sorted(set(extras))}
         source=acquire_source_distribution(pool,candidate['name']+'=='+candidate['version'],key,target)
         if source['sha256']!=sha:
             raise RuntimeError('selected source distribution identity changed during resolution')
-        record={'kind':'sdist','name':source['name'],'version':source['version'],
+        return {'kind':'sdist','name':source['name'],'version':source['version'],
                 'filename':source['filename'],'sha256':source['sha256'],'url':source['url'],
                 'requirements':source['requirements'],'provides_extra':source['provides_extra']}
-    cache[identity]=record
+    record=_memo_get_or_compute(cache,identity,materialize)
+    artifact=pool.objects/record['sha256'][:2]/record['sha256']
+    if artifact.is_symlink() or not artifact.is_file():
+        raise RuntimeError('cached resolver metadata lost its content-addressed artifact')
+    category='python-source' if record['kind']=='sdist' else 'python'
+    pool.reference(record['sha256'],category,key,artifact.stat().st_size)
     return record
 
 
 def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,no_deps=False):
-    """Read lightweight release metadata without downloading rejected artifacts.
-
-    PyPI's immutable release JSON is used only as a solve-time index.  It is
-    bound to the exact candidate filename/URL/SHA and every package selected by
-    the solver is subsequently downloaded and checked against its embedded
-    wheel/static-sdist metadata before a plan can be published.
-    """
+    """Read lightweight release metadata without downloading rejected artifacts."""
     target=_coerce_target(target)
     identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
-              candidate['version'],candidate['filename'])
-    if identity in probe_cache:return probe_cache[identity]
-    sha,url=_candidate_artifact_identity(candidate)
-    if no_deps:
-        record={'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
+              candidate['version'],candidate['filename'],bool(no_deps))
+    def probe():
+        sha,url=_candidate_artifact_identity(candidate)
+        if no_deps:
+            return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
+                    'filename':candidate['filename'],'sha256':sha,'url':url,
+                    'requirements':[],'provides_extra':[]}
+        core=_pep658_candidate_metadata(candidate)
+        if core is not None:
+            requirements,extras=core
+        else:
+            endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
+                      +urllib.parse.quote(candidate['version'],safe='')+'/json')
+            payload=_pypi_json(endpoint)
+            info=payload.get('info');files=payload.get('urls')
+            if not isinstance(info,dict) or not isinstance(files,list):
+                raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
+            _,_,Version,InvalidVersion,_=_packaging_symbols()
+            try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
+            except InvalidVersion:same_version=False
+            if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
+                    or not same_version):
+                raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
+            matched=False
+            for item in files:
+                if not isinstance(item,dict):continue
+                item_sha=str((item.get('digests') or {}).get('sha256',''))
+                if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
+                    matched=True;break
+            if not matched:
+                raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
+            requirements=info.get('requires_dist');extras=info.get('provides_extra')
+            if requirements is None:
+                return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+        if (not isinstance(requirements,list) or not all(isinstance(row,str) for row in requirements)
+                or extras is not None and (not isinstance(extras,list) or not all(isinstance(row,str) for row in extras))):
+            raise RuntimeError('invalid Python release dependency metadata for '+candidate['name']+'=='+candidate['version'])
+        return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
                 'filename':candidate['filename'],'sha256':sha,'url':url,
-                'requirements':[],'provides_extra':[]}
-        probe_cache[identity]=record;return record
-    core=_pep658_candidate_metadata(candidate)
-    if core is not None:
-        requirements,extras=core
-    else:
-        # Old files without PEP 658 metadata use the small release JSON as a
-        # speculative solve index. PyPI documents that upload metadata can differ
-        # from artifact content, so the winning artifact is always rechecked below.
-        endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
-                  +urllib.parse.quote(candidate['version'],safe='')+'/json')
-        payload=_pypi_json(endpoint)
-        info=payload.get('info');files=payload.get('urls')
-        if not isinstance(info,dict) or not isinstance(files,list):
-            raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
-        _,_,Version,InvalidVersion,_=_packaging_symbols()
-        try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
-        except InvalidVersion:same_version=False
-        if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
-                or not same_version):
-            raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
-        matched=False
-        for item in files:
-            if not isinstance(item,dict):continue
-            item_sha=str((item.get('digests') or {}).get('sha256',''))
-            if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
-                matched=True;break
-        if not matched:
-            raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
-        requirements=info.get('requires_dist');extras=info.get('provides_extra')
-        if requirements is None:
-            # A release whose index metadata cannot describe dependencies still
-            # falls back to authoritative archive inspection; only that candidate
-            # pays the full artifact cost.
-            record=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
-            probe_cache[identity]=record;return record
-    if (not isinstance(requirements,list) or not all(isinstance(row,str) for row in requirements)
-            or extras is not None and (not isinstance(extras,list) or not all(isinstance(row,str) for row in extras))):
-        raise RuntimeError('invalid Python release dependency metadata for '+candidate['name']+'=='+candidate['version'])
-    record={'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
-            'filename':candidate['filename'],'sha256':sha,'url':url,
-            'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
-            'provides_extra':sorted(set(extras or []))}
-    probe_cache[identity]=record
-    return record
+                'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
+                'provides_extra':sorted(set(extras or []))}
+    return _memo_get_or_compute(probe_cache,identity,probe)
 
 
 def _materialize_solution(pool,records,key,target,artifact_cache):
@@ -2634,9 +2790,12 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         if _marker_active(req,target):roots.append((req,frozenset()))
     if not roots:return []
     resolver_cache={} if resolver_cache is None else resolver_cache
-    probe_cache=resolver_cache.setdefault('release_metadata',{})
-    artifact_cache=resolver_cache.setdefault('artifact_metadata',{})
-    release_cache=resolver_cache.setdefault('releases',{})
+    probe_cache=resolver_cache.setdefault('release_metadata',_SingleFlightCache())
+    artifact_cache=resolver_cache.setdefault('artifact_metadata',_SingleFlightCache())
+    release_cache=resolver_cache.setdefault('releases',_SingleFlightCache())
+    preferred_versions=resolver_cache.get('preferred_versions')
+    metadata_executor=resolver_cache.get('metadata_executor')
+    metadata_prefetch=resolver_cache.get('metadata_prefetch',1)
     candidate_cache={};failed_states=set()
     stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0}
     target_key=_target_fingerprint(target)
@@ -2672,8 +2831,12 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         if cache_key not in candidate_cache:
             candidate_cache[cache_key]=_candidate_versions(
                 pool,name,requirements,constraint_map.get(name,[]),target,
-                release_cache=release_cache)
+                release_cache=release_cache,preferred_versions=preferred_versions)
         return candidate_cache[cache_key]
+
+    def candidate_record(candidate):
+        return _candidate_release_metadata(
+            pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
 
     def search(entries,selected,expanded):
         entries=tuple(entries);selected=dict(selected);expanded=dict(expanded)
@@ -2734,7 +2897,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
             # branch level. This is the dependency-solver equivalent of unit
             # propagation in a SAT solver.
             if count==1:
-                try:record=_candidate_release_metadata(pool,candidates[0],key,target,probe_cache,artifact_cache,no_deps=no_deps)
+                try:record=candidate_record(candidates[0])
                 except RuntimeError as exc:
                     failed_states.add(current_state)
                     raise RuntimeError('only compatible artifact for '+name+' has unusable metadata: '+str(exc)) from exc
@@ -2742,12 +2905,22 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 continue
 
             branch_causes=causes(rows);combined_conflict=set();metadata_failures=[];last_detail=None
+            prefetched={}
+            def schedule_metadata(position):
+                if metadata_executor is None:return
+                stop=min(len(candidates),position+metadata_prefetch)
+                for offset in range(position,stop):
+                    if offset not in prefetched:
+                        prefetched[offset]=metadata_executor.submit(candidate_record,candidates[offset])
             for index,candidate in enumerate(candidates,1):
                 stats['decisions']+=1
                 print(f"[pool] resolver {key}: decision {stats['decisions']} "
                       f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
                       f"selected={len(selected)}",flush=True)
-                try:record=_candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
+                schedule_metadata(index-1)
+                try:
+                    future=prefetched.pop(index-1,None)
+                    record=future.result() if future is not None else candidate_record(candidate)
                 except RuntimeError as exc:
                     metadata_failures.append(str(exc));continue
                 next_selected=dict(selected);next_selected[name]=record
@@ -2818,7 +2991,7 @@ def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cac
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':3,'name':'static-pypi-release-metadata-v3-conflict-directed','target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':4,'name':'static-pypi-release-metadata-v4-parallel-conflict-directed','target_fingerprint':_target_fingerprint(target)},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
@@ -2848,13 +3021,56 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
 
 
 def acquire_pip_groups(pool, groups):
-    """Acquire all unique logical closures with shared immutable resolver caches."""
-    total=len(groups);resolver_cache={'release_metadata':{},'artifact_metadata':{},'releases':{}}
-    for index,(key,group) in enumerate(sorted(groups.items()),1):
+    """Acquire closures concurrently with single-flight shared immutable metadata."""
+    ordered=sorted(groups.items());total=len(ordered)
+    if not ordered:return
+    configured_closures,configured_metadata=_pip_worker_controls()
+    closure_workers=min(configured_closures,total)
+    metadata_workers=configured_metadata
+    resolver_cache={
+        'release_metadata':_SingleFlightCache(),
+        'artifact_metadata':_SingleFlightCache(),
+        'releases':_SingleFlightCache(),
+        'preferred_versions':_cached_python_versions_snapshot(pool),
+        'metadata_prefetch':metadata_workers,
+    }
+    started=time.monotonic()
+    metadata_executor=concurrent.futures.ThreadPoolExecutor(
+        max_workers=metadata_workers,thread_name_prefix='pip-metadata')
+    resolver_cache['metadata_executor']=metadata_executor
+    closure_executor=concurrent.futures.ThreadPoolExecutor(
+        max_workers=closure_workers,thread_name_prefix='pip-closure')
+
+    def run(index,key,group):
         target=_coerce_target(group['target'])
         print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
               f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
-        acquire_pip_group(pool,key,group,resolver_cache=resolver_cache)
+        return acquire_pip_group(pool,key,group,resolver_cache=resolver_cache)
+
+    futures=[]
+    try:
+        futures=[closure_executor.submit(run,index,key,group)
+                 for index,(key,group) in enumerate(ordered,1)]
+        done,pending=concurrent.futures.wait(
+            futures,return_when=concurrent.futures.FIRST_EXCEPTION)
+        failures=[future for future in done if not future.cancelled() and future.exception() is not None]
+        if failures:
+            for future in pending:future.cancel()
+    finally:
+        closure_executor.shutdown(wait=True,cancel_futures=True)
+        metadata_executor.shutdown(wait=True,cancel_futures=True)
+
+    failures=[]
+    for index,(future,(key,_group)) in enumerate(zip(futures,ordered),1):
+        if future.cancelled():continue
+        exc=future.exception()
+        if exc is not None:failures.append((index,key,exc))
+    if failures:
+        _index,_key,exc=min(failures,key=lambda row:row[0])
+        raise exc
+    elapsed=time.monotonic()-started
+    print(f"[pool] Pip closures complete {total}/{total} in {elapsed:.2f}s "
+          f"with {closure_workers} closure workers and {metadata_workers} metadata workers",flush=True)
 
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib
 import contextlib
+import concurrent.futures
 import io
 import importlib.util
 import json
@@ -9,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -519,8 +521,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',
             'https://files.pythonhosted.org/packages/dep-1.0-py3-none-any.whl'})
         self.assertEqual(len(calls),2)
-        self.assertEqual(plan['plan_schema'],5)
-        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v3-conflict-directed')
+        self.assertEqual(plan['plan_schema'],6)
+        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v4-parallel-conflict-directed')
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
         target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]
@@ -529,7 +531,7 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         def candidate(name,version):
             return {'kind':'wheel','name':name,'version':str(version),
                     'filename':f'{name}-{version}-py3-none-any.whl','item':{}}
-        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None):
+        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None):
             if name=='conflict':return [candidate(name,index) for index in range(1,4)]
             if name=='missing':return []
             if name in noise:return [candidate(name,1),candidate(name,2)]
@@ -702,16 +704,75 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             self.assertTrue((new/'objects/sha256'/sha[:2]/sha).is_file())
             self.assertFalse((new/'metadata'/('pip-plan-'+key+'.json')).exists())
 
-    def test_required_group_failure_stops_before_later_groups(self):
+    def test_pip_groups_use_configured_parallelism(self):
         target_env=fixture_target('3.10.14').as_dict()
+        groups={str(index):{'target':target_env,'requirements':['demo==1.0'],
+                            'constraints':[],'no_deps':False,'required':True,
+                            'tasks':['task-'+str(index)],'steps':['install']}
+                for index in range(4)}
+        lock=__import__('threading').Lock();gate=__import__('threading').Barrier(2)
+        active=0;maximum=0
+        def acquire(_pool,_key,_group,*,resolver_cache=None):
+            nonlocal active,maximum
+            with lock:
+                active+=1;maximum=max(maximum,active)
+            gate.wait(timeout=5)
+            with lock:active-=1
+            return 'acquired'
         with tempfile.TemporaryDirectory() as tmp:
-            candidate=self.make_pool(Path(tmp));groups={
-                'a':{'target':target_env,'requirements':['broken'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
-                'b':{'target':target_env,'requirements':['later'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
-            }
-            with patch.object(pool,'pip_closure',side_effect=[RuntimeError('boom'),AssertionError('continued')]) as solve:
-                with self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):pool.acquire_pip_groups(candidate,groups)
-            self.assertEqual(solve.call_count,1)
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                 patch.object(pool,'acquire_pip_group',side_effect=acquire):
+                pool.acquire_pip_groups(candidate,groups)
+        self.assertEqual(maximum,2)
+
+    def test_required_parallel_group_failure_remains_fatal(self):
+        target_env=fixture_target('3.10.14').as_dict()
+        groups={
+            'a':{'target':target_env,'requirements':['broken'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
+            'b':{'target':target_env,'requirements':['later'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
+        }
+        def acquire(_pool,key,_group,*,resolver_cache=None):
+            if key=='a':raise RuntimeError('required pip closure a failed: boom')
+            return 'acquired'
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                 patch.object(pool,'acquire_pip_group',side_effect=acquire), \
+                 self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):
+                pool.acquire_pip_groups(candidate,groups)
+
+    def test_resolver_prefetches_candidate_metadata_concurrently(self):
+        target=fixture_target('3.10.14')
+        barrier=__import__('threading').Barrier(2)
+        candidate_rows=[
+            {'kind':'wheel','name':'demo','version':'1.0',
+             'filename':'demo-1.0-py3-none-any.whl','item':{}},
+            {'kind':'wheel','name':'demo','version':'2.0',
+             'filename':'demo-2.0-py3-none-any.whl','item':{}},
+        ]
+        def versions(*_args,**_kwargs):return candidate_rows
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
+            barrier.wait(timeout=5)
+            return {**item,'sha256':hashlib.sha256(item['version'].encode()).hexdigest(),
+                    'url':'https://files.pythonhosted.org/'+item['filename'],
+                    'requirements':[],'provides_extra':[]}
+        def materialize(_pool,records,_key,_target,_cache):return records
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor, \
+                 patch.object(pool,'_candidate_versions',side_effect=versions), \
+                 patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
+                 patch.object(pool,'_materialize_solution',side_effect=materialize):
+                result=pool._resolve_registry_plan(
+                    candidate,target,{'demo>=1'},(),'prefetch',
+                    resolver_cache={'release_metadata':pool._SingleFlightCache(),
+                                    'artifact_metadata':pool._SingleFlightCache(),
+                                    'releases':pool._SingleFlightCache(),
+                                    'preferred_versions':{},
+                                    'metadata_prefetch':2,
+                                    'metadata_executor':executor})
+        self.assertEqual(len(result),1)
 
     def test_same_filename_different_bytes_are_separate_cas_objects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -728,6 +789,24 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertNotIn("pool.issue('npm-global'",source)
         self.assertIn("raise RuntimeError('required VCS closure failed",source)
         self.assertIn('PIP_ARTIFACT_MODEL',source)
+
+
+class TestResolverConcurrency(unittest.TestCase):
+    def test_single_flight_computes_one_value_for_concurrent_waiters(self):
+        memo=pool._SingleFlightCache()
+        gate=__import__('threading').Barrier(4)
+        calls=[];lock=__import__('threading').Lock()
+        def worker():
+            gate.wait(timeout=5)
+            return memo.get_or_compute('shared',produce)
+        def produce():
+            with lock:calls.append('produce')
+            __import__('time').sleep(0.02)
+            return 'value'
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            results=list(executor.map(lambda _index:worker(),range(4)))
+        self.assertEqual(results,['value']*4)
+        self.assertEqual(calls,['produce'])
 
 
 class TestNetworkRetries(unittest.TestCase):
@@ -765,24 +844,44 @@ class TestNetworkRetries(unittest.TestCase):
             sleeper.assert_called_once_with(1)
             self.assertIn('network retry 2/5 in 1s after TimeoutError', log.getvalue())
 
+    def test_expected_https_metadata_reuses_one_connection_per_thread(self):
+        class Response:
+            status=200;reason='OK';headers={'Content-Length':'2'}
+            def getheader(self,name,default=''):return self.headers.get(name,default)
+            def read(self,*_args):return b'{}'
+        class Connection:
+            def __init__(self,*_args,**_kwargs):self.sock=None;self.requests=[]
+            def request(self,*args,**kwargs):self.requests.append((args,kwargs))
+            def getresponse(self):return Response()
+            def close(self):pass
+        pool._HTTPS_CONNECTIONS.connections={}
+        with patch.object(pool.http.client,'HTTPSConnection',side_effect=Connection) as factory:
+            self.assertEqual(pool._read_expected_https_once(
+                'https://pypi.org/pypi/a/json',timeout=10,limit=1024,
+                user_agent='test',expected_host='pypi.org'),b'{}')
+            self.assertEqual(pool._read_expected_https_once(
+                'https://pypi.org/pypi/b/json',timeout=10,limit=1024,
+                user_agent='test',expected_host='pypi.org'),b'{}')
+        self.assertEqual(factory.call_count,1)
+
     def test_retryable_http_503_is_retried_for_metadata(self):
         url = 'https://pypi.org/pypi/demo/json'
         failure = pool.urllib.error.HTTPError(url, 503, 'service unavailable', {}, None)
-        response = self.Response(url, [b'{"name":"demo"}'])
-        with patch.object(pool.urllib.request, 'urlopen', side_effect=[failure, response]) as opener, \
+        with patch.object(pool,'_read_expected_https_once',
+                          side_effect=[failure,b'{"name":"demo"}']) as reader, \
              patch.object(pool.time, 'sleep') as sleeper:
             self.assertEqual(pool._pypi_json(url), {'name': 'demo'})
-        self.assertEqual(opener.call_count, 2)
+        self.assertEqual(reader.call_count, 2)
         sleeper.assert_called_once_with(1)
 
     def test_nonretryable_http_404_fails_immediately(self):
         url = 'https://pypi.org/pypi/missing/json'
         failure = pool.urllib.error.HTTPError(url, 404, 'missing', {}, None)
-        with patch.object(pool.urllib.request, 'urlopen', side_effect=failure) as opener, \
+        with patch.object(pool,'_read_expected_https_once',side_effect=failure) as reader, \
              patch.object(pool.time, 'sleep') as sleeper, \
              self.assertRaises(pool.urllib.error.HTTPError):
             pool._pypi_json(url)
-        self.assertEqual(opener.call_count, 1)
+        self.assertEqual(reader.call_count, 1)
         sleeper.assert_not_called()
 
     def test_network_retry_budget_is_bounded(self):
@@ -830,6 +929,26 @@ class TestNetworkRetries(unittest.TestCase):
 
 
 class TestDeduplication(unittest.TestCase):
+    def test_concurrent_same_url_is_downloaded_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            acquired=pool.Pool(Path(tmp))
+            payload=b'concurrent immutable payload'
+            sha=hashlib.sha256(payload).hexdigest()
+            calls=[];lock=__import__('threading').Lock();gate=__import__('threading').Barrier(2)
+            def network(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
+                with lock:calls.append(url)
+                Path(path).write_bytes(payload)
+                return hashlib.sha256(payload).hexdigest()
+            def work(identity):
+                gate.wait(timeout=5)
+                return acquired.download('https://example.test/shared','python',identity,sha=sha)
+            with patch.object(pool,'fetch',side_effect=network), \
+                 concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results=list(executor.map(work,('one','two')))
+            self.assertEqual(results,[sha,sha])
+            self.assertEqual(calls,['https://example.test/shared'])
+            self.assertEqual(set(acquired.provenance['python']),{'one','two'})
+
     def test_sha_and_url_share_one_download(self):
         with tempfile.TemporaryDirectory() as tmp:
             acquired = pool.Pool(Path(tmp))
@@ -1377,6 +1496,24 @@ def run_setup():
             self.assertIn('--ignore-scripts',flat)
             self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
             self.assertNotIn("invoke(['npm'", (ROOT/'scripts/superbench_pool.py').read_text())
+
+    def test_pip_parallelism_uses_cpu_affinity_and_existing_acquisition_capacity(self):
+        controls=tomllib.loads((ROOT/'config/preparation.toml').read_text())
+        configured=controls['acquisition']['workers']
+        with patch.object(pool.os,'sched_getaffinity',return_value={0,1,2,3}):
+            self.assertEqual(pool._pip_worker_controls(),(min(4,configured),configured))
+        with patch.object(pool.os,'sched_getaffinity',return_value=set(range(configured+3))):
+            self.assertEqual(pool._pip_worker_controls(),(configured,configured))
+        source=(ROOT/'scripts/superbench_pool.py').read_text()
+        self.assertIn("config/preparation.toml",source)
+        self.assertIn("os.sched_getaffinity(0)",source)
+        self.assertNotIn("pip_closure_workers",source)
+        self.assertNotIn("pip_metadata_workers",source)
+
+    def test_pip_parallelism_fails_closed_without_host_cpu_affinity(self):
+        with patch.object(pool.os,'sched_getaffinity',side_effect=OSError('unavailable')):
+            with self.assertRaisesRegex(RuntimeError,'CPU affinity is unavailable'):
+                pool._pip_worker_controls()
 
     def test_execution_host_requirements_include_fetch_runtime(self):
         requirements=(ROOT/'requirements.txt').read_text().splitlines()

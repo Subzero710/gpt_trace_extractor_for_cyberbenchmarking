@@ -59,6 +59,7 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
         jobs.golden_dependency_identity = original_identity
     assert source_root == pool / "source"
     assert program == source_root / "scripts/superbench_pool.py"
+    assert "config/preparation.toml" in jobs.FETCH_SOURCE_FILES
     for relative in jobs.FETCH_SOURCE_FILES:
         original = private / relative
         staged = source_root / relative
