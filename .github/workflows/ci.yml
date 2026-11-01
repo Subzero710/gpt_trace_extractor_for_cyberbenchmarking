@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Discover testable components
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.components.outputs.matrix }}
+      docker_components: ${{ steps.components.outputs.docker_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Derive matrix from package metadata and test directories
+        id: components
+        run: |
+          echo "matrix=$(python .github/scripts/ci_manifest.py matrix)" >> "$GITHUB_OUTPUT"
+          echo "docker_matrix=$(python .github/scripts/ci_manifest.py matrix --mode docker)" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate tracked sources and configuration syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install syntax parser and test runner
+        run: python -m pip install 'PyYAML>=6' 'pytest>=8.3,<9'
+      - name: Parse tracked source and configuration files
+        run: python .github/scripts/ci_manifest.py validate
+      - name: Test CI discovery, syntax validation and gate behavior
+        run: python -m pytest -q tests/ci
+
+  distributed:
+    name: Distributed behavioral tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies in this isolated environment
+        run: |
+          python -m pip install -e ./shared -e './apps/workstation-broker[test]' -e './apps/runner[test]' cryptography
+      - name: Exercise offline recovery, CAS, network and transport behavior
+        run: python -m pytest -q -rs tests/distributed
+
+  services:
+    name: Service tests (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.discover.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install this service's declared dependencies only
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          python -m pip install -e ./shared
+          python -m pip install -e "./${COMPONENT}[test]"
+      - name: Execute discovered service tests
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: python -m pytest -q -rs "${COMPONENT}/tests"
+
+  docker:
+    name: Build service image (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.discover.outputs.docker_components) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove the Dockerfile builds without starting infrastructure
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: docker build --file "${COMPONENT}/Dockerfile" .
+
+  browser:
+    name: Browser proxy behavioral tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install proxy test dependencies
+        run: python -m pip install 'pytest>=8.3,<9' aiohttp
+      - name: Exercise HTTP and WebSocket proxy behavior
+        run: python -m pytest -q -rs infra/browser/tests
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [discover, validate, distributed, services, docker, browser]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require successful completion of all prerequisite jobs
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python .github/scripts/ci_manifest.py gate
+
+  codeql:
+    name: CodeQL (eligible repositories)
+    if: >-
+      ${{ github.event.repository.private == false &&
+          (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
