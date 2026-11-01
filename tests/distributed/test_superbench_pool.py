@@ -229,8 +229,13 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                                     'requires_dist':[],'provides_extra':[]},
                             'urls':project['releases']['0.2.1']}
                 raise AssertionError('unexpected PyPI endpoint '+url)
-            with patch.object(pool,"_pypi_json",side_effect=api), \
-                 patch.object(pool,"acquire_source_distribution",return_value=source) as acquire, \
+            def acquire_source(*_args,**_kwargs):
+                artifact=candidate.objects/sha[:2]/sha
+                artifact.parent.mkdir(parents=True,exist_ok=True);artifact.write_bytes(b'source')
+                return source
+            with patch.object(pool,"_pypi_simple_project",return_value=('0.2.1',)), \
+                 patch.object(pool,"_pypi_json",side_effect=api), \
+                 patch.object(pool,"acquire_source_distribution",side_effect=acquire_source) as acquire, \
                  patch.object(pool.subprocess,"run",side_effect=AssertionError("host package execution is forbidden")):
                 pool.pip_closure(candidate,target,{"collective.checkdocs==0.2.1"},"plan-key")
             plan=json.loads((stage/"metadata/pip-plan-plan-key.json").read_text())
@@ -327,7 +332,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 _,selected,_=pool._select_source_release(candidate,'demo>1.4,<2',fixture_target('3.10.14'))
         self.assertEqual(selected,'1.9')
 
-    def test_source_greater_equal_uses_exact_lower_release_when_available(self):
+    def test_source_greater_equal_prefers_latest_compatible_release(self):
         def release(version):
             return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
                      'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
@@ -338,9 +343,9 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate=pool.Pool(Path(tmp))
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(candidate,'demo>=5.1',fixture_target('3.10.14'))
-        self.assertEqual(selected,'5.1')
+        self.assertEqual(selected,'6.0')
 
-    def test_source_greater_equal_uses_first_compatible_release_when_lower_is_missing(self):
+    def test_source_greater_equal_skips_yanked_and_prefers_latest_release(self):
         def release(version, *, yanked=False):
             return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
                      'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
@@ -353,7 +358,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(
                     candidate,'demo>=5.1',fixture_target('3.10.14'))
-        self.assertEqual(selected,'5.2')
+        self.assertEqual(selected,'6.0')
 
     def test_source_greater_equal_prefers_compatible_cached_version_over_lower_pin(self):
         def release(version):
@@ -384,7 +389,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 _,selected,_=pool._select_source_release(candidate,'demo>=5.1,<6.1',fixture_target('3.10.14'))
         self.assertEqual(selected,'6.0')
 
-    def test_constraint_only_greater_equal_without_cache_is_exact_lower_bound(self):
+    def test_constraint_only_greater_equal_without_cache_prefers_latest(self):
         def release(version):
             return [{'packagetype':'sdist','filename':f'demo-{version}.tar.gz',
                      'url':f'https://files.pythonhosted.org/packages/demo-{version}.tar.gz',
@@ -396,7 +401,42 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             with patch.object(pool,'_pypi_json',return_value=project):
                 _,selected,_=pool._select_source_release(
                     candidate,'demo',fixture_target('3.10.14'),constraints={'demo>=5.1'})
-        self.assertEqual(selected,'5.1')
+        self.assertEqual(selected,'6.0')
+
+    def test_exact_source_pin_accepts_explicit_yanked_release(self):
+        sha=hashlib.sha256(b'source').hexdigest()
+        item={'packagetype':'sdist','filename':'demo-1.0.tar.gz',
+              'url':'https://files.pythonhosted.org/packages/demo-1.0.tar.gz',
+              'digests':{'sha256':sha},'requires_python':'>=3.8','yanked':True}
+        release={'info':{'name':'demo','version':'1.0'},'urls':[item]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_exact_release',return_value=('1.0',release)):
+                _req,selected,artifact=pool._select_source_release(
+                    candidate,'demo==1.0',fixture_target('3.10.14'))
+        self.assertEqual(selected,'1.0');self.assertEqual(artifact,item)
+
+    def test_exact_source_pin_uses_release_endpoint_without_project_index(self):
+        sha=hashlib.sha256(b'source').hexdigest()
+        item={'packagetype':'sdist','filename':'demo-1.0.tar.gz',
+              'url':'https://files.pythonhosted.org/packages/demo-1.0.tar.gz',
+              'digests':{'sha256':sha},'requires_python':'>=3.8'}
+        calls=[]
+        def api(url,**_kwargs):
+            calls.append(url)
+            if url.endswith('/pypi/demo/1.0/json'):
+                return {'info':{'name':'demo','version':'1.0'},'urls':[item]}
+            raise AssertionError('full project index must not be fetched for exact source pin: '+url)
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
+                 patch.object(pool,'_pypi_json',side_effect=api):
+                _req,version,selected=pool._select_source_release(
+                    candidate,'demo==1.0',fixture_target('3.10.14'))
+        self.assertEqual(version,'1.0')
+        self.assertEqual(selected,item)
+        self.assertEqual(calls,['https://pypi.org/pypi/demo/1.0/json'])
+
 
     def test_apt_key_uses_downloaded_content_address(self):
         import subprocess
@@ -472,7 +512,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                     return {'info':{'name':'demo','version':'1.0','requires_dist':[],
                                     'provides_extra':[]},'urls':project['releases']['1.0']}
                 raise AssertionError('unexpected PyPI endpoint '+url)
-            with patch.object(pool,'_pypi_json',side_effect=api), \
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
+                 patch.object(pool,'_pypi_json',side_effect=api), \
                  patch.object(pool,'fetch',side_effect=fetch), \
                  patch.object(pool.subprocess,'run',side_effect=AssertionError('pip/build execution is forbidden')):
                 pool.pip_closure(candidate,target,{'demo==1.0'},'group')
@@ -482,7 +523,95 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             self.assertEqual(plan['files'],[{'filename':'demo-1.0-py3-none-any.whl','sha256':sha}])
             self.assertEqual(calls,['https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl'])
 
-    def test_registry_lower_bound_backtracks_to_later_compatible_release(self):
+    def test_registry_exact_pin_uses_release_endpoint_without_project_index(self):
+        target=fixture_target('3.10.14')
+        sha=hashlib.sha256(b'demo').hexdigest()
+        item={'packagetype':'bdist_wheel','filename':'demo-1.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>=3.8'}
+        calls=[]
+        def api(url,**_kwargs):
+            calls.append(url)
+            if url.endswith('/pypi/demo/1.0/json'):
+                return {'info':{'name':'demo','version':'1.0','requires_dist':[],
+                                'provides_extra':[]},'urls':[item]}
+            raise AssertionError('full project index must not be fetched for exact registry pin: '+url)
+        Requirement,_,_,_,_=pool._packaging_symbols()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
+                 patch.object(pool,'_pypi_json',side_effect=api):
+                rows=pool._candidate_versions(candidate,'demo',[Requirement('demo==1.0')],[],target)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['version'],'1.0')
+        self.assertEqual(calls,['https://pypi.org/pypi/demo/1.0/json'])
+
+    def test_exact_pin_maps_pep440_equivalent_text_to_stored_release_identity(self):
+        with patch.object(pool,'_pypi_simple_project',return_value=('23.3','24.0','24.1')):
+            self.assertEqual(pool._canonical_pypi_release('pip','24.0.0'),'24.0')
+
+    def test_exact_release_uses_direct_endpoint_before_simple_fallback(self):
+        calls=[]
+        payload={'info':{'name':'demo','version':'1.0'},'urls':[]}
+        def api(url,**_kwargs):
+            calls.append(url);return payload
+        with patch.object(pool,'_pypi_json',side_effect=api),              patch.object(pool,'_pypi_simple_project',side_effect=AssertionError('simple index must stay cold')):
+            stored,result=pool._pypi_exact_release('demo','1.0')
+        self.assertEqual(stored,'1.0');self.assertIs(result,payload)
+        self.assertEqual(calls,['https://pypi.org/pypi/demo/1.0/json'])
+
+    def test_exact_release_uses_simple_index_only_after_alias_404(self):
+        calls=[]
+        failure=__import__('urllib').error.HTTPError(
+            'https://pypi.org/pypi/pip/24.0.0/json',404,'missing',{},None)
+        payload={'info':{'name':'pip','version':'24.0'},'urls':[]}
+        def api(url,**_kwargs):
+            calls.append(url)
+            if url.endswith('/24.0.0/json'):raise failure
+            if url.endswith('/24.0/json'):return payload
+            raise AssertionError(url)
+        with patch.object(pool,'_pypi_json',side_effect=api),              patch.object(pool,'_pypi_simple_project',return_value=('23.3','24.0','24.1')) as simple:
+            stored,result=pool._pypi_exact_release('pip','24.0.0')
+        self.assertEqual(stored,'24.0');self.assertIs(result,payload);simple.assert_called_once_with('pip')
+        self.assertEqual(calls,['https://pypi.org/pypi/pip/24.0.0/json',
+                                'https://pypi.org/pypi/pip/24.0/json'])
+
+    def test_exact_registry_pin_accepts_explicit_yanked_release(self):
+        target=fixture_target('3.10.14');payload=self.wheel_bytes('demo','1.0')
+        sha=hashlib.sha256(payload).hexdigest()
+        item={'packagetype':'bdist_wheel','filename':'demo-1.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>=3.8','yanked':True}
+        release={'info':{'name':'demo','version':'1.0','requires_dist':[],
+                         'provides_extra':[]},'urls':[item]}
+        Requirement,_,_,_,_=pool._packaging_symbols()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_exact_release',return_value=('1.0',release)):
+                rows=pool._candidate_versions(candidate,'demo',[Requirement('demo==1.0')],[],target)
+        self.assertEqual([(row['name'],row['version']) for row in rows],[('demo','1.0')])
+
+    def test_exact_pin_prefers_candidate_specific_pep658_metadata(self):
+        target=fixture_target('3.10.14')
+        core=(b'Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n'
+              b'Requires-Dist: dep==2\n\n')
+        sha=hashlib.sha256(b'demo').hexdigest()
+        candidate={'kind':'wheel','name':'demo','version':'1.0',
+                   'filename':'demo-1.0-py3-none-any.whl',
+                   'item':{'url':'https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl',
+                           'digests':{'sha256':sha},
+                           'core-metadata':{'sha256':hashlib.sha256(core).hexdigest()}},
+                   '_release_info':{'requires_dist':['dep==1'],'provides_extra':[]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp))
+            with patch.object(pool,'_read_https',return_value=core) as read:
+                record=pool._candidate_release_metadata(
+                    candidate_pool,candidate,'exact',target,{}, {})
+        self.assertEqual(record['requirements'],['dep==2'])
+        read.assert_called_once()
+
+
+    def test_registry_lower_bound_prefers_latest_compatible_release(self):
         target=fixture_target('3.10.14')
         payloads={
             ('root','1.0'):self.wheel_bytes('root','1.0',requires=('dep<2',)),
@@ -523,8 +652,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',
             'https://files.pythonhosted.org/packages/dep-1.0-py3-none-any.whl'})
         self.assertEqual(len(calls),2)
-        self.assertEqual(plan['plan_schema'],7)
-        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v5-parallel-conflict-directed')
+        self.assertEqual(plan['plan_schema'],9)
+        self.assertEqual(plan['resolver_policy']['name'],'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed')
 
 
     def test_registry_lower_bound_skips_yanked_exact_release(self):
@@ -556,8 +685,60 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
                 pool.pip_closure(candidate,target,{'demo>=2'},'missing-lower')
             plan=json.loads((stage/'metadata/pip-plan-missing-lower.json').read_text())
-        self.assertEqual([(row['name'],row['version']) for row in plan['packages']],[('demo','2.0.1')])
-        self.assertEqual(calls,[r201['url']])
+        self.assertEqual([(row['name'],row['version']) for row in plan['packages']],[('demo','2.0.2')])
+        self.assertEqual(calls,[r202['url']])
+
+    def test_registry_broad_lower_bound_prefers_newest_without_version_ladder(self):
+        target=fixture_target('3.10.14')
+        _,_,Version,_,_=pool._packaging_symbols()
+        def candidate(name,version):
+            return {'kind':'wheel','name':name,'version':str(version),
+                    'filename':f'{name}-{version}-py3-none-any.whl',
+                    'item':{'url':f'https://files.pythonhosted.org/{name}-{version}.whl',
+                            'digests':{'sha256':hashlib.sha256(f'{name}-{version}'.encode()).hexdigest()}}}
+        aws=tuple((Version(str(version)),candidate('awscli',version)) for version in range(1,129))
+        bot=((Version('128'),candidate('botocore',128)),)
+        def releases(name,_target,_cache=None):
+            if name=='awscli':return aws
+            raise AssertionError('unexpected project '+name)
+        def exact(name,version,_target,_cache=None):
+            if name=='botocore' and version=='128':return bot
+            raise AssertionError('unexpected exact release '+name+'=='+str(version))
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
+            requirements=['botocore=='+item['version']] if item['name']=='awscli' else []
+            return {**item,'sha256':item['item']['digests']['sha256'],'url':item['item']['url'],
+                    'requirements':requirements,'provides_extra':[]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp));output=io.StringIO()
+            with patch.object(pool,'_registry_release_candidates',side_effect=releases), \
+                 patch.object(pool,'_registry_exact_release_candidate',side_effect=exact), \
+                 patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
+                 contextlib.redirect_stdout(output):
+                solved=pool._resolve_registry_plan(
+                    candidate_pool,target,{'awscli>=1','botocore==128'},(),'wide',materialize=False)
+        self.assertEqual({row['name']:row['version'] for row in solved},{'awscli':'128','botocore':'128'})
+        self.assertEqual(output.getvalue().count('decision '),1)
+
+    def test_resolver_decision_logging_is_logarithmically_bounded(self):
+        target=fixture_target('3.10.14');domain_size=64
+        def candidate(version):
+            return {'kind':'wheel','name':'conflict','version':str(version),
+                    'filename':f'conflict-{version}-py3-none-any.whl','item':{}}
+        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None):
+            if name=='conflict':return [candidate(version) for version in range(domain_size,0,-1)]
+            if name=='missing':return []
+            raise AssertionError('unexpected package '+name)
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
+            return {**item,'sha256':'a'*64,'url':'https://files.pythonhosted.org/fixture.whl',
+                    'requirements':['missing==1'],'provides_extra':[]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp));output=io.StringIO()
+            with patch.object(pool,'_candidate_versions',side_effect=versions), \
+                 patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
+                 contextlib.redirect_stdout(output), \
+                 self.assertRaisesRegex(RuntimeError,'unsatisfiable'):
+                pool._resolve_registry_plan(candidate_pool,target,{'conflict>=1'},(),'bounded-log',materialize=False)
+        self.assertEqual(output.getvalue().count('decision '),domain_size.bit_length())
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
         target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]
@@ -616,10 +797,10 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             metadata_reads.append(Path(path).name);return real_metadata(path)
         with tempfile.TemporaryDirectory() as tmp:
             candidate_pool=self.make_pool(Path(tmp));cache={'release_metadata':{},'artifact_metadata':{},'releases':{}}
-            with patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)),                  patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
                 pool.pip_closure(candidate_pool,target,{'root-a==1.0'},'first',resolver_cache=cache)
                 pool.pip_closure(candidate_pool,target,{'root-b==1.0'},'second',resolver_cache=cache)
-        self.assertEqual(project_calls.count('shared'),1)
+        self.assertEqual(project_calls.count('shared'),0)
         self.assertEqual(release_calls.count(('shared','1.0')),1)
         self.assertEqual(len(metadata_reads),3)
 
@@ -660,7 +841,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                  patch.object(pool,'_read_https',side_effect=read), \
                  patch.object(pool,'fetch',side_effect=fetch):
                 pool.pip_closure(candidate,target,{'root>=1.0','dep>=2.0'},'pep658')
-        self.assertIn('https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl.metadata',metadata_calls)
+        self.assertIn('https://files.pythonhosted.org/packages/root-2.0-py3-none-any.whl.metadata',metadata_calls)
+        self.assertNotIn('https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl.metadata',metadata_calls)
         self.assertNotIn('https://files.pythonhosted.org/packages/root-1.0-py3-none-any.whl',calls)
         self.assertEqual(set(calls),{
             'https://files.pythonhosted.org/packages/root-2.0-py3-none-any.whl',
@@ -679,7 +861,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch), \
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
+                 patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch), \
                  self.assertRaisesRegex(RuntimeError,'release metadata differs from selected artifact'):
                 pool.pip_closure(candidate,target,{'demo==1.0'},'metadata-mismatch')
 
@@ -695,7 +878,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                     return {'info':{'name':'demo','version':'1.0','requires_dist':[],
                                     'provides_extra':[]},'urls':project['releases']['1.0']}
                 raise AssertionError('unexpected PyPI endpoint '+url)
-            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
+            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
+                 patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
                 pool.pip_closure(candidate,fixture_target('3.8.20'),{'demo==1.0'},'first')
                 pool.pip_closure(candidate,fixture_target('3.10.14'),{'demo==1.0'},'second')
             self.assertEqual(set(candidate.links),{sha})
@@ -747,17 +931,19 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 for index in range(4)}
         lock=__import__('threading').Lock();gate=__import__('threading').Barrier(2)
         active=0;maximum=0
-        def acquire(_pool,_key,_group,*,resolver_cache=None):
+        def resolve(_pool,_target,_reqs,_constraints,key,**_kwargs):
             nonlocal active,maximum
             with lock:
                 active+=1;maximum=max(maximum,active)
             gate.wait(timeout=5)
             with lock:active-=1
-            return 'acquired'
+            return [{'kind':'wheel','name':'demo','version':'1.0','filename':key+'.whl',
+                     'sha256':hashlib.sha256(key.encode()).hexdigest(),
+                     'url':'https://files.pythonhosted.org/'+key+'.whl',
+                     'requirements':[],'provides_extra':[]}]
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'acquire_pip_group',side_effect=acquire):
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  patch.object(pool,'_materialize_solution',side_effect=lambda _pool,records,*_args,**_kwargs:records):
                 pool.acquire_pip_groups(candidate,groups)
         self.assertEqual(maximum,2)
 
@@ -767,15 +953,51 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'a':{'target':target_env,'requirements':['broken'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-a'],'steps':['install']},
             'b':{'target':target_env,'requirements':['later'],'constraints':[],'no_deps':False,'required':True,'tasks':['task-b'],'steps':['install']},
         }
-        def acquire(_pool,key,_group,*,resolver_cache=None):
-            if key=='a':raise RuntimeError('required pip closure a failed: boom')
-            return 'acquired'
+        def resolve(_pool,_target,_reqs,_constraints,key,**_kwargs):
+            if key=='a':raise RuntimeError('boom')
+            return [{'kind':'wheel','name':'later','version':'1.0','filename':'later.whl',
+                     'sha256':hashlib.sha256(b'later').hexdigest(),
+                     'url':'https://files.pythonhosted.org/later.whl',
+                     'requirements':[],'provides_extra':[]}]
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'acquire_pip_group',side_effect=acquire), \
-                 self.assertRaisesRegex(RuntimeError,'required pip closure a failed'):
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  self.assertRaisesRegex(RuntimeError,'required pip closure a failed: boom'):
                 pool.acquire_pip_groups(candidate,groups)
+
+    def test_batch_resolves_all_groups_before_full_artifact_materialization(self):
+        target_env=fixture_target('3.10.14').as_dict()
+        groups={name:{'target':target_env,'requirements':[name+'==1.0'],
+                      'constraints':[],'no_deps':False,'required':True,
+                      'tasks':['task-'+name],'steps':['install']}
+                for name in ('alpha','beta')}
+        lock=__import__('threading').Lock();resolved=set();materialized=[]
+        def resolve(_pool,_target,reqs,_constraints,key,**_kwargs):
+            name=reqs[0].split('==',1)[0]
+            with lock:resolved.add(name)
+            return [{'kind':'wheel','name':name,'version':'1.0','filename':name+'.whl',
+                     'sha256':hashlib.sha256(name.encode()).hexdigest(),
+                     'url':'https://files.pythonhosted.org/'+name+'.whl',
+                     'requirements':[],'provides_extra':[]}]
+        def materialize(_pool,records,*_args,**_kwargs):
+            with lock:
+                self.assertEqual(resolved,{'alpha','beta'})
+                materialized.append(records[0]['name'])
+            return records
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  patch.object(pool,'_materialize_solution',side_effect=materialize):
+                pool.acquire_pip_groups(candidate,groups)
+        self.assertEqual(set(materialized),{'alpha','beta'})
+
+    def test_adaptive_prefetch_expands_as_resolvers_finish(self):
+        activity=pool._ResolverActivity(8)
+        for _ in range(8):activity.enter()
+        self.assertEqual(activity.width(),1)
+        for _ in range(4):activity.leave()
+        self.assertEqual(activity.width(),2)
+        for _ in range(3):activity.leave()
+        self.assertEqual(activity.width(),8)
+        activity.leave()
 
     def test_resolver_prefetches_candidate_metadata_concurrently(self):
         target=fixture_target('3.10.14')
@@ -792,7 +1014,7 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             return {**item,'sha256':hashlib.sha256(item['version'].encode()).hexdigest(),
                     'url':'https://files.pythonhosted.org/'+item['filename'],
                     'requirements':[],'provides_extra':[]}
-        def materialize(_pool,records,_key,_target,_cache):return records
+        def materialize(_pool,records,_key,_target,_cache,**_kwargs):return records
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor, \
@@ -808,6 +1030,102 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                                     'metadata_prefetch':2,
                                     'metadata_executor':executor})
         self.assertEqual(len(result),1)
+
+    def test_resolver_discovers_unresolved_domains_concurrently(self):
+        target=fixture_target('3.10.14')
+        barrier=__import__('threading').Barrier(2)
+        def versions(_pool,name,*_args,**_kwargs):
+            barrier.wait(timeout=5)
+            return [{'kind':'wheel','name':name,'version':'1.0',
+                     'filename':name+'-1.0-py3-none-any.whl','item':{}}]
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
+            return {**item,'sha256':hashlib.sha256(item['name'].encode()).hexdigest(),
+                    'url':'https://files.pythonhosted.org/'+item['filename'],
+                    'requirements':[],'provides_extra':[]}
+        def materialize(_pool,records,_key,_target,_cache,**_kwargs):return records
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor, \
+                 patch.object(pool,'_candidate_versions',side_effect=versions), \
+                 patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
+                 patch.object(pool,'_materialize_solution',side_effect=materialize):
+                result=pool._resolve_registry_plan(
+                    candidate,target,{'alpha==1.0','beta==1.0'},(),'domains',
+                    resolver_cache={'release_metadata':pool._SingleFlightCache(),
+                                    'artifact_metadata':pool._SingleFlightCache(),
+                                    'releases':pool._SingleFlightCache(),
+                                    'preferred_versions':{},
+                                    'metadata_prefetch':1,
+                                    'metadata_executor':executor})
+        self.assertEqual({row['name'] for row in result},{'alpha','beta'})
+
+    def test_singleton_domain_and_metadata_use_io_executor(self):
+        target=fixture_target('3.10.14')
+        threads=[]
+        row={'kind':'wheel','name':'demo','version':'1.0',
+             'filename':'demo-1.0-py3-none-any.whl','item':{}}
+        def versions(*_args,**_kwargs):
+            threads.append(('domain',__import__('threading').current_thread().name))
+            return [row]
+        def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
+            threads.append(('metadata',__import__('threading').current_thread().name))
+            return {**item,'sha256':hashlib.sha256(b'demo').hexdigest(),
+                    'url':'https://files.pythonhosted.org/demo.whl',
+                    'requirements':[],'provides_extra':[]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix='fixture-io') as executor,                  patch.object(pool,'_candidate_versions',side_effect=versions),                  patch.object(pool,'_candidate_release_metadata',side_effect=metadata),                  patch.object(pool,'_materialize_solution',side_effect=lambda _pool,records,*_args,**_kwargs:records):
+                result=pool._resolve_registry_plan(
+                    candidate,target,{'demo==1.0'},(),'singleton',
+                    resolver_cache={'release_metadata':pool._SingleFlightCache(),
+                                    'artifact_metadata':pool._SingleFlightCache(),
+                                    'releases':pool._SingleFlightCache(),
+                                    'preferred_versions':{},
+                                    'metadata_prefetch':1,
+                                    'metadata_executor':executor})
+        self.assertEqual(len(result),1)
+        self.assertEqual([kind for kind,_name in threads],['domain','metadata'])
+        self.assertTrue(all(name.startswith('fixture-io') for _kind,name in threads))
+
+    def test_winning_artifacts_materialize_concurrently(self):
+        target=fixture_target('3.10.14')
+        barrier=__import__('threading').Barrier(2)
+        records=[]
+        for name in ('alpha','beta'):
+            records.append({'kind':'wheel','name':name,'version':'1.0',
+                            'filename':name+'-1.0-py3-none-any.whl',
+                            'sha256':hashlib.sha256(name.encode()).hexdigest(),
+                            'url':'https://files.pythonhosted.org/'+name+'.whl',
+                            'requirements':[],'provides_extra':[]})
+        def materialize(_pool,candidate,_key,_target,_cache):
+            barrier.wait(timeout=5)
+            return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
+                    'filename':candidate['filename'],
+                    'sha256':candidate['item']['digests']['sha256'],
+                    'url':candidate['item']['url'],'requirements':[],'provides_extra':[]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_pool=self.make_pool(Path(tmp))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,                  patch.object(pool,'_materialize_candidate_metadata',side_effect=materialize):
+                result=pool._materialize_solution(
+                    candidate_pool,records,'materialize',target,{},executor=executor)
+        self.assertEqual([row['name'] for row in result],['alpha','beta'])
+
+
+    def test_git_mirrors_use_versioned_parallel_io_capacity(self):
+        barrier=__import__('threading').Barrier(2);calls=[];lock=__import__('threading').Lock()
+        def mirror(_stage,repo,commits,*,label='git'):
+            with lock:calls.append((repo,tuple(sorted(commits)),label))
+            barrier.wait(timeout=5)
+            return Path('/tmp')/(repo.replace('/','_')+'.git')
+        with patch.object(pool,'_acquisition_workers',return_value=2), \
+             patch.object(pool,'mirror_commits',side_effect=mirror), \
+             patch.object(pool,'ensure_version_refs',return_value={}):
+            mirrors,refs=pool._acquire_git_mirrors(
+                Path('/tmp'),{'one/repo':{'a'*40},'two/repo':{'b'*40}},
+                freeze_version_refs=True)
+        self.assertEqual(set(mirrors),{'one/repo','two/repo'})
+        self.assertEqual(refs,{'one/repo':{},'two/repo':{}})
+        self.assertEqual(len(calls),2)
 
     def test_same_filename_different_bytes_are_separate_cas_objects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -899,6 +1217,48 @@ class TestNetworkRetries(unittest.TestCase):
                 user_agent='test',expected_host='pypi.org'),b'{}')
         self.assertEqual(factory.call_count,1)
 
+    def test_expected_https_metadata_requests_and_decodes_gzip(self):
+        import gzip
+        payload=b'{"name":"demo","values":['+b'1,'*256+b'0]}'
+        encoded=gzip.compress(payload)
+        class Response:
+            status=200;reason='OK'
+            def __init__(self):
+                self.headers={'Content-Length':str(len(encoded)),'Content-Encoding':'gzip'}
+                self._stream=io.BytesIO(encoded)
+            def getheader(self,name,default=''):return self.headers.get(name,default)
+            def read(self,*args):return self._stream.read(*args)
+        class Connection:
+            def __init__(self,*_args,**_kwargs):self.sock=None;self.headers=None
+            def request(self,_method,_path,headers=None):self.headers=headers
+            def getresponse(self):return Response()
+            def close(self):pass
+        connection=Connection()
+        pool._HTTPS_CONNECTIONS.connections={}
+        with patch.object(pool.http.client,'HTTPSConnection',return_value=connection):
+            raw=pool._read_expected_https_once(
+                'https://pypi.org/pypi/demo/json',timeout=10,limit=len(payload),
+                user_agent='test',expected_host='pypi.org')
+        self.assertEqual(raw,payload)
+        self.assertEqual(connection.headers['Accept-Encoding'],'gzip')
+
+    def test_metadata_size_rejection_does_not_drain_unbounded_body(self):
+        class Response:
+            headers={'Content-Length':'4096','Content-Encoding':'identity'}
+            def getheader(self,name,default=''):return self.headers.get(name,default)
+            def read(self,*_args):raise AssertionError('oversized body must not be drained')
+        with self.assertRaisesRegex(RuntimeError,'exceeds limit'):
+            pool._read_metadata_response(Response(),1024)
+
+    def test_corrupt_gzip_metadata_is_retried(self):
+        url='https://pypi.org/pypi/retry-gzip-fixture/json'
+        with patch.object(pool,'_read_expected_https_once',
+                          side_effect=[pool.MetadataDecodeError('truncated'),b'{"ok":true}']) as reader,              patch.object(pool.time,'sleep') as sleeper:
+            self.assertEqual(pool._pypi_json(url),{'ok':True})
+        self.assertEqual(reader.call_count,2)
+        sleeper.assert_called_once_with(1)
+
+
     def test_retryable_http_503_is_retried_for_metadata(self):
         url = 'https://pypi.org/pypi/demo/json'
         failure = pool.urllib.error.HTTPError(url, 503, 'service unavailable', {}, None)
@@ -983,6 +1343,26 @@ class TestDeduplication(unittest.TestCase):
             self.assertEqual(results,[sha,sha])
             self.assertEqual(calls,['https://example.test/shared'])
             self.assertEqual(set(acquired.provenance['python']),{'one','two'})
+
+    def test_npm_sri_closure_uses_versioned_parallel_io_capacity(self):
+        urls={
+            'https://registry.npmjs.org/a/-/a-1.0.0.tgz':'sha512-a',
+            'https://registry.npmjs.org/b/-/b-1.0.0.tgz':'sha512-b',
+        }
+        barrier=__import__('threading').Barrier(2)
+        active=[];lock=__import__('threading').Lock()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=pool.Pool(Path(tmp))
+            def download(url,category,identity,*,sha=None,sri=None):
+                with lock:active.append((url,category,identity,sri))
+                barrier.wait(timeout=5)
+                return hashlib.sha256(url.encode()).hexdigest()
+            with patch.object(candidate,'download',side_effect=download), \
+                 patch.object(pool,'_acquisition_workers',return_value=2):
+                result=pool._download_sri_closure(candidate,urls,'npm')
+        self.assertEqual(set(result),set(urls))
+        self.assertEqual(len(active),2)
+        self.assertTrue(all(category=='npm' and identity==url for url,category,identity,_sri in active))
 
     def test_sha_and_url_share_one_download(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1532,23 +1912,36 @@ def run_setup():
             self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
             self.assertNotIn("invoke(['npm'", (ROOT/'scripts/superbench_pool.py').read_text())
 
-    def test_pip_parallelism_uses_cpu_affinity_and_existing_acquisition_capacity(self):
+    def test_pip_parallelism_uses_versioned_io_capacity_not_cpu_affinity(self):
         controls=tomllib.loads((ROOT/'config/preparation.toml').read_text())
         configured=controls['acquisition']['workers']
-        with patch.object(pool.os,'sched_getaffinity',return_value={0,1,2,3}):
-            self.assertEqual(pool._pip_worker_controls(),(min(4,configured),configured))
-        with patch.object(pool.os,'sched_getaffinity',return_value=set(range(configured+3))):
+        self.assertEqual(pool._metadata_prefetch_width(configured,configured),1)
+        with patch.object(pool.os,'sched_getaffinity',side_effect=AssertionError('CPU affinity must not throttle network I/O')):
             self.assertEqual(pool._pip_worker_controls(),(configured,configured))
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertIn("config/preparation.toml",source)
-        self.assertIn("os.sched_getaffinity(0)",source)
+        self.assertNotIn("os.sched_getaffinity(0)",source)
+        self.assertNotIn("CONDA_LOCK_WORKERS",source)
+        self.assertIn("_download_sri_closure(pool,npm_urls,'npm')",source)
+        self.assertIn("_acquire_git_mirrors(stage,submodule_commits,label='git-extra')",source)
         self.assertNotIn("pip_closure_workers",source)
         self.assertNotIn("pip_metadata_workers",source)
 
-    def test_pip_parallelism_fails_closed_without_host_cpu_affinity(self):
-        with patch.object(pool.os,'sched_getaffinity',side_effect=OSError('unavailable')):
-            with self.assertRaisesRegex(RuntimeError,'CPU affinity is unavailable'):
-                pool._pip_worker_controls()
+    def test_pip_parallelism_requires_versioned_acquisition_capacity(self):
+        original=pool.__file__
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);(root/'scripts').mkdir();(root/'config').mkdir()
+                fake=root/'scripts/superbench_pool.py';fake.write_text('# fixture')
+                pool.__file__=str(fake);pool._acquisition_workers.cache_clear()
+                with self.assertRaisesRegex(RuntimeError,'missing staged preparation controls'):
+                    pool._acquisition_workers()
+                (root/'config/preparation.toml').write_text('[acquisition]\nworkers = 0\n')
+                pool._acquisition_workers.cache_clear()
+                with self.assertRaisesRegex(RuntimeError,'invalid acquisition worker control'):
+                    pool._acquisition_workers()
+        finally:
+            pool.__file__=original;pool._acquisition_workers.cache_clear()
 
     def test_execution_host_requirements_include_fetch_runtime(self):
         requirements=(ROOT/'requirements.txt').read_text().splitlines()

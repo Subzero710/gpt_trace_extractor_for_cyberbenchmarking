@@ -12,6 +12,7 @@ import importlib.util
 import concurrent.futures
 import functools
 import base64
+import gzip
 import configparser
 import hashlib
 import io
@@ -181,8 +182,13 @@ class DownloadIntegrityError(RuntimeError):
     pass
 
 
+class MetadataDecodeError(RuntimeError):
+    """A metadata transfer completed with a corrupt/truncated transport encoding."""
+    pass
+
+
 def _retryable_network_error(exc):
-    if isinstance(exc, DownloadIntegrityError):
+    if isinstance(exc, (DownloadIntegrityError, MetadataDecodeError)):
         # A transport can terminate cleanly after delivering truncated/corrupted
         # bytes, so urllib may expose no network exception. Retry from byte zero;
         # the artifact is still accepted only after exact integrity verification.
@@ -230,7 +236,32 @@ def _drop_expected_https_connection(host):
         except OSError:pass
 
 
-def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host):
+def _read_metadata_response(response, limit):
+    """Read identity/gzip metadata with a hard decompressed-size bound."""
+    headers=getattr(response,'headers',None)
+    def header(name):
+        if hasattr(response,'getheader'):
+            return response.getheader(name,'') or ''
+        return (headers.get(name,'') if headers is not None else '') or ''
+    encoding=header('Content-Encoding').strip().lower()
+    length=header('Content-Length')
+    if length.isdigit() and int(length)>limit:
+        raise RuntimeError('HTTPS response exceeds limit')
+    if encoding in ('','identity'):
+        raw=response.read(limit+1)
+    elif encoding=='gzip':
+        try:
+            with gzip.GzipFile(fileobj=response,mode='rb') as stream:
+                raw=stream.read(limit+1)
+        except (OSError,EOFError) as exc:
+            raise MetadataDecodeError('invalid gzip HTTPS metadata response') from exc
+    else:
+        raise RuntimeError('unsupported HTTPS metadata content encoding: '+encoding)
+    if len(raw)>limit:raise RuntimeError('HTTPS response exceeds limit')
+    return raw
+
+
+def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
     parsed=urllib.parse.urlsplit(url)
     if parsed.hostname!=expected_host:
         raise RuntimeError('untrusted HTTPS endpoint host')
@@ -246,39 +277,37 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host)
         connection.sock.settimeout(timeout)
     path=urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
     try:
-        connection.request('GET',path,headers={'User-Agent':user_agent,'Accept-Encoding':'identity'})
+        headers={'User-Agent':user_agent,'Accept-Encoding':'gzip'}
+        if accept is not None:headers['Accept']=accept
+        connection.request('GET',path,headers=headers)
         response=connection.getresponse()
-        length=response.getheader('Content-Length','')
-        if length.isdigit() and int(length)>limit:
-            response.read()
-            raise RuntimeError('HTTPS response exceeds limit')
         if 300 <= response.status < 400:
             # Metadata endpoints are expected to be canonical. Preserve the
             # previous redirect validation path if an upstream starts redirecting.
-            response.read()
+            response.close()
             _drop_expected_https_connection(expected_host)
-            request=urllib.request.Request(url,headers={'User-Agent':user_agent})
+            headers={'User-Agent':user_agent,'Accept-Encoding':'gzip'}
+            if accept is not None:headers['Accept']=accept
+            request=urllib.request.Request(url,headers=headers)
             with urllib.request.urlopen(request,timeout=timeout) as redirected_response:
                 redirected=urllib.parse.urlsplit(redirected_response.url)
                 if redirected.scheme!='https' or redirected.hostname!=expected_host:
                     raise RuntimeError('untrusted HTTPS redirect host')
-                redirected_length=redirected_response.headers.get('Content-Length','')
-                if redirected_length.isdigit() and int(redirected_length)>limit:
-                    raise RuntimeError('HTTPS response exceeds limit')
-                raw=redirected_response.read(limit+1)
+                raw=_read_metadata_response(redirected_response,limit)
         elif not 200 <= response.status < 300:
-            body=response.read(limit+1)
-            raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,io.BytesIO(body))
+            # Status is sufficient for retry policy; never spend bandwidth/time
+            # draining an error body that cannot participate in dependency identity.
+            response.close()
+            raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,io.BytesIO(b''))
         else:
-            raw=response.read(limit+1)
+            raw=_read_metadata_response(response,limit)
     except BaseException:
         _drop_expected_https_connection(expected_host)
         raise
-    if len(raw)>limit:raise RuntimeError('HTTPS response exceeds limit')
     return raw
 
 
-def _read_https(url, *, timeout, limit, user_agent, expected_host=None):
+def _read_https(url, *, timeout, limit, user_agent, expected_host=None, accept=None):
     parsed=urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise RuntimeError('untrusted HTTPS endpoint: '+str(url))
@@ -286,8 +315,11 @@ def _read_https(url, *, timeout, limit, user_agent, expected_host=None):
     def read_once():
         if expected_host is not None:
             return _read_expected_https_once(
-                url,timeout=timeout,limit=limit,user_agent=user_agent,expected_host=expected_host)
-        request=urllib.request.Request(url, headers={'User-Agent':user_agent})
+                url,timeout=timeout,limit=limit,user_agent=user_agent,expected_host=expected_host,
+                accept=accept)
+        headers={'User-Agent':user_agent}
+        if accept is not None:headers['Accept']=accept
+        request=urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             redirected=urllib.parse.urlsplit(response.url)
             if redirected.scheme != 'https': raise RuntimeError('untrusted HTTPS redirect')
@@ -420,6 +452,31 @@ def ensure_version_refs(folder, repo, commits):
     if not refs:
         raise RuntimeError('source version metadata requires Git tags but none were frozen: '+repo)
     return dict(sorted(refs.items()))
+
+def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_refs=False):
+    """Fetch independent repositories concurrently within the acquisition I/O budget."""
+    ordered=[(repo,tuple(sorted(commits))) for repo,commits in sorted(repositories.items()) if commits]
+    if not ordered:return {},{}
+    workers=min(_acquisition_workers(),len(ordered))
+    print(f'[pool] {label} mirrors: {len(ordered)} repositories with {workers} workers',flush=True)
+    def acquire(repo,commits):
+        mirror=mirror_commits(stage,repo,set(commits),label=label)
+        refs=ensure_version_refs(mirror,repo,commits) if freeze_version_refs else {}
+        return repo,mirror,refs
+    futures=[];results={};refs={}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                               thread_name_prefix=label+'-mirror') as executor:
+        futures=[executor.submit(acquire,repo,commits) for repo,commits in ordered]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                repo,mirror,version_refs=future.result()
+                results[repo]=mirror;refs[repo]=version_refs
+        except BaseException:
+            for future in futures:future.cancel()
+            raise
+    return ({repo:results[repo] for repo,_commits in ordered},
+            {repo:refs[repo] for repo,_commits in ordered})
+
 
 def ensure_commit(stage,repo,commit,*,label='git-extra'):
     folder=stage/label/(repo.replace('/','_')+'.git')
@@ -1757,8 +1814,23 @@ def salvage_verified_stage(old, new):
 
 # GPT_TRACE_SWEGYM_CONDA_LOCK_V1
 CONDA_LOCK_SCHEMA = 1
-CONDA_LOCK_WORKERS = 8
 CONDA_LOCK_HOSTS = frozenset({'conda.anaconda.org', 'repo.anaconda.com'})
+
+
+@functools.lru_cache(maxsize=1)
+def _acquisition_workers():
+    """Return the versioned I/O concurrency budget staged with the fetcher."""
+    path=Path(__file__).resolve().parents[1]/'config/preparation.toml'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing staged preparation controls')
+    try:
+        with path.open('rb') as stream:payload=tomllib.load(stream)
+    except (OSError,tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError('invalid staged preparation controls') from exc
+    workers=(payload.get('acquisition') or {}).get('workers')
+    if type(workers) is not int or workers<1:
+        raise RuntimeError('invalid acquisition worker control')
+    return workers
 
 
 def conda_recipe_fingerprint(script):
@@ -1890,7 +1962,7 @@ def acquire_locked_conda(pool,lock):
         if actual!=sha:raise RuntimeError('Conda lock download identity changed')
         return sha,raw
     if missing:
-        workers=min(CONDA_LOCK_WORKERS,len(missing))
+        workers=min(_acquisition_workers(),len(missing))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                                                    thread_name_prefix='conda-lock') as executor:
             futures={executor.submit(transfer,sha):sha for sha in missing}
@@ -1999,7 +2071,6 @@ def _packaging_symbols():
     return Requirement, SpecifierSet, Version, InvalidVersion, default_environment
 
 
-@functools.lru_cache(maxsize=1)
 @functools.lru_cache(maxsize=1)
 def _target_environment_module():
     adapter=Path(__file__).resolve().parents[1]/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
@@ -2112,6 +2183,72 @@ def _pypi_json(url, *, limit=16*1024*1024):
         try:return json.loads(raw)
         except ValueError as exc:raise RuntimeError('invalid PyPI metadata JSON') from exc
     return _PYPI_JSON_CACHE.get_or_compute((url,limit),load)
+
+
+_PYPI_SIMPLE_CACHE=_SingleFlightCache()
+
+
+def _pypi_simple_project(name):
+    """Read PyPI's compact PEP 691/700 project index for canonical release identities."""
+    normalized=_normalized_package_name(name)
+    def load():
+        url='https://pypi.org/simple/'+urllib.parse.quote(normalized,safe='')+'/'
+        raw=_read_https(url,timeout=90,limit=16*1024*1024,
+                        user_agent='gpt-trace-dependency-pool/4',expected_host='pypi.org',
+                        accept='application/vnd.pypi.simple.v1+json')
+        try:payload=json.loads(raw)
+        except ValueError as exc:raise RuntimeError('invalid PyPI Simple API JSON') from exc
+        meta=payload.get('meta');versions=payload.get('versions')
+        if (not isinstance(meta,dict) or not isinstance(meta.get('api-version'),str)
+                or not re.fullmatch(r'1\.\d+',meta['api-version'])
+                or _normalized_package_name(payload.get('name',''))!=normalized
+                or not isinstance(versions,list) or not all(isinstance(row,str) for row in versions)):
+            raise RuntimeError('unsupported/incomplete PyPI Simple API project metadata: '+name)
+        return tuple(versions)
+    return _PYPI_SIMPLE_CACHE.get_or_compute(normalized,load)
+
+
+def _canonical_pypi_release(name,version_text):
+    """Map a PEP 440 exact pin to the one stored PyPI release identity."""
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    try:wanted=Version(version_text)
+    except InvalidVersion as exc:raise RuntimeError('invalid exact PyPI version: '+version_text) from exc
+    matches=[]
+    for stored in _pypi_simple_project(name):
+        try:
+            if Version(stored)==wanted:matches.append(stored)
+        except InvalidVersion:
+            continue
+    if len(matches)!=1:
+        raise RuntimeError('exact PyPI requirement does not identify one stored release: '
+                           +name+'=='+version_text)
+    return matches[0]
+
+
+def _pypi_exact_release(name,version_text):
+    """Fetch an exact release directly; consult the project index only for an alias 404."""
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    try:wanted=Version(version_text)
+    except InvalidVersion as exc:raise RuntimeError('invalid exact PyPI version: '+version_text) from exc
+    quoted_name=urllib.parse.quote(name,safe='')
+    def endpoint(stored):
+        return ('https://pypi.org/pypi/'+quoted_name+'/'
+                +urllib.parse.quote(stored,safe='')+'/json')
+    stored=version_text
+    try:
+        payload=_pypi_json(endpoint(stored))
+    except urllib.error.HTTPError as exc:
+        if exc.code!=404:raise
+        stored=_canonical_pypi_release(name,version_text)
+        payload=_pypi_json(endpoint(stored))
+    info=payload.get('info');files=payload.get('urls')
+    if not isinstance(info,dict) or not isinstance(files,list):
+        raise RuntimeError('PyPI release metadata is incomplete for '+name+'=='+version_text)
+    try:same_version=Version(str(info.get('version','')))==wanted
+    except InvalidVersion:same_version=False
+    if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(name) or not same_version):
+        raise RuntimeError('PyPI release metadata identity differs for '+name+'=='+version_text)
+    return str(info['version']),payload
 
 
 def _constraint_specifiers(name, constraints, python_version):
@@ -2235,11 +2372,22 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
     env=_target_marker_environment(python_version)
     if req.marker is not None and not req.marker.evaluate(env):
         raise RuntimeError('source fallback selected an inactive marker: '+requirement)
-    project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(req.name,safe='')+'/json')
-    releases=project.get('releases')
-    if not isinstance(releases,dict):raise RuntimeError('PyPI project has no releases: '+req.name)
     constraint_specs=_constraint_specifiers(req.name,constraints,python_version)
     target=Version(env['python_full_version'])
+    exact_specs=[item for item in req.specifier if item.operator=='==' and '*' not in item.version]
+    exact_text=exact_specs[0].version if len(exact_specs)==1 else None
+    exact_version=None
+    if exact_text is not None:
+        try:exact_version=Version(exact_text)
+        except InvalidVersion:exact_version=None
+    if (exact_version is not None
+            and all(not spec or spec.contains(exact_version,prereleases=None) for spec in constraint_specs)):
+        stored_version,release=_pypi_exact_release(req.name,exact_text)
+        releases={stored_version:release['urls']}
+    else:
+        project=_pypi_json('https://pypi.org/pypi/'+urllib.parse.quote(req.name,safe='')+'/json')
+        releases=project.get('releases')
+        if not isinstance(releases,dict):raise RuntimeError('PyPI project has no releases: '+req.name)
     candidates=[]
     for text,files in releases.items():
         try:version=Version(text)
@@ -2249,7 +2397,8 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
         if not isinstance(files,list):continue
         source=[]
         for item in files:
-            if not isinstance(item,dict) or item.get('packagetype')!='sdist' or item.get('yanked') is True:continue
+            if (not isinstance(item,dict) or item.get('packagetype')!='sdist'
+                    or item.get('yanked') is True and exact_text is None):continue
             digests=item.get('digests') or {};sha=str(digests.get('sha256',''))
             if not SHA.fullmatch(sha):continue
             requires_python=item.get('requires_python')
@@ -2266,7 +2415,7 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
             source.sort(key=lambda x:(x[0],x[1]))
             candidates.append((version,text,source[0][2]))
     if not candidates:
-        raise RuntimeError('no compatible signed source distribution: '+requirement)
+        raise RuntimeError('no compatible hash-addressed source distribution: '+requirement)
     # Pool reuse has priority over choosing another version. Candidate rows
     # already satisfy the complete requirement/constraint/target-Python
     # intersection. If several compatible versions are cached, reuse the newest
@@ -2280,31 +2429,11 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
     if cached:
         selected=cached[-1]
     else:
-        # One effective inclusive lower bound is an exact compatibility pin for
-        # this frozen benchmark. "Effective" includes active pip constraints:
-        # requirement ``demo`` + constraint ``demo>=5.1`` follows the same rule
-        # as requirement ``demo>=5.1``.
-        effective=[]
-        effective.extend(list(req.specifier))
-        for specifier_set in constraint_specs:
-            effective.extend(list(specifier_set))
-        unique={(specifier.operator,specifier.version):specifier for specifier in effective}
-        specifiers=list(unique.values())
-        lone_lower=(specifiers[0] if len(specifiers)==1
-                    and specifiers[0].operator=='>='
-                    and '*' not in specifiers[0].version else None)
-        if lone_lower is not None:
-            try:Version(lone_lower.version)
-            except InvalidVersion as exc:
-                raise RuntimeError('invalid inclusive lower-bound source requirement: '+requirement) from exc
-            # Match normal PEP 440 range semantics: ``>=X`` remains satisfiable
-            # when X itself is absent/yanked/incompatible.  Prefer the oldest
-            # compatible non-yanked source to preserve benchmark stability.
-            selected=candidates[0]
-        else:
-            # Genuine ranges use the newest compatible release only when no
-            # compatible version already exists in the pool.
-            selected=candidates[-1]
+        # Match pip's normal preference: an unpinned range, including ``>=X``,
+        # selects the newest compatible non-yanked release.  Treating ``>=X`` as
+        # a minimum-version preference causes pathological version ladders when
+        # sibling requirements constrain the same transitive dependencies.
+        selected=candidates[-1]
     _,version_text,item=selected
     return req,version_text,item
 
@@ -2438,29 +2567,39 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 7
+PIP_PLAN_SCHEMA = 9
 
 
 def _pip_worker_controls():
-    """Derive Pip concurrency from host CPU affinity and versioned acquisition capacity."""
-    path=Path(__file__).resolve().parents[1]/'config/preparation.toml'
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError('missing staged preparation controls')
-    try:
-        with path.open('rb') as stream:payload=tomllib.load(stream)
-    except (OSError,tomllib.TOMLDecodeError) as exc:
-        raise RuntimeError('invalid staged preparation controls') from exc
-    acquisition=payload.get('acquisition') or {}
-    metadata_workers=acquisition.get('workers')
-    if type(metadata_workers) is not int or metadata_workers<1:
-        raise RuntimeError('invalid acquisition worker control')
-    try:
-        available_cpus=len(os.sched_getaffinity(0))
-    except (AttributeError,OSError) as exc:
-        raise RuntimeError('execution-host CPU affinity is unavailable') from exc
-    if available_cpus<1:
-        raise RuntimeError('execution-host CPU affinity is empty')
-    return min(available_cpus,metadata_workers),metadata_workers
+    """Use the versioned acquisition I/O capacity for network-bound Pip work."""
+    workers=_acquisition_workers()
+    # Solver threads mostly wait on registry metadata/artifact I/O. CPU affinity
+    # must not reduce the already versioned acquisition concurrency budget.
+    return workers,workers
+
+
+def _metadata_prefetch_width(closure_workers,metadata_workers):
+    """Fairly divide global metadata capacity across active closure workers."""
+    if type(closure_workers) is not int or closure_workers<1 or type(metadata_workers) is not int or metadata_workers<1:
+        raise RuntimeError('invalid Pip worker capacity')
+    return max(1,(metadata_workers+closure_workers-1)//closure_workers)
+
+
+class _ResolverActivity:
+    """Grow per-closure prefetch automatically as the resolver batch drains."""
+    def __init__(self,metadata_workers):
+        if type(metadata_workers) is not int or metadata_workers<1:
+            raise RuntimeError('invalid Pip metadata worker capacity')
+        self.metadata_workers=metadata_workers;self.active=0;self.lock=threading.Lock()
+    def enter(self):
+        with self.lock:self.active+=1
+    def leave(self):
+        with self.lock:
+            if self.active<1:raise RuntimeError('Pip resolver activity underflow')
+            self.active-=1
+    def width(self):
+        with self.lock:active=max(1,self.active)
+        return max(1,(self.metadata_workers+active-1)//active)
 
 
 def _target_fingerprint(target):
@@ -2471,7 +2610,7 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v5-parallel-conflict-directed',
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed',
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
@@ -2532,14 +2671,14 @@ def _wheel_rank(filename,target):
     return min(ranks) if ranks else None
 
 
-def _release_artifacts(name,version,files,target):
+def _release_artifacts(name,version,files,target,*,allow_yanked=False):
     """Return deterministic compatible artifacts for one release, wheel first."""
     _,SpecifierSet,Version,_,_=_packaging_symbols()
     python=Version(target.python_full_version)
     wheels=[];sources=[]
     if not isinstance(files,list):return []
     for item in files:
-        if not isinstance(item,dict) or item.get('yanked') is True:continue
+        if not isinstance(item,dict) or item.get('yanked') is True and not allow_yanked:continue
         sha=str((item.get('digests') or {}).get('sha256',''))
         url=item.get('url');filename=str(item.get('filename') or '')
         if not SHA.fullmatch(sha) or not isinstance(url,str):continue
@@ -2582,9 +2721,47 @@ def _registry_release_candidates(name,target,cache=None):
     return _memo_get_or_compute(cache,cache_key,load)
 
 
+def _exact_registry_pin(requirements,constraints):
+    """Return one literal exact pin only when the full active specifier set accepts it."""
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    pins=[]
+    for req in [*requirements,*constraints]:
+        for specifier in req.specifier:
+            if specifier.operator=='==' and '*' not in specifier.version:
+                pins.append(specifier.version)
+    if len(set(pins))!=1:return None
+    text=pins[0]
+    try:version=Version(text)
+    except InvalidVersion:return None
+    if any(req.specifier and not req.specifier.contains(version,prereleases=None)
+           for req in [*requirements,*constraints]):
+        return None
+    return text
+
+
+def _registry_exact_release_candidate(name,version_text,target,cache=None):
+    """Resolve an exact pin from its release endpoint without downloading the full project index."""
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    target=_coerce_target(target)
+    cache_key=('exact',_normalized_package_name(name),version_text,_target_fingerprint(target))
+    def load():
+        stored_version,payload=_pypi_exact_release(name,version_text)
+        info=payload['info'];files=payload['urls']
+        artifacts=_release_artifacts(name,stored_version,files,target,allow_yanked=True)
+        if not artifacts:return tuple()
+        artifact={**artifacts[0], '_release_info':{
+            'requires_dist':info.get('requires_dist'),
+            'provides_extra':info.get('provides_extra')}}
+        return ((Version(stored_version),artifact),)
+    return _memo_get_or_compute(cache,cache_key,load)
+
+
 def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
     _,_,Version,InvalidVersion,_=_packaging_symbols()
-    candidates=[row for row in _registry_release_candidates(name,target,release_cache)
+    exact=_exact_registry_pin(requirements,constraints)
+    universe=(_registry_exact_release_candidate(name,exact,target,release_cache) if exact is not None
+              else _registry_release_candidates(name,target,release_cache))
+    candidates=[row for row in universe
                 if all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
                        for req in [*requirements,*constraints])]
     if not candidates:return []
@@ -2599,20 +2776,10 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
         preferred=sorted(reused,key=lambda row:row[0],reverse=True)
         rest=[row for row in reversed(candidates) if row[0] not in cached]
         return [row[1] for row in [*preferred,*rest]]
-    effective=[]
-    for req in [*requirements,*constraints]:effective.extend(list(req.specifier))
-    unique={(item.operator,item.version):item for item in effective}
-    specifiers=list(unique.values())
-    lone_lower=(specifiers[0] if len(specifiers)==1 and specifiers[0].operator=='>='
-                and '*' not in specifiers[0].version else None)
-    if lone_lower is not None:
-        try:Version(lone_lower.version)
-        except InvalidVersion as exc:raise RuntimeError('invalid inclusive lower-bound requirement') from exc
-        # ``>=X`` is a lower bound, not an exact pin.  The exact X release may
-        # be absent, yanked, or incompatible with the target interpreter. Keep
-        # the historical minimum-version preference by trying the lowest
-        # compatible non-yanked release first, then advance monotonically.
-        return [row[1] for row in candidates]
+    # Pip prefers the newest compatible release for every non-exact range,
+    # including a lone inclusive lower bound.  This is also essential for broad
+    # historical requirements such as ``awscli>=...``: walking thousands of
+    # releases from the oldest upward creates an avoidable resolver ladder.
     return [row[1] for row in reversed(candidates)]
 
 
@@ -2710,33 +2877,42 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
             return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
                     'filename':candidate['filename'],'sha256':sha,'url':url,
                     'requirements':[],'provides_extra':[]}
+        # PEP 658 metadata is artifact-specific and therefore authoritative for
+        # the selected wheel. Exact-release JSON is only a compact fallback when
+        # PyPI does not publish candidate-specific core metadata.
         core=_pep658_candidate_metadata(candidate)
         if core is not None:
             requirements,extras=core
         else:
-            endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
-                      +urllib.parse.quote(candidate['version'],safe='')+'/json')
-            payload=_pypi_json(endpoint)
-            info=payload.get('info');files=payload.get('urls')
-            if not isinstance(info,dict) or not isinstance(files,list):
-                raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
-            _,_,Version,InvalidVersion,_=_packaging_symbols()
-            try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
-            except InvalidVersion:same_version=False
-            if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
-                    or not same_version):
-                raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
-            matched=False
-            for item in files:
-                if not isinstance(item,dict):continue
-                item_sha=str((item.get('digests') or {}).get('sha256',''))
-                if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
-                    matched=True;break
-            if not matched:
-                raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
-            requirements=info.get('requires_dist');extras=info.get('provides_extra')
-            if requirements is None:
-                return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+            exact_info=candidate.get('_release_info')
+            if exact_info is not None:
+                requirements=exact_info.get('requires_dist');extras=exact_info.get('provides_extra')
+                if requirements is None:
+                    return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+            else:
+                endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
+                          +urllib.parse.quote(candidate['version'],safe='')+'/json')
+                payload=_pypi_json(endpoint)
+                info=payload.get('info');files=payload.get('urls')
+                if not isinstance(info,dict) or not isinstance(files,list):
+                    raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
+                _,_,Version,InvalidVersion,_=_packaging_symbols()
+                try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
+                except InvalidVersion:same_version=False
+                if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
+                        or not same_version):
+                    raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
+                matched=False
+                for item in files:
+                    if not isinstance(item,dict):continue
+                    item_sha=str((item.get('digests') or {}).get('sha256',''))
+                    if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
+                        matched=True;break
+                if not matched:
+                    raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
+                requirements=info.get('requires_dist');extras=info.get('provides_extra')
+                if requirements is None:
+                    return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
         if (not isinstance(requirements,list) or not all(isinstance(row,str) for row in requirements)
                 or extras is not None and (not isinstance(extras,list) or not all(isinstance(row,str) for row in extras))):
             raise RuntimeError('invalid Python release dependency metadata for '+candidate['name']+'=='+candidate['version'])
@@ -2747,10 +2923,9 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
     return _memo_get_or_compute(probe_cache,identity,probe)
 
 
-def _materialize_solution(pool,records,key,target,artifact_cache):
-    """Acquire only the winning artifacts and verify solve-time metadata exactly."""
-    materialized=[]
-    for expected in records:
+def _materialize_solution(pool,records,key,target,artifact_cache,executor=None):
+    """Acquire winning artifacts concurrently and verify solve-time metadata exactly."""
+    def materialize(expected):
         candidate={'kind':expected['kind'],'name':expected['name'],'version':expected['version'],
                    'filename':expected['filename'],'item':{'url':expected['url'],
                    'digests':{'sha256':expected['sha256']}}}
@@ -2759,8 +2934,15 @@ def _materialize_solution(pool,records,key,target,artifact_cache):
                 or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])):
             raise RuntimeError('PyPI release metadata differs from selected artifact metadata: '
                                +expected['name']+'=='+expected['version'])
-        materialized.append(actual)
-    return materialized
+        return actual
+    if executor is None or len(records)<2:
+        return [materialize(expected) for expected in records]
+    futures=[executor.submit(materialize,expected) for expected in records]
+    try:
+        return [future.result() for future in futures]
+    except BaseException:
+        for future in futures:future.cancel()
+        raise
 
 
 def _candidate_satisfies(candidate,requirements,constraints):
@@ -2769,7 +2951,7 @@ def _candidate_satisfies(candidate,requirements,constraints):
                for req in [*requirements,*constraints])
 
 
-def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None):
+def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None,materialize=True):
     """Resolve PyPI with propagation and conflict-directed backjumping.
 
     The solver never executes package code. Candidate metadata comes only from
@@ -2791,8 +2973,10 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     preferred_versions=resolver_cache.get('preferred_versions')
     metadata_executor=resolver_cache.get('metadata_executor')
     metadata_prefetch=resolver_cache.get('metadata_prefetch',1)
-    candidate_cache={};failed_states=set()
-    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0}
+    prefetch_controller=resolver_cache.get('prefetch_controller')
+    candidate_cache={};failed_states=set();learned_nogoods=defaultdict(set)
+    decision_packages=defaultdict(int)
+    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0,'learned_skips':0}
     target_key=_target_fingerprint(target)
 
     def grouped(entries):
@@ -2832,6 +3016,25 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     def candidate_record(candidate):
         return _candidate_release_metadata(
             pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
+
+    def nogood_key_for(name,candidate,rows,active_extras):
+        return (name,candidate['kind'],candidate['version'],candidate['filename'],
+                tuple(str(row[0]) for row in rows),tuple(sorted(active_extras)))
+
+    def nogood_matches(clause,selected):
+        return all(package in selected
+                   and (selected[package]['kind'],selected[package]['version'],selected[package]['filename'])==identity
+                   for package,identity in clause)
+
+    def learn_nogood(cache_key,conflict,current_name,selected):
+        # Conflict sets already drive backjumping. Persist the same information
+        # as a compact assignment clause so revisiting an unrelated branch never
+        # re-enters the identical candidate conflict. An empty clause means the
+        # candidate is impossible for this requirement/extras context itself.
+        clause=tuple(sorted((package,(selected[package]['kind'],selected[package]['version'],
+                                      selected[package]['filename']))
+                            for package in conflict if package!=current_name and package in selected))
+        learned_nogoods[cache_key].add(clause)
 
     def search(entries,selected,expanded):
         entries=tuple(entries);selected=dict(selected);expanded=dict(expanded)
@@ -2876,9 +3079,20 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
             if not unresolved:return selected,frozenset(),None
 
             choices=[]
+            domain_futures={}
+            if metadata_executor is not None:
+                domain_futures={name:metadata_executor.submit(domain,name,requirements_by_name[name])
+                                for name in unresolved}
             for name in unresolved:
-                rows=requirements_by_name[name];candidates=domain(name,rows)
+                rows=requirements_by_name[name]
+                future=domain_futures.get(name)
+                try:
+                    candidates=future.result() if future is not None else domain(name,rows)
+                except BaseException:
+                    for pending in domain_futures.values():pending.cancel()
+                    raise
                 if not candidates:
+                    for pending in domain_futures.values():pending.cancel()
                     failed_states.add(current_state)
                     conflict=causes(rows)
                     detail=('no compatible release for '+name+' under requirements '
@@ -2892,7 +3106,10 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
             # branch level. This is the dependency-solver equivalent of unit
             # propagation in a SAT solver.
             if count==1:
-                try:record=candidate_record(candidates[0])
+                try:
+                    future=(metadata_executor.submit(candidate_record,candidates[0])
+                            if metadata_executor is not None else None)
+                    record=future.result() if future is not None else candidate_record(candidates[0])
                 except RuntimeError as exc:
                     failed_states.add(current_state)
                     raise RuntimeError('only compatible artifact for '+name+' has unusable metadata: '+str(exc)) from exc
@@ -2900,33 +3117,72 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 continue
 
             branch_causes=causes(rows);combined_conflict=set();metadata_failures=[];last_detail=None
+            active_extras=frozenset(extras_by_name.get(name,set()))
             prefetched={}
             def schedule_metadata(position):
                 if metadata_executor is None:return
-                stop=min(len(candidates),position+metadata_prefetch)
+                width=(prefetch_controller.width() if prefetch_controller is not None else metadata_prefetch)
+                stop=min(len(candidates),position+width)
                 for offset in range(position,stop):
                     if offset not in prefetched:
                         prefetched[offset]=metadata_executor.submit(candidate_record,candidates[offset])
             for index,candidate in enumerate(candidates,1):
-                stats['decisions']+=1
-                print(f"[pool] resolver {key}: decision {stats['decisions']} "
-                      f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
-                      f"selected={len(selected)}",flush=True)
+                learned_key=nogood_key_for(name,candidate,rows,active_extras)
+                clauses=learned_nogoods.get(learned_key,())
+                if any(nogood_matches(clause,selected) for clause in clauses):
+                    stats['learned_skips']+=1
+                    continue
+                stats['decisions']+=1;decision_packages[name]+=1
+                # Logging every backtracking decision can itself become hundreds
+                # of thousands of small writes. Powers of two retain bounded
+                # progress visibility regardless of search size.
+                if stats['decisions'] & (stats['decisions']-1) == 0:
+                    print(f"[pool] resolver {key}: decision {stats['decisions']} "
+                          f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
+                          f"selected={len(selected)}",flush=True)
                 schedule_metadata(index-1)
                 try:
                     future=prefetched.pop(index-1,None)
                     record=future.result() if future is not None else candidate_record(candidate)
                 except RuntimeError as exc:
                     metadata_failures.append(str(exc));continue
-                next_selected=dict(selected);next_selected[name]=record
-                result,conflict,detail=search(entries,next_selected,expanded)
-                if result is not None:return result,frozenset(),None
+
+                # Reject a candidate immediately when one of its active
+                # dependencies contradicts an assignment already made. This is
+                # the same conflict recursion would discover after expansion,
+                # but avoids constructing and memoizing a redundant child state.
+                immediate=set()
+                if not no_deps:
+                    for raw in record['requirements']:
+                        dep=_parse_registry_requirement(raw)
+                        if not _marker_active(dep,target,active_extras):continue
+                        dep_name=_normalized_package_name(dep.name)
+                        assigned=selected.get(dep_name)
+                        if assigned is None:continue
+                        if not _candidate_satisfies(assigned,[dep],constraint_map.get(dep_name,[])):
+                            immediate.update((name,dep_name));immediate.update(branch_causes)
+                            immediate.update(causes(requirements_by_name.get(dep_name,())))
+                if immediate:
+                    conflict=frozenset(immediate)
+                    detail=('candidate '+name+'=='+record['version']+' conflicts with selected '+
+                            ','.join(sorted(immediate-{name})))
+                    result=None
+                else:
+                    next_selected=dict(selected);next_selected[name]=record
+                    result,conflict,detail=search(entries,next_selected,expanded)
+                if result is not None:
+                    for pending in prefetched.values():pending.cancel()
+                    return result,frozenset(),None
                 last_detail=detail
+                if name in conflict:
+                    learn_nogood(learned_key,conflict,name,selected)
                 if name not in conflict:
+                    for pending in prefetched.values():pending.cancel()
                     stats['backjumps']+=1
                     failed_states.add(current_state)
                     return None,conflict,detail
                 combined_conflict.update(conflict-{name})
+            for pending in prefetched.values():pending.cancel()
             if metadata_failures and len(metadata_failures)==len(candidates):
                 raise RuntimeError('all compatible artifacts require unsupported dynamic metadata for '
                                    +name+': '+metadata_failures[0])
@@ -2936,17 +3192,22 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
             return None,conflict,detail
 
     result,conflict,detail=search(roots,{}, {})
+    hottest=(max(decision_packages.items(),key=lambda item:(item[1],item[0]))
+             if decision_packages else ('-',0))
     if result is None:
         summary=(f"solver decisions={stats['decisions']} propagations={stats['propagations']} "
-                 f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}")
+                 f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
+                 f"learned_skips={stats['learned_skips']} hottest={hottest[0]}:{hottest[1]}")
         raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
                            +(detail or 'root constraints conflict')+'; '+summary)
     solved=[result[name] for name in sorted(result)]
     print(f"[pool] resolver {key}: solved {len(solved)} packages; "
           f"decisions={stats['decisions']} propagations={stats['propagations']} "
-          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']}; "
+          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
+          f"learned_skips={stats['learned_skips']} hottest={hottest[0]}:{hottest[1]}; "
           f"materializing winning artifacts",flush=True)
-    return _materialize_solution(pool,solved,key,target,artifact_cache)
+    return (_materialize_solution(pool,solved,key,target,artifact_cache,executor=metadata_executor)
+            if materialize else solved)
 
 
 def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
@@ -2975,22 +3236,27 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
     print('[pool] reused verified pip closure '+key,flush=True);return True
 
 
+def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False):
+    target=_coerce_target(target);stage=pool.stage
+    if not packages:raise RuntimeError('registry dependency plan is empty')
+    files=[{'filename':row['filename'],'sha256':row['sha256']} for row in packages if row['kind']=='wheel']
+    sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
+             for row in packages if row['kind']=='sdist']
+    plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
+          'resolver_policy':{'schema':7,'name':'static-pypi-release-metadata-v7-latest-first-batched-conflict-directed','target_fingerprint':_target_fingerprint(target)},
+          'target':target.as_dict(),'python':target.python_full_version,
+          'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
+          'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
+    write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps(plan,sort_keys=True,separators=(',',':')))
+
+
 def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cache=None):
     if not reqs:return
     target=_coerce_target(target);stage=pool.stage
     write_new(stage/'metadata'/('pip-'+key+'.txt'),'\n'.join(sorted(set(reqs)))+'\n')
     packages=_resolve_registry_plan(pool,target,reqs,constraints,key,no_deps=no_deps,
                                     resolver_cache=resolver_cache)
-    if not packages:raise RuntimeError('registry dependency plan is empty')
-    files=[{'filename':row['filename'],'sha256':row['sha256']} for row in packages if row['kind']=='wheel']
-    sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
-             for row in packages if row['kind']=='sdist']
-    plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':5,'name':'static-pypi-release-metadata-v5-parallel-conflict-directed','target_fingerprint':_target_fingerprint(target)},
-          'target':target.as_dict(),'python':target.python_full_version,
-          'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
-          'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
-    write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps(plan,sort_keys=True,separators=(',',':')))
+    _write_pip_plan(pool,target,reqs,key,packages,constraints=constraints,no_deps=no_deps)
 
 
 def acquire_pip_group(pool,key,group,*,resolver_cache=None):
@@ -3016,53 +3282,129 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
 
 
 def acquire_pip_groups(pool, groups):
-    """Acquire closures concurrently with single-flight shared immutable metadata."""
+    """Resolve every closure first, then acquire winning artifacts in one bounded phase."""
     ordered=sorted(groups.items());total=len(ordered)
     if not ordered:return
     configured_closures,configured_metadata=_pip_worker_controls()
     closure_workers=min(configured_closures,total)
     metadata_workers=configured_metadata
+    activity=_ResolverActivity(metadata_workers)
     resolver_cache={
         'release_metadata':_SingleFlightCache(),
         'artifact_metadata':_SingleFlightCache(),
         'releases':_SingleFlightCache(),
         'preferred_versions':_cached_python_versions_snapshot(pool),
-        'metadata_prefetch':metadata_workers,
+        'metadata_prefetch':_metadata_prefetch_width(closure_workers,metadata_workers),
+        'prefetch_controller':activity,
     }
     started=time.monotonic()
+    print(f"[pool] Pip resolver batch: {total} closures, {closure_workers} closure workers, "
+          f"{metadata_workers} metadata workers, adaptive candidate prefetch",flush=True)
     metadata_executor=concurrent.futures.ThreadPoolExecutor(
         max_workers=metadata_workers,thread_name_prefix='pip-metadata')
     resolver_cache['metadata_executor']=metadata_executor
     closure_executor=concurrent.futures.ThreadPoolExecutor(
         max_workers=closure_workers,thread_name_prefix='pip-closure')
 
-    def run(index,key,group):
+    def optional_failure(key,group,target,exc):
+        write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
+            'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
+            'target':target.as_dict(),'python':target.python_full_version,
+            'requested':group['requirements'],'constraints':group['constraints'],
+            'no_deps':group['no_deps'],'optional_failed':str(exc),
+            'packages':[],'files':[],'source_archives':[]},sort_keys=True))
+        return 'optional-failed'
+
+    def resolve(index,key,group):
         target=_coerce_target(group['target'])
         print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
               f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
-        return acquire_pip_group(pool,key,group,resolver_cache=resolver_cache)
+        if reuse_pip_plan(pool,target,group['requirements'],key,
+                          constraints=group['constraints'],no_deps=group['no_deps']):
+            return ('reused',target,None)
+        write_new(pool.stage/'metadata'/('pip-'+key+'.txt'),
+                  '\n'.join(sorted(set(group['requirements'])))+'\n')
+        activity.enter()
+        try:
+            records=_resolve_registry_plan(
+                pool,target,group['requirements'],group['constraints'],key,
+                no_deps=group['no_deps'],resolver_cache=resolver_cache,materialize=False)
+        except RuntimeError as exc:
+            if not group['required']:
+                return (optional_failure(key,group,target,exc),target,None)
+            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
+        finally:
+            activity.leave()
+        if not records:
+            exc=RuntimeError('registry dependency plan is empty')
+            if not group['required']:
+                return (optional_failure(key,group,target,exc),target,None)
+            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
+        return ('resolved',target,records)
 
-    futures=[]
+    resolve_futures=[]
+    results={}
     try:
-        futures=[closure_executor.submit(run,index,key,group)
-                 for index,(key,group) in enumerate(ordered,1)]
+        resolve_futures=[closure_executor.submit(resolve,index,key,group)
+                         for index,(key,group) in enumerate(ordered,1)]
         done,pending=concurrent.futures.wait(
-            futures,return_when=concurrent.futures.FIRST_EXCEPTION)
+            resolve_futures,return_when=concurrent.futures.FIRST_EXCEPTION)
         failures=[future for future in done if not future.cancelled() and future.exception() is not None]
         if failures:
             for future in pending:future.cancel()
+            concurrent.futures.wait(resolve_futures)
+            ordered_failures=[]
+            for index,(future,(key,_group)) in enumerate(zip(resolve_futures,ordered),1):
+                if future.cancelled():continue
+                exc=future.exception()
+                if exc is not None:ordered_failures.append((index,key,exc))
+            _index,_key,exc=min(ordered_failures,key=lambda row:row[0])
+            raise exc
+        concurrent.futures.wait(resolve_futures)
+        for future,(key,_group) in zip(resolve_futures,ordered):
+            if future.cancelled():continue
+            results[key]=future.result()
+
+        resolved=[(key,group,results[key][1],results[key][2])
+                  for key,group in ordered if results[key][0]=='resolved']
+        resolution_elapsed=time.monotonic()-started
+        print(f"[pool] Pip resolution complete: {len(resolved)} new closures, "
+              f"{total-len(resolved)} reused/optional in {resolution_elapsed:.2f}s; "
+              f"materializing winning artifacts",flush=True)
+
+        # Full wheel/sdist bytes never compete with resolver metadata.  This phase
+        # begins only after every new logical closure has a deterministic solution.
+        def materialize_group(key,group,target,records):
+            try:
+                packages=_materialize_solution(
+                    pool,records,key,target,resolver_cache['artifact_metadata'],executor=None)
+                _write_pip_plan(pool,target,group['requirements'],key,packages,
+                                constraints=group['constraints'],no_deps=group['no_deps'])
+                return 'acquired'
+            except RuntimeError as exc:
+                if not group['required']:
+                    return optional_failure(key,group,target,exc)
+                raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
+
+        materialize_futures=[closure_executor.submit(materialize_group,key,group,target,records)
+                             for key,group,target,records in resolved]
+        done,pending=concurrent.futures.wait(
+            materialize_futures,return_when=concurrent.futures.FIRST_EXCEPTION)
+        failures=[future for future in done if not future.cancelled() and future.exception() is not None]
+        if failures:
+            for future in pending:future.cancel()
+            concurrent.futures.wait(materialize_futures)
+            failure_rows=[]
+            for position,future in enumerate(materialize_futures):
+                if future.cancelled():continue
+                exc=future.exception()
+                if exc is not None:failure_rows.append((position,exc))
+            raise min(failure_rows,key=lambda row:row[0])[1]
+        concurrent.futures.wait(materialize_futures)
     finally:
         closure_executor.shutdown(wait=True,cancel_futures=True)
         metadata_executor.shutdown(wait=True,cancel_futures=True)
 
-    failures=[]
-    for index,(future,(key,_group)) in enumerate(zip(futures,ordered),1):
-        if future.cancelled():continue
-        exc=future.exception()
-        if exc is not None:failures.append((index,key,exc))
-    if failures:
-        _index,_key,exc=min(failures,key=lambda row:row[0])
-        raise exc
     elapsed=time.monotonic()-started
     print(f"[pool] Pip closures complete {total}/{total} in {elapsed:.2f}s "
           f"with {closure_workers} closure workers and {metadata_workers} metadata workers",flush=True)
@@ -3211,6 +3553,27 @@ def _run_pinned_npm(pool, args, *, cwd, env, timeout=1800):
         return invoke([node,str(cli),*args],cwd=cwd,env=env,timeout=timeout)
 
 
+def _download_sri_closure(pool, urls, category, identity=None):
+    """Acquire one immutable SRI URL set concurrently within the global I/O budget."""
+    ordered=sorted(urls.items())
+    if not ordered:return {}
+    workers=min(_acquisition_workers(),len(ordered))
+    print(f'[pool] {category} closure: {len(ordered)} unique archives with {workers} workers',flush=True)
+    def transfer(url,sri):
+        return url,pool.download(url,category,url if identity is None else identity,sri=sri)
+    results={}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                                               thread_name_prefix=category) as executor:
+        futures=[executor.submit(transfer,url,sri) for url,sri in ordered]
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                url,sha=future.result();results[url]=sha
+        except BaseException:
+            for future in futures:future.cancel()
+            raise
+    return results
+
+
 def npm_package_json_closure(pool, mirror, commit, repo_ref, identity):
     """Resolve pinned VCS package metadata with pinned npm; never run package scripts."""
     candidates=[]
@@ -3245,10 +3608,9 @@ def npm_package_json_closure(pool, mirror, commit, repo_ref, identity):
     if lock_path.is_symlink() or not lock_path.is_file():raise RuntimeError('npm resolver produced no lockfile')
     lock=json.loads(lock_path.read_bytes());urls=npm_lock_urls(lock,repo_ref)
     if not urls:raise RuntimeError('npm resolver produced empty archive closure: '+repo_ref)
-    artifacts=[]
-    for url,sri in sorted(urls.items()):
-        sha=pool.download(url,'npm-vcs',identity,sri=sri)
-        artifacts.append({'url':url,'integrity':sri,'sha256':sha})
+    downloaded=_download_sri_closure(pool,urls,'npm-vcs',identity)
+    artifacts=[{'url':url,'integrity':sri,'sha256':downloaded[url]}
+               for url,sri in sorted(urls.items())]
     write_new(pool.stage/'metadata'/('npm-vcs-'+key+'.json'),json.dumps({
         'repo':repo_ref,'commit':commit,'identity':identity,
         'resolver_npm':_pinned_npm_version(),
@@ -3522,23 +3884,23 @@ def main(argv=None):
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)
     for task in tasks.values():grouped[task['repo']].add(task['base_commit'])
-    mirrors={};gitplan={}
-    for i,(repo,commits) in enumerate(sorted(grouped.items()),1):
-        print(f'[pool] Git {i}/{len(grouped)}: {repo} ({len(commits)} pinned commits)',flush=True)
-        mirror=mirror_commits(stage,repo,commits)
-        mirrors[repo]=mirror
-        gitplan[repo]={'commits':sorted(commits),'submodules':{},
-                       'version_refs':ensure_version_refs(mirror,repo,sorted(commits))}
+    mirrors,version_refs=_acquire_git_mirrors(
+        stage,grouped,label='git',freeze_version_refs=True)
+    gitplan={repo:{'commits':sorted(commits),'submodules':{},
+                   'version_refs':version_refs[repo]}
+             for repo,commits in sorted(grouped.items())}
+    submodule_commits=defaultdict(set)
     for repo,commits in sorted(grouped.items()):
         for commit in sorted(commits):
-            # Preserve exact gitlinks generically.  A single-commit task payload
-            # may need submodule objects, but never an unrelated repository history.
+            # Preserve exact gitlinks generically. Scan locally first, then fetch
+            # each independent submodule repository once with all pinned commits.
             for path,subrepo,sha in read_submodules(mirrors[repo],commit):
                 previous=gitplan[repo]['submodules'].setdefault(path,{'repo':subrepo,'commits':[]})
                 if previous.get('repo')!=subrepo:
                     raise RuntimeError('submodule path changes repository identity: '+repo+':'+path)
                 if sha not in previous['commits']:previous['commits'].append(sha)
-                ensure_commit(stage,subrepo,sha,label='git-extra')
+                submodule_commits[subrepo].add(sha)
+    _acquire_git_mirrors(stage,submodule_commits,label='git-extra')
     # Git files must not be linked to CAS while Git may still mutate refs.
     envplan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set);environment_pip_target={}
@@ -3914,8 +4276,7 @@ def main(argv=None):
                     if url in npm_urls and npm_urls[url]!=integ:
                         raise RuntimeError('conflicting npm lockfile integrity for '+url)
                     npm_urls[url]=integ
-    for url,sri in sorted(npm_urls.items()):
-        pool.download(url,'npm',url,sri=sri)
+    _download_sri_closure(pool,npm_urls,'npm')
     # A pinned recipe may request a global npm CLI update outside its lockfile.
     # Freeze that CLI as an immutable SRI-verified dependency as well.
     if any('npm install --location=global npm' in cmd
