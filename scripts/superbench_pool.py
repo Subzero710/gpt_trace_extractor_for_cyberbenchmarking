@@ -2601,10 +2601,8 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
             digests=item.get('digests') or {};sha=str(digests.get('sha256',''))
             if not SHA.fullmatch(sha):continue
             requires_python=item.get('requires_python')
-            if requires_python:
-                try:
-                    if not SpecifierSet(str(requires_python)).contains(target,prereleases=True):continue
-                except Exception:continue
+            if requires_python is not None and requires_python != '':
+                if not _requires_python_compatible(requires_python,target):continue
             url=item.get('url')
             if not isinstance(url,str) or urllib.parse.urlsplit(url).hostname!='files.pythonhosted.org':continue
             filename=str(item.get('filename') or '')
@@ -2766,8 +2764,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 11
-PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v9-forward-checking-conflict-cache-per-closure-checkpoint'
+PIP_PLAN_SCHEMA = 12
+PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v10-historical-requires-python-lower-bound-forward-checking'
 
 
 def _pip_worker_controls():
@@ -2871,6 +2869,40 @@ def _wheel_rank(filename,target):
     return min(ranks) if ranks else None
 
 
+def _requires_python_compatible(raw, target_python):
+    """Evaluate an explicit Requires-Python constraint against the locked target.
+
+    Historical PyPI releases sometimes declared a lower bound as ``>=3.5.*``.
+    The wildcard is invalid on ordered PEP 440 comparisons. Interpret only
+    this exact historical *inclusive lower-bound* spelling as ``>=3.5``;
+    preserve every other constraint and reject other invalid syntax loudly.
+    Never treat unparseable metadata as proof of incompatibility or accept it
+    by dropping the Requires-Python restriction.
+    """
+    _,SpecifierSet,_,_,_=_packaging_symbols()
+    if not isinstance(raw,str) or not raw.strip():
+        raise RuntimeError('invalid Requires-Python metadata: '+repr(raw))
+    value=raw.strip()
+    try:
+        spec=SpecifierSet(value)
+    except ValueError as exc:
+        pieces=[];changed=False
+        for part in value.split(','):
+            token=part.strip()
+            lower=re.fullmatch(r'>=\s*(\d+(?:\.\d+)*)\.\*',token)
+            if lower is not None:
+                pieces.append('>='+lower.group(1));changed=True
+            else:
+                pieces.append(token)
+        if not changed:
+            raise RuntimeError('invalid Requires-Python metadata: '+repr(value)) from exc
+        try:
+            spec=SpecifierSet(','.join(pieces))
+        except ValueError as malformed:
+            raise RuntimeError('invalid Requires-Python metadata: '+repr(value)) from malformed
+    return spec.contains(target_python,prereleases=True)
+
+
 def _release_artifacts(name,version,files,target,*,allow_yanked=False):
     """Return deterministic compatible artifacts for one release, wheel first."""
     _,SpecifierSet,Version,_,_=_packaging_symbols()
@@ -2885,10 +2917,8 @@ def _release_artifacts(name,version,files,target,*,allow_yanked=False):
         parsed=urllib.parse.urlsplit(url)
         if parsed.scheme!='https' or parsed.hostname!='files.pythonhosted.org':continue
         requires_python=item.get('requires_python')
-        if requires_python:
-            try:
-                if not SpecifierSet(str(requires_python)).contains(python,prereleases=True):continue
-            except Exception:continue
+        if requires_python is not None and requires_python != '':
+            if not _requires_python_compatible(requires_python,python):continue
         if item.get('packagetype')=='bdist_wheel' and filename.endswith('.whl'):
             rank=_wheel_rank(filename,target)
             if rank is not None:wheels.append((rank,filename,item))

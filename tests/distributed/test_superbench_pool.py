@@ -583,6 +583,81 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'0 root entries'):
                 pool._wheel_core_metadata(wheel)
 
+    def test_historical_requires_python_lower_bound_pylint_exact_pin(self):
+        # Frozen old PyPI metadata is >=3.5.*, an invalid modern specifier.
+        target=fixture_target('3.10.14')
+        wheel=self.wheel_bytes('pylint','2.5.3')
+        sha=hashlib.sha256(wheel).hexdigest()
+        item={'packagetype':'bdist_wheel',
+              'filename':'pylint-2.5.3-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/pylint-2.5.3-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>=3.5.*'}
+        info={'name':'pylint','version':'2.5.3','requires_dist':[],
+              'provides_extra':[]}
+        Requirement,_,_,_,_=pool._packaging_symbols()
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value={'info':info,'urls':[item]}):
+                rows=pool._candidate_versions(candidate,'pylint',
+                    [Requirement('pylint==2.5.3')],[],target)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['filename'],item['filename'])
+        self.assertEqual(rows[0]['item']['requires_python'],'>=3.5.*')
+
+    def test_historical_requires_python_minimum_is_enforced(self):
+        from packaging.version import Version
+        check=pool._requires_python_compatible
+        self.assertFalse(check('>=3.5.*',Version('3.4.9')))
+        self.assertTrue(check('>=3.5.*',Version('3.5.0')))
+        self.assertTrue(check('>=3.5.*',Version('3.10.14')))
+        self.assertFalse(check('>=3.11.*',Version('3.10.14')))
+        self.assertFalse(check('>=3.5.*,<3.10',Version('3.10.14')))
+        self.assertTrue(check('>=3.5.*,<3.11',Version('3.10.14')))
+
+    def test_historical_requires_python_sdist_uses_same_policy(self):
+        target=fixture_target('3.10.14');sha=hashlib.sha256(b'sdist').hexdigest()
+        item={'packagetype':'sdist','filename':'example-1.0.tar.gz',
+              'url':'https://files.pythonhosted.org/packages/example-1.0.tar.gz',
+              'digests':{'sha256':sha},'requires_python':'>=3.5.*'}
+        meta={'info':{'name':'example','version':'1.0'},'urls':[item]}
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate=self.make_pool(Path(tmp))
+            with patch.object(pool,'_pypi_json',return_value=meta):
+                _req,version,selected=pool._select_source_release(candidate,
+                    'example==1.0',target)
+        self.assertEqual(version,'1.0')
+        self.assertEqual(selected,item)
+
+    def test_historical_requires_python_keeps_valid_wildcard_equality(self):
+        from packaging.version import Version
+        check=pool._requires_python_compatible
+        self.assertTrue(check('==3.10.*',Version('3.10.14')))
+        self.assertFalse(check('==3.10.*',Version('3.11.0')))
+        self.assertTrue(check('>=3.8,<3.12',Version('3.10.14')))
+
+    def test_historical_requires_python_other_invalid_forms_fail_closed(self):
+        from packaging.version import Version
+        for bad in ('>3.5.*','<=3.5.*','>=3.5.*,not-a-version',
+                    '>=3.5.*; python_version<"4"', '>=bad', 12, False, ''):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(RuntimeError,'invalid Requires-Python'):
+                    pool._requires_python_compatible(bad,Version('3.10.14'))
+
+    def test_historical_requires_python_registry_invalid_is_not_unsatisfiable(self):
+        target=fixture_target('3.10.14');sha=hashlib.sha256(b'wheel').hexdigest()
+        item={'packagetype':'bdist_wheel','filename':'example-1.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>3.5.*'}
+        with self.assertRaisesRegex(RuntimeError,'invalid Requires-Python'):
+            pool._release_artifacts('example','1.0',[item],target)
+
+    def test_historical_requires_python_registry_incompatible_is_excluded(self):
+        target=fixture_target('3.10.14');sha=hashlib.sha256(b'wheel').hexdigest()
+        item={'packagetype':'bdist_wheel','filename':'example-1.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>=3.11.*'}
+        self.assertEqual(pool._release_artifacts('example','1.0',[item],target),[])
+
     def project(self,payload,*,name='demo',version='1.0'):
         sha=hashlib.sha256(payload).hexdigest()
         return {'releases':{version:[{'packagetype':'bdist_wheel',
