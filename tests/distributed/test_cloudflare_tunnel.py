@@ -106,7 +106,7 @@ class UnixShutdownTests(unittest.TestCase):
                 self.assertEqual(status,403)
                 status,_=client.exchange('POST','/v1/shutdown_complete',b'{"shutdown_id":"123"}','Bearer correct')
                 self.assertEqual(status,200)
-                self.assertTrue(conf.completed.is_set())
+                self.assertTrue(conf.completed.wait(client.endpoint.connect_timeout))
             finally:
                 server.shutdown();server.server_close()
 

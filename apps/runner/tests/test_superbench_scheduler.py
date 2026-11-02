@@ -57,6 +57,11 @@ class Settings:
     runner_lock_path = Path("/tmp/sb-v2-test.lock")
 
 
+@pytest.fixture(autouse=True)
+def isolated_runner_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(Settings, "runner_state_root", tmp_path, raising=False)
+
+
 class Registry:
     def resolve_id(self, _):
         raise AssertionError

@@ -161,15 +161,27 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.backend.requests, [])
 
     def test_expired_client_certificate_is_rejected_by_handshake(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+
         expired = self.directory / "expired.crt"
+        authority_certificate = x509.load_pem_x509_certificate((self.authority / "ca.crt").read_bytes())
+        authority_key = serialization.load_pem_private_key((self.authority / "ca.key").read_bytes(), password=None)
+        template = x509.load_pem_x509_certificate((self.credentials / "admin.crt").read_bytes())
         now = datetime.now(timezone.utc)
-        not_before = (now - timedelta(days=2)).strftime("%Y%m%d%H%M%SZ")
-        not_after = (now - timedelta(days=1)).strftime("%Y%m%d%H%M%SZ")
-        subprocess.run(["openssl", "x509", "-req", "-in", str(self.authority / "admin.csr"),
-            "-CA", str(self.authority / "ca.crt"), "-CAkey", str(self.authority / "ca.key"),
-            "-set_serial", "999", "-not_before", not_before, "-not_after", not_after,
-            "-sha256", "-extfile", str(self.authority / "admin.ext"), "-out", str(expired)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(template.subject)
+            .issuer_name(authority_certificate.subject)
+            .public_key(template.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=2))
+            .not_valid_after(now - timedelta(days=1))
+        )
+        for extension in template.extensions:
+            builder = builder.add_extension(extension.value, critical=extension.critical)
+        expired.write_bytes(builder.sign(authority_key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM))
+        expired.chmod(0o644)
         validity = subprocess.run(["openssl", "x509", "-checkend", "0", "-noout", "-in", str(expired)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.assertNotEqual(validity.returncode, 0)

@@ -73,7 +73,7 @@ jobs:
       - name: Install the guest package's declared test runtime
         run: python -m pip install -e ./shared -e './apps/kali-workstation[test]' cryptography
       - name: Exercise the complete Golden recovery and integrity suite
-        run: python -m pytest -q -rs tests/distributed/test_golden_resume.py
+        run: sudo "$(command -v python)" -m pytest -q -rs tests/distributed/test_golden_resume.py
 
   services:
     name: Service tests (${{ matrix.component }})
@@ -116,7 +116,9 @@ jobs:
       - name: Prove the Dockerfile builds without starting infrastructure
         env:
           COMPONENT: ${{ matrix.component }}
-        run: docker build --file "${COMPONENT}/Dockerfile" .
+        run: |
+          CONTEXT="$(python .github/scripts/ci_manifest.py docker-context --component "${COMPONENT}")"
+          docker build --file "${COMPONENT}/Dockerfile" "${CONTEXT}"
 
   browser:
     name: Browser proxy behavioral tests

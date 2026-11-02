@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tokenize
@@ -52,6 +53,107 @@ def components(root: Path, *, docker_only: bool = False) -> list[str]:
     if not discovered:
         raise ValueError("no matching testable services or Dockerfiles were discovered")
     return discovered
+
+
+
+def _docker_copy_sources(dockerfile: Path) -> tuple[str, ...]:
+    """Return local build-context sources referenced by COPY/ADD instructions."""
+    logical: list[str] = []
+    pending = ""
+    for raw in dockerfile.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        pending = pending + stripped if pending else stripped
+        if pending.endswith("\\"):
+            pending = pending[:-1] + " "
+            continue
+        logical.append(pending)
+        pending = ""
+    if pending:
+        logical.append(pending)
+
+    sources: list[str] = []
+    for instruction in logical:
+        head, separator, payload = instruction.partition(" ")
+        if not separator or head.upper() not in {"COPY", "ADD"}:
+            continue
+        payload = payload.strip()
+        from_stage = False
+        while payload.startswith("--"):
+            flag, separator, remainder = payload.partition(" ")
+            if not separator:
+                raise ValueError(f"invalid Docker {head} flags: {dockerfile}")
+            payload = remainder.lstrip()
+            if flag == "--from":
+                _stage, separator, remainder = payload.partition(" ")
+                if not separator:
+                    raise ValueError(f"invalid Docker {head} --from flag: {dockerfile}")
+                payload = remainder.lstrip()
+                from_stage = True
+            elif flag.startswith("--from="):
+                from_stage = True
+        if from_stage:
+            continue
+        if payload.startswith("["):
+            values = json.loads(payload)
+            if not isinstance(values, list) or len(values) < 2 or any(not isinstance(item, str) for item in values):
+                raise ValueError(f"invalid JSON-form Docker {head}: {dockerfile}")
+            candidates = values[:-1]
+        else:
+            tokens = shlex.split(payload, comments=False, posix=True)
+            if len(tokens) < 2:
+                raise ValueError(f"invalid Docker {head}: {dockerfile}")
+            candidates = tokens[:-1]
+        for source in candidates:
+            if source.startswith(("http://", "https://")):
+                continue
+            if not source or source.startswith("/") or "\x00" in source or "$" in source:
+                raise ValueError(f"unsupported local Docker source {source!r}: {dockerfile}")
+            relative = Path(source)
+            if ".." in relative.parts:
+                raise ValueError(f"Docker source escapes its context: {source!r}")
+            sources.append(source)
+    return tuple(sources)
+
+
+def _context_contains_source(context: Path, source: str) -> bool:
+    import glob
+    pattern = context / source
+    matches = [Path(item) for item in glob.glob(str(pattern), recursive=True)]
+    if not matches and not any(char in source for char in "*?["):
+        matches = [pattern] if pattern.exists() else []
+    context = context.resolve()
+    return bool(matches) and all(item.resolve().is_relative_to(context) for item in matches)
+
+
+def docker_context(root: Path, component: str) -> str:
+    """Derive the unique Docker build context from the Dockerfile's local COPY/ADD sources."""
+    root = Path(root).resolve()
+    relative = Path(component)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"invalid component path: {component}")
+    directory = (root / relative).resolve()
+    if not directory.is_relative_to(root) or not directory.is_dir() or directory.is_symlink():
+        raise ValueError(f"component directory is missing or unsafe: {component}")
+    dockerfile = directory / "Dockerfile"
+    if dockerfile.is_symlink() or not dockerfile.is_file():
+        raise ValueError(f"trusted Dockerfile is missing: {dockerfile}")
+    sources = _docker_copy_sources(dockerfile)
+    if not sources:
+        raise ValueError(f"Dockerfile has no local COPY/ADD source to derive context: {dockerfile}")
+    candidates = []
+    for candidate in (root, directory):
+        if all(_context_contains_source(candidate, source) for source in sources):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Docker build context is not uniquely derivable for {component}: "
+            + ", ".join(str(path) for path in candidates)
+        )
+    selected = candidates[0]
+    return "." if selected == root else selected.relative_to(root).as_posix()
+
 
 
 def tracked_paths(root: Path) -> list[Path]:
@@ -127,8 +229,9 @@ def gate(needs: dict) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("matrix", "validate", "gate"))
+    parser.add_argument("command", choices=("matrix", "validate", "gate", "docker-context"))
     parser.add_argument("--mode", choices=("tests", "docker"), default="tests")
+    parser.add_argument("--component")
     parser.add_argument("--root", type=Path,
                         default=Path(__file__).resolve().parents[2])
     args = parser.parse_args(argv)
@@ -136,6 +239,10 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(components(args.root, docker_only=args.mode == "docker"), separators=(",", ":")))
     elif args.command == "validate":
         print(f"Validated syntax of {validate(args.root)} tracked source/configuration files")
+    elif args.command == "docker-context":
+        if not args.component:
+            raise ValueError("--component is required for docker-context")
+        print(docker_context(args.root, args.component))
     else:
         gate(json.loads(os.environ["CI_NEEDS"]))
         print("All CI prerequisites succeeded")

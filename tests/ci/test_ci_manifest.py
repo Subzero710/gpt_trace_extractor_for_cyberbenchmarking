@@ -21,6 +21,10 @@ def test_golden_validation_and_storage_fixture_remain_mandatory():
     commands='\n'.join(step.get('run','') for step in jobs['golden']['steps'])
     assert "apps/kali-workstation[test]" in commands
     assert 'tests/distributed/test_golden_resume.py' in commands
+    assert 'sudo "$(command -v python)" -m pytest' in commands
+    docker_command='\n'.join(step.get('run','') for step in jobs['docker']['steps'])
+    assert 'ci_manifest.py docker-context' in docker_command
+    assert 'docker build --file "${COMPONENT}/Dockerfile" "${CONTEXT}"' in docker_command
     service_test=next(step for step in jobs['services']['steps'] if step.get('name')=='Execute discovered service tests')
     assert service_test['env']['POSTGRES_PASSWORD']
 
@@ -99,3 +103,83 @@ def test_missing_package_metadata_is_a_failure_not_a_silent_skip(tmp_path):
     (tests / "test_new_feature.py").write_text("def test_feature(): assert True\n")
     with pytest.raises(ValueError, match="no trusted Python metadata"):
         CI.components(tmp_path)
+
+
+def write_docker_component(root, name, dockerfile, files):
+    directory = root / "apps" / name
+    directory.mkdir(parents=True)
+    (directory / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+    for relative in files:
+        path = root / relative
+        if relative.startswith("apps/" + name + "/"):
+            path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if relative.endswith("/"):
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.write_text("fixture\n", encoding="utf-8")
+    return directory
+
+
+def test_docker_context_is_derived_from_copy_sources_not_service_names(tmp_path):
+    (tmp_path / "apps").mkdir()
+    root_component = tmp_path / "apps" / "root-context"
+    root_component.mkdir()
+    (root_component / "Dockerfile").write_text(
+        "FROM scratch\nCOPY apps/root-context/src /app/src\nCOPY shared /app/shared\n",
+        encoding="utf-8",
+    )
+    (root_component / "src").mkdir()
+    (tmp_path / "shared").mkdir()
+
+    local_component = tmp_path / "apps" / "local-context"
+    local_component.mkdir()
+    (local_component / "Dockerfile").write_text(
+        "FROM scratch\nCOPY src /app/src\nCOPY pyproject.toml /app/pyproject.toml\n",
+        encoding="utf-8",
+    )
+    (local_component / "src").mkdir()
+    (local_component / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1'\n")
+
+    assert CI.docker_context(tmp_path, "apps/root-context") == "."
+    assert CI.docker_context(tmp_path, "apps/local-context") == "apps/local-context"
+
+
+def test_tracked_dockerfiles_all_have_one_derived_context():
+    root = SOURCE.parents[2]
+    components = CI.components(root, docker_only=True)
+    assert components
+    for component in components:
+        context = CI.docker_context(root, component)
+        assert context in {".", component}
+
+
+def test_docker_context_handles_flags_json_form_and_stage_copies(tmp_path):
+    (tmp_path / "apps").mkdir()
+    component = tmp_path / "apps" / "flagged"
+    component.mkdir()
+    (component / "Dockerfile").write_text(
+        'FROM scratch AS source\n'
+        'COPY --from=source /built /built\n'
+        'COPY --chmod=0644 ["src", "/app/src"]\n',
+        encoding="utf-8",
+    )
+    (component / "src").mkdir()
+    assert CI.docker_context(tmp_path, "apps/flagged") == "apps/flagged"
+
+
+def test_docker_context_refuses_ambiguous_or_missing_sources(tmp_path):
+    (tmp_path / "apps").mkdir()
+    ambiguous = tmp_path / "apps" / "ambiguous"
+    ambiguous.mkdir()
+    (ambiguous / "Dockerfile").write_text("FROM scratch\nCOPY shared.txt /shared.txt\n")
+    (ambiguous / "shared.txt").write_text("component\n")
+    (tmp_path / "shared.txt").write_text("root\n")
+    with pytest.raises(ValueError, match="not uniquely derivable"):
+        CI.docker_context(tmp_path, "apps/ambiguous")
+
+    missing = tmp_path / "apps" / "missing"
+    missing.mkdir()
+    (missing / "Dockerfile").write_text("FROM scratch\nCOPY absent /absent\n")
+    with pytest.raises(ValueError, match="not uniquely derivable"):
+        CI.docker_context(tmp_path, "apps/missing")

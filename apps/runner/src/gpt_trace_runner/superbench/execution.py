@@ -298,7 +298,7 @@ async def run_pending(
         limit = None
     owned_storage = storage is None
     storage = storage or StorageClient(settings.storage_base_url)
-    staging = Path("/data/state/superbench/staging")
+    staging = Path(settings.runner_state_root) / "superbench" / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     attempted = 0
     last_completed_task_at: float | None = None

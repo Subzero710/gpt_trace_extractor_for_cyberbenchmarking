@@ -18,10 +18,19 @@ def _source_tree(root: Path) -> None:
         path.write_text(relative + "\n")
 
 
-def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path):
+def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path, monkeypatch):
     base = tmp_path / "golden.qcow2"
     pool = tmp_path / "dependency-pool"
     pool.mkdir()
+    original_stat = Path.stat
+    def root_owned_pool(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if Path(path) == pool:
+            fields = list(result)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return result
+    monkeypatch.setattr(Path, "stat", root_owned_pool)
     state = {
         "phase": "interrupted",
         "result": None,
