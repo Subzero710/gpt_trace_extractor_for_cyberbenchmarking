@@ -13,6 +13,18 @@ CI = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CI)
 
 
+def test_golden_validation_and_storage_fixture_remain_mandatory():
+    import yaml
+    workflow=yaml.safe_load((SOURCE.parents[1]/'workflows/ci.yml').read_text())
+    jobs=workflow['jobs']
+    assert 'golden' in jobs['gate']['needs']
+    commands='\n'.join(step.get('run','') for step in jobs['golden']['steps'])
+    assert "apps/kali-workstation[test]" in commands
+    assert 'tests/distributed/test_golden_resume.py' in commands
+    service_test=next(step for step in jobs['services']['steps'] if step.get('name')=='Execute discovered service tests')
+    assert service_test['env']['POSTGRES_PASSWORD']
+
+
 def create_project(root, name, *, has_tests):
     directory = root / "apps" / name
     directory.mkdir(parents=True)

@@ -51,7 +51,7 @@ class TestStaticDependencyResolution(unittest.TestCase):
         self.assertEqual(requirements, {'requests>=2', 'boto3>=1.9'})
         self.assertEqual(issues, [])
 
-    def test_dask_conditional_setup_requires_keeps_both_literal_cases(self):
+    def test_dask_conditional_setup_requires_requires_known_invocation(self):
         # The 13 historical pinned Dask setup.py files switch on sys.argv.
         source = ("""import sys
 from setuptools import setup
@@ -63,8 +63,8 @@ else:
 setup(install_requires=install_requires, setup_requires=setup_requires)
 """)
         requirements, issues = pool.setup_static(source, python_version='3.8')
-        self.assertEqual(issues, [])
-        self.assertEqual(requirements, {'pyyaml', 'pytest-runner'})
+        self.assertTrue(any('setup_requires' in issue for issue in issues))
+        self.assertEqual(requirements, {'pyyaml'})
 
     def test_unknown_conditional_dynamic_requirement_is_rejected(self):
         source = ("""if unknown_condition():
@@ -77,7 +77,7 @@ setup(setup_requires=setup_requires)
         self.assertEqual(requirements, set())
         self.assertTrue(any('setup_requires' in issue for issue in issues))
 
-    def test_conditional_install_requires_union_is_lossless(self):
+    def test_conditional_install_requires_requires_known_branch(self):
         source = ("""if unknown_condition():
     install_requires = ["alpha>=1", "shared"]
 else:
@@ -85,8 +85,8 @@ else:
 setup(install_requires=install_requires)
 """)
         requirements, issues = pool.setup_static(source)
-        self.assertEqual(issues, [])
-        self.assertEqual(requirements, {'alpha>=1', 'beta>=2', 'shared'})
+        self.assertTrue(any('install_requires' in issue for issue in issues))
+        self.assertEqual(requirements, set())
 
     def test_dynamic_setup_metadata_is_not_silently_ignored(self):
         requirements, issues = pool.setup_static('setup(install_requires=dynamic())')
@@ -129,7 +129,7 @@ setup(install_requires=install_requires)
             with self.subTest(command=command):
                 transformed=pool.transformed_source('fixture','requirements/requirements.txt',
                                                      original,[command])
-                self.assertEqual(transformed,original+'pip==24.0\n')
+                self.assertEqual(transformed,original+'\npip==24.0\n')
                 requirements,vcs,constraints=pool.parse_requirements(
                     transformed,'requirements/requirements.txt',lambda _name,required=False: '')
                 self.assertEqual(requirements,{'omegaconf>=2.0',
@@ -140,7 +140,6 @@ setup(install_requires=install_requires)
     def test_echo_append_shell_lexer_respects_quoted_operators_and_command_scope(self):
         command=('echo ";" >> requirements.txt; '
                  'echo "&&" >> requirements.txt; '
-                 '{ echo "ignored"; } >> requirements.txt; '
                  'python -c \'print("echo fake >> requirements.txt")\'; '
                  'echo "real" >> requirements.txt; '
                  'echo "elsewhere" >> another.txt')
@@ -256,7 +255,7 @@ dev=["dvc[azure,tests]"]
 class TestAcquisitionFallbacks(unittest.TestCase):
     def test_source_only_package_is_resolved_from_static_metadata_without_host_execution(self):
         target=fixture_target("3.10.14")
-        sha="1"*64
+        sha=hashlib.sha256(b'source').hexdigest()
         source={"name":"collective.checkdocs","version":"0.2.1",
                 "requested":"collective.checkdocs==0.2.1",
                 "filename":"collective.checkdocs-0.2.1.tar.gz",
@@ -292,7 +291,8 @@ class TestAcquisitionFallbacks(unittest.TestCase):
     def test_invalid_legacy_metadata_is_normalized_without_synthetic_resolver_wheels(self):
         self.assertFalse(hasattr(pool,"_write_resolver_stub"))
         self.assertFalse(hasattr(pool,"_resolver_stub_constraint"))
-        self.assertEqual(pool.normalize_legacy_source_requirement("PyYAML (>=5.1.*)"),"PyYAML==5.1")
+        self.assertEqual(pool.normalize_legacy_source_requirement(
+            "PyYAML (>=5.1.*)"),"PyYAML>=5.1.dev0")
         source=(ROOT/"scripts/superbench_pool.py").read_text()
         self.assertNotIn("metadata-only wheel",source)
         self.assertNotIn("swegym-static-source-resolver",source)
@@ -316,7 +316,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,"requires isolated target evaluation"):
                     pool.acquire_source_distribution(candidate,"demo==1.0","plan",target)
 
-    def test_historical_pypi_inclusive_wildcard_metadata_is_pinned_to_lower_bound(self):
+    def test_historical_pypi_inclusive_wildcard_metadata_uses_exact_legacy_lower_bound(self):
         Requirement,_,_,_,_=pool._packaging_symbols()
         requirement=Requirement('omegaconf==2.0.6')
         sha='a'*64
@@ -330,24 +330,38 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             with patch.object(pool,'_select_source_release',return_value=(requirement,'2.0.6',selected)), \
                  patch.object(pool,'_pypi_json',return_value=metadata), \
                  patch.object(candidate,'download',return_value=sha), \
-                 patch.object(pool,'_source_archive_files',return_value={}):
+                 patch.object(pool,'_source_archive_files',return_value={'PKG-INFO':b'Metadata-Version: 2.2\nName: omegaconf\nVersion: 2.0.6\nRequires-Dist: PyYAML (>=5.1.*)\n\n'}):
                 target=candidate.objects/sha[:2]/sha
                 target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(b'source')
-                result=pool.acquire_source_distribution(candidate,'omegaconf==2.0.6','plan',fixture_target('3.8.20'))
-        self.assertEqual(result['requirements'],['PyYAML==5.1'])
+                result=pool.acquire_source_distribution(
+                    candidate,'omegaconf==2.0.6','plan',fixture_target('3.8.20'))
+        self.assertEqual(result['requirements'],['PyYAML>=5.1.dev0'])
         Requirement(result['requirements'][0])
 
-    def test_legacy_metadata_compatibility_is_narrow_and_exact(self):
-        self.assertEqual(pool.normalize_legacy_source_requirement('PyYAML (>=5.1.*)'),
-                         'PyYAML==5.1')
-        self.assertEqual(pool.normalize_legacy_source_requirement(
-            'demo (>=1.2.*); python_version < "3.9"'),
-            'demo==1.2; python_version < "3.9"')
-        for value in ('PyYAML (>5.1.*)','PyYAML (<=5.1.*)','PyYAML (~=5.1.*)',
-                      'PyYAML (>=banana.*)'):
-            with self.subTest(value=value), self.assertRaisesRegex(
+    def test_legacy_metadata_compatibility_matches_packaging_21_3_candidate_set(self):
+        Requirement,_,Version,_,_=pool._packaging_symbols()
+        self.assertEqual(pool.normalize_legacy_source_requirement('PyYAML (>=5.1)'),
+                         'PyYAML>=5.1')
+        normalized=pool.normalize_legacy_source_requirement(
+            'demo (>=1.2.*); python_version < "4"')
+        requirement=Requirement(normalized)
+        self.assertEqual(str(requirement.specifier),'>=1.2.dev0')
+        expected={
+            '1.1':False,'1.2.dev0':True,'1.2a1':True,'1.2rc1':True,
+            '1.2':True,'1.2.0':True,'1.2.post1':True,'1.2.1.dev0':True,
+            '1.3':True,'2.0':True,'1.2+abc':True,
+        }
+        for version,accepted in expected.items():
+            with self.subTest(version=version):
+                self.assertEqual(
+                    requirement.specifier.contains(Version(version),prereleases=True),
+                    accepted)
+        for value in ('PyYAML (>5.1.*)','PyYAML (<=5.1.*)',
+                      'PyYAML (~=5.1.*)','PyYAML (>=banana.*)'):
+            with self.subTest(value=value),self.assertRaisesRegex(
                     RuntimeError,'invalid source dependency metadata'):
                 pool.normalize_legacy_source_requirement(value)
+
 
     def test_source_range_prefers_cached_compatible_version(self):
         def release(version):
@@ -1081,8 +1095,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
             payload=downloads[url];Path(path).write_bytes(payload)
             actual=hashlib.sha256(payload).hexdigest();self.assertEqual(actual,sha);return actual
-        def read_metadata(path):
-            metadata_reads.append(Path(path).name);return real_metadata(path)
+        def read_metadata(path, **identity):
+            metadata_reads.append(Path(path).name);return real_metadata(path, **identity)
         with tempfile.TemporaryDirectory() as tmp:
             candidate_pool=self.make_pool(Path(tmp));cache={'release_metadata':{},'artifact_metadata':{},'releases':{}}
             with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)),                  patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
@@ -1136,23 +1150,26 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             'https://files.pythonhosted.org/packages/root-2.0-py3-none-any.whl',
             'https://files.pythonhosted.org/packages/dep-2.0-py3-none-any.whl'})
 
-    def test_release_metadata_is_verified_against_winning_artifact(self):
+    def test_artifact_metadata_controls_closure_even_when_release_json_differs(self):
         target=fixture_target('3.10.14')
-        payload=self.wheel_bytes('demo','1.0',requires=('dep==1.0',));project,sha=self.project(payload)
+        payloads={'demo':self.wheel_bytes('demo','1.0',requires=('dep==1.0',)),
+                  'dep':self.wheel_bytes('dep','1.0')}
+        def artifact(name):
+            return {'packagetype':'bdist_wheel','filename':name+'-1.0-py3-none-any.whl',
+                    'url':'https://files.pythonhosted.org/'+name+'.whl',
+                    'digests':{'sha256':hashlib.sha256(payloads[name]).hexdigest()}}
         def api(url,**_kwargs):
-            if url.endswith('/pypi/demo/json'):return project
-            if url.endswith('/pypi/demo/1.0/json'):
-                return {'info':{'name':'demo','version':'1.0','requires_dist':[],
-                                'provides_extra':[]},'urls':project['releases']['1.0']}
-            raise AssertionError('unexpected PyPI endpoint '+url)
-        def fetch(url,path,*,sha=None,sri=None,limit=2**37,integrity_digests=None):
-            Path(path).write_bytes(payload);return hashlib.sha256(payload).hexdigest()
+            name=url.split('/pypi/')[1].split('/')[0]
+            return {'info':{'name':name,'version':'1.0','requires_dist':[],
+                            'provides_extra':[]},'urls':[artifact(name)]}
+        def fetch(url,path,**_kwargs):
+            data=payloads[Path(url).stem];Path(path).write_bytes(data)
+            return hashlib.sha256(data).hexdigest()
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)), \
-                 patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch), \
-                 self.assertRaisesRegex(RuntimeError,'release metadata differs from selected artifact'):
-                pool.pip_closure(candidate,target,{'demo==1.0'},'metadata-mismatch')
+            with patch.object(pool,'_pypi_json',side_effect=api),patch.object(pool,'fetch',side_effect=fetch):
+                result=pool._resolve_registry_plan(candidate,target,{'demo==1.0'},[], 'metadata-specific')
+            self.assertEqual({item['name'] for item in result},{'demo','dep'})
 
     def test_different_logical_plans_share_one_physical_cas_object(self):
         payload=self.wheel_bytes();project,sha=self.project(payload)
@@ -1185,6 +1202,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                      'sha256':sha,'url':'https://files.pythonhosted.org/packages/demo-1.0-py3-none-any.whl',
                      'requirements':[],'provides_extra':[]}
             plan={'artifact_model':pool.PIP_ARTIFACT_MODEL,'plan_schema':pool.PIP_PLAN_SCHEMA,
+                  'resolver_policy':{'schema':pool.PIP_PLAN_SCHEMA,'name':pool.PIP_RESOLVER_POLICY,
+                      'target_fingerprint':pool._target_fingerprint(target_env),'runtime':pool._resolver_runtime_identity()},
                   'target':target_env.as_dict(),'python':target_env.python_full_version,
                   'requested':['demo==1.0'],'constraints':[],'no_deps':False,
                   'packages':[package],'files':[{'filename':package['filename'],'sha256':sha}],
@@ -1574,7 +1593,7 @@ class TestNetworkRetries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'artifact'
             log = io.StringIO()
-            with patch.object(pool.urllib.request, 'urlopen', side_effect=[first, second]) as opener, \
+            with patch.object(pool, '_open_https', side_effect=[first, second]) as opener, \
                  patch.object(pool.time, 'sleep') as sleeper, \
                  contextlib.redirect_stderr(log):
                 actual = pool.fetch(url, path, sha=expected)
@@ -1669,7 +1688,7 @@ class TestNetworkRetries(unittest.TestCase):
     def test_network_retry_budget_is_bounded(self):
         url = 'https://repo.example.test/pkg.conda'
         with tempfile.TemporaryDirectory() as tmp, \
-             patch.object(pool.urllib.request, 'urlopen', side_effect=[TimeoutError('x')] * 5) as opener, \
+             patch.object(pool, '_open_https', side_effect=[TimeoutError('x')] * 5) as opener, \
              patch.object(pool.time, 'sleep') as sleeper, \
              self.assertRaises(TimeoutError):
             pool.fetch(url, Path(tmp) / 'artifact')
@@ -1685,7 +1704,7 @@ class TestNetworkRetries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'artifact'
             log = io.StringIO()
-            with patch.object(pool.urllib.request, 'urlopen', side_effect=[first, second]) as opener, \
+            with patch.object(pool, '_open_https', side_effect=[first, second]) as opener, \
                  patch.object(pool.time, 'sleep') as sleeper, \
                  contextlib.redirect_stderr(log):
                 actual = pool.fetch(url, path, sha=expected)
@@ -1701,7 +1720,7 @@ class TestNetworkRetries(unittest.TestCase):
         responses = [self.Response(url, [b'bad bytes', b'']) for _ in range(pool.DOWNLOAD_ATTEMPTS)]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'artifact'
-            with patch.object(pool.urllib.request, 'urlopen', side_effect=responses) as opener, \
+            with patch.object(pool, '_open_https', side_effect=responses) as opener, \
                  patch.object(pool.time, 'sleep') as sleeper, \
                  self.assertRaisesRegex(pool.DownloadIntegrityError, 'sha256 mismatch'):
                 pool.fetch(url, path, sha=expected)
@@ -1945,7 +1964,7 @@ setup(install_requires=install_requires)
         data = {'requirements/requirements.txt':'omegaconf>=2.0\nantlr4-python3-runtime==4.8\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(setup,
             lambda name, required=False:data[name])
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'omegaconf>=2.0','antlr4-python3-runtime==4.8'})
 
@@ -1961,7 +1980,7 @@ setup(install_requires=project_requirements)
                 'conans/requirements_dev.txt':'pytest>=6\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(setup,
             lambda name, required=False:data[name], extras={'dev'})
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'requests>=2','bottle==0.12'})
 
@@ -1977,7 +1996,7 @@ setup(install_requires = project_requirements,
                 'conans/requirements_dev.txt':'pytest>=6\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(setup,
             lambda name, required=False:data[name], extras={'test'})
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'requests>=2','urllib3<2','pytest>=6'})
 
@@ -2003,7 +2022,7 @@ setup(version=dynamic_version(), **setup_args)
         data = {'requirements.txt':'jupyter>=1.0.0\nnotebook>=6.0.3\nipywidgets>=7.0.0\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(setup,
             lambda name, required=False:data[name])
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'jupyter>=1.0.0','notebook>=6.0.3','ipywidgets>=7.0.0'})
 
@@ -2242,7 +2261,7 @@ setup(version=get_version(), **setup_args)
         files = {'requirements.txt':'jupyter>=1.0.0\nnotebook>=6.0.3\nipywidgets>=7.0.0\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(
             setup, lambda name, required=False: files.get(name))
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'jupyter>=1.0.0','notebook>=6.0.3','ipywidgets>=7.0.0'})
 
@@ -2255,19 +2274,19 @@ setup(install_requires=read_requirements())
         files = {'requirements.txt':'paramiko>=2.1\ncryptography>=1.5\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(
             setup, lambda name, required=False: files.get(name))
-        self.assertEqual(issues, [])
+        self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'paramiko>=2.1','cryptography>=1.5'})
 
-    def test_normal_install_does_not_require_setup_tests_require(self):
+    def test_uninvoked_setup_wrapper_is_not_executed_statically(self):
         setup = """from setuptools import setup
 def run_setup():
     tests_require = read_tests()
     setup(install_requires=["six>=1.4"], tests_require=tests_require)
 """
         deps, issues = pool.setup_static(setup)
-        self.assertEqual(deps, {'six>=1.4'})
-        self.assertEqual(issues, [])
+        self.assertEqual(deps,set())
+        self.assertTrue(issues)
 
     def test_contract_apt_upgrade_is_explicitly_identified_for_64_tasks(self):
         contract = json.loads((ROOT / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,7 +55,10 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
     original_identity = jobs.golden_dependency_identity
     jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
     try:
-        source_root, program = jobs.stage_fetch_sources(manager, pool, golden_dependency=dependency)
+        expected_sources = {name: hashlib.sha256((private/name).read_bytes()).hexdigest()
+                            for name in jobs.FETCH_SOURCE_FILES}
+        source_root, program = jobs.stage_fetch_sources(manager, pool, golden_dependency=dependency,
+                                                       expected_sources=expected_sources)
     finally:
         jobs.golden_dependency_identity = original_identity
     assert source_root == pool / "source"

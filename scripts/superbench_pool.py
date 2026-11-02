@@ -96,10 +96,22 @@ PIP_ARTIFACT_MODEL = 'global-content-addressed-pip-v2-target-provenance'
 
 
 def digest(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as stream:
-        for chunk in iter(lambda: stream.read(1048576), b''): h.update(chunk)
-    return h.hexdigest()
+    path = Path(path)
+    before = path.lstat()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError('unsafe or changed SHA-256 input')
+        h = hashlib.sha256()
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(1048576), b''): h.update(chunk)
+        after = os.fstat(fd)
+        if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError('file changed during SHA-256 verification')
+        return h.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
@@ -153,7 +165,8 @@ def sri_parts(sri):
         candidates.append((algorithm, expected))
     if not candidates:
         raise RuntimeError('missing package integrity token')
-    return candidates
+    strongest = max(hashlib.new(algorithm).digest_size for algorithm, _ in candidates)
+    return [part for part in candidates if hashlib.new(part[0]).digest_size == strongest]
 
 
 def verify_sri(path, sri):
@@ -164,8 +177,10 @@ def verify_sri(path, sri):
     with Path(path).open('rb') as stream:
         for block in iter(lambda: stream.read(1048576), b''):
             for h, _ in checks: h.update(block)
-    if not any(h.digest() == expected for h, expected in checks):
+    matched = [part for part, (h, expected) in zip(candidates, checks) if h.digest() == expected]
+    if not matched:
         raise RuntimeError('integrity mismatch for cached package')
+    return tuple(matched)
 
 
 def _discard_partial_download(path):
@@ -211,7 +226,8 @@ def _network_retry(label, operation, *, cleanup=None):
     for attempt in range(1, DOWNLOAD_ATTEMPTS+1):
         if cleanup is not None: cleanup()
         try:
-            return operation()
+            with _network_slots():
+                return operation()
         except Exception as exc:
             if not _retryable_network_error(exc): raise
             if cleanup is not None: cleanup()
@@ -222,6 +238,12 @@ def _network_retry(label, operation, *, cleanup=None):
                   file=sys.stderr, flush=True)
             time.sleep(delay)
     raise AssertionError('unreachable network retry loop')
+
+
+@functools.lru_cache(maxsize=1)
+def _network_slots():
+    """One HTTP budget across metadata and artifact worker pools."""
+    return threading.BoundedSemaphore(_acquisition_workers())
 
 
 _HTTPS_CONNECTIONS=threading.local()
@@ -249,6 +271,8 @@ def _read_metadata_response(response, limit):
         raise RuntimeError('HTTPS response exceeds limit')
     if encoding in ('','identity'):
         raw=response.read(limit+1)
+        if length.isdigit() and len(raw) != int(length):
+            raise MetadataDecodeError('truncated HTTPS metadata response')
     elif encoding=='gzip':
         try:
             with gzip.GzipFile(fileobj=response,mode='rb') as stream:
@@ -261,10 +285,36 @@ def _read_metadata_response(response, limit):
     return raw
 
 
+def _validate_https_endpoint(url, expected_host=None):
+    try:
+        parsed=urllib.parse.urlsplit(url)
+        port=parsed.port
+    except (TypeError,ValueError) as exc:
+        raise RuntimeError('invalid HTTPS endpoint') from exc
+    if (parsed.scheme!='https' or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.fragment or port not in (None,443)
+            or any(ord(char)<33 or ord(char)==127 for char in url)
+            or (expected_host is not None and parsed.hostname!=expected_host)):
+        raise RuntimeError('untrusted HTTPS endpoint or redirect')
+    return parsed
+
+
+class _ValidatedHTTPSRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self,expected_host=None):
+        self.expected_host=expected_host
+
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        _validate_https_endpoint(newurl,self.expected_host)
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+
+
+def _open_https(request, *, timeout, expected_host=None):
+    _validate_https_endpoint(request.full_url,expected_host)
+    return urllib.request.build_opener(_ValidatedHTTPSRedirect(expected_host)).open(request,timeout=timeout)
+
+
 def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
-    parsed=urllib.parse.urlsplit(url)
-    if parsed.hostname!=expected_host:
-        raise RuntimeError('untrusted HTTPS endpoint host')
+    parsed=_validate_https_endpoint(url,expected_host)
     connections=getattr(_HTTPS_CONNECTIONS,'connections',None)
     if connections is None:
         connections={}
@@ -289,7 +339,7 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host,
             headers={'User-Agent':user_agent,'Accept-Encoding':'gzip'}
             if accept is not None:headers['Accept']=accept
             request=urllib.request.Request(url,headers=headers)
-            with urllib.request.urlopen(request,timeout=timeout) as redirected_response:
+            with _open_https(request,timeout=timeout,expected_host=expected_host) as redirected_response:
                 redirected=urllib.parse.urlsplit(redirected_response.url)
                 if redirected.scheme!='https' or redirected.hostname!=expected_host:
                     raise RuntimeError('untrusted HTTPS redirect host')
@@ -320,12 +370,10 @@ def _read_https(url, *, timeout, limit, user_agent, expected_host=None, accept=N
         headers={'User-Agent':user_agent}
         if accept is not None:headers['Accept']=accept
         request=urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_https(request, timeout=timeout) as response:
             redirected=urllib.parse.urlsplit(response.url)
             if redirected.scheme != 'https': raise RuntimeError('untrusted HTTPS redirect')
-            length=response.headers.get('Content-Length','')
-            if length.isdigit() and int(length)>limit: raise RuntimeError('HTTPS response exceeds limit')
-            raw=response.read(limit+1)
+            raw=_read_metadata_response(response,limit)
         if len(raw)>limit: raise RuntimeError('HTTPS response exceeds limit')
         return raw
     return _network_retry(label, read_once)
@@ -339,7 +387,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
     label=(parsed.hostname or '')+parsed.path
     def transfer():
         request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
-        with urllib.request.urlopen(request,timeout=180) as response:
+        with _open_https(request,timeout=180) as response:
             if urllib.parse.urlsplit(response.url).scheme != 'https':
                 raise RuntimeError('untrusted download redirect')
             if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
@@ -356,6 +404,9 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                     for other in other_hashes.values(): other.update(block)
                     for sri_hash,_ in checks: sri_hash.update(block)
                 stream.flush(); os.fsync(stream.fileno())
+        length=response.headers.get('Content-Length','')
+        if length.isdigit() and size!=int(length):
+            raise MetadataDecodeError('truncated HTTPS artifact response')
         actual=h.hexdigest()
         if sha and actual != sha:
             raise DownloadIntegrityError('download sha256 mismatch: '+str(path))
@@ -818,6 +869,8 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
     except SyntaxError: return set(), ['unparseable setup.py']
 
     env = {}
+    setup_calls=[]
+    control_issues=[]
     unresolved = object()
     target_version = None
     if python_version is not None:
@@ -905,9 +958,8 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             if isinstance(op,ast.GtE): return left>=right
         raise ValueError('dynamic setup.py condition')
 
-    # GPT_TRACE_STATIC_DEPENDENCY_BRANCH_MERGE_V1
     def merge_static_dependency_branches(node):
-        """Conservatively include every literal dependency from either branch.
+        """Accept an unknown condition only when both dependency outcomes are identical.
 
         Only accept complete if/else branches consisting entirely of safe
         assignments to the same setuptools requirement fields. Never execute
@@ -940,10 +992,10 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
         true_branch = assignments(node.body)
         false_branch = assignments(node.orelse)
         if (true_branch is None or false_branch is None
-                or true_branch.keys() != false_branch.keys()):
+                or true_branch != false_branch):
             return False
         for name in true_branch:
-            env[name] = list(dict.fromkeys((*true_branch[name], *false_branch[name])))
+            env[name] = list(true_branch[name])
         return True
 
     def apply_statement(node):
@@ -959,6 +1011,10 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             return
         if isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):
             call=node.value
+            if (getattr(call.func,'id',None)=='setup' or
+                    isinstance(call.func,ast.Attribute) and getattr(call.func.value,'id',None)=='setuptools' and call.func.attr=='setup'):
+                setup_calls.append((call,{key:unresolved if value is unresolved else copy.deepcopy(value) for key,value in env.items()}))
+                return
             if (isinstance(call.func,ast.Attribute) and isinstance(call.func.value,ast.Name)
                     and call.func.attr in ('append','extend') and not call.keywords
                     and call.func.value.id in env and env[call.func.value.id] is not unresolved):
@@ -975,18 +1031,22 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
         if isinstance(node,ast.If):
             try:selected=node.body if condition(node.test) else node.orelse
             except (TypeError,ValueError,KeyError,IndexError):
-                # A finite literal dependency choice has a safe conservative union.
+                # Unequal unknown branches do not define a concrete target closure.
                 if merge_static_dependency_branches(node):
                     return
-                # Only variables mutated by an unresolved branch become unsafe.
+                if any(isinstance(child,ast.Call) and getattr(child.func,'id',None)=='setup' for child in ast.walk(node)):
+                    control_issues.append('setup.py invokes setup under an unresolved condition')
+                # Variables assigned or mutated by an unresolved branch become unsafe.
                 names=set()
                 for child in ast.walk(node):
+                    if isinstance(child,ast.Name) and isinstance(child.ctx,ast.Store):
+                        names.add(child.id)
                     if (isinstance(child,ast.Call) and isinstance(child.func,ast.Attribute)
                             and isinstance(child.func.value,ast.Name)
                             and child.func.attr in ('append','extend')):
                         names.add(child.func.value.id)
                 for name in names:
-                    if name in env: env[name]=unresolved
+                    env[name]=unresolved
                 return
             for child in selected: apply_statement(child)
 
@@ -994,7 +1054,9 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
     for statement in tree.body:
         apply_statement(statement)
 
-    deps,issues=set(),[]
+    deps,issues=set(),list(control_issues)
+    if not setup_calls:
+        issues.append('setup.py has no statically reached setup invocation')
 
     def fields_from_call(call):
         fields={kw.arg:kw.value for kw in call.keywords if kw.arg is not None}
@@ -1024,8 +1086,8 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
                     except SyntaxError:
                         fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
         return fields
-    for node in ast.walk(tree):
-        if not isinstance(node,ast.Call) or getattr(node.func,'id',None)!='setup': continue
+    for node,snapshot in setup_calls:
+        env=snapshot
         fields=fields_from_call(node)
         for name in ('install_requires','setup_requires'):
             if name not in fields: continue
@@ -1188,13 +1250,10 @@ def setup_requirements_from_sources(source, get_file, *, extras=(), python_versi
         deps.update(normal);vcs.update(remote);parsed_any=True
     if not parsed_any:
         return deps,vcs,issues
-    # Every unresolved dependency field reached by this fallback must be backed
-    # by at least one literal file.  Non-dependency setup metadata is irrelevant
-    # to acquisition and remains deliberately unevaluated.
-    dependency_issues=[item for item in issues if any(token in item for token in (
-        'install_requires','setup_requires','extras_require','**kwargs'))]
-    remaining=[item for item in issues if item not in dependency_issues]
-    return deps,vcs,remaining
+    # A literal filename is not proof that an arbitrary helper returns its
+    # contents unchanged or that every unresolved field has been evaluated.
+    # Retain diagnostics until the exact expression is statically understood.
+    return deps,vcs,issues
 
 
 def git_requirements(mirror, commit, *, python_version=None):
@@ -1221,23 +1280,28 @@ def git_requirements(mirror, commit, *, python_version=None):
 
 
 def shell_segments(line):
-    """Split a literal shell line on control operators while respecting quotes."""
-    lexer = shlex.shlex(line, posix=True, punctuation_chars=';&|')
-    lexer.whitespace_split = True
-    lexer.commenters = ''
-    tokens = list(lexer)
-    segments=[]; current=[]; previous=None
-    for token in tokens:
-        if token in (';', '&&', '||', '|'):
-            if current:
-                segments.append((current, previous, token))
-                current=[]
-            previous=token
+    """Split shell operators without confusing quoted words with syntax."""
+    tokens=_quoted_shell_tokens(line)
+    segments=[];current=[];previous=None
+    for raw in tokens:
+        if raw in (';','\n','&&','||','|','&','|&'):
+            if current:segments.append((current,previous,raw));current=[]
+            previous=raw
         else:
-            current.append(token)
-    if current:
-        segments.append((current, previous, None))
+            parsed=shlex.split(raw,posix=True)
+            if len(parsed)!=1:raise ValueError('unsupported compound shell word')
+            current.append(parsed[0])
+    if current:segments.append((current,previous,None))
     return segments
+
+
+def _literal_command_index(tokens):
+    position=0
+    while position<len(tokens) and re.match(r'^[A-Za-z_][A-Za-z_0-9]*=',tokens[position]):position+=1
+    if position<len(tokens) and tokens[position]=='sudo':
+        position+=1
+        if position<len(tokens) and tokens[position] in ('-n','--non-interactive'):position+=1
+    return position
 
 
 def pip_commands(commands):
@@ -1246,12 +1310,14 @@ def pip_commands(commands):
     for line in commands:
         try:
             segments=shell_segments(line)
-        except ValueError:
+        except (ValueError,RuntimeError):
             issues.append('unparseable shell command')
             continue
         for index,(tokens,previous,next_operator) in enumerate(segments):
             pip_index=None
-            for pos, token in enumerate(tokens):
+            position=_literal_command_index(tokens)
+            for pos in range(position,min(position+1,len(tokens))):
+                token=tokens[pos]
                 base=Path(token).name
                 if base in ('pip','pip3') and pos+1 < len(tokens) and tokens[pos+1]=='install':
                     pip_index=pos
@@ -1417,7 +1483,29 @@ def _sed_substitution(expression, value, *, extended=False):
         if flags not in ('','g'):raise RuntimeError('unsupported sed substitution flags: '+flags)
         pattern=parts[0] if extended else _sed_basic_regex_to_python(parts[0])
         replacement=parts[1]
-        try:return re.sub(pattern,replacement,value,count=0 if flags=='g' else 1)
+        def replace(match):
+            out=[];index=0
+            while index<len(replacement):
+                char=replacement[index]
+                if char=='&':out.append(match.group(0))
+                elif char=='\\':
+                    index+=1
+                    if index==len(replacement):raise RuntimeError('incomplete sed replacement escape')
+                    escaped=replacement[index]
+                    if escaped.isdigit():out.append(match.group(int(escaped)) or '')
+                    elif escaped in ('&','\\'):out.append(escaped)
+                    elif escaped=='n':out.append('\n')
+                    else:raise RuntimeError('unsupported sed replacement escape: '+escaped)
+                else:out.append(char)
+                index+=1
+            return ''.join(out)
+        try:
+            output=[]
+            for line in re.findall(r'[^\n]*\n|[^\n]+$', value):
+                newline='\n' if line.endswith('\n') else ''
+                content=line[:-1] if newline else line
+                output.append(re.sub(pattern,replace,content,count=0 if flags=='g' else 1)+newline)
+            return ''.join(output)
         except re.error as exc:raise RuntimeError('invalid sed dependency substitution') from exc
     delete=re.fullmatch(r'/((?:\\.|[^/])*)/d',expression)
     if delete:
@@ -1430,68 +1518,105 @@ def _sed_substitution(expression, value, *, extended=False):
     raise RuntimeError('unsupported dependency-file sed expression: '+expression)
 
 
-def literal_echo_appends(command):
-    """Recognize only simple literal ``echo TEXT >> PATH`` shell commands.
-
-    POSIX-style shell separators must be tokenized before recognizing a
-    redirection. A regex over a whole compound recipe can otherwise join
-    distinct quoted arguments across ``; } >>`` and manufacture a dependency.
-    The non-POSIX lexer preserves quotes, distinguishing quoted control
-    operators (e.g. ``";"``) from actual shell syntax.
-    """
-    lexer=shlex.shlex(command,posix=False,punctuation_chars=';&|<>')
+def _quoted_shell_tokens(command):
+    lexer=shlex.shlex(command,posix=False,punctuation_chars=';&|<>\n')
+    lexer.whitespace=' \t\r'
     lexer.whitespace_split=True
     lexer.commenters=''
-    try:tokens=list(lexer)
-    except ValueError as exc:
-        raise RuntimeError('invalid shell quoting in dependency-file recipe') from exc
+    try:return list(lexer)
+    except ValueError as exc:raise RuntimeError('invalid shell quoting in dependency-file recipe') from exc
 
-    separators={';','&&','||','|','&','|&','{','}'}
+
+def _literal_shell_word(word):
+    if word.startswith("'") and word.endswith("'"):
+        return word[1:-1]
+    if any(char in word for char in ('$', '`', '\\')):
+        raise RuntimeError('dynamic echo content or shell word cannot be resolved statically')
+    parts=shlex.split(word,posix=True)
+    if len(parts)!=1:raise RuntimeError('unsupported compound shell word')
+    return parts[0]
+
+
+def literal_echo_appends(command):
+    """Yield literal standalone echo appends, retaining quoted operator identity."""
     segment=[]
-    for token in [*tokens,';']:
-        if token not in separators:
-            segment.append(token)
-            continue
+    for token in [*_quoted_shell_tokens(command),';']:
+        if token not in {';','\n','&&','||','|','&','|&','{','}'}:
+            segment.append(token);continue
         if len(segment)==4 and segment[0]=='echo' and segment[2]=='>>':
-            raw,raw_path=segment[1],segment[3]
-            if len(raw)>=2 and raw[0] in ('\"',"'") and raw[-1]==raw[0]:
-                if '\\' in raw:
-                    raise RuntimeError('escaped echo content cannot be resolved statically')
-                # Only literal, non-expanding shell strings are interpreted.
-                # Executing the recipe to evaluate expansions is forbidden.
-                if raw[0]=='\"' and any(char in raw for char in ('$', '`')):
-                    raise RuntimeError('dynamic echo content cannot be resolved statically')
-                parsed=shlex.split(raw,posix=True)
-                path_parts=shlex.split(raw_path,posix=True)
-                if len(parsed)!=1 or len(path_parts)!=1:
-                    raise RuntimeError('ambiguous literal echo append in dependency recipe')
-                yield parsed[0],path_parts[0]
+            yield _literal_shell_word(segment[1]),_literal_shell_word(segment[3])
         segment=[]
 
 
 def transformed_source(repo, path, value, commands):
-    """Apply literal recipe text edits generically, without repository branches.
+    """Interpret a finite literal edit surface in its original command order.
 
-    Only bounded sed substitutions/deletions/first-line inserts and literal echo
-    appends to the requested file are interpreted.  The repository argument is
-    retained for call compatibility but never selects behavior.
+    Quoted command-looking strings never become executable edits. Unknown
+    redirections affecting this file and unknown conditionals fail explicitly.
+    No recipe or external source is executed by this interpreter.
     """
     del repo
-    if value is None:return value
     normalized=Path(path).as_posix().removeprefix('./')
     result=value
-    sed_pattern=re.compile(r"\bsed\s+(?:(-E|--regexp-extended)\s+)?-i\s+(['\"])(.*?)\2\s+([^\s;]+)")
-
+    def matches(word):
+        return Path(_literal_shell_word(word)).as_posix().removeprefix('./')==normalized
+    def apply(segment,previous):
+        nonlocal result
+        if not segment:return
+        if segment[0]=='sed':
+            words=[_literal_shell_word(word) for word in segment]
+            if not any(Path(word).as_posix().removeprefix('./')==normalized for word in words[1:]):return
+            if previous not in (None,';','\n'):
+                raise RuntimeError('conditional dependency-file sed cannot be resolved statically')
+            extended=len(words)>1 and words[1] in ('-E','--regexp-extended')
+            offset=2 if extended else 1
+            if len(words)!=offset+3 or words[offset]!='-i' or words[-1]!=normalized:
+                raise RuntimeError('unsupported dependency-file sed invocation')
+            if result is None:raise RuntimeError('sed dependency file does not exist')
+            result=_sed_substitution(words[offset+1],result,extended=extended)
+            return
+        for index,word in enumerate(segment):
+            if word not in ('>','>>') or index+1==len(segment) or not matches(segment[index+1]):continue
+            if (len(segment)!=4 or segment[0]!='echo' or index!=2
+                    or previous not in (None,';','\n')):
+                raise RuntimeError('unsupported or conditional dependency-file redirection')
+            text=_literal_shell_word(segment[1])
+            if text.startswith('-') or '\\' in text:
+                raise RuntimeError('implementation-dependent echo semantics')
+            if word=='>':result=text+'\n'
+            else:result=(result or '')+text+'\n'
+            return
     for command in commands:
-        for match in sed_pattern.finditer(command):
-            target=Path(match.group(4)).as_posix().removeprefix('./')
-            if target==normalized:
-                result=_sed_substitution(match.group(3),result,extended=bool(match.group(1)))
-        for text,target_path in literal_echo_appends(command):
-            target=Path(target_path).as_posix().removeprefix('./')
-            if target==normalized:
-                if result and not result.endswith('\n'):result+='\n'
-                result+=text+'\n'
+        tokens=_quoted_shell_tokens(command);segment=[];previous=None;index=0
+        while index<len(tokens):
+            token=tokens[index]
+            if token=='{':
+                apply(segment,previous);segment=[]
+                try:end=tokens.index('}',index+1)
+                except ValueError:raise RuntimeError('unclosed shell group')
+                if end+2<len(tokens) and tokens[end+1] in ('>','>>') and matches(tokens[end+2]):
+                    body=[_literal_shell_word(word) if word not in ('|','&&',';') else word
+                          for word in tokens[index+1:end]]
+                    expected=['tail','-n1',normalized,'|','grep','-q','.','&&','echo','',';']
+                    if body!=expected or tokens[end+1]!='>>':
+                        raise RuntimeError('unsupported dependency-file group redirection')
+                    # Exact semantics of the bounded tail/grep/echo newline guard.
+                    lines=(result or '').split('\n')
+                    last=lines[-2] if result and result.endswith('\n') else lines[-1]
+                    if last:result=(result or '')+'\n'
+                    index=end+3;previous=';';continue
+                # A group with no outer redirection still requires control-flow
+                # interpretation; do not silently apply an edit inside it.
+                body=tokens[index+1:end]
+                if any(word in ('sed','echo','printf','cat') for word in body):
+                    if any(word.strip("\"'").removeprefix('./')==normalized for word in body):
+                        raise RuntimeError('unsupported dependency-file shell group')
+                index=end+1;previous=';';continue
+            if token in {';','\n','&&','||','|','&','|&'}:
+                apply(segment,previous);segment=[];previous=token
+            else:segment.append(token)
+            index+=1
+        apply(segment,previous)
     return result
 
 
@@ -1582,8 +1707,8 @@ def conda_post_install_specs(script):
         try: segments=shell_segments(command)
         except ValueError: continue
         for tokens,_,_ in segments:
-            try: pos=next(i for i,t in enumerate(tokens) if Path(t).name=='conda' and i+1<len(tokens) and tokens[i+1]=='install')
-            except StopIteration: continue
+            pos=_literal_command_index(tokens)
+            if pos+1>=len(tokens) or Path(tokens[pos]).name!='conda' or tokens[pos+1]!='install':continue
             specs=[];i=pos+2
             while i<len(tokens):
                 token=tokens[i]
@@ -1607,7 +1732,9 @@ def apt_recipe_operations(commands):
         except ValueError:
             raise RuntimeError('unparseable APT shell command')
         for tokens,_,_ in segments:
-            for pos,token in enumerate(tokens):
+            position=_literal_command_index(tokens)
+            for pos in range(position,min(position+1,len(tokens))):
+                token=tokens[pos]
                 if Path(token).name != 'apt-get':
                     continue
                 i=pos+1
@@ -1652,6 +1779,7 @@ class Pool:
         self.by_sri = {}
         self.sri_verified = set()
         self.verified_objects = set()  # SHA-256 verified at acquisition or recovery
+        self._verified_signatures = {}
         # Pip closures run concurrently. Mutable provenance/CAS indexes remain
         # process-local and are protected independently from network transfer.
         self._state_lock = threading.RLock()
@@ -1662,10 +1790,29 @@ class Pool:
         self._pip_cache_context = tempfile.TemporaryDirectory(prefix='swegym-pip-cache-')
         self.pip_cache = Path(self._pip_cache_context.name)
 
+    def verify_object(self, sha):
+        """Reuse a digest only while the verified file identity remains unchanged."""
+        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+            raise RuntimeError('invalid CAS SHA-256 identity')
+        with self._state_lock:
+            target = self.objects / sha[:2] / sha
+            if target.parent.is_symlink():raise RuntimeError('unsafe CAS directory')
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode):raise RuntimeError('unsafe CAS object')
+            def signature(value):
+                return (value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+            current = signature(info)
+            if self._verified_signatures.get(sha) != current:
+                if digest(target) != sha:raise RuntimeError('CAS bytes fail SHA-256 verification: '+sha)
+                if signature(target.lstat()) != current:raise RuntimeError('CAS changed during verification')
+                self._verified_signatures[sha] = current
+            self.verified_objects.add(sha)
+            return info.st_size
+
     def reference(self, sha, category, identity, size):
         with self._state_lock:
             target = self.objects / sha[:2] / sha
-            if not target.is_file() or target.is_symlink() or target.stat().st_size != size:
+            if self.verify_object(sha) != size:
                 raise RuntimeError('missing/invalid content-addressed dependency')
             self.links.setdefault(sha, {'path': target.relative_to(self.stage).as_posix(),
                                         'size': size, 'sha256': sha})
@@ -1755,20 +1902,17 @@ class Pool:
                 cached = self.by_url.get(url)
         if cached is not None:
             target = self.objects / cached[:2] / cached
-            if (target.is_symlink() or not target.is_file()
-                    or cached not in self.verified_objects and digest(target)!=cached):
-                raise RuntimeError('retained CAS bytes fail SHA-256 verification: '+cached)
+            self.verify_object(cached)
             if sha is not None and cached != sha:
                 raise RuntimeError('conflicting expected checksum for existing download URL/SRI')
             target = self.objects / cached[:2] / cached
-            if sri_value and not any((cached, part) in self.sri_verified for part in sri_value):
-                verify_sri(target, sri)
+            matched_sri = verify_sri(target, sri) if sri_value else ()
             with self._state_lock:
                 self.verified_objects.add(cached)
                 if sri_value:
-                    self.sri_verified.update((cached, part) for part in sri_value)
+                    self.sri_verified.update((cached, part) for part in matched_sri)
                 self.by_url[url] = cached
-                for part in sri_value:
+                for part in matched_sri:
                     existing = self.by_sri.setdefault(part, cached)
                     if existing != cached:
                         raise RuntimeError('conflicting SRI artifact identity')
@@ -1798,6 +1942,7 @@ class Pool:
                 raw.unlink()
         if actual is None:
             actual = fetch(url, raw, sha=sha, sri=sri, integrity_digests=known_hashes)
+        matched_sri = verify_sri(raw, sri) if sri_value else ()
         self.put(raw, category, identity, verified_sha=actual)
         self.coalesce_stage_file(raw, actual)
         with self._state_lock:
@@ -1808,7 +1953,7 @@ class Pool:
                 if existing != actual:
                     raise RuntimeError('conflicting content-addressed identity')
                 self.sri_verified.add((actual, token))
-            for part in sri_value:
+            for part in matched_sri:
                 existing = self.by_sri.setdefault(part, actual)
                 if existing != actual:
                     raise RuntimeError('conflicting SRI artifact identity')
@@ -2251,17 +2396,11 @@ def apt_closure(pool,packages):
 
 
 def _packaging_symbols():
-    """Use packaging if installed, otherwise pip's vendored copy already required here."""
-    try:
-        from packaging.markers import default_environment
-        from packaging.requirements import Requirement
-        from packaging.specifiers import SpecifierSet
-        from packaging.version import Version, InvalidVersion
-    except ImportError:
-        from pip._vendor.packaging.markers import default_environment
-        from pip._vendor.packaging.requirements import Requirement
-        from pip._vendor.packaging.specifiers import SpecifierSet
-        from pip._vendor.packaging.version import Version, InvalidVersion
+    """Use the explicit packaging dependency required by target_environment."""
+    from packaging.markers import default_environment
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version, InvalidVersion
     return Requirement, SpecifierSet, Version, InvalidVersion, default_environment
 
 
@@ -2467,38 +2606,35 @@ def _constraint_specifiers(name, constraints, python_version):
 
 # GPT_TRACE_SWEGYM_CONSERVATIVE_VERSION_POLICY_V2
 def normalize_legacy_source_requirement(value):
-    """Normalize only the historical ``>=N.*`` metadata defect, conservatively.
+    """Preserve packaging 21.3 ``>=N.*`` semantics for modern candidates.
 
-    ``>=N.*`` is invalid modern PEP 440.  For the frozen benchmark we interpret
-    that specific historical spelling as the exact lower-bound release ``==N``.
-    Other invalid wildcard operators stay fatal instead of being guessed.
+    packaging 21.3 accepted this non-standard spelling through LegacySpecifier.
+    For the PEP 440-valid release candidates admitted by this resolver, its
+    inclusive lower bound begins at ``N.dev0`` when prereleases are considered.
+    ``>=N.dev0`` therefore preserves the historical candidate set, unlike
+    ``==N`` (too narrow) or ``>=N`` (drops prereleases of N).  No other invalid
+    wildcard operator is rewritten.
     """
-    if not isinstance(value,str):
-        raise RuntimeError('non-string source dependency metadata')
+    if not isinstance(value,str):raise RuntimeError('non-string source dependency metadata')
     Requirement,_,_,_,_=_packaging_symbols()
-    try:
-        return str(Requirement(value))
+    try:return str(Requirement(value))
     except Exception as original:
         head,separator,marker=value.partition(';')
         rewritten=re.sub(
-            r'(?<![=!<>~])>=\s*([0-9]+(?:\.[0-9]+)*)\.\*(?=\s*(?:[,)]|$))',
-            lambda match: '=='+match.group(1),
+            r'(?<![=!<>~])>=\s*(\d+(?:\.\d+)*)\.\*(?=\s*(?:[,)]|$))',
+            lambda match: '>='+match.group(1)+'.dev0',
             head,
         )
         if rewritten==head:
             raise RuntimeError('invalid source dependency metadata: '+value) from original
         candidate=rewritten+(separator+marker if separator else '')
-        try:
-            return str(Requirement(candidate))
+        try:return str(Requirement(candidate))
         except Exception as exc:
             raise RuntimeError('invalid source dependency metadata: '+value) from exc
 
 
 def _parse_wheel_filename(value):
-    try:
-        from packaging.utils import parse_wheel_filename
-    except ImportError:
-        from pip._vendor.packaging.utils import parse_wheel_filename
+    from packaging.utils import parse_wheel_filename
     return parse_wheel_filename(value)
 
 
@@ -2613,6 +2749,10 @@ def _select_source_release(pool, requirement, python_version, constraints=()):
             candidates.append((version,text,source[0][2]))
     if not candidates:
         raise RuntimeError('no compatible hash-addressed source distribution: '+requirement)
+    combined=SpecifierSet(','.join(str(spec) for spec in [req.specifier,*constraint_specs] if str(spec)))
+    admitted=set(combined.filter([row[0] for row in candidates],prereleases=None))
+    candidates=[row for row in candidates if row[0] in admitted]
+    if not candidates:raise RuntimeError('no compatible source version after prerelease policy: '+requirement)
     # Pool reuse has priority over choosing another version. Candidate rows
     # already satisfy the complete requirement/constraint/target-Python
     # intersection. If several compatible versions are cached, reuse the newest
@@ -2640,25 +2780,47 @@ def _source_archive_files(path, filename):
     import tarfile
     import zipfile
     wanted={'PKG-INFO','setup.py','setup.cfg','pyproject.toml'}
-    result={}
+    result={}; roots=set(); paths=set(); total=0
+    def validate_name(name):
+        from pathlib import PurePosixPath
+        rel=PurePosixPath(name)
+        if (not name or '\\' in name or '\x00' in name or rel.is_absolute()
+                or '..' in rel.parts or name.rstrip('/')!=rel.as_posix()):
+            raise RuntimeError('unsafe source archive path')
+        return rel
     def accept(rel,size):
-        if len(rel.parts)!=2 or size>2*1024*1024:return False
+        if len(rel.parts)<2:return False
         name=rel.name
-        return (name in wanted or
-                (name.lower().endswith('.txt') and re.fullmatch(r'[A-Za-z0-9_.-]*(?:requirements?|requires?)[A-Za-z0-9_.-]*\.txt',name,re.I)))
+        selected=((len(rel.parts)==2 and name in wanted) or
+                  (name.lower().endswith('.txt') and re.fullmatch(r'[A-Za-z0-9_.-]*(?:requirements?|requires?)[A-Za-z0-9_.-]*\.txt',name,re.I)))
+        if selected and size>2*1024*1024:
+            raise RuntimeError('source metadata file exceeds security limit')
+        return bool(selected)
+    def keep(rel,data):
+        nonlocal total
+        relative='/'.join(rel.parts[1:])
+        if relative in result or rel.parts[0] in roots and rel.as_posix() in paths:
+            raise RuntimeError('duplicate source archive metadata')
+        roots.add(rel.parts[0]);paths.add(rel.as_posix())
+        if len(roots)!=1:raise RuntimeError('ambiguous source archive metadata roots')
+        total+=len(data)
+        if total>MAX_SOURCE:raise RuntimeError('source archive metadata exceeds security limit')
+        result[relative]=data
     if filename.endswith(('.tar.gz','.tar.bz2','.tar.xz','.tgz')):
         with tarfile.open(path,'r:*') as archive:
             for member in archive:
-                rel=Path(member.name)
-                if not member.isfile() or not accept(rel,member.size):continue
+                rel=validate_name(member.name)
+                if not accept(rel,member.size):continue
+                if not member.isfile():raise RuntimeError('source metadata is not a regular file')
                 stream=archive.extractfile(member)
-                if stream is not None:result[rel.name]=stream.read(2*1024*1024+1)
+                if stream is not None:keep(rel,stream.read(2*1024*1024+1))
     elif filename.endswith('.zip'):
         with zipfile.ZipFile(path) as archive:
-            for name in archive.namelist():
-                rel=Path(name);info=archive.getinfo(name)
+            for info in archive.infolist():
+                name=info.filename;rel=validate_name(name)
                 if not accept(rel,info.file_size):continue
-                result[rel.name]=archive.read(name)
+                if stat.S_ISLNK(info.external_attr>>16):raise RuntimeError('source metadata is a symlink')
+                keep(rel,archive.read(info))
     else:raise RuntimeError('unsupported source archive: '+filename)
     return result
 
@@ -2716,18 +2878,28 @@ def acquire_source_distribution(pool, requirement, plan_key, target, *, constrai
     candidates=_source_archive_files(source,filename)
     requirements=set();provides_extra=set();dynamic_issues=[]
     info=metadata.get('info') or {}
-    info_requirements=info.get('requires_dist')
-    if info_requirements is not None:
-        if not isinstance(info_requirements,list) or not all(isinstance(row,str) for row in info_requirements):
-            raise RuntimeError('PyPI source metadata has invalid Requires-Dist')
-        requirements.update(info_requirements)
-    provides_extra.update(info.get('provides_extra') or [])
+    authoritative=False
     if 'PKG-INFO' in candidates:
-        parsed=email.parser.Parser().parsestr(candidates['PKG-INFO'].decode('utf-8',errors='replace'),headersonly=True)
-        requirements.update(parsed.get_all('Requires-Dist') or [])
-        provides_extra.update(parsed.get_all('Provides-Extra') or [])
-    text_files={name:data.decode('utf-8',errors='replace') for name,data in candidates.items()}
-    get_file=lambda name,required=False:text_files.get(Path(name).name)
+        _name,_version,embedded_requirements,embedded_extras=_core_metadata_fields(
+            candidates['PKG-INFO'],expected_name=req.name,expected_version=selected,target=target)
+        parsed=email.parser.Parser().parsestr(candidates['PKG-INFO'].decode('utf-8'),headersonly=True)
+        metadata_version=tuple(int(part) for part in parsed['Metadata-Version'].split('.'))
+        dynamic={field.lower() for field in parsed.get_all('Dynamic',[])}
+        if dynamic & {'requires-dist','requires-python','provides-extra'}:
+            dynamic_issues.append('dynamic sdist dependency metadata')
+        authoritative=metadata_version>=(2,2) and not dynamic_issues
+        if authoritative:
+            requirements.update(embedded_requirements)
+            provides_extra.update(embedded_extras)
+    try:text_files={name:data.decode('utf-8') for name,data in candidates.items()}
+    except UnicodeDecodeError as exc:raise RuntimeError('source metadata is not valid UTF-8') from exc
+    def get_file(name,required=False):
+        name=str(name).removeprefix('./')
+        if not name or Path(name).is_absolute() or '..' in Path(name).parts or '\\' in name:
+            raise RuntimeError('unsafe sdist metadata file reference')
+        value=text_files.get(name)
+        if value is None and required:raise RuntimeError('missing sdist dependency file: '+name)
+        return value
     if 'pyproject.toml' in text_files:
         deps,issues=_sdist_pyproject_requirements(text_files['pyproject.toml'],extras=set(req.extras))
         requirements.update(deps);dynamic_issues.extend(issues)
@@ -2735,12 +2907,18 @@ def acquire_source_distribution(pool, requirement, plan_key, target, *, constrai
         deps,issues=setup_cfg_static(text_files['setup.cfg'],extras=set(req.extras))
         if issues:raise RuntimeError('invalid source setup.cfg: '+repr(issues))
         requirements.update(deps)
-    if 'setup.py' in text_files and info_requirements is None and 'PKG-INFO' not in candidates:
+    if 'setup.py' in text_files and not authoritative:
         deps,remote,issues=setup_requirements_from_sources(
             text_files['setup.py'],get_file,extras=set(req.extras),python_version=target.python_full_version)
         if remote:raise RuntimeError('sdist setup.py contains VCS dependency: '+requirement)
         requirements.update(deps);dynamic_issues.extend(issues)
-    if dynamic_issues and not requirements:
+    if not authoritative and 'setup.py' not in text_files and 'setup.cfg' not in text_files:
+        project=tomllib.loads(text_files.get('pyproject.toml','')).get('project')
+        if not isinstance(project,dict) or 'dependencies' not in project:
+            dynamic_issues.append('source runtime dependencies are not statically established')
+    if not authoritative and not ({'setup.py','setup.cfg','pyproject.toml'} & text_files.keys()):
+        dynamic_issues.append('legacy sdist does not establish complete dependency metadata')
+    if dynamic_issues:
         raise RuntimeError('source metadata requires isolated target evaluation: '+requirement+': '+'; '.join(dynamic_issues))
     clean=set()
     for row in sorted(requirements):
@@ -2749,7 +2927,7 @@ def acquire_source_distribution(pool, requirement, plan_key, target, *, constrai
     extras=sorted(x for x in provides_extra|set(req.extras) if isinstance(x,str) and re.fullmatch(r'[A-Za-z0-9_.-]+',x))
     if not clean and not ({'setup.py','PKG-INFO','setup.cfg','pyproject.toml'}&text_files.keys()):
         raise RuntimeError('source archive has no inspectable dependency metadata')
-    return {'name':info.get('name') or req.name,'version':selected,'requested':requirement,
+    return {'name':req.name,'version':selected,'requested':requirement,
             'filename':filename,'url':url,'sha256':sha,'requirements':sorted(clean),
             'provides_extra':extras,'metadata_mode':'static-core-metadata'}
 
@@ -2764,8 +2942,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 12
-PIP_RESOLVER_POLICY = 'static-pypi-release-metadata-v10-historical-requires-python-lower-bound-forward-checking'
+PIP_PLAN_SCHEMA = 14
+PIP_RESOLVER_POLICY = 'static-pypi-v12-verified-identities-and-legacy-lower-bound-compatibility'
 
 
 def _pip_worker_controls():
@@ -2808,10 +2986,53 @@ def _target_fingerprint(target):
 def pip_group_key(target, reqs, constraints=(), no_deps=False):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
-    payload={'schema':PIP_PLAN_SCHEMA,'resolver':PIP_RESOLVER_POLICY,
+    payload={'schema':PIP_PLAN_SCHEMA,'resolver':PIP_RESOLVER_POLICY,'runtime':_resolver_runtime_identity(),
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
              'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
+
+
+def _resolver_runtime_identity():
+    import packaging
+    return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3]))}
+
+
+def _validate_pip_plan_graph(plan):
+    """Independently check the complete recorded graph before checkpoint/reuse."""
+    target=_coerce_target(plan['target'])
+    expected_policy={'schema':PIP_PLAN_SCHEMA,'name':PIP_RESOLVER_POLICY,
+                     'target_fingerprint':_target_fingerprint(target),'runtime':_resolver_runtime_identity()}
+    if plan.get('resolver_policy')!=expected_policy:
+        raise ValueError('pip checkpoint resolver policy/runtime differs')
+    if type(plan.get('no_deps')) is not bool:raise ValueError('invalid pip checkpoint no_deps')
+    for field in ('requested','constraints'):
+        if not isinstance(plan.get(field),list) or not all(isinstance(row,str) for row in plan[field]):
+            raise ValueError('invalid pip checkpoint '+field)
+    constraints=_constraint_map(plan['constraints'],target)
+    records={}
+    for row in plan['packages']:
+        name=_normalized_package_name(row['name'])
+        if name in records:raise ValueError('duplicate package in pip closure: '+name)
+        if not isinstance(row.get('requirements'),list) or not all(isinstance(raw,str) for raw in row['requirements']):
+            raise ValueError('invalid pip closure dependency metadata')
+        records[name]=row
+    pending=[_parse_registry_requirement(raw) for raw in plan['requested']]
+    pending=[req for req in pending if _marker_active(req,target)]
+    extras=defaultdict(set);expanded={};reached=set()
+    while pending:
+        req=pending.pop();name=_normalized_package_name(req.name)
+        record=records.get(name)
+        if record is None or not _candidate_satisfies(record,[req],constraints.get(name,[])):
+            raise ValueError('pip closure does not satisfy '+str(req))
+        reached.add(name);extras[name].update(req.extras)
+        active=frozenset(extras[name])
+        if expanded.get(name)==active:continue
+        expanded[name]=active
+        if plan['no_deps']:continue
+        for raw in record['requirements']:
+            dep=_parse_registry_requirement(raw)
+            if _marker_active(dep,target,active):pending.append(dep)
+    if reached!=set(records):raise ValueError('pip closure has unreferenced packages')
 
 
 def _pip_plan_artifact_shas(plan):
@@ -2828,6 +3049,7 @@ def _pip_plan_artifact_shas(plan):
                 or not SHA.fullmatch(str(row.get('sha256','')))):
             raise ValueError('invalid pip package artifact row')
         shas.append(row['sha256'])
+    _validate_pip_plan_graph(plan)
     return shas
 
 
@@ -2920,6 +3142,12 @@ def _release_artifacts(name,version,files,target,*,allow_yanked=False):
         if requires_python is not None and requires_python != '':
             if not _requires_python_compatible(requires_python,python):continue
         if item.get('packagetype')=='bdist_wheel' and filename.endswith('.whl'):
+            try:
+                wheel_name,wheel_version,_,_=_parse_wheel_filename(filename)
+            except ValueError as exc:
+                raise RuntimeError('invalid wheel filename identity: '+filename) from exc
+            if _normalized_package_name(wheel_name)!=_normalized_package_name(name) or wheel_version!=Version(version):
+                raise RuntimeError('wheel filename identity differs from release: '+filename)
             rank=_wheel_rank(filename,target)
             if rank is not None:wheels.append((rank,filename,item))
         elif item.get('packagetype')=='sdist':
@@ -2991,22 +3219,23 @@ def _registry_exact_release_candidate(name,version_text,target,cache=None):
 
 
 def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
-    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    _,SpecifierSet,Version,InvalidVersion,_=_packaging_symbols()
     exact=_exact_registry_pin(requirements,constraints)
     universe=(_registry_exact_release_candidate(name,exact,target,release_cache) if exact is not None
               else _registry_release_candidates(name,target,release_cache))
-    def allowed(row):
-        return all(not req.specifier or req.specifier.contains(row[0],prereleases=None)
-                   for req in [*requirements,*constraints])
+    combined=SpecifierSet(','.join(str(req.specifier) for req in [*requirements,*constraints] if str(req.specifier)))
+    admitted=set(combined.filter([row[0] for row in universe],prereleases=None))
+    def allowed(row):return row[0] in admitted
     candidates=[row for row in universe if allowed(row)]
     if not candidates and exact is None:
         # PEP 592 permits a historical yanked release *only if* no compatible
         # active release satisfies these exact constraints and target tags.
         # This is an explicit deterministic resolver policy, not a package-name
         # exception, an unverified replacement dependency or a silent omission.
-        candidates=[row for row in _registry_release_candidates(
-            name,target,release_cache,allow_yanked=True)
-            if row[1]['item'].get('yanked') is True and allowed(row)]
+        withdrawn=[row for row in _registry_release_candidates(name,target,release_cache,allow_yanked=True)
+                   if row[1]['item'].get('yanked') is True]
+        admitted=set(combined.filter([row[0] for row in withdrawn],prereleases=None))
+        candidates=[row for row in withdrawn if allowed(row)]
         if candidates:
             print('[pool] WARNING: '+name+' has no compatible non-yanked PyPI release '
                   'for this target and active constraints; selecting a withdrawn '
@@ -3030,18 +3259,41 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
     return [row[1] for row in reversed(candidates)]
 
 
-def _core_metadata_fields(raw):
+def _core_metadata_fields(raw, *, expected_name=None, expected_version=None, target=None):
     import email.parser
     if not isinstance(raw,(bytes,bytearray)) or len(raw)>MAX_SOURCE:
         raise RuntimeError('Python core metadata exceeds security limit')
-    parsed=email.parser.Parser().parsestr(bytes(raw).decode('utf-8',errors='replace'),headersonly=True)
+    try:text=bytes(raw).decode('utf-8')
+    except UnicodeDecodeError as exc:raise RuntimeError('Python core metadata is not valid UTF-8') from exc
+    parsed=email.parser.Parser().parsestr(text,headersonly=True)
+    if parsed.defects:raise RuntimeError('malformed Python core metadata headers')
+    for field in ('Metadata-Version','Name','Version'):
+        if len(parsed.get_all(field) or [])!=1:
+            raise RuntimeError('Python core metadata requires a unique '+field)
+    if len(parsed.get_all('Requires-Python') or [])>1:
+        raise RuntimeError('duplicate Requires-Python metadata')
+    metadata_version=parsed.get('Metadata-Version')
+    if not re.fullmatch(r'[12]\.\d+',metadata_version or ''):
+        raise RuntimeError('unsupported Python core metadata version')
     name=parsed.get('Name');version=parsed.get('Version')
+    if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?',name or ''):
+        raise RuntimeError('invalid Python core metadata name identity')
     if not isinstance(name,str) or not name or not isinstance(version,str) or not version:
         raise RuntimeError('Python core metadata lacks package identity')
+    _,_,Version,InvalidVersion,_=_packaging_symbols()
+    try:parsed_version=Version(version)
+    except InvalidVersion as exc:raise RuntimeError('invalid Python core metadata version identity') from exc
+    if expected_name is not None and _normalized_package_name(name)!=_normalized_package_name(expected_name):
+        raise RuntimeError('Python core metadata name identity differs')
+    if expected_version is not None and parsed_version!=Version(expected_version):
+        raise RuntimeError('Python core metadata version identity differs')
+    requires_python=parsed.get('Requires-Python')
+    if target is not None and requires_python and not _requires_python_compatible(requires_python,Version(target.python_full_version)):
+        raise RuntimeError('Python core metadata Requires-Python rejects target')
     return name,version,parsed.get_all('Requires-Dist') or [],parsed.get_all('Provides-Extra') or []
 
 
-def _wheel_core_metadata(path):
+def _wheel_core_metadata(path, *, expected_name=None, expected_version=None, target=None):
     import zipfile
     path=Path(path)
     try:
@@ -3060,11 +3312,18 @@ def _wheel_core_metadata(path):
             if info.file_size>MAX_SOURCE:raise RuntimeError('wheel metadata exceeds security limit')
             raw=archive.read(names[0])
     except zipfile.BadZipFile as exc:raise RuntimeError('invalid wheel archive') from exc
-    _name,_version,requirements,extras=_core_metadata_fields(raw)
+    _name,_version,requirements,extras=_core_metadata_fields(raw,expected_name=expected_name,
+        expected_version=expected_version,target=target)
+    directory=names[0].split('/')[0].removesuffix('.dist-info')
+    try:directory_name,directory_version,_,_=_parse_wheel_filename(directory+'-py3-none-any.whl')
+    except ValueError as exc:raise RuntimeError('invalid wheel dist-info identity') from exc
+    Version=_packaging_symbols()[2]
+    if _normalized_package_name(directory_name)!=_normalized_package_name(_name) or directory_version!=Version(_version):
+        raise RuntimeError('wheel dist-info identity differs from core metadata')
     return requirements,extras
 
 
-def _pep658_candidate_metadata(candidate):
+def _pep658_candidate_metadata(candidate, target=None):
     """Return hash-verified artifact-specific Core Metadata when PyPI publishes it."""
     item=candidate['item'];descriptor=item.get('core-metadata')
     if descriptor is False or descriptor is None:return None
@@ -3075,7 +3334,8 @@ def _pep658_candidate_metadata(candidate):
                     user_agent='gpt-trace-dependency-pool/4',expected_host='files.pythonhosted.org')
     if hashlib.sha256(raw).hexdigest()!=descriptor['sha256']:
         raise RuntimeError('PyPI core-metadata SHA-256 mismatch')
-    name,version,requirements,extras=_core_metadata_fields(raw)
+    name,version,requirements,extras=_core_metadata_fields(raw,expected_name=candidate['name'],
+        expected_version=candidate['version'],target=target)
     _,_,Version,InvalidVersion,_=_packaging_symbols()
     try:same_version=Version(version)==Version(candidate['version'])
     except InvalidVersion:same_version=False
@@ -3104,13 +3364,14 @@ def _candidate_yank_provenance(candidate):
 def _materialize_candidate_metadata(pool,candidate,key,target,cache):
     """Download one chosen artifact and read its authoritative embedded metadata."""
     identity=(_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
-              candidate['version'],candidate['filename'])
+              candidate['version'],candidate['filename'],_candidate_artifact_identity(candidate))
     def materialize():
         sha,url=_candidate_artifact_identity(candidate)
         if candidate['kind']=='wheel':
             actual=pool.download(url,'python',key,sha=sha)
             path=pool.objects/actual[:2]/actual
-            requirements,extras=_wheel_core_metadata(path)
+            requirements,extras=_wheel_core_metadata(path,expected_name=candidate['name'],
+                expected_version=candidate['version'],target=target)
             return {'kind':'wheel','name':candidate['name'],'version':candidate['version'],
                     'filename':candidate['filename'],'sha256':actual,'url':url,
                     'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
@@ -3135,63 +3396,29 @@ def _materialize_candidate_metadata(pool,candidate,key,target,cache):
 def _candidate_probe_identity(candidate,target,no_deps):
     """One identity for release metadata and read-only compatibility probes."""
     return (_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
-            candidate['version'],candidate['filename'],bool(no_deps))
+            candidate['version'],candidate['filename'],_candidate_artifact_identity(candidate),bool(no_deps))
 
 
 def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,no_deps=False):
-    """Read lightweight release metadata without downloading rejected artifacts."""
+    """Use only artifact-specific metadata as evidence for dependency decisions.
+
+    Release JSON may describe another wheel from the same release. It cannot
+    prove that this candidate is SAT or UNSAT. A hash-bound sidecar is usable;
+    otherwise inspecting the pinned archive is necessary, without installation.
+    --no-deps controls graph expansion, never metadata integrity verification.
+    """
     target=_coerce_target(target)
     identity=_candidate_probe_identity(candidate,target,no_deps)
     def probe():
         sha,url=_candidate_artifact_identity(candidate)
-        if no_deps:
-            return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
-                    'filename':candidate['filename'],'sha256':sha,'url':url,
-                    'requirements':[],'provides_extra':[],
-                    **_candidate_yank_provenance(candidate)}
-        # PEP 658 metadata is artifact-specific and therefore authoritative for
-        # the selected wheel. Exact-release JSON is only a compact fallback when
-        # PyPI does not publish candidate-specific core metadata.
-        core=_pep658_candidate_metadata(candidate)
-        if core is not None:
-            requirements,extras=core
-        else:
-            exact_info=candidate.get('_release_info')
-            if exact_info is not None:
-                requirements=exact_info.get('requires_dist');extras=exact_info.get('provides_extra')
-                if requirements is None:
-                    return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
-            else:
-                endpoint=('https://pypi.org/pypi/'+urllib.parse.quote(candidate['name'],safe='')+'/'
-                          +urllib.parse.quote(candidate['version'],safe='')+'/json')
-                payload=_pypi_json(endpoint)
-                info=payload.get('info');files=payload.get('urls')
-                if not isinstance(info,dict) or not isinstance(files,list):
-                    raise RuntimeError('PyPI release metadata is incomplete for '+candidate['name']+'=='+candidate['version'])
-                _,_,Version,InvalidVersion,_=_packaging_symbols()
-                try:same_version=Version(str(info.get('version','')))==Version(candidate['version'])
-                except InvalidVersion:same_version=False
-                if (_normalized_package_name(info.get('name',''))!=_normalized_package_name(candidate['name'])
-                        or not same_version):
-                    raise RuntimeError('PyPI release metadata identity differs for '+candidate['name']+'=='+candidate['version'])
-                matched=False
-                for item in files:
-                    if not isinstance(item,dict):continue
-                    item_sha=str((item.get('digests') or {}).get('sha256',''))
-                    if item.get('filename')==candidate['filename'] and item.get('url')==url and item_sha==sha:
-                        matched=True;break
-                if not matched:
-                    raise RuntimeError('PyPI release metadata does not contain selected immutable artifact')
-                requirements=info.get('requires_dist');extras=info.get('provides_extra')
-                if requirements is None:
-                    return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
-        if (not isinstance(requirements,list) or not all(isinstance(row,str) for row in requirements)
-                or extras is not None and (not isinstance(extras,list) or not all(isinstance(row,str) for row in extras))):
-            raise RuntimeError('invalid Python release dependency metadata for '+candidate['name']+'=='+candidate['version'])
+        core=_pep658_candidate_metadata(candidate,target)
+        if core is None:
+            return _materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+        requirements,extras=core
         return {'kind':candidate['kind'],'name':candidate['name'],'version':candidate['version'],
                 'filename':candidate['filename'],'sha256':sha,'url':url,
                 'requirements':[normalize_legacy_source_requirement(row) for row in requirements],
-                'provides_extra':sorted(set(extras or [])),
+                'provides_extra':sorted(set(extras)),
                 **_candidate_yank_provenance(candidate)}
     return _memo_get_or_compute(probe_cache,identity,probe)
 
@@ -3224,7 +3451,7 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None):
 
 def _candidate_satisfies(candidate,requirements,constraints):
     _,_,Version,_,_=_packaging_symbols();version=Version(candidate['version'])
-    return all(not req.specifier or req.specifier.contains(version,prereleases=None)
+    return all(not req.specifier or req.specifier.contains(version,prereleases=True)
                for req in [*requirements,*constraints])
 
 
@@ -3470,7 +3697,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 selected[name]=record;stats['propagations']+=1
                 continue
 
-            branch_causes=causes(rows);combined_conflict=set();metadata_failures=[];last_detail=None
+            branch_causes=causes(rows);combined_conflict=set();last_detail=None
             active_extras=frozenset(extras_by_name.get(name,set()))
             prefetched={}
             def schedule_metadata(position):
@@ -3499,7 +3726,9 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                     future=prefetched.pop(index-1,None)
                     record=future.result() if future is not None else candidate_record(candidate)
                 except RuntimeError as exc:
-                    metadata_failures.append(str(exc));continue
+                    for pending in prefetched.values():pending.cancel()
+                    raise RuntimeError('candidate metadata could not be validated; satisfiability is not established: '
+                                       +name+'=='+candidate['version']+': '+str(exc)) from exc
 
                 # Reject a candidate immediately when one of its active
                 # dependencies contradicts an assignment already made. This is
@@ -3529,9 +3758,6 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                     return None,conflict,detail
                 combined_conflict.update(conflict-{name})
             for pending in prefetched.values():pending.cancel()
-            if metadata_failures and len(metadata_failures)==len(candidates):
-                raise RuntimeError('all compatible artifacts require unsupported dynamic metadata for '
-                                   +name+': '+metadata_failures[0])
             conflict=frozenset(combined_conflict|set(branch_causes))
             failed_states.add(current_state)
             detail=(last_detail or ('all compatible candidates exhausted for '+name))
@@ -3574,14 +3800,13 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
         shas=_pip_plan_artifact_shas(plan)
         for sha in shas:
             artifact=pool.objects/sha[:2]/sha
-            if (artifact.is_symlink() or not artifact.is_file()
-                    or sha not in pool.verified_objects and digest(artifact)!=sha):return False
-            pool.verified_objects.add(sha)
+            pool.verify_object(sha)
         for row in plan['packages']:
             category='python-source' if row['kind']=='sdist' else 'python'
             artifact=pool.objects/row['sha256'][:2]/row['sha256']
             pool.reference(row['sha256'],category,key,artifact.stat().st_size)
-    except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError):return False
+    except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError) as exc:
+        raise RuntimeError('invalid retained pip checkpoint: '+str(exc)) from exc
     print('[pool] reused verified pip closure '+key,flush=True);return True
 
 
@@ -3592,10 +3817,13 @@ def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
              for row in packages if row['kind']=='sdist']
     plan={'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-          'resolver_policy':{'schema':9,'name':PIP_RESOLVER_POLICY,'target_fingerprint':_target_fingerprint(target)},
+          'resolver_policy':{'schema':PIP_PLAN_SCHEMA,'name':PIP_RESOLVER_POLICY,'target_fingerprint':_target_fingerprint(target),
+                             'runtime':_resolver_runtime_identity()},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources}
+    try:_pip_plan_artifact_shas(plan)
+    except (ValueError,KeyError,TypeError) as exc:raise RuntimeError('invalid pip closure: '+str(exc)) from exc
     # A completed checkpoint is durable only after its CAS links and metadata
     # directory entries have been synchronized, not merely their file contents.
     for directory in sorted({(pool.objects/row['sha256'][:2]) for row in packages}):
@@ -3745,7 +3973,17 @@ def npm_lock_urls(lock, label, *, workspace_checker=None):
     if isinstance(packages,dict) and packages:
         records=list(packages.values())
     elif isinstance(dependencies,dict):
-        records=list(dependencies.values())
+        records=[];pending=[dependencies];seen=set()
+        while pending:
+            nested=pending.pop()
+            if id(nested) in seen:raise RuntimeError('cyclic npm dependency tree: '+label)
+            seen.add(id(nested))
+            if not isinstance(nested,dict):raise RuntimeError('invalid npm dependencies: '+label)
+            for name in sorted(nested):
+                record=nested[name]
+                if not isinstance(record,dict):raise RuntimeError('invalid npm dependency record: '+label)
+                records.append(record)
+                if 'dependencies' in record:pending.append(record['dependencies'])
     else:
         raise RuntimeError('npm lockfile has no package records: '+label)
     for item in records:
@@ -4023,6 +4261,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
                 if not optional or not isinstance(failed,str):
                     raise ValueError('failure marker on required closure')
                 return
+            _pip_plan_artifact_shas(closure)
             if not closure.get('files') and not closure.get('source_archives'):
                 raise ValueError('empty closure')
             for artifact in closure.get('files',[]):
@@ -4231,7 +4470,10 @@ def main(argv=None):
     # Git files must not be linked to CAS while Git may still mutate refs.
     envplan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set);environment_pip_target={}
-    conda_transaction_plan,_locked_base_python=acquire_locked_conda(pool,conda_lock)
+    # Lock validation supplies transaction identities without downloading its
+    # archive corpus. Static recipes and Python closures must be inspected first.
+    conda_transaction_plan={env:[item['key'] for item in row['transactions']]
+                            for env,row in conda_lock['environments'].items()}
     target_model=_target_environment_module()
     transaction_targets=target_model.locked_conda_targets(conda_lock,base_target=golden_target)
     base_target_by_env={};final_target_by_env={}
@@ -4289,7 +4531,7 @@ def main(argv=None):
         # Installation-relevant evaluator commands are public pinned spec data;
         # no patch, oracle, test command or private evaluator material is exported.
         commands.extend(spec.get('eval_commands',[]))
-        for package in spec.get('pip_packages',[]):commands.append('pip install '+package)
+        for package in spec.get('pip_packages',[]):commands.append('pip install '+shlex.quote(package))
         get_file = lambda path,required=False: transformed_source(
             repo, path, git_file(mirror,commit,path,required=required), commands)
         for command in list(commands):
@@ -4323,7 +4565,7 @@ def main(argv=None):
         for ptext in cfg_problems:pool.issue(logical,ptext)
         setup=get_file('setup.py')
         deps,remote,problems=setup_requirements_from_sources(
-            setup,get_file,extras=extras,python_version=version)
+            setup,get_file,extras=extras,python_version=task_target.python_full_version)
         reqs.update(deps); vcs_task.update(remote)
         for ptext in problems:pool.issue(logical,ptext)
 
@@ -4622,6 +4864,9 @@ def main(argv=None):
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
         raise RuntimeError('required signed Kali closure unavailable: '+str(exc)) from exc
+    acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
+    if acquired_transactions!=conda_transaction_plan:
+        raise RuntimeError('acquired Conda transaction identities differ from prevalidated lock')
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
                     conda_lock_sha256=conda_lock_sha256)

@@ -25,6 +25,16 @@ BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
 TASK_RUNTIME_SCHEMA = 2
+FETCH_SOURCE_FILES = (
+    "scripts/superbench_pool.py",
+    "config/preparation.toml",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
+)
 def golden_source_pins(source_root=ROOT):
     builder = golden_builder(source_root)
     return frozenset({(builder.SOURCE + builder.ARCHIVE, builder.ARCHIVE_SHA256)})
@@ -533,7 +543,8 @@ def pool_contract(source_root=ROOT):
     platform = lock_payload.get("platform")
     if not isinstance(platform, str) or not platform:
         raise RuntimeError("SWE-Gym Lite Conda lock has no target platform identity")
-    return {"fetch_kind": "download-only-pool-v3", "pool_schema": 3,
+    return {"fetch_kind": "download-only-pool-v4", "pool_schema": 4,
             "pins": pins, "platform": platform, "coverage": coverage,
             "conda_lock_sha256": digest(lock),
-            "fetcher_sha256": digest(source_root / "scripts/superbench_pool.py")}
+            "fetcher_sha256": digest(source_root / "scripts/superbench_pool.py"),
+            "fetch_sources": {name: digest(source_root / name) for name in FETCH_SOURCE_FILES}}

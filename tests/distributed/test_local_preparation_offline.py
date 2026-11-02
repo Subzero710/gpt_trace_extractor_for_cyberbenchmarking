@@ -770,7 +770,12 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             cfg = {"deployment": {"control_id": "fixture-control", "execution_id": "fixture-execution"}}
             recipe = local.pool_contract(ROOT)
-            expected = recipe
+            from test_superbench_pool import fixture_target
+            target = fixture_target().as_dict()
+            target.update(source="verified-target-interpreter", interpreter_sha256="f" * 64,
+                          python_artifact_sha256=None)
+            expected = {**recipe, "golden_dependency": {
+                "schema": 1, "target_environment": target, "npm_version": "10.9.9"}}
             operation_id = hashlib.sha256(local.canonical(expected)).hexdigest()
             identified = {"operation_id": operation_id, "compatibility": expected, "deployment": cfg["deployment"]}
             calls = []

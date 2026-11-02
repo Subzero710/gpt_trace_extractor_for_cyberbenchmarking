@@ -24,24 +24,12 @@ from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
-    verify_local_validation, verify_manifest, activate)
+    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, pool_contract)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
 
 TERMINAL = frozenset({"ready", "failed", "interrupted", "canceled"})
 PHASES = TERMINAL | {"starting", "running", "validating"}
-
-FETCH_SOURCE_FILES = (
-    "scripts/superbench_pool.py",
-    "config/preparation.toml",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
-    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
-)
-
 
 def locked_python_minors(source_root):
     lock = Path(source_root) / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json"
@@ -107,9 +95,12 @@ def trusted_fetch_python():
     return interpreter
 
 
-def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, golden_dependency=None):
+def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, golden_dependency=None, *, expected_sources=None):
     """Copy exact worker inputs plus the verified dependency target into a sealed snapshot."""
     repository = manager.source_root.resolve(strict=True)
+    expected_sources = pool_contract(repository)['fetch_sources'] if expected_sources is None else expected_sources
+    if set(expected_sources) != set(FETCH_SOURCE_FILES):
+        raise RuntimeError('admitted fetch source contract is incomplete')
     if operation_id is None or attempt is None:
         snapshot = pool_root / "source"
     else:
@@ -126,7 +117,10 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
             raise RuntimeError("fetch source escapes repository: " + relative)
         target = snapshot / relative
         target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        target.write_bytes(source.read_bytes())
+        data = source.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected_sources[relative]:
+            raise RuntimeError('fetch source changed after admission: '+relative)
+        target.write_bytes(data)
         os.chown(target, 0, 0)
         target.chmod(0o444)
     dependency = golden_dependency_identity(manager.base, manager.source_root) if golden_dependency is None else golden_dependency
@@ -831,7 +825,7 @@ def _prepare(manager, state):
     # documented read-only fixture; production passes the durable identity.
     source_root, program = stage_fetch_sources(
         manager, root, state['operation_id'], state['attempt'],
-        state['compatibility']['golden_dependency'])
+        state['compatibility']['golden_dependency'], expected_sources=current['fetch_sources'])
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
     # unprivileged downloader or any of its subprocesses. No proxy/auth env.
