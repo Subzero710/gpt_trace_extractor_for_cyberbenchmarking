@@ -3016,9 +3016,16 @@ def _wheel_core_metadata(path):
     path=Path(path)
     try:
         with zipfile.ZipFile(path) as archive:
-            names=[name for name in archive.namelist()
-                   if name.endswith('.dist-info/METADATA') and '..' not in Path(name).parts]
-            if len(names)!=1:raise RuntimeError('wheel has no unique dist-info/METADATA')
+            # Wheel Core Metadata lives in a top-level *.dist-info directory.
+            # Vendor-bundled packages may contain their own nested *.dist-info
+            # directories, which must never be mistaken for the wheel's own.
+            names=[member.filename for member in archive.infolist()
+                   if member.filename.endswith('.dist-info/METADATA')
+                   and member.filename.count('/')==1
+                   and '..' not in member.filename.split('/')]
+            if len(names)!=1:
+                raise RuntimeError('wheel has no unique root dist-info/METADATA: '
+                                   +path.name+' ('+str(len(names))+' root entries)')
             info=archive.getinfo(names[0])
             if info.file_size>MAX_SOURCE:raise RuntimeError('wheel metadata exceeds security limit')
             raw=archive.read(names[0])

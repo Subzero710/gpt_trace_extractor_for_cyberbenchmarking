@@ -531,6 +531,58 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             archive.writestr(dist+'/RECORD','')
         return buffer.getvalue()
 
+    def test_wheel_root_metadata_ignores_nested_vendor_metadata(self):
+        import zipfile
+        for nested in (
+            'package/_vendor/dependency-2.0.dist-info/METADATA',
+            'package/_vendored_packages/dependency-2.0.dist-info/METADATA',
+        ):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as tmp:
+                wheel=Path(tmp)/'primary.whl'
+                with zipfile.ZipFile(io.BytesIO(self.wheel_bytes('primary','1.0',
+                                      requires=('actual-dependency>=2',)))) as original:
+                    with zipfile.ZipFile(wheel,'w') as archive:
+                        for entry in original.infolist():
+                            archive.writestr(entry,original.read(entry))
+                        archive.writestr(nested,
+                            'Metadata-Version: 2.1\nName: dependency\nVersion: 2.0\n'
+                            'Requires-Dist: unrelated-package\n\n')
+                        archive.writestr(nested.removesuffix('METADATA')+'WHEEL',
+                                         'Wheel-Version: 1.0\n')
+                dependencies,extras=pool._wheel_core_metadata(wheel)
+                self.assertEqual(dependencies,['actual-dependency>=2'])
+                self.assertEqual(extras,[])
+
+    def test_wheel_root_metadata_rejects_nested_metadata_without_root(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel=Path(tmp)/'missing-root.whl'
+            with zipfile.ZipFile(wheel,'w') as archive:
+                archive.writestr('pkg/_vendor/dependency-1.0.dist-info/METADATA',
+                    'Metadata-Version: 2.1\nName: dependency\nVersion: 1.0\n')
+            with self.assertRaisesRegex(RuntimeError,'no unique root dist-info/METADATA'):
+                pool._wheel_core_metadata(wheel)
+
+    def test_wheel_root_metadata_rejects_two_root_directories(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel=Path(tmp)/'ambiguous.whl'
+            with zipfile.ZipFile(wheel,'w') as archive:
+                for name in ('first','second'):
+                    archive.writestr(name+'-1.0.dist-info/METADATA',
+                        'Metadata-Version: 2.1\nName: '+name+'\nVersion: 1.0\n')
+            with self.assertRaisesRegex(RuntimeError,'2 root entries'):
+                pool._wheel_core_metadata(wheel)
+
+    def test_wheel_root_metadata_rejects_missing_metadata(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel=Path(tmp)/'empty.whl'
+            with zipfile.ZipFile(wheel,'w') as archive:
+                archive.writestr('package/__init__.py','')
+            with self.assertRaisesRegex(RuntimeError,'0 root entries'):
+                pool._wheel_core_metadata(wheel)
+
     def project(self,payload,*,name='demo',version='1.0'):
         sha=hashlib.sha256(payload).hexdigest()
         return {'releases':{version:[{'packagetype':'bdist_wheel',
