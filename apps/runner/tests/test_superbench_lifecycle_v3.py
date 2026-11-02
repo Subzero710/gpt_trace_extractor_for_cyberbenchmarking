@@ -35,6 +35,7 @@ from gpt_trace_runner.superbench.run_control import (
 class V3Settings:
     superbench_active_run_path: Path
     runner_lock_path: Path
+    runner_state_root: Path
     storage_base_url: str = "http://storage"
     chatgpt_expected_model_slug: str = "m"
     chatgpt_conversation_turns: int = 1
@@ -81,6 +82,7 @@ def make_settings(tmp_path: Path) -> V3Settings:
     return V3Settings(
         superbench_active_run_path=tmp_path / "active-run.json",
         runner_lock_path=tmp_path / "runner.lock",
+        runner_state_root=tmp_path / "runner-state",
     )
 
 
@@ -108,22 +110,12 @@ def freeze(settings: V3Settings, adapter: MutableAdapter, *, limit=None):
 @pytest.mark.asyncio
 async def test_frozen_limit_selection_is_identical_on_repeated_resume_execution(
     tmp_path,
-    monkeypatch,
 ):
     settings = make_settings(tmp_path)
     adapter = MutableAdapter()
     adapters, state = freeze(settings, adapter, limit=1)
     selected = tuple(task.run_task_id for task in state.selected_tasks)
     assert len(selected) == 1
-
-    original_path = execution_module.Path
-
-    def path_factory(value):
-        if str(value) == "/data/state/superbench/staging":
-            return tmp_path / "staging"
-        return original_path(value)
-
-    monkeypatch.setattr(execution_module, "Path", path_factory)
 
     class MissingStorage:
         async def health(self):

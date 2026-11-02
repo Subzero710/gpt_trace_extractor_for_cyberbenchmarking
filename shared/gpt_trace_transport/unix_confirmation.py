@@ -24,8 +24,7 @@ class ConfirmationHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self): self.handle_operation()
     def handle_operation(self):
         length = self.headers.get_all('Content-Length', [])
-        if (self.command != 'POST' or self.path not in ('/v1/shutdown_status','/v1/shutdown_complete')
-                or self.headers.get_all('Transfer-Encoding') or len(length) != 1
+        if (self.headers.get_all('Transfer-Encoding') or len(length) != 1
                 or not length[0].isdigit() or int(length[0]) > 4096):
             self.respond(404, b'{"detail":"confirmation only"}')
             return
@@ -33,6 +32,9 @@ class ConfirmationHandler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(int(length[0]))
         if len(raw) != int(length[0]):
             self.respond(400, b'{"detail":"truncated body"}')
+            return
+        if self.command != 'POST' or self.path not in ('/v1/shutdown_status','/v1/shutdown_complete'):
+            self.respond(404, b'{"detail":"confirmation only"}')
             return
         authorization = self.headers.get_all('Authorization', [])
         status, data = self.server.confirmation.exchange(self.command, self.path, raw,
