@@ -853,25 +853,30 @@ def setup_cfg_static(source, *, extras=()):
     return specs, []
 
 
-def setup_static(source, *, extras=(), get_file=None, python_version=None):
+def setup_static(source, *, extras=(), get_file=None, python_version=None, setup_argv=None):
     """Evaluate a bounded subset of setuptools metadata without executing it.
 
-    Supported constructs are literals, top-level names/list concatenation,
-    selected ``extras_require`` groups, literal ``Path(...).read_text()`` chains
-    backed by the pinned Git reader, and simple ``append``/``extend`` mutations
-    guarded by target-Python ``sys.version_info`` conditions. Anything else
-    remains fail-closed.
+    The evaluator models setup.py as a script (``__name__ == '__main__'``),
+    follows only statically-audited Python control/data flow, and virtualizes
+    file reads through the pinned Git reader.  User functions are interpreted
+    only through the same bounded statement/expression surface; arbitrary
+    project code is never imported or executed.
     """
     import ast
     import copy
+    import posixpath
     if not source: return set(), []
     try: tree = ast.parse(source)
     except SyntaxError: return set(), ['unparseable setup.py']
 
-    env = {}
+    unresolved = object()
+    argv = tuple(setup_argv) if setup_argv is not None else ('setup.py','egg_info')
+    if (not argv or argv[0] != 'setup.py' or
+            not all(isinstance(item,str) and '\x00' not in item for item in argv)):
+        return set(), ['invalid static setup.py invocation']
+    env = {'__name__':'__main__','__file__':'setup.py'}
     setup_calls=[]
     control_issues=[]
-    unresolved = object()
     target_version = None
     if python_version is not None:
         match = re.fullmatch(r'(\d+)\.(\d+)(?:\.(\d+))?', str(python_version))
@@ -879,15 +884,47 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             return set(), ['invalid target Python version for setup.py: '+str(python_version)]
         target_version = tuple(int(x or 0) for x in match.groups())
 
-    def safe_path(name):
-        if not isinstance(name,str) or not name or Path(name).is_absolute() or '..' in Path(name).parts:
+    functions={node.name:node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    active_functions=set()
+    imports={}
+    for node in tree.body:
+        if isinstance(node,ast.Import):
+            for alias in node.names:
+                imports[alias.asname or alias.name.split('.')[0]]=alias.name
+        elif isinstance(node,ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name!='*':imports[alias.asname or alias.name]=node.module+'.'+alias.name
+
+    def symbol(node):
+        if isinstance(node,ast.Name):return imports.get(node.id,node.id)
+        if isinstance(node,ast.Attribute):
+            base=symbol(node.value)
+            return None if base is None else base+'.'+node.attr
+        return None
+
+    def virtual_path(value):
+        if not isinstance(value,str) or '\x00' in value or '\\' in value:
             raise ValueError('unsafe setup.py metadata path')
+        # ``abspath(__file__)`` is deliberately virtualized to the pinned Git
+        # checkout root; host absolute paths must never influence acquisition.
+        normalized=posixpath.normpath(value)
+        if normalized in ('','.'):return '.'
+        if normalized.startswith('/') or normalized=='..' or normalized.startswith('../'):
+            raise ValueError('unsafe setup.py metadata path')
+        return normalized.removeprefix('./')
+
+    def safe_path(name):
+        name=virtual_path(name)
+        if name=='.':raise ValueError('setup.py metadata path names a directory')
         if get_file is None:
             raise ValueError('setup.py file-backed metadata requires pinned source reader')
         value=get_file(name,required=True)
         if not isinstance(value,str):
             raise ValueError('setup.py metadata file is not text: '+name)
         return value
+
+    class StaticReturn(BaseException):
+        def __init__(self,value):self.value=value
 
     def evaluate(node, visiting=frozenset()):
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bool, int, float, type(None))):
@@ -896,24 +933,30 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             if node.id in visiting or node.id not in env or env[node.id] is unresolved:
                 raise ValueError('unresolved setup.py name ' + node.id)
             return copy.deepcopy(env[node.id])
-        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-            values=[evaluate(item,visiting) for item in node.elts]
-            return tuple(values) if isinstance(node,ast.Tuple) else values
+        if isinstance(node, ast.List):
+            return [evaluate(item,visiting) for item in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(evaluate(item,visiting) for item in node.elts)
+        if isinstance(node, ast.Set):
+            return set(evaluate(item,visiting) for item in node.elts)
         if isinstance(node, ast.Dict):
             result={}
             for key,value in zip(node.keys,node.values):
                 key_value=evaluate(key,visiting)
                 if not isinstance(key_value,str):
                     raise ValueError('non-string setup.py mapping key')
-                result[key_value]=evaluate(value,visiting)
+                try:result[key_value]=evaluate(value,visiting)
+                except (TypeError,ValueError,KeyError,IndexError):result[key_value]=unresolved
             return result
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return evaluate(node.left,visiting)+evaluate(node.right,visiting)
-        if isinstance(node, ast.Attribute) and isinstance(node.value,ast.Name):
-            if node.value.id=='sys' and node.attr=='version_info':
+        if isinstance(node, ast.Attribute):
+            name=symbol(node)
+            if name in ('sys.version_info',):
                 if target_version is None:
                     raise ValueError('target Python required for sys.version_info')
                 return target_version
+            if name in ('sys.argv',):return argv
         if isinstance(node, ast.Subscript):
             base=evaluate(node.value,visiting)
             index=evaluate(node.slice,visiting)
@@ -922,23 +965,91 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             value=evaluate(node.operand,visiting)
             if not isinstance(value,(int,float)): raise ValueError('non-numeric setup.py unary expression')
             return -value
+        if isinstance(node, ast.IfExp):
+            return evaluate(node.body if condition(node.test) else node.orelse,visiting)
+        if isinstance(node,ast.ListComp):
+            if len(node.generators)!=1 or node.generators[0].is_async or not isinstance(node.generators[0].target,ast.Name):
+                raise ValueError('dynamic setup.py comprehension')
+            generator=node.generators[0]
+            values=evaluate(generator.iter,visiting)
+            if not isinstance(values,(list,tuple,set)) or len(values)>4096:
+                raise ValueError('dynamic setup.py comprehension')
+            name=generator.target.id;had=name in env;previous=env.get(name)
+            result=[]
+            try:
+                for value in values:
+                    env[name]=copy.deepcopy(value)
+                    if all(condition(item) for item in generator.ifs):result.append(evaluate(node.elt,visiting))
+            finally:
+                if had:env[name]=previous
+                else:env.pop(name,None)
+            return result
         if isinstance(node, ast.Call):
-            if isinstance(node.func,ast.Name) and node.func.id=='str' and len(node.args)==1 and not node.keywords:
+            callee=symbol(node.func)
+            if isinstance(node.func,ast.Name) and node.func.id in functions:
+                return call_function(functions[node.func.id],node.args,node.keywords)
+            if callee in ('str','builtins.str') and len(node.args)==1 and not node.keywords:
                 return str(evaluate(node.args[0],visiting))
-            if isinstance(node.func,ast.Name) and node.func.id=='Path' and len(node.args)==1 and not node.keywords:
+            if callee in ('len','builtins.len') and len(node.args)==1 and not node.keywords:
+                return len(evaluate(node.args[0],visiting))
+            if callee in ('list','builtins.list','tuple','builtins.tuple','set','builtins.set') and len(node.args)<=1 and not node.keywords:
+                value=[] if not node.args else evaluate(node.args[0],visiting)
+                return {'list':list,'builtins.list':list,'tuple':tuple,'builtins.tuple':tuple,
+                        'set':set,'builtins.set':set}[callee](value)
+            if callee in ('pathlib.Path','Path') and len(node.args)==1 and not node.keywords:
                 value=evaluate(node.args[0],visiting)
-                if not isinstance(value,str): raise ValueError('non-string setup.py Path')
-                return ('__pinned_path__',value)
+                return ('__pinned_path__',virtual_path(value))
+            if callee in ('open','builtins.open','codecs.open','io.open'):
+                if not node.args:raise ValueError('setup.py open path is absent')
+                path=evaluate(node.args[0],visiting)
+                if isinstance(path,tuple) and len(path)==2 and path[0]=='__pinned_path__':path=path[1]
+                return ('__pinned_file__',virtual_path(path))
+            if callee in ('os.path.join','posixpath.join') or callee=='join' and imports.get('join')=='os.path.join':
+                parts=[evaluate(item,visiting) for item in node.args]
+                if not all(isinstance(item,str) for item in parts):raise ValueError('dynamic setup.py path join')
+                return virtual_path(posixpath.join(*parts))
+            if callee in ('os.path.dirname','posixpath.dirname') or callee=='dirname' and imports.get('dirname')=='os.path.dirname':
+                if len(node.args)!=1:raise ValueError('dynamic setup.py dirname')
+                value=evaluate(node.args[0],visiting)
+                if not isinstance(value,str):raise ValueError('dynamic setup.py dirname')
+                return posixpath.dirname(value) or '.'
+            if callee in ('os.path.abspath','posixpath.abspath') or callee=='abspath' and imports.get('abspath')=='os.path.abspath':
+                if len(node.args)!=1:raise ValueError('dynamic setup.py abspath')
+                value=evaluate(node.args[0],visiting)
+                return virtual_path(value)
+            if callee in ('pkg_resources.parse_requirements',):
+                if len(node.args)!=1 or node.keywords:raise ValueError('dynamic parse_requirements invocation')
+                value=evaluate(node.args[0],visiting)
+                if isinstance(value,tuple) and len(value)==2 and value[0]=='__pinned_file__':value=safe_path(value[1])
+                if not isinstance(value,str):raise ValueError('dynamic parse_requirements input')
+                Requirement,_,_,_,_=_packaging_symbols();result=[]
+                for raw in value.splitlines():
+                    raw=raw.strip()
+                    if not raw or raw.startswith('#'):continue
+                    try:result.append(str(Requirement(raw)))
+                    except Exception as exc:raise ValueError('invalid setup.py parsed requirement: '+raw) from exc
+                return result
             if isinstance(node.func,ast.Attribute) and not node.keywords:
-                owner=evaluate(node.func.value,visiting)
-                method=node.func.attr
+                owner=evaluate(node.func.value,visiting);method=node.func.attr
+                if method=='open' and isinstance(owner,tuple) and len(owner)==2 and owner[0]=='__pinned_path__':
+                    return ('__pinned_file__',owner[1])
                 if method=='read_text' and isinstance(owner,tuple) and len(owner)==2 and owner[0]=='__pinned_path__':
                     if node.args: raise ValueError('setup.py read_text arguments are unsupported')
                     return safe_path(owner[1])
-                if method=='strip' and isinstance(owner,str) and not node.args:
-                    return owner.strip()
-                if method=='splitlines' and isinstance(owner,str) and not node.args:
-                    return owner.splitlines()
+                if method=='read' and isinstance(owner,tuple) and len(owner)==2 and owner[0]=='__pinned_file__':
+                    if node.args:raise ValueError('setup.py file read arguments are unsupported')
+                    return safe_path(owner[1])
+                if method=='readlines' and isinstance(owner,tuple) and len(owner)==2 and owner[0]=='__pinned_file__':
+                    if node.args:raise ValueError('setup.py file readlines arguments are unsupported')
+                    return safe_path(owner[1]).splitlines(keepends=True)
+                if method=='strip' and isinstance(owner,str) and not node.args:return owner.strip()
+                if method=='splitlines' and isinstance(owner,str) and not node.args:return owner.splitlines()
+                if method=='startswith' and isinstance(owner,str) and len(node.args) in (1,2,3):
+                    return owner.startswith(*(evaluate(item,visiting) for item in node.args))
+                if method=='endswith' and isinstance(owner,str) and len(node.args) in (1,2,3):
+                    return owner.endswith(*(evaluate(item,visiting) for item in node.args))
+                if method=='intersection' and isinstance(owner,(set,list,tuple)) and len(node.args)==1:
+                    return set(owner).intersection(evaluate(node.args[0],visiting))
             raise ValueError('dynamic setup.py metadata expression')
         raise ValueError('dynamic setup.py metadata expression')
 
@@ -956,54 +1067,94 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             if isinstance(op,ast.LtE): return left<=right
             if isinstance(op,ast.Gt): return left>right
             if isinstance(op,ast.GtE): return left>=right
+            if isinstance(op,ast.Is): return left is right
+            if isinstance(op,ast.IsNot): return left is not right
+            if isinstance(op,ast.In): return left in right
+            if isinstance(op,ast.NotIn): return left not in right
+        value=evaluate(node)
+        if isinstance(value,(bool,str,int,float,list,tuple,set,dict,type(None))):return bool(value)
         raise ValueError('dynamic setup.py condition')
 
     def merge_static_dependency_branches(node):
-        """Accept an unknown condition only when both dependency outcomes are identical.
-
-        Only accept complete if/else branches consisting entirely of safe
-        assignments to the same setuptools requirement fields. Never execute
-        upstream code and never guess the value of a dynamic expression.
-        """
+        """Accept an unknown condition only when both dependency outcomes are identical."""
         allowed = {'install_requires', 'setup_requires'}
-
         def assignments(statements):
             values = {}
-            if not statements:
-                return None
+            if not statements:return None
             for statement in statements:
-                if (not isinstance(statement, ast.Assign)
-                        or len(statement.targets) != 1
-                        or not isinstance(statement.targets[0], ast.Name)):
+                if (not isinstance(statement,ast.Assign) or len(statement.targets)!=1
+                        or not isinstance(statement.targets[0],ast.Name)):
                     return None
-                name = statement.targets[0].id
-                if name not in allowed or name in values:
-                    return None
-                try:
-                    requirements = evaluate(statement.value)
-                except (TypeError, ValueError, KeyError, IndexError):
-                    return None
-                if (not isinstance(requirements, (list, tuple))
-                        or not all(isinstance(req, str) for req in requirements)):
-                    return None
-                values[name] = requirements
+                name=statement.targets[0].id
+                if name not in allowed or name in values:return None
+                try:requirements=evaluate(statement.value)
+                except (TypeError,ValueError,KeyError,IndexError):return None
+                if (not isinstance(requirements,(list,tuple))
+                        or not all(isinstance(req,str) for req in requirements)):return None
+                values[name]=requirements
             return values
-
-        true_branch = assignments(node.body)
-        false_branch = assignments(node.orelse)
-        if (true_branch is None or false_branch is None
-                or true_branch != false_branch):
-            return False
-        for name in true_branch:
-            env[name] = list(true_branch[name])
+        true_branch=assignments(node.body);false_branch=assignments(node.orelse)
+        if true_branch is None or false_branch is None or true_branch!=false_branch:return False
+        for name in true_branch:env[name]=list(true_branch[name])
         return True
 
-    def apply_statement(node):
+    def bound_target(target,value):
+        if isinstance(target,ast.Name):env[target.id]=copy.deepcopy(value);return True
+        return False
+
+    def assigned_names(node):
+        names=set()
+        for child in ast.walk(node):
+            if isinstance(child,ast.Name) and isinstance(child.ctx,ast.Store):names.add(child.id)
+            if (isinstance(child,ast.Call) and isinstance(child.func,ast.Attribute)
+                    and isinstance(child.func.value,ast.Name) and child.func.attr in ('append','extend')):
+                names.add(child.func.value.id)
+        return names
+
+    def is_setup_call(call):
+        return isinstance(call,ast.Call) and symbol(call.func) in {
+            'setup','setuptools.setup','distutils.core.setup',
+        }
+
+    def call_function(function,args,keywords):
+        if function.name in active_functions:raise ValueError('recursive setup.py helper')
+        if function.args.vararg or function.args.kwarg or function.args.kwonlyargs:
+            raise ValueError('dynamic setup.py helper signature')
+        positional=[evaluate(item) for item in args]
+        named={kw.arg:evaluate(kw.value) for kw in keywords if kw.arg is not None}
+        if any(kw.arg is None for kw in keywords):raise ValueError('dynamic setup.py helper arguments')
+        params=[arg.arg for arg in function.args.args]
+        required=len(params)-len(function.args.defaults)
+        if len(positional)>len(params):raise ValueError('setup.py helper argument mismatch')
+        values={}
+        for index,value in enumerate(positional):values[params[index]]=value
+        for name,value in named.items():
+            if name not in params or name in values:raise ValueError('setup.py helper argument mismatch')
+            values[name]=value
+        defaults=dict(zip(params[required:],function.args.defaults))
+        for name in params:
+            if name not in values:
+                if name not in defaults:raise ValueError('setup.py helper argument mismatch')
+                values[name]=evaluate(defaults[name])
+        saved=copy.deepcopy(env);active_functions.add(function.name)
+        try:
+            env.update(copy.deepcopy(values))
+            try:
+                for statement in function.body:apply_statement(statement,in_function=True)
+            except StaticReturn as returned:
+                return returned.value
+            return None
+        finally:
+            env.clear();env.update(saved);active_functions.remove(function.name)
+
+    def apply_statement(node, *, in_function=False):
+        if isinstance(node,(ast.Import,ast.ImportFrom,ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Pass)):
+            return
         if isinstance(node,ast.Assign):
             try:value=evaluate(node.value)
-            except (TypeError,ValueError,KeyError,IndexError): value=unresolved
+            except (TypeError,ValueError,KeyError,IndexError):value=unresolved
             for target in node.targets:
-                if isinstance(target,ast.Name): env[target.id]=copy.deepcopy(value)
+                if isinstance(target,ast.Name):env[target.id]=copy.deepcopy(value)
             return
         if isinstance(node,ast.AnnAssign) and isinstance(node.target,ast.Name) and node.value is not None:
             try:env[node.target.id]=evaluate(node.value)
@@ -1011,101 +1162,132 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None):
             return
         if isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):
             call=node.value
-            if (getattr(call.func,'id',None)=='setup' or
-                    isinstance(call.func,ast.Attribute) and getattr(call.func.value,'id',None)=='setuptools' and call.func.attr=='setup'):
-                setup_calls.append((call,{key:unresolved if value is unresolved else copy.deepcopy(value) for key,value in env.items()}))
+            if is_setup_call(call):
+                setup_calls.append((call,{key:unresolved if value is unresolved else copy.deepcopy(value) for key,value in env.items()}));return
+            if isinstance(call.func,ast.Name) and call.func.id in functions:
+                try:call_function(functions[call.func.id],call.args,call.keywords)
+                except (TypeError,ValueError,KeyError,IndexError):
+                    if any(is_setup_call(child) for child in ast.walk(functions[call.func.id])):
+                        control_issues.append('setup.py setup helper cannot be resolved statically')
                 return
             if (isinstance(call.func,ast.Attribute) and isinstance(call.func.value,ast.Name)
                     and call.func.attr in ('append','extend') and not call.keywords
                     and call.func.value.id in env and env[call.func.value.id] is not unresolved):
-                current=env[call.func.value.id]
-                if not isinstance(current,list) or len(call.args)!=1:
+                if len(call.args)!=1:
                     env[call.func.value.id]=unresolved;return
                 try:value=evaluate(call.args[0])
-                except (TypeError,ValueError,KeyError,IndexError):
-                    env[call.func.value.id]=unresolved;return
-                if call.func.attr=='append': current.append(value)
-                elif isinstance(value,(list,tuple)): current.extend(value)
-                else: env[call.func.value.id]=unresolved
+                except (TypeError,ValueError,KeyError,IndexError):env[call.func.value.id]=unresolved;return
+                current=env.get(call.func.value.id,unresolved)
+                if not isinstance(current,list):env[call.func.value.id]=unresolved;return
+                if call.func.attr=='append':current.append(value)
+                elif isinstance(value,(list,tuple)):current.extend(value)
+                else:env[call.func.value.id]=unresolved
             return
         if isinstance(node,ast.If):
             try:selected=node.body if condition(node.test) else node.orelse
             except (TypeError,ValueError,KeyError,IndexError):
-                # Unequal unknown branches do not define a concrete target closure.
-                if merge_static_dependency_branches(node):
-                    return
-                if any(isinstance(child,ast.Call) and getattr(child.func,'id',None)=='setup' for child in ast.walk(node)):
+                if merge_static_dependency_branches(node):return
+                if any(is_setup_call(child) for child in ast.walk(node)):
                     control_issues.append('setup.py invokes setup under an unresolved condition')
-                # Variables assigned or mutated by an unresolved branch become unsafe.
-                names=set()
-                for child in ast.walk(node):
-                    if isinstance(child,ast.Name) and isinstance(child.ctx,ast.Store):
-                        names.add(child.id)
-                    if (isinstance(child,ast.Call) and isinstance(child.func,ast.Attribute)
-                            and isinstance(child.func.value,ast.Name)
-                            and child.func.attr in ('append','extend')):
-                        names.add(child.func.value.id)
-                for name in names:
-                    env[name]=unresolved
+                for name in assigned_names(node):env[name]=unresolved
                 return
-            for child in selected: apply_statement(child)
+            for child in selected:apply_statement(child,in_function=in_function)
+            return
+        if isinstance(node,(ast.With,ast.AsyncWith)):
+            saved={}
+            for item in node.items:
+                if not isinstance(item.optional_vars,(ast.Name,type(None))):
+                    for name in assigned_names(node):env[name]=unresolved
+                    return
+                if item.optional_vars is not None:
+                    name=item.optional_vars.id;saved[name]=(name in env,env.get(name))
+                    try:env[name]=evaluate(item.context_expr)
+                    except (TypeError,ValueError,KeyError,IndexError):env[name]=unresolved
+            try:
+                for child in node.body:apply_statement(child,in_function=in_function)
+            finally:
+                for name,(had,value) in saved.items():
+                    if had:env[name]=value
+                    else:env.pop(name,None)
+            return
+        if isinstance(node,ast.For):
+            try:values=evaluate(node.iter)
+            except (TypeError,ValueError,KeyError,IndexError):
+                for name in assigned_names(node):env[name]=unresolved
+                return
+            if not isinstance(values,(list,tuple,set)) or len(values)>4096 or not isinstance(node.target,ast.Name):
+                for name in assigned_names(node):env[name]=unresolved
+                return
+            name=node.target.id;had=name in env;previous=env.get(name)
+            try:
+                for value in values:
+                    env[name]=copy.deepcopy(value)
+                    for child in node.body:apply_statement(child,in_function=in_function)
+                for child in node.orelse:apply_statement(child,in_function=in_function)
+            finally:
+                if had:env[name]=previous
+                else:env.pop(name,None)
+            return
+        if isinstance(node,ast.Try):
+            # Both the normal path and every handler are possible without executing
+            # project code.  Dependency sets are unioned later across reached setup().
+            for child in node.body:apply_statement(child,in_function=in_function)
+            for handler in node.handlers:
+                for child in handler.body:apply_statement(child,in_function=in_function)
+            for child in node.orelse:apply_statement(child,in_function=in_function)
+            for child in node.finalbody:apply_statement(child,in_function=in_function)
+            return
+        if isinstance(node,ast.Return) and in_function:
+            raise StaticReturn(None if node.value is None else evaluate(node.value))
+        if isinstance(node,(ast.AugAssign,ast.Delete,ast.While,ast.AsyncFor,ast.Match)):
+            for name in assigned_names(node):env[name]=unresolved
+            if any(is_setup_call(child) for child in ast.walk(node)):
+                control_issues.append('setup.py invokes setup through unsupported control flow')
+            return
 
-    # Evaluate only module-level state; function/class bodies are never run.
-    for statement in tree.body:
-        apply_statement(statement)
+    for statement in tree.body:apply_statement(statement)
 
     deps,issues=set(),list(control_issues)
-    if not setup_calls:
-        issues.append('setup.py has no statically reached setup invocation')
+    if not setup_calls:issues.append('setup.py has no statically reached setup invocation')
 
     def fields_from_call(call):
         fields={kw.arg:kw.value for kw in call.keywords if kw.arg is not None}
         for kw in call.keywords:
-            if kw.arg is not None: continue
+            if kw.arg is not None:continue
             try:mapping=evaluate(kw.value)
             except (TypeError,ValueError,KeyError,IndexError) as exc:
-                # Never silently discard an unresolved **kwargs mapping: it may
-                # contain install_requires/setup_requires/extras_require. Known
-                # pinned projects with audited file-backed mappings are handled
-                # by setup_requirements_from_sources below.
-                issues.append('setup.py computes **kwargs dynamically: '+str(exc))
-                continue
+                issues.append('setup.py computes **kwargs dynamically: '+str(exc));continue
             if not isinstance(mapping,dict):
-                issues.append('setup.py **kwargs is not a mapping')
-                continue
+                issues.append('setup.py **kwargs is not a mapping');continue
             for key,value in mapping.items():
                 if key in fields:continue
-                if value is unresolved:
-                    fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
+                if value is unresolved:fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
                 else:
-                    # The mapping contains already-evaluated values; wrap
-                    # them in a literal AST so the same validation path below
-                    # can be used without executing code. Non-literal sentinels
-                    # remain explicitly unresolved.
                     try:fields[key]=ast.parse(repr(value),mode='eval').body
-                    except SyntaxError:
-                        fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
+                    except SyntaxError:fields[key]=ast.Name(id='__unresolved_setup_kwarg__',ctx=ast.Load())
         return fields
     for node,snapshot in setup_calls:
-        env=snapshot
-        fields=fields_from_call(node)
-        for name in ('install_requires','setup_requires'):
-            if name not in fields: continue
-            try:values=evaluate(fields[name])
-            except (TypeError,ValueError,KeyError,IndexError) as exc:
-                issues.append('setup.py computes '+name+' dynamically: '+str(exc));continue
-            if isinstance(values,(list,tuple)) and all(isinstance(v,str) for v in values):deps.update(values)
-            else:issues.append('setup.py unexpected '+name)
-        if extras and 'extras_require' in fields:
-            try:mapping=evaluate(fields['extras_require'])
-            except (TypeError,ValueError,KeyError,IndexError) as exc:
-                issues.append('setup.py computes extras_require dynamically: '+str(exc));continue
-            if not isinstance(mapping,dict):
-                issues.append('setup.py computes extras_require dynamically: extras_require is not a mapping');continue
-            for group,values in mapping.items():
-                if group not in extras and '*' not in extras: continue
+        saved=env;env=snapshot
+        try:
+            fields=fields_from_call(node)
+            for name in ('install_requires','setup_requires'):
+                if name not in fields:continue
+                try:values=evaluate(fields[name])
+                except (TypeError,ValueError,KeyError,IndexError) as exc:
+                    issues.append('setup.py computes '+name+' dynamically: '+str(exc));continue
                 if isinstance(values,(list,tuple)) and all(isinstance(v,str) for v in values):deps.update(values)
-                else:issues.append('setup.py computes extras_require dynamically: dynamic setup.py extra '+str(group))
+                else:issues.append('setup.py unexpected '+name)
+            if extras and 'extras_require' in fields:
+                try:mapping=evaluate(fields['extras_require'])
+                except (TypeError,ValueError,KeyError,IndexError) as exc:
+                    issues.append('setup.py computes extras_require dynamically: '+str(exc));continue
+                if not isinstance(mapping,dict):
+                    issues.append('setup.py computes extras_require dynamically: extras_require is not a mapping');continue
+                for group,values in mapping.items():
+                    if group not in extras and '*' not in extras:continue
+                    if isinstance(values,(list,tuple)) and all(isinstance(v,str) for v in values):deps.update(values)
+                    else:issues.append('setup.py computes extras_require dynamically: dynamic setup.py extra '+str(group))
+        finally:env=saved
     return deps,issues
 
 def _setup_dependency_files(source, *, extras=()):
@@ -1226,9 +1408,9 @@ def _setup_dependency_files(source, *, extras=()):
     return found
 
 
-def setup_requirements_from_sources(source, get_file, *, extras=(), python_version=None):
+def setup_requirements_from_sources(source, get_file, *, extras=(), python_version=None, setup_argv=None):
     """Resolve safe setuptools metadata and literal file-backed dependencies."""
-    deps, issues = setup_static(source, extras=extras, get_file=get_file, python_version=python_version)
+    deps, issues = setup_static(source, extras=extras, get_file=get_file, python_version=python_version, setup_argv=setup_argv)
     vcs=set()
     if not source or get_file is None or not issues:
         return deps,vcs,issues
@@ -1293,6 +1475,36 @@ def shell_segments(line):
             current.append(parsed[0])
     if current:segments.append((current,previous,None))
     return segments
+
+
+def setup_script_invocations(commands):
+    """Derive setup.py argv identities from the pinned official install stream."""
+    invocations=[];local_pip=False
+    for line in commands:
+        for tokens,_previous,_next in shell_segments(line):
+            position=_literal_command_index(tokens)
+            if position>=len(tokens):continue
+            executable=Path(tokens[position]).name
+            if (re.fullmatch(r'python(?:3(?:\.\d+)?)?',executable)
+                    and position+1<len(tokens) and Path(tokens[position+1]).name=='setup.py'):
+                invocations.append(tuple(['setup.py',*tokens[position+2:]]));continue
+            pip_position=None
+            if executable in ('pip','pip3') and position+1<len(tokens) and tokens[position+1]=='install':
+                pip_position=position
+            elif (re.fullmatch(r'python(?:3(?:\.\d+)?)?',executable)
+                    and tokens[position+1:position+3]==['-m','pip']
+                    and position+3<len(tokens) and tokens[position+3]=='install'):
+                pip_position=position+2
+            if pip_position is None:continue
+            parts=tokens[pip_position+2:]
+            for index,item in enumerate(parts):
+                if item in ('.','./') or item.startswith('.['):local_pip=True
+                if item in ('-e','--editable','-ve','-ev') and index+1<len(parts):
+                    target=parts[index+1]
+                    if target in ('.','./') or target.startswith('.['):local_pip=True
+    if local_pip:invocations.append(('setup.py','egg_info'))
+    if not invocations:invocations.append(('setup.py','egg_info'))
+    return tuple(dict.fromkeys(invocations))
 
 
 def _literal_command_index(tokens):
@@ -2965,8 +3177,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 15
-PIP_RESOLVER_POLICY = 'static-pypi-v13-verified-identities-legacy-lower-bound-and-guarded-source-edits'
+PIP_PLAN_SCHEMA = 16
+PIP_RESOLVER_POLICY = 'static-pypi-v14-verified-identities-setup-script-dataflow'
 
 
 def _pip_worker_controls():
@@ -4587,10 +4799,14 @@ def main(argv=None):
         reqs.update(cfg_deps)
         for ptext in cfg_problems:pool.issue(logical,ptext)
         setup=get_file('setup.py')
-        deps,remote,problems=setup_requirements_from_sources(
-            setup,get_file,extras=extras,python_version=task_target.python_full_version)
-        reqs.update(deps); vcs_task.update(remote)
-        for ptext in problems:pool.issue(logical,ptext)
+        setup_deps=set();setup_remote=set();setup_problems=[]
+        for setup_argv in setup_script_invocations(commands):
+            deps,remote,problems=setup_requirements_from_sources(
+                setup,get_file,extras=extras,python_version=task_target.python_full_version,
+                setup_argv=setup_argv)
+            setup_deps.update(deps);setup_remote.update(remote);setup_problems.extend(problems)
+        reqs.update(setup_deps);vcs_task.update(setup_remote)
+        for ptext in sorted(set(setup_problems)):pool.issue(logical,ptext)
 
         task_steps=[];environment_steps=[];optional_steps=[];optional_skips=[]
         def register(req, constraints, name, *, no_deps=False, optional=False,
@@ -4710,8 +4926,12 @@ def main(argv=None):
 
     # Reject known-invalid pinned metadata BEFORE costly pip / VCS / npm / APT downloads.
     if pool.issues:
-        write_new(stage/'metadata'/'static-errors.json', json.dumps(sorted(set(pool.issues)), indent=2))
-        raise RuntimeError('static dependency closure rejected before network resolution: '+pool.issues[0])
+        static_issues=sorted(set(pool.issues))
+        write_new(stage/'metadata'/'static-errors.json', json.dumps(static_issues, indent=2))
+        for issue in static_issues:
+            print('[pool] static issue: '+issue,file=sys.stderr,flush=True)
+        raise RuntimeError('static dependency closure rejected before network resolution: '
+                           +str(len(static_issues))+' issue(s); first: '+static_issues[0])
     acquire_pip_groups(pool,groups)
     # Pin VCS inputs, resolve metadata from pyproject/setup.cfg/setup.py, and
     # propagate nested VCS references only to tasks that depend on them.

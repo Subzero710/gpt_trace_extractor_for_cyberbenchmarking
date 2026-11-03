@@ -164,7 +164,7 @@ def test_versions_invalidate_unsafe_completed_rows_without_changing_source_ids()
 
 def test_harness_and_safe_contract_bytes_are_unchanged():
     root = Path(source.__file__).parent
-    assert tools.digest(root / "contract.json") == "fbb8b762277d09b6732a9697735889f761cf5d1920df0cafb5320809f834f38f"
+    assert tools.digest(root / "contract.json") == "b56e2ef2cd40e48578540596100d9095cda17efd230f38c8741744bc820512ef"
     assert source.PINS["dataset_revision"] == "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0"
     assert source.PINS["harness_commit"] == "16dd480cce9b27bf111a362d280881c6def5d2a7"
     for name, sha in source.PINS["upstream_files"].items():

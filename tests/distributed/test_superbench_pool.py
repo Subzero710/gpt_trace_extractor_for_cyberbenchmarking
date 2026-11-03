@@ -63,7 +63,7 @@ else:
 setup(install_requires=install_requires, setup_requires=setup_requires)
 """)
         requirements, issues = pool.setup_static(source, python_version='3.8')
-        self.assertTrue(any('setup_requires' in issue for issue in issues))
+        self.assertEqual(issues, [])
         self.assertEqual(requirements, {'pyyaml'})
 
     def test_unknown_conditional_dynamic_requirement_is_rejected(self):
@@ -93,8 +93,14 @@ setup(install_requires=install_requires)
         self.assertFalse(requirements)
         self.assertTrue(issues)
 
-    def test_dynamic_setup_kwargs_is_not_silently_ignored(self):
+    def test_dynamic_unrelated_setup_kwargs_do_not_poison_literal_dependencies(self):
         source = 'setup_args={"name": dynamic_name(), "install_requires": ["dep==1"]}\nsetup(**setup_args)\n'
+        requirements, issues = pool.setup_static(source)
+        self.assertEqual(requirements,{'dep==1'})
+        self.assertEqual(issues,[])
+
+    def test_dynamic_setup_kwarg_key_is_not_silently_ignored(self):
+        source = 'setup_args={dynamic_key(): ["dep==1"]}\nsetup(**setup_args)\n'
         requirements, issues = pool.setup_static(source)
         self.assertFalse(requirements)
         self.assertTrue(any('**kwargs' in item for item in issues))
@@ -178,6 +184,57 @@ setup(install_requires=install_requires)
         with self.assertRaisesRegex(RuntimeError,'dynamic echo content'):
             pool.transformed_source('fixture','requirements.txt','',
                                     ['echo "$DEPENDENCY" >> requirements.txt'])
+
+    def test_setup_main_guard_uses_script_identity(self):
+        source=('from setuptools import setup\n'
+                'if __name__ == "__main__":\n'
+                '    setup(install_requires=["dep>=1"])\n')
+        requirements,issues=pool.setup_static(source,python_version='3.10.14')
+        self.assertEqual(requirements,{'dep>=1'})
+        self.assertEqual(issues,[])
+
+    def test_setup_file_reader_and_partial_kwargs_are_resolved_without_execution(self):
+        source=('from setuptools import setup\n'
+                'from os.path import join, dirname, abspath\n'
+                'def read_requirements(name):\n'
+                '    path=join(dirname(abspath(__file__)),name)\n'
+                '    with open(path) as stream:\n'
+                '        return [row.strip() for row in stream.readlines()]\n'
+                'def extras_require():\n'
+                '    return {"test":["pytest"]}\n'
+                'requirements=read_requirements("requirements.txt")\n'
+                'unrelated=dynamic_value()\n'
+                'kwargs={"install_requires":requirements,"extras_require":extras_require(),"data_files":unrelated}\n'
+                'setup(**kwargs)\n')
+        requirements,remote,issues=pool.setup_requirements_from_sources(
+            source,lambda name,required=False:'alpha>=1\nbeta==2\n' if name=='requirements.txt' else None,
+            python_version='3.10.14')
+        self.assertEqual(requirements,{'alpha>=1','beta==2'})
+        self.assertEqual(remote,set())
+        self.assertEqual(issues,[])
+
+    def test_setup_wrapper_reached_from_main_guard_is_interpreted_statically(self):
+        source=('from setuptools import setup\n'
+                'def run_setup(binary=False):\n'
+                '    if binary:\n'
+                '        ext=["native"]\n'
+                '    else:\n'
+                '        ext=[]\n'
+                '    setup(install_requires=["six>=1.4"],ext_modules=ext)\n'
+                'if __name__ == "__main__":\n'
+                '    try:\n'
+                '        run_setup(binary=True)\n'
+                '    except RuntimeError:\n'
+                '        run_setup(binary=False)\n')
+        requirements,issues=pool.setup_static(source,python_version='3.10.14')
+        self.assertEqual(requirements,{'six>=1.4'})
+        self.assertEqual(issues,[])
+
+    def test_setup_invocations_are_derived_from_official_commands(self):
+        self.assertEqual(pool.setup_script_invocations([
+            'python setup.py develop',
+            'python -m pip install -e .',
+        ]),(('setup.py','develop'),('setup.py','egg_info')))
 
     def test_pydantic_make_install_invocations_keep_order(self):
         commands = ['python -m pip install -U pip', 'pip install -r requirements/all.txt', 'pip install -e .']
@@ -1873,29 +1930,37 @@ class TestVerifiedPoolResume(unittest.TestCase):
     def test_broker_selects_only_a_quiescent_matching_legacy_stage(self):
         import ast
         import re
+        import stat
         import types
         source=(ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
         tree=ast.parse(source)
-        method=next(x for x in tree.body if isinstance(x,ast.FunctionDef)
-                    and x.name=='retained_dependency_stage')
+        names={'_salvage_identity','_retained_stage_score','retained_dependency_stage'}
+        methods=[x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name in names]
+        self.assertEqual({x.name for x in methods},names)
         class Scope:
             members=staticmethod(lambda state: [])
         namespace={'Path':Path,'SHA':re.compile(r'[0-9a-f]{64}\Z'),
                    'TERMINAL':{'interrupted','canceled','failed','ready'},
-                   'JobScope':Scope,'hashlib':hashlib,'RuntimeError':RuntimeError}
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[method],type_ignores=[])),
+                   'JobScope':Scope,'hashlib':hashlib,'RuntimeError':RuntimeError,
+                   'ValueError':ValueError,'stat':stat}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=methods,type_ignores=[])),
                      '<retained-stage>', 'exec'),namespace)
         select=namespace['retained_dependency_stage']
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);poolroot=root/'pool';poolroot.mkdir()
             legacy=poolroot/'incoming';legacy.mkdir(mode=0o700)
             (legacy/'STAGING').write_text('legacy')
+            reusable='a'*64
+            obj=legacy/'objects'/'sha256'/reusable[:2]/reusable
+            obj.parent.mkdir(parents=True);obj.write_bytes(b'reusable')
             jobs=root/'preparations';jobs.mkdir()
             operation='1'*64;(jobs/operation).mkdir()
             previous={'phase':'interrupted','compatibility':{
+                'fetch_kind':'download-only-pool-v4','pool_schema':4,'platform':'linux-x86_64',
                 'pins':{'same':True},'conda_lock_sha256':'c'*64,'fetcher_sha256':'a'*64},
                 'operation_id':operation,'attempt':1,'result':None}
-            active={'compatibility':{**previous['compatibility'],'fetcher_sha256':'b'*64}}
+            active={'compatibility':{**previous['compatibility'],'pins':{'same':False},
+                                     'fetcher_sha256':'b'*64}}
             class Manager:
                 root=jobs
                 def _read(self,op):return previous
@@ -1905,7 +1970,7 @@ class TestVerifiedPoolResume(unittest.TestCase):
             previous['phase']='running'
             self.assertIsNone(select(Manager(),poolroot,active,account))
             previous['phase']='interrupted'
-            previous['compatibility']['pins']={'same':False}
+            active['compatibility']['pool_schema']=5
             self.assertIsNone(select(Manager(),poolroot,active,account))
 
     def test_retained_symlink_is_rejected_without_modification(self):
@@ -1982,7 +2047,7 @@ setup(install_requires=install_requires)
         data = {'requirements/requirements.txt':'omegaconf>=2.0\nantlr4-python3-runtime==4.8\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(setup,
             lambda name, required=False:data[name])
-        self.assertTrue(issues)
+        self.assertEqual(issues, [])
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'omegaconf>=2.0','antlr4-python3-runtime==4.8'})
 
@@ -2017,6 +2082,27 @@ setup(install_requires = project_requirements,
         self.assertTrue(issues)
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'requests>=2','urllib3<2','pytest>=6'})
+
+    def test_conan_audited_file_reader_function_is_resolved_without_execution(self):
+        setup=("""from setuptools import setup
+def get_requires(filename):
+    requirements=[]
+    with open(filename,"rt") as stream:
+        for line in stream.read().splitlines():
+            if not line.strip().startswith("#"):
+                requirements.append(line)
+    return requirements
+project_requirements=get_requires("conans/requirements.txt")
+project_requirements.extend(get_requires("conans/requirements_server.txt"))
+setup(install_requires=project_requirements)
+""")
+        data={'conans/requirements.txt':'requests>=2\n# ignored\n',
+              'conans/requirements_server.txt':'bottle==0.12\n'}
+        deps,remote,issues=pool.setup_requirements_from_sources(
+            setup,lambda name,required=False:data[name])
+        self.assertEqual(deps,{'requests>=2','bottle==0.12'})
+        self.assertEqual(remote,set())
+        self.assertEqual(issues,[])
 
     def test_modin_spreadsheet_setup_kwargs_reads_pinned_runtime_requirements(self):
         # Matches modin-spreadsheet@49ffd89: dynamic setup_args metadata plus a
@@ -2292,7 +2378,7 @@ setup(install_requires=read_requirements())
         files = {'requirements.txt':'paramiko>=2.1\ncryptography>=1.5\n'}
         deps, remote, issues = pool.setup_requirements_from_sources(
             setup, lambda name, required=False: files.get(name))
-        self.assertTrue(issues)
+        self.assertEqual(issues, [])
         self.assertEqual(remote, set())
         self.assertEqual(deps, {'paramiko>=2.1','cryptography>=1.5'})
 
