@@ -68,7 +68,9 @@ def _golden_dependency():
         raise RuntimeError('sealed Kali dependency identity is invalid') from exc
     target = value.get('target_environment') if isinstance(value, dict) else None
     if (not isinstance(value, dict)
-            or set(value) != {'schema', 'target_environment', 'npm_version'}
+            or set(value) != {'schema', 'target_environment', 'npm_version', 'apt_package_manifest_sha256'}
+            or not isinstance(value.get('apt_package_manifest_sha256'), str)
+            or SHA.fullmatch(value['apt_package_manifest_sha256']) is None
             or value.get('schema') != 1 or not isinstance(target, dict)):
         raise RuntimeError('sealed Kali dependency identity is invalid')
     return value
@@ -3493,10 +3495,10 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
                  '--requirement', requirements, '--constraint', constraints_file])
     if no_deps:
         argv.append('--no-deps')
-    # A single cache writer makes pip's HTTP cache and CAS extraction deterministic.
-    with _NATIVE_POOL_LOCK:
-        _native_run(argv, runtime)
-        data = json.loads(report.read_text())
+    # Each closure has its own report directory. Pip's HTTP cache is
+    # concurrency-safe; CAS publication still uses its content locks.
+    _native_run(argv, runtime)
+    data = json.loads(report.read_text())
     installs = data.get('install')
     if not isinstance(installs, list) or not installs:
         raise RuntimeError('native pip returned an empty resolved closure: '+key)
@@ -3587,11 +3589,11 @@ def _native_local_metadata(pool,target,mirror,commit,commands,extras):
         if updated is not None and updated!=old:
             entry.write_text(updated)
     report=runtime['root']/'plans'/('local-'+identity+'.json')
+    report.parent.mkdir(parents=True, exist_ok=True)
     argv=[python,'-m','pip','install','--dry-run','--ignore-installed','--no-deps',
           '--report',report,str(checkout)+('['+','.join(sorted(extras))+']' if extras else '')]
-    with _NATIVE_POOL_LOCK:
-        _native_run(argv,runtime)
-        result=json.loads(report.read_text())
+    _native_run(argv,runtime)
+    result=json.loads(report.read_text())
     installs=result.get('install') or []
     if len(installs)!=1:
         raise RuntimeError('local project metadata produced an ambiguous plan')
@@ -4532,7 +4534,10 @@ def acquire_pip_groups(pool, groups):
     ordered=sorted(groups.items())
     if not ordered:
         return
-    workers=min(_acquisition_workers(),len(ordered))
+    closure_workers, _metadata_workers = _pip_worker_controls()
+    if type(closure_workers) is not int or closure_workers < 1:
+        raise RuntimeError('invalid configured pip closure concurrency')
+    workers=min(closure_workers,len(ordered))
     print('[pool] native Pip resolver: '+str(len(ordered))+' closures, '
           +str(workers)+' workers; locked Python; host-only',flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers,

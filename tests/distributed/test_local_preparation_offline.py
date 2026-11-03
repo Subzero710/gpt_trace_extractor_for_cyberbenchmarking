@@ -105,7 +105,8 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
     def test_task_checkpoint_reuse_uses_semantic_schema_and_never_falls_back_to_stored_env(self):
         builder_source = (ROOT / "scripts/build_local_templates.py").read_text()
         guest_source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
-        self.assertIn("TASK_RUNTIME_SCHEMA = 2", builder_source)
+        self.assertIn(f"TASK_RUNTIME_SCHEMA = {local.TASK_RUNTIME_SCHEMA}", builder_source)
+        self.assertIn(f"TASK_RUNTIME_SCHEMA = {local.TASK_RUNTIME_SCHEMA}", guest_source)
         self.assertIn('"task-v" + str(TASK_RUNTIME_SCHEMA)', builder_source)
         self.assertNotIn("runtime_fingerprint", builder_source)
         self.assertNotIn("task_runtime_fingerprint", guest_source)
@@ -114,7 +115,7 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertNotIn("stored_env_prefix(item)", recovery)
         self.assertIn("replay-state.json", guest_source)
         contract = local.template_contract(ROOT)
-        self.assertEqual(contract["task_runtime_schema"], 2)
+        self.assertEqual(contract["task_runtime_schema"], local.TASK_RUNTIME_SCHEMA)
 
     def test_package_capture_prefers_built_wheels_and_uses_all_four_guest_cpus(self):
         source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
@@ -775,7 +776,8 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
             target.update(source="verified-target-interpreter", interpreter_sha256="f" * 64,
                           python_artifact_sha256=None)
             expected = {**recipe, "golden_dependency": {
-                "schema": 1, "target_environment": target, "npm_version": "10.9.9"}}
+                "schema": 1, "target_environment": target, "npm_version": "10.9.9",
+                "apt_package_manifest_sha256": hashlib.sha256(b"fixture apt manifest").hexdigest()}}
             operation_id = hashlib.sha256(local.canonical(expected)).hexdigest()
             identified = {"operation_id": operation_id, "compatibility": expected, "deployment": cfg["deployment"]}
             calls = []

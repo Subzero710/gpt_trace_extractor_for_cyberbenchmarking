@@ -88,12 +88,15 @@ class AuditRegressions(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'UTF-8'):
             pool._core_metadata_fields(b'Metadata-Version: 2.1\nName: demo\xff\nVersion: 1.0\n\n')
 
-    def test_wheel_filename_identity_matches_release(self):
+    def test_foreign_wheel_is_excluded_from_release_candidates(self):
         row = {'packagetype': 'bdist_wheel', 'filename': 'other-1.0-py3-none-any.whl',
                'url': 'https://files.pythonhosted.org/other.whl',
                'digests': {'sha256': 'a' * 64}}
-        with self.assertRaisesRegex(RuntimeError, 'identity'):
-            pool._release_artifacts('demo', '1.0', [row], fixture_target())
+        self.assertEqual(pool._release_artifacts('demo', '1.0', [row], fixture_target()), [])
+        valid = {**row, 'filename': 'demo-1.0-py3-none-any.whl'}
+        selected = pool._release_artifacts('demo', '1.0', [row, valid], fixture_target())
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]['filename'], valid['filename'])
 
     def test_no_deps_preserves_metadata_without_expanding_it(self):
         data = fixtures.TestGlobalPipArtifactPool.wheel_bytes(requires=('missing-package==1',))

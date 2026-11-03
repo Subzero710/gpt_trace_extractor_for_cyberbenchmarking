@@ -572,11 +572,29 @@ class TestAcquisitionFallbacks(unittest.TestCase):
         self.assertEqual(calls,['https://pypi.org/pypi/demo/1.0/json'])
 
 
+    def test_golden_acquisition_identity_accepts_verified_apt_manifest(self):
+        target = fixture_target().as_dict()
+        expected = {"schema": 1, "target_environment": target,
+                    "npm_version": "10.9.9",
+                    "apt_package_manifest_sha256": hashlib.sha256(b"fixture apt").hexdigest()}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "golden-dependency.json").write_text(json.dumps(expected))
+            with patch.object(pool, "__file__", str(root / "scripts" / "superbench_pool.py")):
+                self.assertEqual(pool._golden_dependency(), expected)
+                damaged = {**expected, "apt_package_manifest_sha256": "invalid"}
+                (root / "golden-dependency.json").write_text(json.dumps(damaged))
+                with self.assertRaisesRegex(RuntimeError, "invalid"):
+                    pool._golden_dependency()
+
     def test_apt_key_uses_downloaded_content_address(self):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
             candidate = pool.Pool(stage)
+            golden_package_list = b'testpkg 1\n'
+            (stage / 'golden-packages.txt').write_bytes(golden_package_list)
+            golden_identity = {'apt_package_manifest_sha256': hashlib.sha256(golden_package_list).hexdigest()}
             sha = hashlib.sha256(b'key-bytes').hexdigest()
             target = candidate.objects / sha[:2] / sha
             target.parent.mkdir(parents=True)
@@ -596,7 +614,9 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                  patch.object(pool, 'invoke', side_effect=commands), \
                  patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(['gpg'], 0)), \
                  patch.object(pool.subprocess, 'check_output', side_effect=dpkg), \
-                 patch.object(pool, '_target_debian_architecture', return_value='amd64'):
+                 patch.object(pool, '_target_debian_architecture', return_value='amd64'), \
+                 patch.object(pool, '_golden_dependency', return_value=golden_identity), \
+                 patch.object(pool, '__file__', str(stage / 'scripts' / 'superbench_pool.py')):
                 pool.apt_closure(candidate, {'testpkg'})
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
 
@@ -1373,8 +1393,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
             with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'_resolve_registry_plan',side_effect=resolve), \
-                 patch.object(pool,'_materialize_solution',side_effect=materialize):
+                 patch.object(pool,'_native_resolve_registry',
+                     side_effect=lambda *args,**kwargs: materialize(args[0], resolve(*args,**kwargs))):
                 pool.acquire_pip_groups(candidate,groups)
         self.assertEqual(maximum,2)
 
@@ -1392,7 +1412,9 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                      'requirements':[],'provides_extra':[]}]
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)),                  patch.object(pool,'_resolve_registry_plan',side_effect=resolve),                  self.assertRaisesRegex(RuntimeError,'required pip closure a failed: boom'):
+            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                 patch.object(pool,'_native_resolve_registry',side_effect=resolve), \
+                 self.assertRaisesRegex(RuntimeError,'required native pip closure a failed: boom'):
                 pool.acquire_pip_groups(candidate,groups)
 
     def test_each_completed_closure_checkpoints_before_another_closure_fails(self):
@@ -1433,10 +1455,10 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
             with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'_resolve_registry_plan',side_effect=resolve), \
-                 patch.object(pool,'_materialize_solution',side_effect=materialize), \
+                 patch.object(pool,'_native_resolve_registry',
+                     side_effect=lambda *args,**kwargs: materialize(args[0],resolve(*args,**kwargs))), \
                  patch.object(pool,'_write_pip_plan',side_effect=checkpoint), \
-                 self.assertRaisesRegex(RuntimeError,'required pip closure beta failed: planned sibling failure'):
+                 self.assertRaisesRegex(RuntimeError,'required native pip closure beta failed: planned sibling failure'):
                 pool.acquire_pip_groups(candidate,groups)
             self.assertTrue(persisted.is_set())
             plan=json.loads((Path(tmp)/'metadata/pip-plan-alpha.json').read_text())
@@ -2360,7 +2382,10 @@ build-backend="poetry.masonry.api"
         deps, vcs, issues = pool.static_project(pyproject)
         self.assertEqual(issues, [])
         self.assertEqual(vcs, set())
-        self.assertEqual(deps, {'poetry>=0.12'})
+        self.assertEqual(deps, set())
+        build, build_issues = pool._sdist_pyproject_requirements(pyproject)
+        self.assertEqual(build_issues, [])
+        self.assertIn('poetry>=0.12', build)
         deps, _, issues = pool.static_project(pyproject, extra_groups={'xdg_home'})
         self.assertEqual(issues, [])
         self.assertIn('appdirs>=1.4.0,<2.0.0', deps)

@@ -66,7 +66,7 @@ def test_warming_freezes_repo_and_eval_install_inventories_separately(history, t
     _, item, *_ = history
     item = {**item, "eval_setup_commands": ["official evaluation install"]}
     root = tmp_path / "runtime"
-    for name in ("task-provenance", "logs"):
+    for name in ("task-provenance", "logs", "caches/pip-index"):
         (root / name).mkdir(parents=True)
     monkeypatch.setattr(guest, "ROOT", root)
     phase = {"inventory": {"pip_freeze": "repo-dependency==1"}}
@@ -79,6 +79,8 @@ def test_warming_freezes_repo_and_eval_install_inventories_separately(history, t
     monkeypatch.setattr(guest, "shell", eval_install)
     monkeypatch.setattr(guest, "run", lambda *args, **kwargs: b"{}" if "-c" in args else b"[]")
     monkeypatch.setattr(guest, "freeze_vcs_dependencies", lambda *args: None)
+    monkeypatch.setattr(guest, "seed_pool_vcs", lambda *args: None)
+    monkeypatch.setattr(guest, "_write_warm_state", lambda *args: None)
     guest.warm_task(item, {})
     records = root / "task-provenance"
     assert json.loads((records / (item["instance_id"] + ".setup.json")).read_text()) == {"pip_freeze": "repo-dependency==1"}
