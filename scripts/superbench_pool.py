@@ -2873,6 +2873,11 @@ def _parse_wheel_filename(value):
     return parse_wheel_filename(value)
 
 
+def _parse_sdist_filename(value):
+    from packaging.utils import parse_sdist_filename
+    return parse_sdist_filename(value)
+
+
 def _cached_python_versions(pool, name):
     """Return exact Python-package versions already represented by the pip pool."""
     normalized=_normalized_package_name(name);found=set()
@@ -3361,9 +3366,15 @@ def _requires_python_compatible(raw, target_python):
 
 
 def _release_artifacts(name,version,files,target,*,allow_yanked=False):
-    """Return deterministic compatible artifacts for one release, wheel first."""
+    """Return deterministic compatible artifacts for one release, wheel first.
+
+    PyPI contains historical release buckets with files whose filename identity
+    belongs to a neighbouring release.  Such files are not candidates for this
+    release.  Apply target-wheel admission before interpreting metadata so an
+    irrelevant foreign-platform wheel cannot poison an otherwise valid project.
+    """
     _,SpecifierSet,Version,_,_=_packaging_symbols()
-    python=Version(target.python_full_version)
+    release_version=Version(version);python=Version(target.python_full_version)
     wheels=[];sources=[]
     if not isinstance(files,list):return []
     for item in files:
@@ -3373,19 +3384,36 @@ def _release_artifacts(name,version,files,target,*,allow_yanked=False):
         if not SHA.fullmatch(sha) or not isinstance(url,str):continue
         parsed=urllib.parse.urlsplit(url)
         if parsed.scheme!='https' or parsed.hostname!='files.pythonhosted.org':continue
-        requires_python=item.get('requires_python')
-        if requires_python is not None and requires_python != '':
-            if not _requires_python_compatible(requires_python,python):continue
-        if item.get('packagetype')=='bdist_wheel' and filename.endswith('.whl'):
+        packagetype=item.get('packagetype')
+        if packagetype=='bdist_wheel' and filename.endswith('.whl'):
             try:
-                wheel_name,wheel_version,_,_=_parse_wheel_filename(filename)
-            except ValueError as exc:
-                raise RuntimeError('invalid wheel filename identity: '+filename) from exc
-            if _normalized_package_name(wheel_name)!=_normalized_package_name(name) or wheel_version!=Version(version):
-                raise RuntimeError('wheel filename identity differs from release: '+filename)
-            rank=_wheel_rank(filename,target)
-            if rank is not None:wheels.append((rank,filename,item))
-        elif item.get('packagetype')=='sdist':
+                wheel_name,wheel_version,_,tags=_parse_wheel_filename(filename)
+            except ValueError:
+                continue
+            order={tag:index for index,tag in enumerate(target.tags)}
+            ranks=[order[str(tag)] for tag in tags if str(tag) in order]
+            if not ranks:
+                continue
+            if (_normalized_package_name(wheel_name)!=_normalized_package_name(name)
+                    or wheel_version!=release_version):
+                continue
+            requires_python=item.get('requires_python')
+            if requires_python is not None and requires_python != '':
+                if not _requires_python_compatible(requires_python,python):continue
+            wheels.append((min(ranks),filename,item))
+            continue
+        if packagetype=='sdist':
+            try:
+                source_name,source_version=_parse_sdist_filename(filename)
+            except ValueError:
+                pass
+            else:
+                if (_normalized_package_name(source_name)!=_normalized_package_name(name)
+                        or source_version!=release_version):
+                    continue
+            requires_python=item.get('requires_python')
+            if requires_python is not None and requires_python != '':
+                if not _requires_python_compatible(requires_python,python):continue
             rank=0 if filename.endswith('.tar.gz') else 1 if filename.endswith('.zip') else 2
             sources.append((rank,filename,item))
     wheels.sort(key=lambda row:(row[0],row[1]));sources.sort(key=lambda row:(row[0],row[1]))

@@ -747,6 +747,45 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
               'digests':{'sha256':sha},'requires_python':'>=3.11.*'}
         self.assertEqual(pool._release_artifacts('example','1.0',[item],target),[])
 
+    def test_incompatible_misbucketed_historical_wheel_cannot_poison_release(self):
+        target=fixture_target('3.10.14')
+        bad={'packagetype':'bdist_wheel','filename':'regex-2015.11.05b-cp25-none-win32.whl',
+             'url':'https://files.pythonhosted.org/packages/regex-2015.11.05b-cp25-none-win32.whl',
+             'digests':{'sha256':hashlib.sha256(b'bad-wheel').hexdigest()},
+             'requires_python':'>=2.5'}
+        source={'packagetype':'sdist','filename':'regex-2015.11.05.tar.gz',
+                'url':'https://files.pythonhosted.org/packages/regex-2015.11.05.tar.gz',
+                'digests':{'sha256':hashlib.sha256(b'source').hexdigest()}}
+        rows=pool._release_artifacts('regex','2015.11.05',[bad,source],target)
+        self.assertEqual([(row['kind'],row['filename']) for row in rows],
+                         [('sdist','regex-2015.11.05.tar.gz')])
+
+    def test_incompatible_wheel_does_not_validate_irrelevant_requires_python(self):
+        target=fixture_target('3.10.14')
+        item={'packagetype':'bdist_wheel','filename':'example-1.0-cp25-none-win32.whl',
+              'url':'https://files.pythonhosted.org/packages/example-1.0-cp25-none-win32.whl',
+              'digests':{'sha256':hashlib.sha256(b'old-wheel').hexdigest()},
+              'requires_python':'>3.5.*'}
+        self.assertEqual(pool._release_artifacts('example','1.0',[item],target),[])
+
+    def test_target_compatible_misbucketed_wheel_is_not_a_release_candidate(self):
+        target=fixture_target('3.10.14')
+        wrong={'packagetype':'bdist_wheel','filename':'example-2.0-py3-none-any.whl',
+               'url':'https://files.pythonhosted.org/packages/example-2.0-py3-none-any.whl',
+               'digests':{'sha256':hashlib.sha256(b'wrong').hexdigest()}}
+        good={'packagetype':'bdist_wheel','filename':'example-1.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl',
+              'digests':{'sha256':hashlib.sha256(b'good').hexdigest()}}
+        rows=pool._release_artifacts('example','1.0',[wrong,good],target)
+        self.assertEqual([row['filename'] for row in rows],['example-1.0-py3-none-any.whl'])
+
+    def test_parseable_misbucketed_sdist_is_not_a_release_candidate(self):
+        target=fixture_target('3.10.14')
+        wrong={'packagetype':'sdist','filename':'example-2.0.tar.gz',
+               'url':'https://files.pythonhosted.org/packages/example-2.0.tar.gz',
+               'digests':{'sha256':hashlib.sha256(b'wrong-source').hexdigest()}}
+        self.assertEqual(pool._release_artifacts('example','1.0',[wrong],target),[])
+
     def project(self,payload,*,name='demo',version='1.0'):
         sha=hashlib.sha256(payload).hexdigest()
         return {'releases':{version:[{'packagetype':'bdist_wheel',
