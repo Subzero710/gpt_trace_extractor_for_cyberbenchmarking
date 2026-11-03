@@ -117,6 +117,24 @@ setup(install_requires=install_requires)
         self.assertEqual(constraints, set())
         self.assertEqual(vcs, {'git+https://github.com/timothycrosley/isort.git@c54b3dd#egg=isort'})
 
+    def test_literal_file_guarded_sed_uses_pinned_source_existence(self):
+        command = "[ -f setup.py ] && sed -i 's/old-dependency/new-dependency/' setup.py"
+        self.assertEqual(
+            pool.transformed_source('fixture', 'setup.py', 'old-dependency\n', [command]),
+            'new-dependency\n',
+        )
+        self.assertIsNone(pool.transformed_source('fixture', 'setup.py', None, [command]))
+
+    def test_contract_has_no_glued_adjacent_file_existence_guard(self):
+        contract=json.loads((ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
+        glued=[]
+        for task in contract['tasks'].values():
+            for command in task['repo_script_list']:
+                marker=command.find('[ -f ')
+                if marker>0 and not command[marker-1].isspace():
+                    glued.append(command)
+        self.assertEqual(glued,[])
+
     def test_compound_shell_echo_does_not_swallow_earlier_quote_or_group_redirection(self):
         # Reproduce the exact recipe syntax retained in the pinned benchmark.
         contract=json.loads((ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())

@@ -99,3 +99,41 @@ def test_fetch_worker_uses_system_python_not_broker_venv():
         "def stage_fetch_sources", 1
     )[0]
     assert '"-m", "pip", "--version"' in trusted
+
+
+def test_resume_compatibility_is_structural_not_fetch_source_identity():
+    first = {
+        "fetch_kind": "download-only-pool-v4",
+        "pool_schema": 4,
+        "platform": "linux-x86_64",
+        "pins": {"revision": "old"},
+        "conda_lock_sha256": "1" * 64,
+        "fetcher_sha256": "2" * 64,
+        "fetch_sources": {"worker": "2" * 64, "contract": "3" * 64},
+        "golden_dependency": {"identity": "old"},
+    }
+    changed = {
+        **first,
+        "pins": {"revision": "new"},
+        "conda_lock_sha256": "4" * 64,
+        "fetcher_sha256": "5" * 64,
+        "fetch_sources": {"worker": "5" * 64, "contract": "6" * 64},
+        "golden_dependency": {"identity": "new"},
+    }
+    assert jobs._salvage_identity(first) == jobs._salvage_identity(changed)
+    incompatible = {**changed, "pool_schema": 5}
+    assert jobs._salvage_identity(first) != jobs._salvage_identity(incompatible)
+
+
+def test_retained_stage_score_prefers_existing_cas_over_newer_empty_stage(tmp_path):
+    rich = tmp_path / "rich"
+    empty = tmp_path / "empty"
+    rich.mkdir()
+    empty.mkdir()
+    sha = "a" * 64
+    obj = rich / "objects" / "sha256" / sha[:2] / sha
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"reusable")
+    newer = rich.stat().st_mtime_ns + 10_000_000
+    os.utime(empty, ns=(newer, newer))
+    assert jobs._retained_stage_score(rich) > jobs._retained_stage_score(empty)

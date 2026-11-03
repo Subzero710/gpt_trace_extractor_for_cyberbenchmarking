@@ -15,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import stat
 import sys
 import time
 import tomllib
@@ -708,17 +709,44 @@ class PreparationManager:
 
 
 # GPT_TRACE_SWEGYM_VERIFIED_RESUME_V1
-# Select only a terminal, cryptographically compatible predecessor. Neither
-# state nor original stage is removed; the new worker verifies reused bytes.
+# Select only a terminal predecessor with the same persisted pool layout. The
+# new worker re-verifies every reusable byte against the CURRENT lock/plan.
+def _salvage_identity(value):
+    """Return only compatibility fields that govern retained-stage layout.
+
+    Contract, resolver, fetch-source and golden identities may change between
+    attempts. They determine what the new worker may *use*, not whether old
+    content-addressed bytes are safe to re-verify and salvage.
+    """
+    if not isinstance(value,dict):
+        raise ValueError('invalid preparation compatibility identity')
+    return {key:value.get(key) for key in ('fetch_kind','pool_schema','platform')}
+
+
+def _retained_stage_score(path):
+    """Prefer the retained stage with the largest structurally valid CAS corpus."""
+    path=Path(path);count=0;size=0
+    cas=path/'objects'/'sha256'
+    if cas.is_dir() and not cas.is_symlink():
+        for prefix in cas.iterdir():
+            try:prefix_info=prefix.lstat()
+            except FileNotFoundError:continue
+            if not stat.S_ISDIR(prefix_info.st_mode) or stat.S_ISLNK(prefix_info.st_mode):
+                continue
+            for obj in prefix.iterdir():
+                try:info=obj.lstat()
+                except FileNotFoundError:continue
+                if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or SHA.fullmatch(obj.name) is None or prefix.name!=obj.name[:2]):
+                    continue
+                count+=1;size+=info.st_size
+    return (count,size,path.stat().st_mtime_ns,str(path))
+
+
 def retained_dependency_stage(manager, pool_root, state, account):
     # Recovery copies only SHA-verified CAS bytes and mutable Git mirrors into a
-    # fresh stage. Target-specific logical plans are separately keyed by their
-    # exact serialized target, so old bytes remain safe to salvage when the
-    # fetcher or golden dependency identity changes.
-    def salvage_identity(value):
-        return {k:v for k,v in value.items()
-                if k not in {'fetcher_sha256', 'golden_dependency'}}
-    wanted=salvage_identity(state['compatibility'])
+    # fresh stage. Logical plans remain separately schema/target/requirement keyed.
+    wanted=_salvage_identity(state['compatibility'])
     candidates=[]
     for entry in manager.root.iterdir():
         if not entry.is_dir() or entry.is_symlink() or SHA.fullmatch(entry.name) is None:
@@ -726,7 +754,7 @@ def retained_dependency_stage(manager, pool_root, state, account):
         previous=manager._read(entry.name)
         if (previous is None or previous['phase'] not in TERMINAL or
                 previous.get('result') is not None or previous.get('publication_verified') or
-                salvage_identity(previous['compatibility'])!=wanted):
+                _salvage_identity(previous['compatibility'])!=wanted):
             continue
         # No process/cgroup/source container from a past operation may write
         # into the stage while it is read for recovery.
@@ -752,7 +780,7 @@ def retained_dependency_stage(manager, pool_root, state, account):
                     continue
         matches.append(path)
     if not matches:return None
-    return max(set(matches),key=lambda p:(p.stat().st_mtime_ns,str(p)))
+    return max(set(matches),key=_retained_stage_score)
 
 def _integrate_published_pool(manager, state, ready, result):
     """Build/validate templates from an already sealed pool after a crash."""

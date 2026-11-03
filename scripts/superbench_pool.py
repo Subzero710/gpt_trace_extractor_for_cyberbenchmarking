@@ -1548,11 +1548,28 @@ def literal_echo_appends(command):
         segment=[]
 
 
+def _literal_dependency_file_guard(segment, normalized, exists):
+    """Evaluate only literal file-existence tests for the dependency file in scope."""
+    if not segment:return None
+    try:words=[_literal_shell_word(word) for word in segment]
+    except RuntimeError:return None
+    candidate=None
+    if len(words)==4 and words[0]=='[' and words[3]==']' and words[1] in ('-f','-e'):
+        candidate=words[2]
+    elif len(words)==3 and words[0]=='test' and words[1] in ('-f','-e'):
+        candidate=words[2]
+    if candidate is None:return None
+    target=Path(candidate).as_posix().removeprefix('./')
+    if target!=normalized:return None
+    return bool(exists)
+
+
 def transformed_source(repo, path, value, commands):
     """Interpret a finite literal edit surface in its original command order.
 
-    Quoted command-looking strings never become executable edits. Unknown
-    redirections affecting this file and unknown conditionals fail explicitly.
+    Quoted command-looking strings never become executable edits. Literal
+    existence guards for the exact dependency file are evaluated from the
+    pinned Git snapshot; every other conditional remains fail-closed.
     No recipe or external source is executed by this interpreter.
     """
     del repo
@@ -1560,14 +1577,18 @@ def transformed_source(repo, path, value, commands):
     result=value
     def matches(word):
         return Path(_literal_shell_word(word)).as_posix().removeprefix('./')==normalized
-    def apply(segment,previous):
+    def conditional_allows(previous,guard):
+        if previous in (None,';','\n'):return True
+        if previous=='&&' and guard is not None:return guard
+        if previous=='||' and guard is not None:return not guard
+        raise RuntimeError('conditional dependency-file edit cannot be resolved statically')
+    def apply(segment,previous,guard):
         nonlocal result
         if not segment:return
         if segment[0]=='sed':
             words=[_literal_shell_word(word) for word in segment]
             if not any(Path(word).as_posix().removeprefix('./')==normalized for word in words[1:]):return
-            if previous not in (None,';','\n'):
-                raise RuntimeError('conditional dependency-file sed cannot be resolved statically')
+            if not conditional_allows(previous,guard):return
             extended=len(words)>1 and words[1] in ('-E','--regexp-extended')
             offset=2 if extended else 1
             if len(words)!=offset+3 or words[offset]!='-i' or words[-1]!=normalized:
@@ -1577,9 +1598,9 @@ def transformed_source(repo, path, value, commands):
             return
         for index,word in enumerate(segment):
             if word not in ('>','>>') or index+1==len(segment) or not matches(segment[index+1]):continue
-            if (len(segment)!=4 or segment[0]!='echo' or index!=2
-                    or previous not in (None,';','\n')):
-                raise RuntimeError('unsupported or conditional dependency-file redirection')
+            if len(segment)!=4 or segment[0]!='echo' or index!=2:
+                raise RuntimeError('unsupported dependency-file redirection')
+            if not conditional_allows(previous,guard):return
             text=_literal_shell_word(segment[1])
             if text.startswith('-') or '\\' in text:
                 raise RuntimeError('implementation-dependent echo semantics')
@@ -1587,11 +1608,12 @@ def transformed_source(repo, path, value, commands):
             else:result=(result or '')+text+'\n'
             return
     for command in commands:
-        tokens=_quoted_shell_tokens(command);segment=[];previous=None;index=0
+        tokens=_quoted_shell_tokens(command);segment=[];previous=None;guard=None;index=0
         while index<len(tokens):
             token=tokens[index]
             if token=='{':
-                apply(segment,previous);segment=[]
+                current_guard=_literal_dependency_file_guard(segment,normalized,result is not None)
+                apply(segment,previous,guard);segment=[];guard=current_guard
                 try:end=tokens.index('}',index+1)
                 except ValueError:raise RuntimeError('unclosed shell group')
                 if end+2<len(tokens) and tokens[end+1] in ('>','>>') and matches(tokens[end+2]):
@@ -1604,19 +1626,20 @@ def transformed_source(repo, path, value, commands):
                     lines=(result or '').split('\n')
                     last=lines[-2] if result and result.endswith('\n') else lines[-1]
                     if last:result=(result or '')+'\n'
-                    index=end+3;previous=';';continue
+                    index=end+3;previous=';';guard=None;continue
                 # A group with no outer redirection still requires control-flow
                 # interpretation; do not silently apply an edit inside it.
                 body=tokens[index+1:end]
                 if any(word in ('sed','echo','printf','cat') for word in body):
                     if any(word.strip("\"'").removeprefix('./')==normalized for word in body):
                         raise RuntimeError('unsupported dependency-file shell group')
-                index=end+1;previous=';';continue
+                index=end+1;previous=';';guard=None;continue
             if token in {';','\n','&&','||','|','&','|&'}:
-                apply(segment,previous);segment=[];previous=token
+                current_guard=_literal_dependency_file_guard(segment,normalized,result is not None)
+                apply(segment,previous,guard);segment=[];guard=current_guard;previous=token
             else:segment.append(token)
             index+=1
-        apply(segment,previous)
+        apply(segment,previous,guard)
     return result
 
 
@@ -2942,8 +2965,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 14
-PIP_RESOLVER_POLICY = 'static-pypi-v12-verified-identities-and-legacy-lower-bound-compatibility'
+PIP_PLAN_SCHEMA = 15
+PIP_RESOLVER_POLICY = 'static-pypi-v13-verified-identities-legacy-lower-bound-and-guarded-source-edits'
 
 
 def _pip_worker_controls():

@@ -1,6 +1,6 @@
 {
   "conda_platform": "linux-x86_64",
-  "contract_sha256": "fbb8b762277d09b6732a9697735889f761cf5d1920df0cafb5320809f834f38f",
+  "contract_sha256": "b56e2ef2cd40e48578540596100d9095cda17efd230f38c8741744bc820512ef",
   "dataset_revision": "f70b1a29ab120eb0a0ee7a1deb029825e735b2b0",
   "evaluation_image_prefix": "xingyaoww/sweb.eval.x86_64.",
   "harness_commit": "16dd480cce9b27bf111a362d280881c6def5d2a7",
@@ -8,7 +8,7 @@
   "recipe_version": 2,
   "schema_version": 2,
   "upstream_files": {
-    "constants.py": "98ec039c1ed7e0bdba4f442169b429e0cd1c947549f91fad5b96b5d3d2e71240",
+    "constants.py": "4983063098ad84b78d0a160cc4811b75c18516bccce086bb76247a0d8a282653",
     "dockerfiles.py": "94c0b9937d2d3f6ca752676835225ed249b8397481645d03e0c73981ec5ab919",
     "grading.py": "51eb584b85ffbc245042332a080ff20ba2529c712e76db14da16f246b0e0675d",
     "log_parsers.py": "6d1bce4088dc4d7cb614783dcd63eeb5c20478906158a82cc97ce0b886367b7c",

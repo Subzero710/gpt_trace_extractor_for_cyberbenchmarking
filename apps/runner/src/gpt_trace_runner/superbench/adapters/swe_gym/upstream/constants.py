@@ -1802,7 +1802,7 @@ SPECS_DVC = {
             # fix moto dev version missing issue
             "[ -f setup.py ] && sed -E -i 's/moto==([0-9]+\\.[0-9]+\\.[0-9]+)\\.dev[0-9]+/moto==\\1/' setup.py",
             # fix pyarrow version issue
-            "[ -f setup.py ] && sed -i 's/pyarrow==0.15.1/pyarrow==0.16/' setup.py"
+            "[ -f setup.py ] && sed -i 's/pyarrow==0.15.1/pyarrow==0.16/' setup.py",
             # fix boto version conflict
             "[ -f setup.py ] && sed -i 's/boto3==1.9.115/boto3==1.9.201/' setup.py"
         ],
