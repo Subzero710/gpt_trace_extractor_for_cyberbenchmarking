@@ -104,3 +104,43 @@ def resolve(folder):
         raise RuntimeError("resolved closure lacks a required OS package")
     (folder / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     return manifest
+
+def resolve_from_pool(folder, source):
+    """Produce the exact Kali OS manifest from host-fetched packages, offline.
+
+    The input is an immutable SHA-256 manifest issued by the host acquisition
+    phase; installation in this disposable Kali guest is only for validation.
+    """
+    import shutil
+    folder = Path(folder)
+    source = Path(source)
+    if folder.is_symlink() or source.is_symlink():
+        raise RuntimeError('unsafe OS replay input')
+    evidence = json.loads((source / 'acquired.json').read_text())
+    requested = evidence.get('requested')
+    records = evidence.get('artifacts')
+    if (not isinstance(requested, list) or not set(PACKAGES).issubset(requested)
+            or not isinstance(records, dict) or not records):
+        raise RuntimeError('acquired OS closure is incomplete')
+    folder.mkdir(parents=True, exist_ok=True)
+    before = installed()
+    for filename, record in sorted(records.items()):
+        if (not re.fullmatch(r'[A-Za-z0-9+._:%~\-]+\.deb', filename) or
+                not isinstance(record, dict) or not re.fullmatch(r'[a-f0-9]{64}',
+                str(record.get('sha256','')))):
+            raise RuntimeError('invalid downloaded OS package')
+        original = source / filename
+        if original.is_symlink() or not original.is_file() or digest(original) != record['sha256']:
+            raise RuntimeError('downloaded OS bytes differ')
+        if deb_identity(original) != {k:record[k] for k in ('package','version','architecture')}:
+            raise RuntimeError('downloaded OS package identity differs')
+        shutil.copyfile(original, folder / filename)
+    manifest = {'schema_version': 1, 'requested': requested,
+                'installed_before': before, 'artifacts': records,
+                'repository_metadata': evidence.get('repository_metadata', {})}
+    manifest['installed_after'] = install(folder, manifest, compare_final=False)
+    present = {name.split(':')[0] for name in manifest['installed_after']}
+    if not set(PACKAGES).issubset(present):
+        raise RuntimeError('offline APT replay omitted a mandatory package')
+    (folder / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, separators=(',',':')))
+    return manifest

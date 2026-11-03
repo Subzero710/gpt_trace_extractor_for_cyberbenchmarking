@@ -30,7 +30,7 @@ def run(*args, cwd=None, env=None, input=None):
 
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 BUILDER_WHEEL_STORE = Path("/opt/swe-gym-task/wheel-cas")
-TASK_RUNTIME_SCHEMA = 2
+TASK_RUNTIME_SCHEMA = 3
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -301,6 +301,78 @@ def setup_commands(item, destination, prefix):
     return adapted
 
 
+def seed_pool_vcs(item):
+    """Use only host-fetched, SHA-pinned Git mirrors during task warm-up."""
+    index = Path('/opt/swe-gym-task/vcs-index.json')
+    if not index.is_file() or index.is_symlink():
+        raise RuntimeError('host-fetched task VCS index was not staged')
+    rows = json.loads(index.read_text())
+    if not isinstance(rows, list):
+        raise RuntimeError('invalid host-fetched VCS index')
+    root = ROOT / 'caches/git'
+    root.mkdir(parents=True, exist_ok=True)
+    for record in rows:
+        if set(record) != {'url', 'commit', 'archive'}:
+            raise RuntimeError('invalid staged VCS record')
+        url = record['url']
+        commit = record['commit']
+        relative = record['archive']
+        if (not url.startswith('https://github.com/') or
+                not re.fullmatch(r'[a-f0-9]{40}', commit) or
+                not re.fullmatch(r'[0-9a-f]{64}\.git', relative)):
+            raise RuntimeError('untrusted staged VCS identity')
+        source = Path('/opt/swe-gym-task/vcs') / relative
+        if source.is_symlink() or not source.is_dir():
+            raise RuntimeError('missing staged Git mirror')
+        if run('git','--git-dir',str(source),'cat-file','-t',commit).decode().strip() != 'commit':
+            raise RuntimeError('staged Git mirror lacks exact commit')
+        key = hashlib.sha256((url + '@' + commit).encode()).hexdigest()
+        target = root / (key + '.git')
+        if not target.exists():
+            shutil.copytree(source, target, symlinks=False)
+        if run('git','--git-dir',str(target),'cat-file','-t',commit).decode().strip() != 'commit':
+            raise RuntimeError('copied Git mirror differs')
+        run('git','--git-dir',str(target),'update-ref','refs/heads/frozen',commit)
+        run('git','--git-dir',str(target),'symbolic-ref','HEAD','refs/heads/frozen')
+        # Rewrite only a fully qualified repository URL. The sandbox can never
+        # contact GitHub from warm or replay, even if a recipe makes a mistake.
+        for variant in (url, url.removesuffix('.git'), url.removesuffix('.git')+'.git'):
+            run('git','config','--global','--add','url.file://' + str(target) + '.insteadOf',variant)
+    run('git','config','--global','protocol.file.allow','always')
+
+
+def seed_pool_npm():
+    """Load the authoritative URL-to-integrity tarballs into npm's cacache."""
+    manifest = ROOT / 'npm-pool.json'
+    if not manifest.exists():
+        raise RuntimeError('host-fetched npm dependency manifest missing')
+    rows = json.loads(manifest.read_text())
+    if not isinstance(rows, list):
+        raise RuntimeError('invalid npm pool manifest')
+    if not rows:
+        return
+    script = r'''
+const fs = require('fs');
+const path = require('path');
+const cacache = require('cacache');
+const root = process.argv[1];
+const entries = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+(async () => {
+  for (const entry of entries) {
+    const data = fs.readFileSync(path.join(root, entry.sha256));
+    const crypto = require('crypto');
+    if (crypto.createHash('sha256').update(data).digest('hex') !== entry.sha256)
+      throw Error('npm pool integrity mismatch');
+    await cacache.put(path.join(process.argv[3], '_cacache'), entry.url, data);
+  }
+})().catch(err => { console.error(err); process.exitCode = 1; });
+'''
+    folder = ROOT / 'npm-artifacts'
+    if not folder.is_dir() or folder.is_symlink():
+        raise RuntimeError('host-fetched npm artifacts missing')
+    run('node', '-e', script, str(folder), str(manifest), str(ROOT / 'caches/npm'))
+    shutil.rmtree(folder)
+
 def runtime_environment(item, *, offline):
     env = build_limits()
     shared = None if offline else _shared_warm_cache()
@@ -311,8 +383,11 @@ def runtime_environment(item, *, offline):
                PIPX_HOME=str(ROOT / "caches/pipx"), PIPX_BIN_DIR="/root/.local/bin",
                npm_config_prefix=str(ROOT / "caches/npm-global"))
     env["PATH"] = str(ROOT / "offline-bin") + ":" + str(ROOT / "caches/npm-global/bin") + ":" + env["PATH"]
-    if offline:
-        env.update(PIP_NO_INDEX="1", PIP_FIND_LINKS=str(ROOT / "wheelhouse" / item["instance_id"]),
+    shared_wheelhouse = ROOT / "caches/pip-index"
+    # A pool-backed warm-up is network-disabled just like normal replay.
+    if offline or shared_wheelhouse.is_dir():
+        links = [str(shared_wheelhouse), str(ROOT / "wheelhouse" / item["instance_id"])]
+        env.update(PIP_NO_INDEX="1", PIP_FIND_LINKS=" ".join(links),
                    npm_config_offline="true", PDM_NO_UPDATE_CHECK="1")
     return env
 
@@ -336,9 +411,10 @@ def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
     commands = setup_commands(item, destination, prefix)
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
+    pool_backed = (ROOT / "caches/pip-index").is_dir()
     _timed(item, prefix_name + "_repo_setup",
            lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=offline),
-                         offline=offline, log=log))
+                         offline=offline or pool_backed, log=log))
     if offline:
         expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).read_text())
         if env_inventory(prefix) != expected:
@@ -572,6 +648,9 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse):
 
 def warm_task(item, artifact):
     prime_shared_pip_cache(item)
+    if not (ROOT / "caches/pip-index").is_dir():
+        raise RuntimeError("verified host-fetched pip pool is not installed")
+    seed_pool_vcs(item)
     _reset_task_warm_outputs(item)
     baseline = pip_versions(pristine_stored_env(item))
     prefix = prepare(item, artifact=artifact, offline=False,
@@ -580,7 +659,7 @@ def warm_task(item, artifact):
         json.dumps(env_inventory(prefix), sort_keys=True))
     _timed(item, "warm_eval_setup",
            lambda: shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
-                         log=ROOT / "logs/eval-warm.log"))
+                         offline=True, log=ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
@@ -651,6 +730,8 @@ print(json.dumps(result))
     frozen = []
     folder = ROOT / "caches/git"
     folder.mkdir(exist_ok=True)
+    acquired = json.loads(Path('/opt/swe-gym-task/vcs-index.json').read_text())
+    indexed = {(row['url'].removesuffix('.git'),row['commit']):row for row in acquired}
     for record in records:
         url, vcs = record["url"], record["vcs_info"]
         commit = vcs["commit_id"]
@@ -659,8 +740,13 @@ print(json.dumps(result))
         key = hashlib.sha256((url + "@" + commit).encode()).hexdigest()
         mirror = folder / (key + ".git")
         if not mirror.exists():
-            run("git", "init", "--bare", str(mirror))
-            run("git", "--git-dir", str(mirror), "fetch", "--depth=1", url, commit)
+            matched=indexed.get((url.removesuffix('.git'),commit))
+            if matched is None:
+                raise RuntimeError('installed VCS dependency was not previously acquired: '+url)
+            source=Path('/opt/swe-gym-task/vcs') / matched['archive']
+            if source.is_symlink() or not source.is_dir():
+                raise RuntimeError('pinned VCS mirror missing from offline pool')
+            shutil.copytree(source,mirror,symlinks=False)
             run("git", "--git-dir", str(mirror), "update-ref", "refs/heads/frozen", commit)
             run("git", "--git-dir", str(mirror), "symbolic-ref", "HEAD", "refs/heads/frozen")
             requested = vcs.get("requested_revision")
@@ -899,7 +985,7 @@ def _link_or_copy(source, destination):
 
 def _cache_copy_ignore(directory, names):
     if Path(directory) == ROOT / "caches":
-        return {"pip", "wheels"} & set(names)
+        return {"pip", "wheels", "pip-index"} & set(names)
     return set()
 
 

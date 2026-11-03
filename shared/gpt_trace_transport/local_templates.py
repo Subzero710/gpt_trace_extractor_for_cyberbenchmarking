@@ -24,7 +24,7 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
-TASK_RUNTIME_SCHEMA = 2
+TASK_RUNTIME_SCHEMA = 3
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "config/preparation.toml",
@@ -283,7 +283,11 @@ def golden_dependency_identity(base, source_root=ROOT):
     npm = provenance.get("npm")
     if not isinstance(npm, dict) or not isinstance(npm.get("version"), str) or not npm["version"]:
         raise ValueError("installed Kali npm provenance is missing")
-    return {"schema": 1, "target_environment": target.as_dict(), "npm_version": npm["version"]}
+    apt_digest = provenance.get("apt_package_manifest_sha256")
+    if not isinstance(apt_digest, str) or SHA.fullmatch(apt_digest) is None:
+        raise ValueError("golden APT package inventory is not pinned")
+    return {"schema": 1, "target_environment": target.as_dict(), "npm_version": npm["version"],
+            "apt_package_manifest_sha256": apt_digest}
 
 
 def seal_validation(folder, expected):

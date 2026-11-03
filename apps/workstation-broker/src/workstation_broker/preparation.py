@@ -131,6 +131,14 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
     target.write_bytes(canonical(dependency) + b"\n")
     os.chown(target, 0, 0)
     target.chmod(0o444)
+    # Stage the ACTUAL golden package inventory, not an Ubuntu host guess.
+    packages = safe(manager.base.parent / "kali-packages.txt", immutable=True)
+    if hashlib.sha256(packages.read_bytes()).hexdigest() != dependency["apt_package_manifest_sha256"]:
+        raise RuntimeError("sealed golden APT package inventory differs")
+    inventory = snapshot / "golden-packages.txt"
+    inventory.write_bytes(packages.read_bytes())
+    os.chown(inventory, 0, 0)
+    inventory.chmod(0o444)
     for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
                             key=lambda p: len(p.parts), reverse=True):
         os.chown(directory, 0, 0)

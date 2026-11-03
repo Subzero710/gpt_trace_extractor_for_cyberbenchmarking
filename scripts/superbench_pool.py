@@ -733,8 +733,7 @@ def static_project(file, *, extra_groups=()):
     else:
         deps.update(raw_dependencies)
     build_requires = data.get('build-system',{}).get('requires',[])
-    if isinstance(build_requires, list): deps.update(build_requires)
-    else: issues.append('invalid build-system requires')
+    if not isinstance(build_requires, list): issues.append('invalid build-system requires')
     for k in ('dependencies','optional-dependencies'):
         if k in project.get('dynamic',[]):issues.append('dynamic PEP621 '+k)
 
@@ -2589,45 +2588,75 @@ def _target_debian_architecture():
 
 
 def apt_closure(pool,packages):
-    """Signed Kali APT metadata; isolated empty package-status DB; download-only."""
+    """Signed Kali APT resolution from the golden's real installed inventory.
+
+    Uses an isolated APT state/list/archive directory and only download-only
+    operations. Ubuntu's installed status and package lists never participate.
+    """
     deb_arch=_target_debian_architecture()
     stage=pool.stage;apt=stage/'apt';apt.mkdir(exist_ok=True)
     for name in ('lists','archives','partial','sourceparts'):(apt/name).mkdir(exist_ok=True)
     (apt/'lists'/'partial').mkdir(exist_ok=True)
     (apt/'archives'/'partial').mkdir(exist_ok=True)
-    key_sha = pool.download('https://archive.kali.org/archive-key.asc','apt','signing-key')
-    key_path = pool.objects / key_sha[:2] / key_sha
+    key_sha=pool.download('https://archive.kali.org/archive-key.asc','apt','signing-key')
+    key_path=pool.objects/key_sha[:2]/key_sha
     imported=invoke(['gpg','--show-keys','--with-colons',key_path],capture=True)
-    if KALI_SIGNING_FPR not in [line.split(':')[9] for line in imported.splitlines() if line.startswith('fpr:')]:
-        raise RuntimeError('Kali archive key fingerprint mismatch')
+    if KALI_SIGNING_FPR not in [row.split(':')[9] for row in imported.splitlines() if row.startswith('fpr:')]:
+        raise RuntimeError('Kali signing key fingerprint differs')
     ring=apt/'kali.gpg'
-    with ring.open('xb') as dest:
-        subprocess.run(['gpg','--dearmor'],input=key_path.read_bytes(),stdout=dest,check=True)
+    with ring.open('xb') as output:
+        subprocess.run(['gpg','--dearmor'],input=key_path.read_bytes(),stdout=output,check=True)
     sources=apt/'sources.list'
     write_new(sources,'deb [arch='+deb_arch+' signed-by='+str(ring)+'] https://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware\n')
-    status=apt/'status';write_new(status,'')
+    golden=Path(__file__).resolve().parents[1]/'golden-packages.txt'
+    if golden.is_symlink() or not golden.is_file():
+        raise RuntimeError('authenticated golden package inventory is missing')
+    contents=golden.read_bytes()
+    expected=_golden_dependency()['apt_package_manifest_sha256']
+    if hashlib.sha256(contents).hexdigest()!=expected:
+        raise RuntimeError('golden package inventory SHA-256 differs')
+    status_rows=[]
+    for line in contents.decode('utf-8').splitlines():
+        fields=line.strip().split()
+        if len(fields)!=2:
+            raise RuntimeError('golden package inventory line is malformed')
+        name,version=fields
+        if (not re.fullmatch(r'[A-Za-z0-9+._:-]+',name) or
+                not re.fullmatch(r'[A-Za-z0-9+._:~+-]+',version)):
+            raise RuntimeError('unsafe installed Debian identity')
+        name,separator,qualified=name.partition(':')
+        architecture=qualified if separator else deb_arch
+        if architecture not in (deb_arch,'all'):
+            raise RuntimeError('golden package is foreign-architecture: '+name)
+        status_rows.append('Package: '+name+'\nVersion: '+version+'\nArchitecture: '
+                           +architecture+'\nStatus: install ok installed\n')
+    status=apt/'status'
+    write_new(status,'\n'.join(status_rows)+'\n')
     opts=['-o','Dir::Etc::sourcelist='+str(sources),'-o','Dir::Etc::sourceparts=-',
           '-o','Dir::State::Lists='+str(apt/'lists'),'-o','Dir::State::status='+str(status),
           '-o','Dir::Cache::Archives='+str(apt/'archives'),
-          '-o','APT::Get::AllowUnauthenticated=false','-o','Acquire::AllowInsecureRepositories=false',
+          '-o','APT::Get::AllowUnauthenticated=false',
+          '-o','Acquire::AllowInsecureRepositories=false',
           '-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
     invoke(['apt-get',*opts,'update'])
-    # Empty status DB means dependencies are resolved independently of Ubuntu host.
     invoke(['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)])
     debs=sorted((apt/'archives').glob('*.deb'))
-    if not debs:raise RuntimeError('APT closure did not download any .deb')
+    if not debs:
+        raise RuntimeError('signed Kali resolution lacks any required new Debian archives')
     meta=[]
     for path in debs:
-        control = subprocess.check_output(['dpkg-deb','-f',str(path)], text=True, timeout=90)
-        fields = {}
+        control=subprocess.check_output(['dpkg-deb','-f',str(path)],text=True,timeout=90)
+        fields={}
         for field in ('Package','Version','Architecture'):
-            found = re.search(r'^'+field+r':\s*(\S+)\s*$', control, flags=re.M)
-            if not found: raise RuntimeError('APT archive missing '+field+': '+path.name)
-            fields[field] = found.group(1)
+            found=re.search(r'^'+field+r':\s*(\S+)\s*$',control,flags=re.M)
+            if not found:raise RuntimeError('APT archive missing '+field+': '+path.name)
+            fields[field]=found.group(1)
         sha=pool.put(path,'apt','kali-last-snapshot')
         meta.append({'sha256':sha,'package':fields['Package'],
-                     'version':fields['Version'], 'architecture':fields['Architecture']})
-    write_new(stage/'metadata'/'apt-closure.json',json.dumps({'requested':sorted(packages),'resolved':meta},sort_keys=True))
+                     'version':fields['Version'],'architecture':fields['Architecture']})
+    write_new(stage/'metadata'/'apt-closure.json',json.dumps({
+        'requested':sorted(packages),'resolved':meta,
+        'golden_package_inventory_sha256':expected},sort_keys=True))
 
 
 def _packaging_symbols():
@@ -3182,8 +3211,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 16
-PIP_RESOLVER_POLICY = 'static-pypi-v14-verified-identities-setup-script-dataflow'
+PIP_PLAN_SCHEMA = 17
+PIP_RESOLVER_POLICY = 'native-pip-target-lock-v1'
 
 
 def _pip_worker_controls():
@@ -3236,6 +3265,360 @@ def _resolver_runtime_identity():
     import packaging
     return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3]))}
 
+
+# Native pip is responsible for PyPI resolution; the surrounding pipeline still
+# owns immutable source selection, SHA-256 CAS, manifests and task provenance.
+_NATIVE_POOL_LOCK = threading.RLock()
+
+
+def _native_pool_runtime(pool):
+    """Private, non-root host scratch for exact locked interpreters (no KVM)."""
+    with _NATIVE_POOL_LOCK:
+        runtime = getattr(pool, '_native_runtime', None)
+        if runtime is not None:
+            return runtime
+        if not isinstance(getattr(pool, 'conda_lock', None), dict):
+            raise RuntimeError('native resolver needs the validated locked Conda transactions')
+        temporary = tempfile.TemporaryDirectory(prefix='.native-pip-', dir=pool.stage)
+        root = Path(temporary.name)
+        home = root / 'home'
+        home.mkdir(mode=0o700)
+        environ = {
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'HOME': str(home), 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+            'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+            'PIP_CONFIG_FILE': '/dev/null', 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+            'PIP_NO_INPUT': '1', 'PIP_INDEX_URL': 'https://pypi.org/simple',
+            'PIP_CACHE_DIR': str(root / 'pip-cache'),
+            'CONDARC': '/dev/null', 'CONDA_PKGS_DIRS': str(root / 'conda-pkgs'),
+            'CONDA_ENVS_DIRS': str(root / 'envs'),
+            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
+        }
+        native = {'context': temporary, 'root': root, 'env': environ,
+                  'prefixes': {}, 'bootstrapped': False}
+        pool._native_runtime = native
+        return native
+
+
+def _native_run(argv, runtime, *, timeout=7200):
+    """Unprivileged subprocess; no credentials, shell expansion or repo writes."""
+    output = subprocess.run([str(arg) for arg in argv], cwd=runtime['root'],
+                            env=runtime['env'], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=timeout)
+    if output.returncode:
+        raise RuntimeError('native package command failed (exit '
+            + str(output.returncode) + '): ' + output.stdout[-5000:].decode(errors='replace'))
+    return output.stdout
+
+
+def _native_bootstrap(pool, runtime):
+    if runtime['bootstrapped']:
+        return runtime['root'] / 'conda' / 'bin' / 'conda'
+    path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    with path.open('rb') as stream:
+        bootstrap = tomllib.load(stream)['bootstrap']
+    name = bootstrap['miniconda_archive']
+    sha = bootstrap['miniconda_sha256']
+    if (not re.fullmatch(r'[A-Za-z0-9_.+-]+\.sh', name) or
+            not SHA.fullmatch(str(sha))):
+        raise RuntimeError('invalid pinned Miniconda bootstrap')
+    pool.download('https://repo.anaconda.com/miniconda/' + name,
+                  'bootstrap', 'miniconda-installer', sha=sha)
+    archive = pool.objects / sha[:2] / sha
+    destination = runtime['root'] / 'conda'
+    _native_run(['/bin/bash', archive, '-b', '-p', destination], runtime)
+    executable = destination / 'bin' / 'conda'
+    if not executable.is_file():
+        raise RuntimeError('pinned Miniconda bootstrap did not install conda')
+    runtime['bootstrapped'] = True
+    return executable
+
+
+def _native_locked_python(pool, target):
+    """Obtain actual CPython from the checked lock, not the Ubuntu host Python."""
+    target = _coerce_target(target)
+    runtime = _native_pool_runtime(pool)
+    sha = target.python_artifact_sha256
+    if sha is None:
+        return None  # golden system interpreter uses pip's explicit cross-target mode
+    if not SHA.fullmatch(sha):
+        raise RuntimeError('target Python does not have a locked package identity')
+    with _NATIVE_POOL_LOCK:
+        if sha in runtime['prefixes']:
+            return runtime['prefixes'][sha]
+        candidates = []
+        lock = pool.conda_lock
+        for env in lock['environments'].values():
+            for transaction in env['transactions']:
+                packages = transaction['packages']
+                if sha in packages:
+                    candidates.append((len(packages), transaction['key'], packages))
+        if not candidates:
+            raise RuntimeError('locked target interpreter artifact absent from Conda transactions: '+sha)
+        _length, key, packages = min(candidates, key=lambda row: (row[0], row[1]))
+        if lock['artifacts'][sha]['version'] != target.python_full_version:
+            raise RuntimeError('locked native Python differs from target identity')
+        conda = _native_bootstrap(pool, runtime)
+        archive_root = runtime['root'] / 'archives'
+        archive_root.mkdir(exist_ok=True)
+        explicit = []
+        for package_sha in packages:
+            item = lock['artifacts'][package_sha]
+            pool.download(item['url'], 'conda', key, sha=package_sha)
+            filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
+            if (not filename or Path(filename).name != filename or
+                    not filename.endswith(('.conda', '.tar.bz2'))):
+                raise RuntimeError('invalid locked Conda artifact filename')
+            archive = archive_root / package_sha / filename
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            if not archive.exists():
+                os.link(pool.objects / package_sha[:2] / package_sha, archive)
+            if digest(archive) != package_sha:
+                raise RuntimeError('locked interpreter dependency was modified')
+            explicit.append(archive.as_uri())
+        explicit_file = runtime['root'] / ('python-' + sha + '.explicit')
+        explicit_file.write_text('@EXPLICIT\n' + '\n'.join(explicit) + '\n')
+        prefix = runtime['root'] / 'envs' / sha
+        _native_run([conda, 'create', '--offline', '--yes', '--prefix', prefix,
+                     '--file', explicit_file], runtime, timeout=14400)
+        python = prefix / 'bin' / 'python'
+        version = _native_run([python, '-c',
+             'import platform; print(platform.python_version())'], runtime).decode().strip()
+        if version != target.python_full_version:
+            raise RuntimeError('materialized locked interpreter has the wrong patch version')
+        _native_run([python, '-m', 'pip', '--version'], runtime)
+        runtime['prefixes'][sha] = python
+        return python
+
+
+
+def _native_acquired_archive(pool,runtime,url,sha,category,key):
+    """Import pip's HTTP-cache bytes into CAS instead of fetching them twice."""
+    already=pool.objects/sha[:2]/sha
+    if already.is_file():
+        pool.verify_object(sha)
+        with pool._state_lock:pool.by_url[url]=sha
+        return pool.reference(sha,category,key,already.stat().st_size)
+    with _NATIVE_POOL_LOCK:
+        index=runtime.setdefault('http_content_index',{})
+        cache_root=runtime['root']/'pip-cache'
+        for body in cache_root.rglob('*.body'):
+            if body.is_symlink() or not body.is_file():
+                raise RuntimeError('unsafe pip HTTP cache body')
+            if body in runtime.setdefault('http_content_scanned',set()):
+                continue
+            index[digest(body)]=body
+            runtime['http_content_scanned'].add(body)
+        cached=index.get(sha)
+        if cached is not None and cached.is_file() and digest(cached)==sha:
+            # Never hardlink a mutable pip HTTP cache file into permanent CAS.
+            target=pool.stage/'downloads'/('pip-cached-'+sha)
+            if not target.exists():
+                shutil.copyfile(cached,target)
+            if digest(target)!=sha:
+                raise RuntimeError('pip HTTP cache contents changed during archival')
+            result=pool.put(target,category,key,verified_sha=sha,durable=True)
+            with pool._state_lock:pool.by_url[url]=sha
+            return result
+    # The backend may explicitly mark an archive as non-cacheable. Downloading
+    # its pinned bytes is then necessary; no unverified local data is accepted.
+    return pool.download(url,category,key,sha=sha)
+
+
+def _native_acquire_build_dependencies(pool,target,packages):
+    """Preserve PEP 517 build requirements separately from runtime closures."""
+    for row in packages:
+        if row['kind']!='sdist':continue
+        with _NATIVE_POOL_LOCK:
+            seen=getattr(pool,'_native_build_seen',None)
+            if seen is None:
+                seen=set();pool._native_build_seen=seen
+            identity=(_target_fingerprint(target),row['sha256'])
+            if identity in seen:continue
+            seen.add(identity)
+        path=pool.objects/row['sha256'][:2]/row['sha256']
+        source=_source_archive_files(path,row['filename'])
+        project=source.get('pyproject.toml')
+        if project is None:continue
+        try:
+            document=tomllib.loads(project.decode())
+        except (UnicodeError,ValueError) as exc:
+            raise RuntimeError('unreadable PEP517 build dependencies for '+row['filename']) from exc
+        build=document.get('build-system')
+        if build is None:continue
+        if not isinstance(build,dict):
+            raise RuntimeError('invalid PEP517 build section for '+row['filename'])
+        requires=build.get('requires')
+        if not isinstance(requires,list) or not all(isinstance(item,str) for item in requires):
+            raise RuntimeError('invalid PEP517 build requirements for '+row['filename'])
+        if not requires:continue
+        key=pip_group_key(target,requires)
+        acquire_pip_group(pool,key,{
+            'target':target.as_dict(),'requirements':sorted(set(requires)),
+            'constraints':[],'no_deps':False,'required':True,
+            'tasks':[],'steps':['PEP517 build '+row['sha256']]})
+
+
+def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False):
+    """Use pip's native resolver and PEP 517 metadata hooks on the real target."""
+    target = _coerce_target(target)
+    runtime = _native_pool_runtime(pool)
+    python = _native_locked_python(pool, target)
+    root = runtime['root'] / 'plans' / key
+    root.mkdir(parents=True, exist_ok=True)
+    requirements = root / 'requirements.txt'
+    requirements.write_text('\n'.join(sorted(set(reqs))) + '\n')
+    constraints_file = root / 'constraints.txt'
+    constraints_file.write_text('\n'.join(sorted(set(constraints))) + '\n')
+    report = root / 'pip-report.json'
+    if python is not None:
+        argv = [python, '-m', 'pip', 'install']
+    else:
+        # The golden system Python is recorded by the actual Kali interpreter,
+        # but is not part of a Conda transaction. Explicit wheel-only cross-target
+        # resolution is valid for its pipx application requirements.
+        argv = [sys.executable, '-m', 'pip', 'install', '--only-binary=:all:',
+                '--python-version', target.python_full_version,
+                '--implementation', 'cp', '--abi', target.abi]
+        platforms = []
+        for tag in target.tags:
+            parts = tag.split('-', 2)
+            if len(parts) == 3 and parts[2] != 'any' and parts[2] not in platforms:
+                platforms.append(parts[2])
+        if not platforms:
+            raise RuntimeError('golden target has no verified wheel platform')
+        for platform_tag in platforms:
+            argv.extend(['--platform', platform_tag])
+    argv.extend(['--dry-run', '--ignore-installed', '--report', report,
+                 '--requirement', requirements, '--constraint', constraints_file])
+    if no_deps:
+        argv.append('--no-deps')
+    # A single cache writer makes pip's HTTP cache and CAS extraction deterministic.
+    with _NATIVE_POOL_LOCK:
+        _native_run(argv, runtime)
+        data = json.loads(report.read_text())
+    installs = data.get('install')
+    if not isinstance(installs, list) or not installs:
+        raise RuntimeError('native pip returned an empty resolved closure: '+key)
+    result = []
+    for installed in installs:
+        metadata = installed.get('metadata') or {}
+        download = installed.get('download_info') or {}
+        origin = download.get('url')
+        if not isinstance(origin, str):
+            raise RuntimeError('native pip plan has no artifact URL')
+        parsed = urllib.parse.urlsplit(origin)
+        if parsed.scheme != 'https' or parsed.hostname != 'files.pythonhosted.org':
+            raise RuntimeError('native pip plan has unpinned/non-PyPI artifact: '+origin)
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ''))
+        filename = urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1])
+        if (not filename or Path(filename).name != filename or
+                not filename.endswith(('.whl', '.tar.gz', '.zip', '.tar.bz2'))):
+            raise RuntimeError('native pip plan has an invalid artifact filename')
+        archive_info = download.get('archive_info') or {}
+        hashes = archive_info.get('hashes') or {}
+        sha = hashes.get('sha256')
+        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+            raise RuntimeError('native pip plan lacks authoritative SHA-256 for '+filename)
+        name = metadata.get('name')
+        version = metadata.get('version')
+        if not isinstance(name, str) or not isinstance(version, str):
+            raise RuntimeError('native pip plan lacks distribution identity')
+        wheel = filename.endswith('.whl')
+        if wheel:
+            from packaging.utils import parse_wheel_filename
+            from packaging.tags import parse_tag
+            wheel_name, wheel_version, _build, tags = parse_wheel_filename(filename)
+            if (_normalized_package_name(wheel_name) != _normalized_package_name(name)
+                    or str(wheel_version) != version
+                    or not {str(tag) for tag in tags}.intersection(target.tags)):
+                raise RuntimeError('native pip selected an incompatible wheel: '+filename)
+        stored = _native_acquired_archive(pool, runtime, url, sha, 'python' if wheel else 'python-source', key)
+        if stored != sha:
+            raise RuntimeError('native pip artifact digest differs')
+        requirements_rows = []
+        for requirement in metadata.get('requires_dist') or []:
+            requirements_rows.append(normalize_legacy_source_requirement(requirement))
+        result.append({'kind': 'wheel' if wheel else 'sdist',
+            'name': name, 'version': version, 'filename': filename,
+            'url': url, 'sha256': sha, 'requirements': sorted(set(requirements_rows)),
+            'provides_extra': sorted(set(metadata.get('provides_extra') or [])),
+            'yanked': bool(installed.get('is_yanked', False)),
+            'yanked_reason': None})
+    plan = {'target': target.as_dict(), 'requested': sorted(set(reqs)),
+            'constraints': sorted(set(constraints)), 'no_deps': bool(no_deps),
+            'packages': result,
+            'resolver_policy': {'schema': PIP_PLAN_SCHEMA, 'name': PIP_RESOLVER_POLICY,
+                                'target_fingerprint': _target_fingerprint(target),
+                                'runtime': _resolver_runtime_identity()}}
+    _validate_pip_plan_graph(plan)
+    return result
+
+
+def _native_local_metadata(pool,target,mirror,commit,commands,extras):
+    """Run the pinned local project's real build backend for metadata only.
+
+    This replaces attempting to emulate arbitrary setup.py dataflow. The source
+    checkout is private to an unprivileged host process; it cannot alter the
+    original immutable Git mirror or the system's Python environments.
+    """
+    target=_coerce_target(target)
+    runtime=_native_pool_runtime(pool)
+    python=_native_locked_python(pool,target)
+    if python is None:
+        raise RuntimeError('local project metadata requires a locked target interpreter')
+    identity=hashlib.sha256(json.dumps({
+        'mirror':str(mirror),'commit':commit,'target':target.as_dict(),
+        'commands':commands,'extras':sorted(extras)},sort_keys=True).encode()).hexdigest()
+    checkout=runtime['root']/'local-sources'/identity
+    checkout.parent.mkdir(exist_ok=True)
+    _native_run(['git','clone','--quiet','--shared','--no-checkout',str(mirror),str(checkout)],runtime)
+    _native_run(['git','-C',str(checkout),'checkout','--quiet','--detach',commit],runtime)
+    from pathlib import Path
+    for entry in checkout.rglob('*'):
+        if (not entry.is_file() or entry.is_symlink() or entry.stat().st_size>12*1024*1024
+                or entry.name not in {'setup.py','setup.cfg','pyproject.toml'}):
+            continue
+        # Exact supported textual setup transformations, never shell execution.
+        rel=entry.relative_to(checkout).as_posix()
+        try:old=entry.read_text()
+        except UnicodeError:continue
+        updated=transformed_source('metadata',rel,old,commands)
+        if updated is not None and updated!=old:
+            entry.write_text(updated)
+    report=runtime['root']/'plans'/('local-'+identity+'.json')
+    argv=[python,'-m','pip','install','--dry-run','--ignore-installed','--no-deps',
+          '--report',report,str(checkout)+('['+','.join(sorted(extras))+']' if extras else '')]
+    with _NATIVE_POOL_LOCK:
+        _native_run(argv,runtime)
+        result=json.loads(report.read_text())
+    installs=result.get('install') or []
+    if len(installs)!=1:
+        raise RuntimeError('local project metadata produced an ambiguous plan')
+    metadata=installs[0]['metadata']
+    dependencies=set();remote=set()
+    for row in metadata.get('requires_dist') or []:
+        normalized=normalize_legacy_source_requirement(row)
+        try:requirement=_parse_registry_requirement(normalized)
+        except (ValueError,RuntimeError) as exc:
+            if vcs_reference(normalized):
+                remote.add(vcs_reference(normalized));continue
+            raise RuntimeError('invalid native project requirement: '+normalized) from exc
+        if _marker_active(requirement,target,extras):
+            if requirement.url:
+                ref=vcs_reference(str(requirement))
+                if ref is None:
+                    raise RuntimeError('native project returned an unpinned non-Git direct URL')
+                remote.add(ref)
+            else:
+                dependencies.add(str(requirement))
+    return dependencies,remote
+
+def _native_close(pool):
+    runtime = getattr(pool, '_native_runtime', None)
+    if runtime is not None:
+        runtime['context'].cleanup()
+        pool._native_runtime = None
 
 def _validate_pip_plan_graph(plan):
     """Independently check the complete recorded graph before checkpoint/reuse."""
@@ -4109,53 +4492,32 @@ def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cac
 
 
 def acquire_pip_group(pool,key,group,*,resolver_cache=None):
-    """Acquire one deduplicated logical closure; required failures are fatal."""
+    """Deduplicate concurrent build/runtime closures by exact plan identity."""
+    with pool._state_lock:
+        locks=getattr(pool,'_native_group_locks',None)
+        if locks is None:
+            locks={};pool._native_group_locks=locks
+        lock=locks.setdefault(key,threading.RLock())
+    with lock:
+        return _native_pip_group_locked(pool,key,group)
+
+
+def _native_pip_group_locked(pool,key,group):
+    """Checkpoint a real pip solution, keeping optional groups explicit."""
     target=_coerce_target(group['target'])
     if reuse_pip_plan(pool,target,group['requirements'],key,
-                      constraints=group['constraints'],no_deps=group['no_deps']):return 'reused'
+                      constraints=group['constraints'],no_deps=group['no_deps']):
+        return 'reused'
     try:
-        pip_closure(pool,target,group['requirements'],key,
-                    constraints=group['constraints'],no_deps=group['no_deps'],
-                    resolver_cache=resolver_cache)
+        packages=_native_resolve_registry(pool,target,group['requirements'],
+            group['constraints'],key,no_deps=group['no_deps'])
+        _write_pip_plan(pool,target,group['requirements'],key,packages,
+                        constraints=group['constraints'],no_deps=group['no_deps'])
+        _native_acquire_build_dependencies(pool,target,packages)
         return 'acquired'
-    except RuntimeError as exc:
-        if not group['required']:
-            write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
-                'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
-                'target':target.as_dict(),'python':target.python_full_version,
-                'requested':group['requirements'],'constraints':group['constraints'],
-                'no_deps':group['no_deps'],'optional_failed':str(exc),
-                'packages':[],'files':[],'source_archives':[]},sort_keys=True))
-            return 'optional-failed'
-        raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
-
-
-def acquire_pip_groups(pool, groups):
-    """Acquire and checkpoint each closure independently as soon as it solves.
-
-    Resolvers and artifact transfers share the same versioned closure worker
-    capacity, so a slow/broken closure cannot discard other completed work.
-    Every completed plan references only SHA-256 verified artifacts in the CAS.
-    """
-    ordered=sorted(groups.items());total=len(ordered)
-    if not ordered:return
-    configured_closures,configured_metadata=_pip_worker_controls()
-    closure_workers=min(configured_closures,total)
-    metadata_workers=configured_metadata
-    activity=_ResolverActivity(metadata_workers)
-    resolver_cache={
-        'release_metadata':_SingleFlightCache(),
-        'artifact_metadata':_SingleFlightCache(),
-        'releases':_SingleFlightCache(),
-        'preferred_versions':_cached_python_versions_snapshot(pool),
-        'metadata_prefetch':_metadata_prefetch_width(closure_workers,metadata_workers),
-        'prefetch_controller':activity,
-    }
-    started=time.monotonic()
-    print(f"[pool] Pip resolver batch: {total} closures, {closure_workers} closure workers, "
-          f"{metadata_workers} metadata workers, incremental verified checkpoints",flush=True)
-
-    def optional_failure(key,group,target,exc):
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        if group['required']:
+            raise RuntimeError('required native pip closure '+key+' failed: '+str(exc)) from exc
         write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
             'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
             'target':target.as_dict(),'python':target.python_full_version,
@@ -4164,69 +4526,30 @@ def acquire_pip_groups(pool, groups):
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
 
-    def acquire(index,key,group):
-        target=_coerce_target(group['target'])
-        print(f"[pool] Pip closure {index}/{total}: Python {target.python_full_version}, "
-              f"{len(group['requirements'])} direct specs, {len(group['tasks'])} consumers",flush=True)
-        if reuse_pip_plan(pool,target,group['requirements'],key,
-                          constraints=group['constraints'],no_deps=group['no_deps']):
-            return 'reused'
-        write_new(pool.stage/'metadata'/('pip-'+key+'.txt'),
-                  '\n'.join(sorted(set(group['requirements'])))+'\n')
-        activity.enter()
-        try:
-            records=_resolve_registry_plan(
-                pool,target,group['requirements'],group['constraints'],key,
-                no_deps=group['no_deps'],resolver_cache=resolver_cache,materialize=False)
-        except RuntimeError as exc:
-            if not group['required']:
-                return optional_failure(key,group,target,exc)
-            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
-        finally:
-            activity.leave()
-        if not records:
-            exc=RuntimeError('registry dependency plan is empty')
-            if not group['required']:
-                return optional_failure(key,group,target,exc)
-            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
-        try:
-            packages=_materialize_solution(
-                pool,records,key,target,resolver_cache['artifact_metadata'],executor=None)
-            _write_pip_plan(pool,target,group['requirements'],key,packages,
-                            constraints=group['constraints'],no_deps=group['no_deps'])
-            print(f'[pool] checkpointed verified pip closure {key}: '
-                  f'{len(packages)} package artifacts',flush=True)
-            return 'acquired'
-        except RuntimeError as exc:
-            if not group['required']:
-                return optional_failure(key,group,target,exc)
-            raise RuntimeError('required pip closure '+key+' failed: '+str(exc)) from exc
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=metadata_workers,thread_name_prefix='pip-metadata') as metadata_executor:
-        resolver_cache['metadata_executor']=metadata_executor
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=closure_workers,thread_name_prefix='pip-closure') as closure_executor:
-            futures=[closure_executor.submit(acquire,index,key,group)
-                     for index,(key,group) in enumerate(ordered,1)]
-            done,pending=concurrent.futures.wait(
-                futures,return_when=concurrent.futures.FIRST_EXCEPTION)
-            failures=[future for future in done if not future.cancelled() and future.exception() is not None]
-            if failures:
-                for future in pending:future.cancel()
-                concurrent.futures.wait(futures)
-                ordered_failures=[]
-                for index,(future,(key,_group)) in enumerate(zip(futures,ordered),1):
-                    if future.cancelled():continue
-                    exc=future.exception()
-                    if exc is not None:ordered_failures.append((index,key,exc))
-                _index,_key,exc=min(ordered_failures,key=lambda row:row[0])
-                raise exc
-            concurrent.futures.wait(futures)
-            for future in futures:future.result()
-    elapsed=time.monotonic()-started
-    print(f"[pool] Pip closures complete {total}/{total} in {elapsed:.2f}s "
-          f"with {closure_workers} closure workers and {metadata_workers} metadata workers",flush=True)
+def acquire_pip_groups(pool, groups):
+    """Native pip resolution with per-target interpreter reuse and CAS checkpoints."""
+    ordered=sorted(groups.items())
+    if not ordered:
+        return
+    workers=min(_acquisition_workers(),len(ordered))
+    print('[pool] native Pip resolver: '+str(len(ordered))+' closures, '
+          +str(workers)+' workers; locked Python; host-only',flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+            thread_name_prefix='native-pip') as executor:
+        futures={executor.submit(acquire_pip_group,pool,key,group):key
+                 for key,group in ordered}
+        errors=[]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except BaseException as exc:
+                errors.append((futures[future],exc))
+                for other in futures:
+                    if not other.done():other.cancel()
+        if errors:
+            key,exc=min(errors,key=lambda row:row[0])
+            raise RuntimeError('native pip closure '+key+' failed: '+str(exc)) from exc
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):
     """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""
@@ -4662,10 +4985,15 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         reject('npm-vcs','missing/bad VCS npm requirement manifest: '+str(exc))
 
     issues=sorted(set(pool.issues))
+    for url, sha in pool.by_url.items():
+        if not isinstance(url,str) or not SHA.fullmatch(sha) or sha not in pool.links:
+            reject('URL-index','unregistered URL-to-CAS artifact')
+    issues=sorted(set(pool.issues))
     summary={'schema':2,'kind':'download-only-pool','complete':not issues,
              'operation_id':operation_id,'tasks':len(task_plan),'repos':len(gitplan),
              'conda_recipes':len(envplan),'python_versions':list(PYTHONS),
              'files':files,'issues':issues,'objects':pool.links,
+             'url_index':dict(sorted(pool.by_url.items())),
              'provenance':pool.provenance,'task_plan':task_plan,
              'environment_plan':envplan,'conda_transactions':conda_transactions,
              'conda_lock_sha256':conda_lock_sha256,'git_plan':gitplan}
@@ -4710,6 +5038,7 @@ def main(argv=None):
     if args.reuse_from is not None:
         verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
     pool=Pool(stage)
+    pool.conda_lock=conda_lock
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)
     for task in tasks.values():grouped[task['repo']].add(task['base_commit'])
@@ -4821,7 +5150,13 @@ def main(argv=None):
             try:
                 dep,git,problem=static_project(raw,extra_groups=extras)
                 reqs.update(dep);vcs_task.update(git)
-                for ptext in problem:pool.issue(logical,ptext)
+                dynamic={issue for issue in problem if issue.startswith('dynamic PEP621 ')}
+                if dynamic:
+                    native_deps,native_vcs=_native_local_metadata(
+                        pool,task_target,mirror,commit,commands,extras)
+                    reqs.update(native_deps);vcs_task.update(native_vcs)
+                for ptext in problem:
+                    if ptext not in dynamic:pool.issue(logical,ptext)
             except (ValueError,TypeError) as exc:pool.issue(logical,'invalid pyproject.toml: '+str(exc))
         cfg_deps,cfg_problems=setup_cfg_static(get_file('setup.cfg'),extras=extras)
         reqs.update(cfg_deps)
@@ -4834,7 +5169,11 @@ def main(argv=None):
                 setup_argv=setup_argv)
             setup_deps.update(deps);setup_remote.update(remote);setup_problems.extend(problems)
         reqs.update(setup_deps);vcs_task.update(setup_remote)
-        for ptext in sorted(set(setup_problems)):pool.issue(logical,ptext)
+        if setup_problems:
+            native_deps,native_vcs=_native_local_metadata(
+                pool,task_target,mirror,commit,commands,extras)
+            reqs.update(native_deps)
+            vcs_task.update(native_vcs)
 
         task_steps=[];environment_steps=[];optional_steps=[];optional_skips=[]
         def register(req, constraints, name, *, no_deps=False, optional=False,
@@ -5138,6 +5477,11 @@ def main(argv=None):
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
         raise RuntimeError('acquired Conda transaction identities differ from prevalidated lock')
+    _native_close(pool)
+    with (Path(__file__).resolve().parents[1] / 'config/preparation.toml').open('rb') as stream:
+        bootstrap=tomllib.load(stream)['bootstrap']
+    pool.download('https://repo.anaconda.com/miniconda/' + bootstrap['miniconda_archive'],
+                  'bootstrap', 'miniconda-installer', sha=bootstrap['miniconda_sha256'])
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
                     conda_lock_sha256=conda_lock_sha256)

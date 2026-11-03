@@ -92,7 +92,7 @@ COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 2
+TASK_RUNTIME_SCHEMA = 3
 
 
 class RecoverableBuildError(RuntimeError):
@@ -645,7 +645,9 @@ def build(args):
     # template generation has a separate immutable golden/source identity.
     # Both are recorded in the final manifest; neither may be confused with
     # the other during resume.
-    if not isinstance(pool_compatibility, dict) or pool_compatibility.get("pool_schema") != 3:
+    from gpt_trace_transport.local_templates import pool_contract
+    if (not isinstance(pool_compatibility, dict) or
+            pool_compatibility.get("pool_schema") != pool_contract(ROOT)["pool_schema"]):
         raise RuntimeError("preparation job lacks the verified dependency-pool contract")
     job = {**job, "compatibility": installed, "pool_compatibility": pool_compatibility}
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
@@ -844,36 +846,53 @@ def build(args):
                     continue
 
         def mirror_for(url, name):
+            """Reuse the verified host Git pool: no external Git operations here."""
             from urllib.parse import urlparse
             parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
-                raise RuntimeError("unsupported trusted public Git source URL")
+            if parsed.scheme != 'https' or parsed.hostname != 'github.com' or parsed.username or parsed.password:
+                raise RuntimeError('unsupported pinned Git source URL')
+            canonical = parsed.path.strip('/').removesuffix('.git')
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', canonical):
+                raise RuntimeError('invalid Git pool repository')
+            source_name = canonical.replace('/', '_') + '.git'
+            source = dependency_pool / 'git' / source_name
+            if not source.is_dir():
+                source = dependency_pool / 'git-extra' / source_name
+            if source.is_symlink() or not source.is_dir():
+                raise RuntimeError('host Git acquisition omitted '+canonical)
             path = cache_root / name
             if path.is_symlink() or (path.exists() and path.stat().st_uid != 0):
-                raise RuntimeError("untrusted host mirror")
-            if path.exists():
-                cmd("git", "--git-dir", str(path), "fetch", "--prune", "origin", timeout=14400)
+                raise RuntimeError('untrusted host mirror')
+            if not path.exists():
+                shutil.copytree(source, path, symlinks=False)
             else:
-                cmd("git", "clone", "--mirror", url, str(path), timeout=14400)
+                # Pull only from the immutable local pool, never from origin.
+                cmd('git', '--git-dir', str(path), 'fetch', '--no-tags', str(source),
+                    '+refs/*:refs/remotes/pool/*', timeout=14400)
             return path
 
         def submodule_mirror(url, commit):
+            """Use the exact submodule commit already acquired in the dependency pool."""
             parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.username or parsed.password or not parsed.netloc:
-                raise RuntimeError("unsupported trusted public Git submodule URL")
+            if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.username or parsed.password:
+                raise RuntimeError("unsupported Git submodule URL")
+            normalized = parsed.path.lstrip("/").removesuffix(".git")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
+                raise RuntimeError("untrusted Git submodule repository")
+            if not re.fullmatch(r"[a-f0-9]{40}", commit):
+                raise RuntimeError("untrusted Git submodule commit")
+            origin = dependency_pool / "git-extra" / (normalized.replace("/", "_") + ".git")
+            if not origin.is_dir() or origin.is_symlink():
+                raise RuntimeError("submodule was not acquired: " + normalized)
+            cmd("git", "--git-dir", str(origin), "cat-file", "-e", commit + "^{commit}")
             key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
-            path = cache_root / key
-            # Exact pinned commit already present: no need to re-fetch the entire
-            # upstream mirror for each contract task source archive.
-            if path.is_dir() and not path.is_symlink() and path.stat().st_uid == 0:
-                probe = subprocess.run(
-                    ["git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}"],
-                    capture_output=True, timeout=60, check=False)
-                if probe.returncode == 0:
-                    return path
-            path = mirror_for(url, key)  # Missing object: fetch then validate.
-            cmd("git", "--git-dir", str(path), "cat-file", "-e", commit + "^{commit}")
-            return path
+            destination = cache_root / key
+            if destination.is_symlink():
+                raise RuntimeError("untrusted submodule cache path")
+            if not destination.exists():
+                shutil.copytree(origin, destination, symlinks=False)
+            cmd("git", "--git-dir", str(destination), "cat-file", "-e", commit + "^{commit}")
+            return destination
 
         def task_boot(item, artifact, *, mode, cache=None):
             # Only this item/source/cache ever enters this scratch disk.
@@ -1133,7 +1152,7 @@ def build(args):
             resolver = cache_root / "os-resolver.qcow2"
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
-            resolver_completion = {"schema": 1, "kind": "os-resolver",
+            resolver_completion = {"schema": 2, "kind": "os-resolver",
                 "source_fingerprint": inputs["source_fingerprint"]}
             if (os_folder / "manifest.json").is_file():
                 os_manifest = json.loads((os_folder / "manifest.json").read_text())
@@ -1145,9 +1164,7 @@ def build(args):
                     overlay(resolver, BASE)
                 elif resolver.is_symlink() or not resolver.is_file():
                     raise RuntimeError("unsafe persistent OS resolver volume; preserved")
-                legacy_resolver_complete = (generic_guest_complete(resolver) and
-                    isinstance(guest_json_optional(resolver, "/opt/swe-gym-os/manifest.json"), dict))
-                resolver_ready = completion_matches(resolver, RESOLVER_COMPLETION, resolver_completion) or legacy_resolver_complete
+                resolver_ready = completion_matches(resolver, RESOLVER_COMPLETION, resolver_completion)
                 if not resolver_ready:
                     # resolve() is intentionally not idempotent.  Keep the QCOW2
                     # volume itself and clear only its incomplete guest scratch.
@@ -1159,10 +1176,32 @@ def build(args):
                         shutil.rmtree(os_payload)
                     os_payload.mkdir()
                     shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
+                    artifact_root = os_payload / "artifacts"
+                    artifact_root.mkdir()
+                    rows = json.loads((dependency_pool / "metadata/apt-closure.json").read_bytes())
+                    expected = {entry["sha256"]:entry for entry in rows["resolved"]}
+                    received = {}
+                    for archive in sorted((dependency_pool / "apt/archives").glob("*.deb")):
+                        sha = digest(archive)
+                        if sha not in expected:
+                            raise RuntimeError("unregistered OS artifact in dependency pool")
+                        entry = expected[sha]
+                        identity = os_tools.deb_identity(archive)
+                        if identity != {"package":entry["package"], "version":entry["version"],
+                                        "architecture":entry["architecture"]}:
+                            raise RuntimeError("resolved Kali archive identity mismatch")
+                        shutil.copyfile(archive, artifact_root / archive.name)
+                        received[sha] = {**identity,"sha256":sha,"size":archive.stat().st_size}
+                    if set(received) != set(expected):
+                        raise RuntimeError("host Kali package closure incomplete")
+                    packages = {name:received[digest(artifact_root / name)]
+                                for name in sorted(path.name for path in artifact_root.glob("*.deb"))}
+                    (artifact_root / "acquired.json").write_text(json.dumps({
+                        "requested":rows["requested"], "artifacts":packages},sort_keys=True))
                     resolver_boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\n"
-                    resolver_boot += "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve']('/opt/swe-gym-os')\n"
+                    resolver_boot += "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve_from_pool']('/opt/swe-gym-os','/opt/swe-gym-os-helper/artifacts')\n"
                     resolver_boot += "json.dump(" + repr(resolver_completion) + ",open('" + RESOLVER_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
-                    provision(resolver, resolver_boot, os_payload, network=True,
+                    provision(resolver, resolver_boot, os_payload, network=False,
                         completion=(RESOLVER_COMPLETION, resolver_completion))
                     shutil.rmtree(os_payload)
                 else:
@@ -1210,28 +1249,63 @@ def build(args):
                 if digest(cache_installer) != MINICONDA_SHA256:
                     raise RuntimeError("cached Miniconda digest mismatch")
             else:
-                for attempt in range(1, 11):
-                    partial = cache_installer.with_suffix(".part")
-                    _discard(partial)
-                    try:
-                        with urllib.request.urlopen("https://repo.anaconda.com/miniconda/" + MINICONDA, timeout=180) as response, partial.open("wb") as output:
-                            while chunk := response.read(1048576):
-                                output.write(chunk)
-                                free_space(staged, margin)
-                        if digest(partial) != MINICONDA_SHA256:
-                            raise RuntimeError("pinned Miniconda installer digest mismatch")
-                        partial.chmod(0o444)
-                        os.replace(partial, cache_installer)
-                        break
-                    except (OSError, TimeoutError) as exc:
-                        if attempt == 10: raise RecoverableBuildError("Miniconda download interrupted") from exc
-                        time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
+                bootstrap = pool_record.get("provenance", {}).get("bootstrap", {}).get("miniconda-installer", [])
+                if MINICONDA_SHA256 not in bootstrap:
+                    raise RuntimeError("Miniconda bootstrap absent from dependency pool")
+                downloaded = locked_pool / MINICONDA_SHA256[:2] / MINICONDA_SHA256
+                if downloaded.is_symlink() or not downloaded.is_file() or digest(downloaded) != MINICONDA_SHA256:
+                    raise RuntimeError("Miniconda pool object missing or corrupted")
+                os.link(downloaded, cache_installer)
             shutil.copyfile(cache_installer, installer)
+
+            # Import verified wheel/sdist and npm bytes from the *same* pool
+            # that the unprivileged resolver produced. Builders never refetch.
+            package_root = payload / 'pip-artifacts'
+            package_root.mkdir()
+            filenames = {}
+            for path in sorted((dependency_pool / 'metadata').glob('pip-plan-*.json')):
+                plan = json.loads(path.read_bytes())
+                if plan.get('optional_failed'):
+                    continue
+                for row in plan['packages']:
+                    name, sha = row['filename'], row['sha256']
+                    if not isinstance(name,str) or name != Path(name).name or not SHA.fullmatch(sha):
+                        raise RuntimeError('invalid resolved Python artifact')
+                    old = filenames.setdefault(name,sha)
+                    if old != sha:
+                        raise RuntimeError('different Python artifacts share one immutable filename: '+name)
+            for name, sha in sorted(filenames.items()):
+                source = locked_pool / sha[:2] / sha
+                if source.is_symlink() or not source.is_file() or digest(source) != sha:
+                    raise RuntimeError('PyPI pool object missing or modified: '+sha)
+                os.link(source, package_root / name)
+            npm_root = payload / 'npm-artifacts'
+            npm_root.mkdir()
+            npm_shas = set()
+            for category, groups in pool_record.get('provenance', {}).items():
+                if category.startswith('npm'):
+                    for hashes in groups.values():
+                        npm_shas.update(hashes)
+            npm_urls = []
+            for url, sha in sorted(pool_record.get('url_index', {}).items()):
+                if sha not in npm_shas or urlparse(url).scheme != 'https':
+                    continue
+                source = locked_pool / sha[:2] / sha
+                if source.is_symlink() or not source.is_file() or digest(source) != sha:
+                    raise RuntimeError('npm pool object missing or modified')
+                dest = npm_root / sha
+                if not dest.exists():
+                    os.link(source,dest)
+                npm_urls.append({'url':url,'sha256':sha})
+            if npm_shas - {row['sha256'] for row in npm_urls}:
+                raise RuntimeError('npm dependency has no recorded download URL')
+            (payload / 'npm-pool.json').write_text(json.dumps(npm_urls,sort_keys=True))
+
             common = staged / "common.qcow2"
             initial_common = not common.exists()
             if initial_common:
                 overlay(common, BASE)
-            common_completion = {"schema": 1, "kind": "common",
+            common_completion = {"schema": 2, "kind": "common",
                 "template_abi": job["compatibility"]["template_abi"],
                 "source_fingerprint": inputs["source_fingerprint"]}
             marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
@@ -1242,6 +1316,10 @@ cp /opt/swe-gym-build/environments.json /opt/swe-gym-lite/build-environments.jso
 cp /opt/swe-gym-build/conda-lock.json /opt/swe-gym-lite/conda-lock.json
 mkdir -p /opt/swe-gym-lock
 cp -a /opt/swe-gym-build/conda-artifacts/. /opt/swe-gym-lock/
+mkdir -p /opt/swe-gym-lite/caches/pip-index /opt/swe-gym-lite/npm-artifacts
+cp -a /opt/swe-gym-build/pip-artifacts/. /opt/swe-gym-lite/caches/pip-index/
+cp -a /opt/swe-gym-build/npm-artifacts/. /opt/swe-gym-lite/npm-artifacts/
+cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 cp /opt/swe-gym-build/os-artifacts/manifest.json /opt/swe-gym-lite/os-manifest.json
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
@@ -1251,6 +1329,10 @@ PY_GUEST
 ''' + root_growth() + r'''
 test ! -e /opt/miniconda3
 bash /opt/swe-gym-build/miniconda.sh -b -p /opt/miniconda3
+/usr/bin/python3 - <<'PY_NPM'
+import runpy
+runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
+PY_NPM
 rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
@@ -1260,6 +1342,15 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
 ''' + marker_line + r'''PY_GUEST
 '''
             boot_resume = r'''
+mkdir -p /opt/swe-gym-lite/caches/pip-index /opt/swe-gym-lite/npm-artifacts
+cp -a /opt/swe-gym-build/pip-artifacts/. /opt/swe-gym-lite/caches/pip-index/
+cp -a /opt/swe-gym-build/npm-artifacts/. /opt/swe-gym-lite/npm-artifacts/
+cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
+/usr/bin/python3 - <<'PY_NPM'
+import runpy
+runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
+PY_NPM
+rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
@@ -1280,7 +1371,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                                 for key in inputs["environments"]))
                 except (OSError, ValueError, subprocess.SubprocessError):
                     legacy_common_complete = False
-            common_ready = completion_matches(common, COMMON_COMPLETION, common_completion) or legacy_common_complete
+            common_ready = completion_matches(common, COMMON_COMPLETION, common_completion)
 
             def refresh_incomplete_common_runtime():
                 # Only incomplete common images are mutable. Refresh all helper
@@ -1322,7 +1413,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
                 try:
                     provision(common, boot_resume if has_conda else boot,
-                              None if has_conda else payload, network=True,
+                              payload, network=False,
                               completion=(COMMON_COMPLETION, common_completion))
                 except RuntimeError as exc:
                     if _transient_failure(exc):
@@ -1480,6 +1571,56 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                         return True
                 return False
 
+
+            def stage_pinned_vcs(logical, incoming):
+                """Only this task's pinned public mirrors enter its scratch VM."""
+                plans = pool_record.get('task_plan') or {}
+                plan = plans.get(logical)
+                if not isinstance(plan, dict):
+                    raise RuntimeError('dependency pool lacks a task plan: '+logical)
+                refs = sorted(set(plan.get('vcs', []) + plan.get('optional_vcs', [])))
+                frozen_file = dependency_pool / 'metadata' / 'vcs-frozen.json'
+                frozen = json.loads(frozen_file.read_bytes())
+                index = []
+                for ref in refs:
+                    commit = frozen.get(ref)
+                    if commit is None:
+                        if ref in plan.get('optional_vcs', []):
+                            continue
+                        raise RuntimeError('unfrozen required task VCS '+str(ref))
+                    raw = ref.removeprefix('git+').split('#', 1)[0]
+                    parsed = urlparse(raw)
+                    candidate = parsed.path.lstrip('/')
+                    revision = None
+                    if '@' in candidate:
+                        candidate, revision = candidate.rsplit('@', 1)
+                    candidate = candidate.removesuffix('.git')
+                    if (parsed.scheme != 'https' or parsed.hostname != 'github.com'
+                            or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', candidate)
+                            or not re.fullmatch(r'[a-f0-9]{40}', commit)):
+                        raise RuntimeError('invalid frozen VCS in pool')
+                    base_url = 'https://github.com/' + candidate + '.git'
+                    mirror = dependency_pool / 'git-extra' / (candidate.replace('/', '_') + '.git')
+                    if not mirror.is_dir() or mirror.is_symlink():
+                        raise RuntimeError('missing pinned VCS mirror '+candidate)
+                    key = hashlib.sha256((base_url + '@' + commit).encode()).hexdigest()
+                    target = incoming / 'vcs' / (key + '.git')
+                    target.parent.mkdir(exist_ok=True)
+                    if not target.exists():
+                        shutil.copytree(mirror, target, symlinks=False)
+                    cmd('git', '--git-dir', str(target), 'cat-file', '-e', commit + '^{commit}')
+                    cmd('git', '--git-dir', str(target), 'update-ref', 'refs/heads/frozen', commit)
+                    cmd('git', '--git-dir', str(target), 'symbolic-ref', 'HEAD', 'refs/heads/frozen')
+                    if revision and not re.fullmatch(r'[a-f0-9]{7,40}', revision):
+                        result = subprocess.run(['git','check-ref-format','refs/heads/'+revision],
+                                                capture_output=True)
+                        if result.returncode:
+                            raise RuntimeError('unsafe frozen VCS branch name')
+                        cmd('git', '--git-dir', str(target), 'update-ref',
+                            'refs/heads/' + revision, commit)
+                    index.append({'url':base_url,'commit':commit,'archive':target.name})
+                (incoming / 'vcs-index.json').write_text(json.dumps(index, sort_keys=True))
+
             offline_proofs, vcs_provenance, task_inventories = {}, {}, {}
             incoming = scratch_root / "swe-gym-task"
             scratch_tasks_root = scratch_root / "tasks"
@@ -1548,6 +1689,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 incoming.mkdir(mode=0o700)
                 (incoming / "item.json").write_text(json.dumps(item))
                 shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
+                stage_pinned_vcs(logical, incoming)
 
                 warm_boot, warm_completion = task_boot(item, source_record, mode="warm")
                 warm_matches_item = (scratch_uses_common(warm) and
@@ -1569,7 +1711,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                                       completion_matches(warm, TASK_COMPLETION, warm_completion))
                     if not warm_ready:
                         warm = reset_scratch_overlay(warm, common)
-                        provision(warm, warm_boot, incoming, network=True,
+                        provision(warm, warm_boot, incoming, network=False,
                                   completion=(TASK_COMPLETION, warm_completion),
                                   cache_disk=warm_cache, trim=False, serial_log=warm_serial,
                                   refresh_runtime=True)

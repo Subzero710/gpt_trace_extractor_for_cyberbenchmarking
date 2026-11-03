@@ -428,7 +428,8 @@ def preparation_fetch(cfg):
     target = golden_dependency.get("target_environment") if isinstance(golden_dependency, dict) else None
     markers = target.get("markers") if isinstance(target, dict) else None
     if (not isinstance(golden_dependency, dict)
-            or set(golden_dependency) != {"schema", "target_environment", "npm_version"}
+            or set(golden_dependency) != {"schema", "target_environment", "npm_version", "apt_package_manifest_sha256"}
+             or re.fullmatch(r"[0-9a-f]{64}", str(golden_dependency.get("apt_package_manifest_sha256", ""))) is None
             or golden_dependency.get("schema") != 1
             or not isinstance(target, dict) or target.get("schema") != 2
             or target.get("source") != "verified-target-interpreter"
