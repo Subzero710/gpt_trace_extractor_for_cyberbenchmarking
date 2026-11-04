@@ -3346,11 +3346,48 @@ def _native_pool_runtime(pool):
         return native
 
 
-def _native_run(argv, runtime, *, timeout=7200):
-    """Unprivileged subprocess; no credentials, shell expansion or repo writes."""
-    output = subprocess.run([str(arg) for arg in argv], cwd=runtime['root'],
-                            env=runtime['env'], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, timeout=timeout)
+def _native_run(argv, runtime, *, timeout=7200, interpreter=None):
+    """Run an actual package tool with a complete, per-invocation interpreter PATH.
+
+    Build backends and installed command entrypoints can invoke
+    ``#!/usr/bin/env python`` regardless of their own executable name. Bind
+    that name to the exact locked Python selected for this operation, without
+    modifying global state or contaminating parallel target environments.
+    The Miniconda prefix is discoverable even while its bootstrap is underway.
+    """
+    command = [str(arg) for arg in argv]
+    if not command:
+        raise RuntimeError('empty native package command')
+    environment = dict(runtime['env'])
+    base_bin = Path(runtime['root']) / 'conda' / 'bin'
+    paths = [str(base_bin)]
+    if interpreter is not None:
+        selected = Path(interpreter)
+        if (not selected.is_absolute() or not selected.is_file()
+                or not os.access(selected, os.X_OK)):
+            raise RuntimeError('native interpreter is not an executable absolute file: ' + str(selected))
+        executable_dir = selected.parent
+        if selected.name != 'python':
+            # Never add an alias to a host-owned directory. Long /usr/bin/python3.X
+            # names use a per-runtime, per-interpreter private launcher instead.
+            identity = hashlib.sha256(os.fsencode(str(selected))).hexdigest()
+            executable_dir = Path(runtime['root']) / 'python-launchers' / identity
+            executable_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            alias = executable_dir / 'python'
+            try:
+                alias.symlink_to(selected)
+            except FileExistsError:
+                pass
+            if not alias.is_symlink() or os.readlink(alias) != str(selected):
+                raise RuntimeError('native interpreter launcher identity mismatch')
+        paths.insert(0, str(executable_dir))
+    inherited = environment.get('PATH', '')
+    if inherited:
+        paths.append(inherited)
+    environment['PATH'] = os.pathsep.join(paths)
+    output = subprocess.run(command, cwd=runtime['root'], env=environment,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=timeout)
     if output.returncode:
         raise RuntimeError('native package command failed (exit '
             + str(output.returncode) + '): ' + output.stdout[-5000:].decode(errors='replace'))
@@ -3372,7 +3409,12 @@ def _native_build_requirements(scratch):
         layers = defaultdict(set)
         for path in environment.rglob('*'):
             if path.is_symlink():
-                raise RuntimeError('symlink in native build environment')
+                # Package entrypoints may legitimately be symlinks. Do not
+                # inspect their contents or allow symlinks on metadata paths.
+                # Directory symlinks could conceal an unrecorded build layer.
+                if path.is_dir() or path.name == 'METADATA' or path.name.endswith('.dist-info'):
+                    raise RuntimeError('symlink in native build metadata path')
+                continue
             if path.name != 'METADATA' or not path.parent.name.endswith('.dist-info'):
                 continue
             if not path.is_file() or path.stat().st_size > MAX_SOURCE:
@@ -3389,7 +3431,7 @@ def _native_metadata_command(argv, runtime, directory):
     """Execute the production pip command and capture its build-time closure."""
     with tempfile.TemporaryDirectory(prefix='build-metadata-', dir=directory) as temporary:
         local = {**runtime, 'env': {**runtime['env'], 'TMPDIR': temporary}}
-        _native_run([*argv, '--no-clean'], local)
+        _native_run([*argv, '--no-clean'], local, interpreter=argv[0])
         return _native_build_requirements(temporary)
 
 
@@ -3472,13 +3514,14 @@ def _native_locked_python(pool, target):
         # the fetch host's PATH and kernel shebang length constraints.
         _native_run([conda.parent / 'python', '-m', 'conda',
                      'create', '--offline', '--yes', '--prefix', prefix,
-                     '--file', explicit_file], runtime, timeout=14400)
+                     '--file', explicit_file], runtime, timeout=14400,
+                     interpreter=conda.parent / 'python')
         python = prefix / 'bin' / 'python'
         version = _native_run([python, '-c',
-             'import platform; print(platform.python_version())'], runtime).decode().strip()
+             'import platform; print(platform.python_version())'], runtime, interpreter=python).decode().strip()
         if version != target.python_full_version:
             raise RuntimeError('materialized locked interpreter has the wrong patch version')
-        _native_run([python, '-m', 'pip', '--version'], runtime)
+        _native_run([python, '-m', 'pip', '--version'], runtime, interpreter=python)
         runtime['prefixes'][sha] = python
         return python
 

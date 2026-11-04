@@ -50,6 +50,9 @@ def cas_probe(function):
         sha = hashlib.sha256(data).hexdigest()
         source = candidate.stage / 'source'; source.write_bytes(data)
         candidate.put(source, 'contract', 'source')
+        # A fresh verifier must exercise the expensive checksum branch.
+        # Otherwise a cached signature masks violations of the cold path.
+        candidate._verified_signatures.pop(sha, None)
         verify = MethodType(function, candidate)
         if not accepts(verify, sha):
             return False
@@ -98,4 +101,4 @@ def test_contracts_detect_generated_comparison_mutations(function, probe):
     assert results, 'the mutation operator must generate candidates'
     killed = sum(not result for result in results)
     print(f'{function.__qualname__}: generated={len(results)} killed={killed} surviving={sum(results)}')
-    assert killed > 0, 'the contract failed to detect every generated violation'
+    assert killed == len(results), 'a generated contract violation survived undetected'
