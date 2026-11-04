@@ -2578,3 +2578,58 @@ def run_setup():
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPinnedMinicondaBootstrapFilename(unittest.TestCase):
+    def test_executes_verified_cas_bytes_under_the_pinned_sh_name(self):
+        """Miniconda checks $0 ends with .sh; SHA-named CAS files cannot run."""
+        with (ROOT / 'config/preparation.toml').open('rb') as stream:
+            pin = tomllib.load(stream)['bootstrap']
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            sha = pin['miniconda_sha256']
+            archive = scratch / 'objects' / sha[:2] / sha
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b'synthetic pinned installer fixture')
+            runtime_root = scratch / 'runtime'
+            runtime_root.mkdir()
+            runtime = {'root': runtime_root, 'env': {}, 'bootstrapped': False}
+            observed = []
+
+            class Candidate:
+                objects = scratch / 'objects'
+
+                def download(self, url, category, identity, *, sha=None):
+                    self_url = 'https://repo.anaconda.com/miniconda/' + pin['miniconda_archive']
+                    self_check = (url, category, identity, sha)
+                    assert self_check == (self_url, 'bootstrap', 'miniconda-installer',
+                                          pin['miniconda_sha256'])
+                    observed.append('download')
+
+                def verify_object(self, requested):
+                    assert requested == sha
+                    observed.append('verified')
+                    return archive.stat().st_size
+
+            def execute(args, target, *, timeout=7200):
+                assert target is runtime
+                assert args[0] == '/bin/bash'
+                assert Path(args[1]).name == pin['miniconda_archive']
+                assert Path(args[1]).suffix == '.sh'
+                assert Path(args[1]).samefile(archive)
+                assert args[2:4] == ['-b', '-p']
+                assert Path(args[4]) == runtime_root / 'conda'
+                assert observed == ['download', 'verified']
+                observed.append('run')
+                binary = Path(args[4]) / 'bin' / 'conda'
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b'fixture')
+                return b''
+
+            with patch.object(pool, '_native_run', side_effect=execute):
+                conda = pool._native_bootstrap(Candidate(), runtime)
+                self.assertEqual(conda, runtime_root / 'conda/bin/conda')
+                self.assertTrue(runtime['bootstrapped'])
+                self.assertEqual(observed, ['download', 'verified', 'run'])
+                self.assertEqual(pool._native_bootstrap(Candidate(), runtime), conda)
+                self.assertEqual(observed, ['download', 'verified', 'run'])

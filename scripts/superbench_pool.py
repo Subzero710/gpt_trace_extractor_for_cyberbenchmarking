@@ -3327,8 +3327,14 @@ def _native_bootstrap(pool, runtime):
     pool.download('https://repo.anaconda.com/miniconda/' + name,
                   'bootstrap', 'miniconda-installer', sha=sha)
     archive = pool.objects / sha[:2] / sha
+    pool.verify_object(sha)
+    # The Miniconda installer validates $0 and requires its .sh basename.
+    # Preserve the immutable CAS object: link its verified bytes into the
+    # private bootstrap scratch instead of copying or renaming the CAS.
+    installer = runtime['root'] / name
+    os.link(archive, installer)
     destination = runtime['root'] / 'conda'
-    _native_run(['/bin/bash', archive, '-b', '-p', destination], runtime)
+    _native_run(['/bin/bash', installer, '-b', '-p', destination], runtime)
     executable = destination / 'bin' / 'conda'
     if not executable.is_file():
         raise RuntimeError('pinned Miniconda bootstrap did not install conda')
