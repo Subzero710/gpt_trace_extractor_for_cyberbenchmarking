@@ -2045,22 +2045,25 @@ class TestVerifiedPoolResume(unittest.TestCase):
 
 
 class TestPublicationRecovery(unittest.TestCase):
-    def test_published_verified_pool_is_reconciled_without_rehash_or_retry(self):
+    def test_published_verified_pool_is_reconciled_without_artifact_rehash_or_retry(self):
         import ast
+        import hashlib
         import types
         source = (ROOT / 'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
         tree = ast.parse(source)
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'PreparationManager')
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '_reconcile')
+        verifier = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'verify_published_inventory')
         class Scope:
             @staticmethod
             def members(state): return []
             @staticmethod
             def close(state): return state
         namespace = {'JobScope': Scope, 'TERMINAL': {'ready','failed','canceled','interrupted'},
-                     'RuntimeError': RuntimeError, 'Path': Path, 'json': json,
+                     'RuntimeError': RuntimeError, 'Path': Path, 'json': json, 'hashlib': hashlib,
                      'safe': lambda path, **kwargs: Path(path)}
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[verifier, method], type_ignores=[])),
                      str(ROOT / 'apps/workstation-broker/src/workstation_broker/preparation.py'), 'exec'), namespace)
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp) / 'golden.qcow2'; base.write_bytes(b'unrelated')
@@ -2069,11 +2072,13 @@ class TestPublicationRecovery(unittest.TestCase):
             contract=json.loads((ROOT/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json').read_bytes())
             coverage={'tasks':len(contract['tasks']),'repos':len({row['repo'] for row in contract['tasks'].values()}),
                       'conda_recipes':len(contract['environments'])}
-            record = {'operation_id': operation, 'complete': True, **coverage}
+            record = {'operation_id': operation, 'complete': True,
+                      'kind': 'download-only-pool', **coverage}
             (ready/'inventory.json').write_text(json.dumps(record))
             expected = {'kind':'download-only-pool','complete':True,
                         'pool_directory':str(ready),**coverage,'runtime_integrated':True,
-                        'offline_replay':True,'generation':'8'*64}
+                        'offline_replay':True,'generation':'8'*64,
+                        'manifest_sha256': hashlib.sha256((ready/'inventory.json').read_bytes()).hexdigest()}
             state = {'phase':'interrupted','operation_id':operation,
                      'publication_verified':expected, 'error':'worker died after rename'}
             class FakeManager:

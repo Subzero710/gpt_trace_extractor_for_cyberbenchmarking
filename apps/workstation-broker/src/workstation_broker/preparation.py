@@ -25,7 +25,8 @@ from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
-    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, pool_contract)
+    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, pool_contract, seal,
+    sync_directory)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
 
@@ -430,14 +431,13 @@ class PreparationManager:
                 raise RuntimeError('preparation spawn has no claimed identity; slot is still held; no duplicate permitted')
             return state
         # Recovery is allowed ONLY for an already-verified, atomically
-        # published result. No download, process restart, or post-ready hash.
+        # published result. Only its small inventory is rehashed; no downloads,
+        # process restart or full CAS scan is performed by status.
         proof = state.get('publication_verified')
         if state['phase'] in {'running', 'validating', 'interrupted', 'canceled'} and isinstance(proof, dict):
             ready = self.base.parent / 'dependency-pool' / 'ready'
             if ready.exists() or ready.is_symlink():
-                safe(ready, immutable=True, directory=True)
-                inventory_path = safe(ready / 'inventory.json', immutable=True)
-                inventory = json.loads(inventory_path.read_bytes())
+                inventory = verify_published_inventory(ready, state, proof)
                 pending_integration = proof.get('runtime_integrated') != True
                 if (proof.get('kind') != 'download-only-pool' or proof.get('complete') is not True
                         or proof.get('pool_directory') != str(ready)
@@ -466,7 +466,7 @@ class PreparationManager:
         return closed
 
     def _verify_ready(self, state):
-        """No rehash after the pool was verified and sealed at publication."""
+        """Rebind the inventory proof without rescanning sealed pool artifacts."""
         result = state.get("result")
         task_count, repo_count, env_count = contract_counts(self.source_root)
         if (not isinstance(result, dict) or result.get("kind") != "download-only-pool"
@@ -479,10 +479,9 @@ class PreparationManager:
                 or state.get("compatibility") != self.expected()):
             self._write({**state, "phase": "failed", "error": "invalid pool publication record"})
             return {**state, "phase": "failed", "error": "invalid pool publication record"}
-        # No hash/re-scan: sealed root-owned files are immutable after initial verification.
+        # Sealed artifacts are immutable; verify the inventory's exact identity.
         folder = self.base.parent / "dependency-pool" / "ready"
-        safe(folder, immutable=True, directory=True)
-        safe(folder / "inventory.json", immutable=True)
+        verify_published_inventory(folder, state, result)
         return state
 
     def status(self, payload):
@@ -514,8 +513,7 @@ class PreparationManager:
                 # An explicit operator retry is safe only after _reconcile
                 # verified the previous worker and all descendants are absent.
                 pending_integration = (isinstance(previous.get('publication_verified'), dict)
-                    and previous['publication_verified'].get('runtime_integrated') != True
-                    and (self.base.parent/'dependency-pool'/'ready').is_dir())
+                    and previous['publication_verified'].get('runtime_integrated') != True)
                 if not (payload['retry'] and previous['phase'] in {'failed','interrupted'}
                         and previous.get('result') is None
                         and (previous.get('publication_verified') is None or pending_integration)
@@ -551,6 +549,9 @@ class PreparationManager:
                     "created_at": previous["created_at"] if previous else now, "updated_at": now,
                     "worker": None, "result": None, "error": None,
                     "scope": JobScope.create(operation_id, attempt),
+                    "publication_verified": previous.get("publication_verified") if previous else None,
+                    **({"publication_attempt": previous.get("publication_attempt", previous["attempt"])}
+                       if previous and previous.get("publication_verified") else {}),
                     "built_generation": previous.get("built_generation") if previous else None}
                 self._write(state)
                 environment = dict(os.environ, GPT_TRACE_PREPARATION_ID=operation_id, LIBGUESTFS_BACKEND="direct")
@@ -790,6 +791,22 @@ def retained_dependency_stage(manager, pool_root, state, account):
     if not matches:return None
     return max(set(matches),key=_retained_stage_score)
 
+def verify_published_inventory(folder, state, proof):
+    """Bind every reused publication to its durable byte and operation identity."""
+    safe(folder, immutable=True, directory=True)
+    raw = safe(Path(folder) / 'inventory.json', immutable=True).read_bytes()
+    if (not isinstance(proof, dict) or
+            hashlib.sha256(raw).hexdigest() != proof.get('manifest_sha256')):
+        raise RuntimeError('published pool inventory differs from its publication proof')
+    inventory = json.loads(raw)
+    if (inventory.get('operation_id') != state['operation_id'] or
+            inventory.get('complete') is not True or inventory.get('issues') or
+            any(inventory.get(key) != proof.get(key)
+                for key in ('kind', 'tasks', 'repos', 'conda_recipes', 'python_versions'))):
+        raise RuntimeError('published pool identity differs from its publication proof')
+    return inventory
+
+
 def _integrate_published_pool(manager, state, ready, result):
     """Build/validate templates from an already sealed pool after a crash."""
     builder_path = manager.source_root / "scripts/build_local_templates.py"
@@ -838,14 +855,19 @@ def _prepare(manager, state):
     root.chmod(0o1770)
     ready = root / "ready"
     stage = root / ('incoming-'+state['operation_id']+'-'+str(state['attempt']))
+    pending = state.get("publication_verified")
+    if isinstance(pending, dict) and pending.get("runtime_integrated") != True:
+        if not ready.exists() and not ready.is_symlink():
+            acquisition_attempt = state.get('publication_attempt', state['attempt'])
+            if type(acquisition_attempt) is not int or not 1 <= acquisition_attempt <= state['attempt']:
+                raise RuntimeError('invalid original publication attempt')
+            sealed = root / ('incoming-'+state['operation_id']+'-'+str(acquisition_attempt))
+            verify_published_inventory(sealed, state, pending)
+            os.rename(sealed, ready)
+            sync_directory(root)
+        verify_published_inventory(ready, state, pending)
+        return _integrate_published_pool(manager, state, ready, pending)
     if ready.exists() or ready.is_symlink():
-        pending = state.get("publication_verified")
-        if isinstance(pending, dict) and pending.get("runtime_integrated") != True:
-            safe(ready, immutable=True, directory=True)
-            inventory = json.loads(safe(ready / "inventory.json", immutable=True).read_bytes())
-            if inventory.get("operation_id") != state["operation_id"] or inventory.get("complete") is not True:
-                raise RuntimeError("published dependency pool cannot be resumed safely")
-            return _integrate_published_pool(manager, state, ready, pending)
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
         raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
@@ -906,6 +928,10 @@ def _prepare(manager, state):
         raise RuntimeError("download worker exceeded configured acquisition deadline; zombie preserved") from exc
     if exitcode != 0:
         raise subprocess.CalledProcessError(exitcode, child.args)
+    # Package build backends may spawn children. A successful downloader exit
+    # cannot authorize publication while any descendant can still write bytes.
+    if any(member['pid'] != os.getpid() for member in JobScope.members(state)):
+        raise RuntimeError('acquisition descendants remain; pool publication refused')
     remove_fetch_sources(source_root)
     inventory_path = stage / "inventory.json"
     if inventory_path.is_symlink() or not inventory_path.is_file():
@@ -991,6 +1017,9 @@ def _prepare(manager, state):
         item.chmod(0o555 if item.is_dir() else 0o444)
     os.chown(stage, 0, 0)
     stage.chmod(0o555)
+    # File contents, directory entries and permission changes must all be
+    # durable before a state record can authorize recovery of this generation.
+    seal(stage)
     # Write a durable verified-publication record BEFORE the atomic rename.
     # If the process dies after rename, reconciliation can acknowledge the
     # ALREADY VERIFIED immutable result without retrying or rehashing files.
@@ -1000,6 +1029,7 @@ def _prepare(manager, state):
               "file_count": len(inventory["files"]),
               "manifest_sha256": hashlib.sha256(raw).hexdigest(),
               "pool_directory": str(ready), "runtime_integrated": "pending"}
+    state = {**state, "publication_attempt": state['attempt']}
     manager._write({**state, "phase": "validating", "publication_verified": result})
     os.rename(stage, ready)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

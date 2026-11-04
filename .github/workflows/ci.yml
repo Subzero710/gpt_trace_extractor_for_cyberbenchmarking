@@ -40,9 +40,11 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install syntax parser and test runner
-        run: python -m pip install 'PyYAML>=6' 'pytest>=8.3,<9'
+        run: python -m pip install 'PyYAML>=6' 'pytest>=8.3,<9' 'ruff>=0.9,<1'
       - name: Parse tracked source and configuration files
         run: python .github/scripts/ci_manifest.py validate
+      - name: Reject undefined names and invalid Python syntax
+        run: python -m ruff check --select F821,F822,F823,E9 .
       - name: Test CI discovery, syntax validation and gate behavior
         run: python -m pytest -q tests/ci
 
@@ -59,7 +61,11 @@ jobs:
         run: |
           python -m pip install -e ./shared -e './apps/workstation-broker[test]' -e './apps/runner[test]' cryptography
       - name: Exercise offline recovery, CAS, network and transport behavior
-        run: python -m pytest -q -rs tests/distributed --ignore=tests/distributed/test_golden_resume.py
+        run: |
+          sudo "$(command -v python)" -m coverage run --branch --source=scripts,shared/gpt_trace_transport,apps/workstation-broker/src -m pytest -q -rs tests/distributed --ignore=tests/distributed/test_golden_resume.py
+          python -m coverage report
+      - name: Exercise real package acquisition and native locked interpreters
+        run: GPT_TRACE_NETWORK_TESTS=1 python -m pytest -q -rs tests/distributed/test_pipeline_external.py
 
   golden:
     name: Golden behavioral tests with the declared guest runtime

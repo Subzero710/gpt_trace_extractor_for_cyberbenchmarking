@@ -60,6 +60,10 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
     pool = tmp_path / "dependency-pool"
     pool.mkdir()
     dependency = {"schema": 1, "target_environment": {"schema": 2}, "npm_version": "10.9.9"}
+    packages = tmp_path / "kali-packages.txt"
+    packages.write_bytes(b"fixture-package\t1\tall\n")
+    packages.chmod(0o444)
+    dependency["apt_package_manifest_sha256"] = hashlib.sha256(packages.read_bytes()).hexdigest()
     manager = SimpleNamespace(source_root=private, base=tmp_path / "golden.qcow2")
     original_identity = jobs.golden_dependency_identity
     jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
@@ -82,6 +86,7 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
     staged_dependency = source_root / "golden-dependency.json"
     assert staged_dependency.read_bytes() == jobs.canonical(dependency) + b"\n"
     assert staged_dependency.stat().st_uid == 0
+    assert (source_root / "golden-packages.txt").read_bytes() == packages.read_bytes()
     assert stat.S_IMODE(staged_dependency.stat().st_mode) == 0o444
     assert stat.S_IMODE(source_root.stat().st_mode) == 0o555
 

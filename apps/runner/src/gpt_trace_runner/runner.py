@@ -10,6 +10,7 @@ from rich.console import Console
 from .app_lifecycle import AppLifecycle
 from .chatgpt import ChatGPTClient
 from .exceptions import (
+    AppInfrastructureError,
     FatalUIState,
     RecoveryIncomplete,
     StorageConflict,

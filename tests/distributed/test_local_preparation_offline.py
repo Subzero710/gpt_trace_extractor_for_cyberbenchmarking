@@ -439,7 +439,7 @@ class DurableJobProcessTests(unittest.TestCase):
         self.count = self.parent / "construction-boundary-count"
         # Only physical preparation is replaced. The actual worker claim, lock,
         # phases, complete registry validation, activation and ready stamp run.
-        body = '''import json,os,sys,time
+        body = '''import hashlib,json,os,sys,time
 from pathlib import Path
 sys.path[:0] = INPUT_PATHS
 from workstation_broker import preparation as jobs
@@ -470,13 +470,14 @@ def physical_boundary(manager,state):
     ready.mkdir()
     coverage = COVERAGE
     record = {'schema': 2, 'operation_id': state['operation_id'],
+              'kind': 'download-only-pool', 'python_versions': LOCKED_PYTHONS,
               'complete': True, **coverage}
     (ready/'inventory.json').write_text(json.dumps(record))
     (ready/'inventory.json').chmod(0o444)
     ready.chmod(0o555)
     result = {'kind': 'download-only-pool', 'complete': True, **coverage,
               'python_versions': LOCKED_PYTHONS,
-              'file_count': 0, 'manifest_sha256': 'a' * 64,
+              'file_count': 0, 'manifest_sha256': hashlib.sha256((ready/'inventory.json').read_bytes()).hexdigest(),
               'pool_directory': str(ready), 'runtime_integrated': True,
               'offline_replay': True, 'generation': GENERATION}
     return result
