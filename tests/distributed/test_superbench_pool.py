@@ -1983,6 +1983,7 @@ class TestVerifiedPoolResume(unittest.TestCase):
             def command(argv,*,cwd=None,capture=False,env=None,timeout=3600):
                 if 'rev-parse' in argv:return 'true'
                 if 'cat-file' in argv:return ''
+                if 'update-ref' in argv:return None
                 raise AssertionError('network or git init forbidden: '+repr(argv))
             with patch.object(pool,'invoke',side_effect=command),patch.object(
                     pool.subprocess,'run',return_value=type('Result',(),{'returncode':0})()):

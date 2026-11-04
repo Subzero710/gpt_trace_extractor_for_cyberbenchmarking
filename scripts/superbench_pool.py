@@ -469,7 +469,7 @@ def git_files_named(mirror, commit, basename, *, limit=64):
             if len(rows)>limit:raise RuntimeError('Git basename search exceeds finite bound: '+basename)
     return sorted(set(rows))
 
-def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600):
+def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600, refetch=False):
     """Fetch immutable GitHub refs quietly with bounded in-process retries.
 
     A failed network transfer is retried inside the same preparation so a transient
@@ -484,6 +484,11 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600):
     command=['git','-c','protocol.file.allow=never','--git-dir',str(folder),'fetch',
              '--quiet','--no-recurse-submodules','--no-auto-maintenance','--no-write-fetch-head',
              '--depth=1']
+    if refetch:
+        # Git may otherwise decline to transfer an already-present commit even
+        # when a reachable tree/blob object is absent from a retained mirror.
+        # --refetch obtains the pinned object's entire closure again.
+        command.append('--refetch')
     if not explicit_tags:command.append('--no-tags')
     command.extend(['https://github.com/'+repo+'.git',*refs])
     last_detail='unknown git fetch failure'
@@ -515,29 +520,79 @@ def _git_has_commit(folder, commit):
         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
 
 
+def _git_tree_closure_issue(folder, commits):
+    """Prove every pinned commit's reachable trees and blobs exist.
+
+    ``cat-file -e <sha>^{commit}`` proves only the commit header: a retained
+    shallow/borrowed object store can still lack the trees needed by checkout.
+    A scoped connectivity check audits the complete object closure without
+    depending on unrelated dangling objects or fetching from the network.
+    """
+    refs = tuple(sorted(set(commits)))
+    if not refs or any(not isinstance(ref, str) or COMMIT.fullmatch(ref) is None for ref in refs):
+        raise RuntimeError('invalid pinned Git tree-closure inputs')
+    try:
+        result = subprocess.run(
+            ['git', '--git-dir', str(folder), 'fsck', '--full', '--connectivity-only',
+             '--no-reflogs', '--no-progress', '--no-dangling', *refs],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('pinned Git tree-closure verification timed out') from exc
+    if result.returncode == 0:
+        return None
+    return (result.stderr or result.stdout or ('git fsck exited '+str(result.returncode)))[-2000:]
+
+
+def _git_ensure_complete(folder, repo, commits):
+    """Repair missing objects only from the same immutable, pinned Git refs.
+
+    Never accept a commit object as proof of the corresponding source tree.
+    A failed refetch is fatal; no alternate source, static approximation or
+    non-identical revision is substituted.
+    """
+    refs = tuple(sorted(set(commits)))
+    if not REPO.fullmatch(repo) or not refs or any(COMMIT.fullmatch(ref) is None for ref in refs):
+        raise RuntimeError('invalid pinned Git mirror requirements')
+    missing = [ref for ref in refs if not _git_has_commit(folder, ref)]
+    if missing:
+        _git_fetch(folder, repo, missing)
+    issue = _git_tree_closure_issue(folder, refs)
+    if issue is not None:
+        # Repeating a normal fetch is insufficient: Git can decide the commit
+        # already exists although a nested tree or blob was lost on recovery.
+        print('[pool] incomplete pinned Git object graph; refetching exact commits: '
+              + repo, flush=True)
+        _git_fetch(folder, repo, refs, refetch=True)
+        issue = _git_tree_closure_issue(folder, refs)
+        if issue is not None:
+            raise RuntimeError('pinned Git tree/blob closure remains incomplete for '
+                               + repo + ': ' + issue)
+    for ref in refs:
+        if not _git_has_commit(folder, ref):
+            raise RuntimeError('pinned Git commit disappeared after verification: ' + repo + '@' + ref)
+
+
 def mirror_commits(root, repo, commits, *, label='git'):
     if not REPO.fullmatch(repo) or not commits or any(not COMMIT.fullmatch(x) for x in commits):
         raise RuntimeError('untrusted Git repo/commit')
     folder=root/label/(repo.replace('/','_')+'.git')
     folder.parent.mkdir(exist_ok=True)
-    # Reuse only actual pinned commits already present in the copied mirror.
-    # A stale/incomplete Git directory is never accepted as proof of a commit.
-    retained_mirror=folder.exists()
-    if retained_mirror:
+    if folder.exists() or folder.is_symlink():
         if folder.is_symlink() or not folder.is_dir():
             raise RuntimeError('unsafe retained Git mirror')
         if invoke(['git','--git-dir',folder,'rev-parse','--is-bare-repository'],capture=True).strip()!='true':
             raise RuntimeError('retained Git repository is not bare')
-        missing=[commit for commit in sorted(commits) if not _git_has_commit(folder,commit)]
     else:
         invoke(['git','init','--bare','--quiet',folder])
-        missing=sorted(commits)
-    if missing:
-        # Fetch missing pinned commits only; never follow a moving branch.
-        _git_fetch(folder,repo,missing)
-    for commit in commits:
-        if not _git_has_commit(folder,commit):
-            raise RuntimeError('Git fetch completed without pinned commit '+commit+': '+repo)
+    _git_ensure_complete(folder, repo, commits)
+    # A bare mirror fetched by raw commit SHA has no heads.  `git clone`
+    # then considers it an empty repository, despite having every Git object,
+    # and a subsequent checkout fails with "unable to read tree".  Publish
+    # verified, immutable commit refs under a private namespace so local
+    # metadata checkouts have a real advertised source graph.
+    for ref in sorted(commits):
+        name = 'refs/heads/gpttrace-pinned-' + ref
+        invoke(['git', '--git-dir', folder, 'update-ref', name, ref])
     return folder
 
 
@@ -601,12 +656,9 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
 
 def ensure_commit(stage,repo,commit,*,label='git-extra'):
     folder=stage/label/(repo.replace('/','_')+'.git')
-    if not folder.exists():return mirror_commits(stage,repo,{commit},label=label)
-    if not _git_has_commit(folder,commit):
-        _git_fetch(folder,repo,[commit])
-    if not _git_has_commit(folder,commit):
-        raise RuntimeError('Git fetch completed without pinned commit '+commit+': '+repo)
-    return folder
+    # The same full-tree requirement applies to dynamically discovered VCS
+    # dependencies; the old commit-header-only check could accept a broken CAS.
+    return mirror_commits(stage,repo,{commit},label=label)
 
 
 def vcs_reference(value):
