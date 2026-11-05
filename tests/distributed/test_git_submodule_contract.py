@@ -146,7 +146,7 @@ def test_untrusted_submodule_url_is_rejected_without_remote_access(generated_gra
     def forbidden_fetch(*args, **kwargs):
         raise AssertionError('Git must not fetch untrusted submodule origins')
     monkeypatch.setattr(pool, '_git_fetch', forbidden_fetch)
-    with pytest.raises(RuntimeError, match='untrusted pinned Git submodule'):
+    with pytest.raises(RuntimeError, match='unsupported Git submodule URL'):
         pool._git_submodule_entries(dest, changed)
 
 
