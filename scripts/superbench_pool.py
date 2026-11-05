@@ -3481,6 +3481,168 @@ def _native_pool_runtime(pool):
         return native
 
 
+class _NativePipByteProgress:
+    """One terminal line for concurrent pip transfers, with real byte denominators.
+
+    Pip's documented raw progress reports actual CURRENT and TOTAL bytes for
+    individual downloads; TOTAL=0 means the server did not supply a size.
+    Unknown future downloads make a global fetch percentage mathematically
+    unavailable. Therefore the bar is strictly for one currently observed file.
+    """
+    _line = re.compile(rb'Progress ([0-9]+) of ([0-9]+)\s*\Z')
+
+    def __init__(self, interval):
+        if type(interval) is not int or interval < 1:
+            raise RuntimeError('invalid Pip byte progress interval')
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.active = {}
+        self.transferred = 0
+        self.sample_bytes = 0
+        self.sample_time = time.monotonic()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def begin(self, identity):
+        with self.lock:
+            if identity in self.active:
+                raise RuntimeError('duplicate pip progress identity')
+            self.active[identity] = {'current': 0, 'total': 0, 'seen': False}
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._monitor, daemon=True,
+                                               name='native-pip-byte-progress')
+                self.thread.start()
+
+    def observe(self, identity, line):
+        match = self._line.fullmatch(line.strip())
+        if match is None:
+            return False
+        current, total = map(int, match.groups())
+        with self.lock:
+            state = self.active[identity]
+            previous = state['current'] if state['seen'] else 0
+            # A smaller current count starts a NEW file, not negative bytes.
+            delta = current if state['seen'] and current < previous else max(0, current - previous)
+            self.transferred += delta
+            state.update(current=current, total=total, seen=True)
+        return True
+
+    def snapshot(self):
+        """Return immutable byte counters; never invent a global total."""
+        with self.lock:
+            observed = [
+                (identity, row['current'], row['total'])
+                for identity, row in self.active.items() if row['seen']
+            ]
+            known = [item for item in observed if item[2] > 0 and item[1] <= item[2]]
+            # Show the largest currently observable transfer; no task-count weighting.
+            selected = max(known, key=lambda row: (row[2], row[1], row[0])) if known else None
+            return {'bytes': self.transferred, 'jobs': len(self.active),
+                    'observed': len(observed), 'file': selected}
+
+    def _render(self):
+        now = time.monotonic()
+        with self.lock:
+            delta_time = now - self.sample_time
+            speed = ((self.transferred - self.sample_bytes) / delta_time
+                     if delta_time > 0 else 0.0)
+            self.sample_time = now
+            self.sample_bytes = self.transferred
+        state = self.snapshot()
+        prefix = ('[pool] Pip transfers: %.1f MiB observed | %.2f MiB/s | %d pip active | '
+                  % (state['bytes'] / 1048576, speed / 1048576, state['jobs']))
+        selected = state['file']
+        if selected is None:
+            return prefix + 'resolving / download size unknown (no global percent)'
+        identity, current, total = selected
+        width = 20
+        filled = min(width, current * width // total)
+        return (prefix + '%s [%s%s] %.1f%% (%.1f/%.1f MiB, this file only)' % (
+            identity, '#' * filled, '-' * (width - filled),
+            100 * current / total, current / 1048576, total / 1048576))
+
+    def _monitor(self):
+        while not self.stop_event.wait(self.interval):
+            with self.lock:
+                running = bool(self.active)
+            if running:
+                print('\r\x1b[K' + self._render(), end='', flush=True)
+
+    def end(self, identity):
+        with self.lock:
+            if identity not in self.active:
+                raise RuntimeError('unknown pip progress identity')
+            self.active.pop(identity)
+            remaining = bool(self.active)
+        if not remaining:
+            print('\r\x1b[K' + self._render(), flush=True)
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join()
+
+
+def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
+    """Stream pip raw progress; retain only a bounded diagnostic tail on errors."""
+    import signal
+    with _NATIVE_POOL_LOCK:
+        meter = runtime.get('_pip_byte_progress')
+        if meter is None:
+            meter = _NativePipByteProgress(_conda_progress_interval())
+            runtime['_pip_byte_progress'] = meter
+    # The command is unique across concurrently executed resolver groups. Also
+    # distinguish repeated commands from different thread workers.
+    identity = hashlib.sha256(
+        ('\0'.join(command) + '\0' + str(threading.get_ident())).encode()).hexdigest()[:12]
+    meter.begin(identity)
+    tail = bytearray()
+    errors = []
+    process = None
+    try:
+        process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+
+        def consume():
+            try:
+                for line in iter(process.stdout.readline, b''):
+                    if meter.observe(identity, line):
+                        continue
+                    tail.extend(line)
+                    if len(tail) > 65536:
+                        del tail[:-65536]
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                process.stdout.close()
+
+        reader = threading.Thread(target=consume, daemon=True,
+                                  name='native-pip-output-reader')
+        reader.start()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # Kill pip AND children of its PEP 517 build environment; otherwise
+            # orphaned build subprocesses may survive the fetcher's deadline.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            reader.join()
+            raise subprocess.TimeoutExpired(command, timeout, output=bytes(tail)) from exc
+        reader.join()
+        if errors:
+            raise RuntimeError('pip output-reader failed: ' + str(errors[0])) from errors[0]
+        if process.returncode:
+            raise RuntimeError('native package command failed (exit '
+                + str(process.returncode) + '): ' + tail[-5000:].decode(errors='replace'))
+        return bytes(tail)
+    finally:
+        meter.end(identity)
+
+
 def _native_run(argv, runtime, *, timeout=7200, interpreter=None):
     """Run an actual package tool with a complete, per-invocation interpreter PATH.
 
@@ -3520,6 +3682,12 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None):
     if inherited:
         paths.append(inherited)
     environment['PATH'] = os.pathsep.join(paths)
+    # The raw pip progress protocol reports CURRENT and TOTAL in real bytes.
+    # A global task percentage is intentionally never inferred from group counts.
+    for index in range(len(command) - 2):
+        if command[index:index + 3] == ['-m', 'pip', 'install']:
+            command.insert(index + 3, '--progress-bar=raw')
+            return _native_run_pip_with_byte_progress(command, runtime, environment, timeout)
     output = subprocess.run(command, cwd=runtime['root'], env=environment,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=timeout)
@@ -3960,6 +4128,9 @@ def _native_local_metadata(pool,target,mirror,commit,commands,extras):
 def _native_close(pool):
     runtime = getattr(pool, '_native_runtime', None)
     if runtime is not None:
+        progress = runtime.get('_pip_byte_progress')
+        if progress is not None:
+            progress.close()
         runtime['context'].cleanup()
         pool._native_runtime = None
 
