@@ -1749,7 +1749,7 @@ def _git_submodule_entries(mirror, commit):
         try:
             repository = github_repository(url)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError('untrusted pinned Git submodule repository: ' + str(url)) from exc
+            raise RuntimeError('unsupported Git submodule URL: ' + str(url)) from exc
         raw = invoke(['git', '--git-dir', mirror, 'ls-tree', commit, '--', path], capture=True).strip()
         expected = re.fullmatch(r'160000 commit ([0-9a-f]{40})\t(.+)', raw)
         if expected is None or expected.group(2) != path:
@@ -4894,6 +4894,76 @@ def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cac
     _write_pip_plan(pool,target,reqs,key,packages,constraints=constraints,no_deps=no_deps)
 
 
+def _historical_exact_pip_pins(requirements, target):
+    """Extract exact active direct installs; no PyPI version substitution.
+
+    Pins from preceding successful, required recipe commands are part of the
+    task-local installed environment, even if the next requirements file names
+    the same distribution without a version.  Keep this per task and target.
+    """
+    Requirement, _SpecifierSet, _Version, _InvalidVersion, _env = _packaging_symbols()
+    markers = _target_marker_environment(target)
+    result = {}
+    for raw in sorted(set(requirements)):
+        requirement = Requirement(normalize_legacy_source_requirement(raw))
+        if requirement.url is not None:
+            continue
+        if requirement.marker is not None and not requirement.marker.evaluate(markers):
+            continue
+        specifications = tuple(requirement.specifier)
+        if (len(specifications) != 1 or specifications[0].operator != '=='
+                or '*' in specifications[0].version):
+            continue
+        name = _normalized_package_name(requirement.name)
+        exact = requirement.name + '==' + specifications[0].version
+        if name in result and result[name] != exact:
+            raise RuntimeError('conflicting exact pins within a pip recipe step: ' + name)
+        result[name] = exact
+    return result
+
+
+def _historical_pip_constraints(prior, requirements, constraints, target, *, upgrade=False):
+    """Reconstruct pinned distributions present before the next pip command.
+
+    Respect explicit newer constraints and intentional upgrades.  Never replace
+    an unavailable distribution with a different project, and never introduce
+    pins from unrelated tasks, environments or repositories.
+    """
+    Requirement, _SpecifierSet, Version, InvalidVersion, _env = _packaging_symbols()
+    current_pins = _historical_exact_pip_pins(requirements, target)
+    requested = {}
+    for raw in sorted(set(requirements)):
+        requirement = Requirement(normalize_legacy_source_requirement(raw))
+        if requirement.marker is not None and not requirement.marker.evaluate(_target_marker_environment(target)):
+            continue
+        requested[_normalized_package_name(requirement.name)] = requirement
+    explicit_constraints = {}
+    for raw in sorted(set(constraints)):
+        requirement = Requirement(normalize_legacy_source_requirement(raw))
+        if requirement.marker is not None and not requirement.marker.evaluate(_target_marker_environment(target)):
+            continue
+        explicit_constraints.setdefault(_normalized_package_name(requirement.name), []).append(requirement)
+    inherited = {}
+    for name, original in sorted(prior.items()):
+        if name in current_pins:
+            continue
+        if upgrade and name in requested:
+            continue
+        installed = Requirement(original)
+        try:
+            version = Version(next(iter(installed.specifier)).version)
+        except (InvalidVersion, ValueError, StopIteration) as exc:
+            raise RuntimeError('invalid retained pip recipe pin') from exc
+        if (name in requested and requested[name].specifier
+                and not requested[name].specifier.contains(version, prereleases=True)):
+            continue
+        if any(req.specifier and not req.specifier.contains(version, prereleases=True)
+               for req in explicit_constraints.get(name, ())):
+            continue
+        inherited[name] = original
+    return inherited
+
+
 def acquire_pip_group(pool,key,group,*,resolver_cache=None):
     """Deduplicate concurrent build/runtime closures by exact plan identity."""
     with pool._state_lock:
@@ -5671,6 +5741,10 @@ def main(argv=None):
         register(env_requirements,set(),'conda-environment-pip',
                  resolver_target=env_pip_target,bucket='environment')
 
+        # A later pip command runs in the SAME task environment as earlier
+        # required commands.  The resolver works in fresh --ignore-installed
+        # scratch prefixes, so carry exact earlier installs as constraints.
+        historical_pins = {}
         for step in steps:
             dependencies=set(step['requirements']);step_constraints=set(inline_constraints)
             step_vcs=set(step['vcs']);skip=False
@@ -5709,8 +5783,27 @@ def main(argv=None):
             if step['local_project']:
                 if not step['no_deps']:
                     dependencies.update(reqs)
+            # The actual task installs these sequentially. Resolve an identical
+            # Python target with only task-local previously pinned distributions.
+            upgrade = any(token in ('-U', '--upgrade')
+                          for token in shlex.split(step['command']))
+            inherited = _historical_pip_constraints(
+                historical_pins, dependencies, step_constraints, task_target,
+                upgrade=upgrade)
+            step_constraints.update(inherited.values())
             register(dependencies,step_constraints,step['command'],
                      no_deps=step['no_deps'],optional=step['optional'])
+            if not step['optional']:
+                # The explicit new installation overrides any previous exact
+                # pin for the same project; optional failures cannot establish
+                # installed state for subsequent required steps.
+                present = _historical_exact_pip_pins(dependencies,task_target)
+                if upgrade:
+                    names={_normalized_package_name(
+                        _packaging_symbols()[0](normalize_legacy_source_requirement(row)).name)
+                        for row in dependencies}
+                    for name in names:historical_pins.pop(name,None)
+                historical_pins.update(present)
 
         try:
             packages,upgrades=apt_recipe_operations(commands)
