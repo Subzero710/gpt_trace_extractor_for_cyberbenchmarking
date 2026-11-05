@@ -1713,25 +1713,108 @@ def github_repository(url):
     return repository
 
 
-def read_submodules(mirror, commit):
-    conf=git_file(mirror,commit,'.gitmodules')
-    if not conf:return []
-    parser=configparser.ConfigParser(interpolation=None)
-    parser.read_string(conf)
-    result=[]
+def _git_submodule_entries(mirror, commit):
+    """Read pinned gitlinks and their named HTTPS origins without executing project code.
+
+    The names are necessary to override Git's submodule transport with the
+    independently acquired, commit-verified local mirror.  Never trust
+    .gitmodules to select a network destination during metadata evaluation.
+    """
+    from pathlib import PurePosixPath
+
+    content = git_file(mirror, commit, '.gitmodules')
+    if content is None:
+        return ()
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    try:
+        parser.read_string(content)
+    except configparser.Error as exc:
+        raise RuntimeError('invalid pinned Git submodule configuration') from exc
+    entries = []
+    names, paths = set(), set()
     for section in parser.sections():
-        path=parser.get(section,'path',fallback='')
-        url=parser.get(section,'url',fallback='')
-        if not path or url.startswith(('.', 'git@')):raise RuntimeError('relative/untrusted Git submodule URL')
+        match = re.fullmatch(r'submodule "([^"\x00-\x1f\x7f]+)"', section)
+        if match is None:
+            raise RuntimeError('unsupported pinned Git submodule section')
+        name = match.group(1)
+        path = parser.get(section, 'path', fallback='')
+        url = parser.get(section, 'url', fallback='')
+        normalized = PurePosixPath(path)
+        if (not path or path.startswith('/') or '\\' in path
+                or normalized.as_posix() != path
+                or any(part in ('..', '.git') for part in normalized.parts)
+                or not normalized.parts or any(ord(c) < 32 or ord(c) == 127 for c in path)
+                or name in names or path in paths):
+            raise RuntimeError('unsafe or ambiguous pinned Git submodule path/name')
         try:
-            subrepo=github_repository(url)
-        except ValueError as exc:
-            raise RuntimeError('unsupported Git submodule URL: '+url) from exc
-        row=invoke(['git','--git-dir',mirror,'ls-tree',commit,'--',path],capture=True).strip()
-        m=re.fullmatch(r'160000 commit ([a-f0-9]{40})\t.+',row)
-        if not m:raise RuntimeError('submodule Gitlink missing: '+path)
-        result.append((path,subrepo,m.group(1)))
-    return result
+            repository = github_repository(url)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError('untrusted pinned Git submodule repository: ' + str(url)) from exc
+        raw = invoke(['git', '--git-dir', mirror, 'ls-tree', commit, '--', path], capture=True).strip()
+        expected = re.fullmatch(r'160000 commit ([0-9a-f]{40})\t(.+)', raw)
+        if expected is None or expected.group(2) != path:
+            raise RuntimeError('pinned Git submodule is not a matching gitlink: ' + path)
+        names.add(name)
+        paths.add(path)
+        entries.append((name, path, repository, expected.group(1)))
+    return tuple(sorted(entries, key=lambda entry: entry[1]))
+
+
+def read_submodules(mirror, commit):
+    """Preserve the existing public, direct-submodule tuple contract."""
+    return [(path, repo, sha) for _name, path, repo, sha
+            in _git_submodule_entries(mirror, commit)]
+
+
+def _acquire_nested_submodules(stage, gitplan):
+    """Acquire all transitive gitlinks and record their immutable identities.
+
+    Level-order traversal batches independently pinned repositories while
+    rejecting cycles, conflicts, and unbounded graphs.  No branch or implicit
+    submodule URL is followed.
+    """
+    frontier = []
+    identities = set()
+    for root, plan in sorted(gitplan.items()):
+        for path, value in sorted(plan['submodules'].items()):
+            for commit in sorted(value['commits']):
+                node = (value['repo'], commit)
+                frontier.append((root, path, node, (node,)))
+                identities.add(node)
+    if len(identities) > MAX_VCS_CLOSURE:
+        raise RuntimeError('pinned submodule graph exceeds its closure bound')
+    seen = set()
+    while frontier:
+        required = defaultdict(set)
+        following = []
+        for root, prefix, node, ancestry in frontier:
+            repo, commit = node
+            visit = (root, prefix, repo, commit)
+            if visit in seen:
+                continue
+            seen.add(visit)
+            mirror = stage / 'git-extra' / (repo.replace('/', '_') + '.git')
+            if mirror.is_symlink() or not mirror.is_dir():
+                raise RuntimeError('pinned submodule mirror is missing or unsafe: ' + repo)
+            for path, subrepo, sha in read_submodules(mirror, commit):
+                child = (subrepo, sha)
+                if child in ancestry:
+                    raise RuntimeError('cyclic pinned Git submodule graph')
+                full_path = prefix + '/' + path
+                record = gitplan[root]['submodules'].setdefault(
+                    full_path, {'repo': subrepo, 'commits': []})
+                if record['repo'] != subrepo:
+                    raise RuntimeError('nested submodule path changes repository identity: ' + full_path)
+                if sha not in record['commits']:
+                    record['commits'].append(sha)
+                identities.add(child)
+                if len(identities) > MAX_VCS_CLOSURE:
+                    raise RuntimeError('pinned submodule graph exceeds its closure bound')
+                required[subrepo].add(sha)
+                following.append((root, full_path, child, (*ancestry, child)))
+        if required:
+            _acquire_git_mirrors(stage, required, label='git-extra')
+        frontier = following
 
 
 def _sed_basic_regex_to_python(pattern):
@@ -3772,6 +3855,57 @@ def _native_project_requirements(metadata, target, extras):
     return dependencies, remote
 
 
+def _native_populate_submodules(pool, runtime, mirror, commit, checkout, ancestry=()):
+    """Reproduce complete pinned submodule worktrees using local mirrors only.
+
+    Every clone is restricted to the file transport, uses an exact checked
+    gitlink, and performs no fetch.  Recursive sources are obtained from their
+    pinned origins separately, so an arbitrary build backend cannot trigger an
+    implicit upstream checkout through pip.
+    """
+    from pathlib import Path
+    checkout = Path(checkout)
+    entries_cache = runtime.setdefault('pinned_submodule_entries', {})
+    identity = (str(mirror), commit)
+    if identity not in entries_cache:
+        entries_cache[identity] = _git_submodule_entries(mirror, commit)
+    verified_mirrors = runtime.setdefault('pinned_submodule_mirrors', {})
+    git_runtime = {**runtime, 'env': {**runtime['env'], 'GIT_ALLOW_PROTOCOL': 'file'}}
+    for name, path, repo, sha in entries_cache[identity]:
+        node = (repo, sha)
+        if node in ancestry or len(ancestry) >= MAX_VCS_CLOSURE:
+            raise RuntimeError('cyclic or unbounded pinned Git submodule checkout')
+        relative = Path(path)
+        destination = checkout / relative
+        if not destination.resolve().is_relative_to(checkout.resolve()):
+            raise RuntimeError('pinned submodule escapes its checkout')
+        for parent in (checkout, *(checkout.joinpath(*relative.parts[:i])
+                                   for i in range(1, len(relative.parts) + 1))):
+            if parent.is_symlink():
+                raise RuntimeError('pinned submodule path traverses a symlink')
+        if node not in verified_mirrors:
+            verified_mirrors[node] = mirror_commits(pool.stage, repo, {sha}, label='git-extra')
+        source = verified_mirrors[node]
+        # Initialize private worktree configuration so `git submodule status`
+        # recognizes the checkout as initialized, not merely present on disk.
+        # The override never modifies the authenticated upstream .gitmodules.
+        _native_run(['git', '-C', checkout, 'config', '--local',
+                     'submodule.' + name + '.url', str(source)], git_runtime)
+        _native_run(['git', '-C', checkout, 'config', '--local',
+                     'submodule.' + name + '.update', 'checkout'], git_runtime)
+        # -c takes precedence even if the child clone has unexpected config.
+        # GIT_ALLOW_PROTOCOL=file blocks every network transport in child Git.
+        _native_run([
+            'git', '-c', 'submodule.' + name + '.url=' + str(source),
+            '-c', 'submodule.' + name + '.update=checkout',
+            '-C', checkout, 'submodule', 'update', '--init', '--no-fetch',
+            '--', path,
+        ], git_runtime)
+        actual = _native_run(['git', '-C', destination, 'rev-parse', 'HEAD'], git_runtime).decode().strip()
+        if actual != sha:
+            raise RuntimeError('materialized Git submodule differs from pinned gitlink: ' + path)
+        _native_populate_submodules(pool, runtime, source, sha, destination, (*ancestry, node))
+
 def _native_local_metadata(pool,target,mirror,commit,commands,extras):
     """Run the pinned local project's real build backend for metadata only.
 
@@ -3795,6 +3929,7 @@ def _native_local_metadata(pool,target,mirror,commit,commands,extras):
     checkout.parent.mkdir(exist_ok=True)
     _native_run(['git','clone','--quiet','--shared','--no-checkout',str(mirror),str(checkout)],runtime)
     _native_run(['git','-C',str(checkout),'checkout','--quiet','--detach',commit],runtime)
+    _native_populate_submodules(pool, runtime, mirror, commit, checkout)
     from pathlib import Path
     for entry in checkout.rglob('*'):
         if (not entry.is_file() or entry.is_symlink() or entry.stat().st_size>12*1024*1024
@@ -5391,6 +5526,7 @@ def main(argv=None):
                 if sha not in previous['commits']:previous['commits'].append(sha)
                 submodule_commits[subrepo].add(sha)
     _acquire_git_mirrors(stage,submodule_commits,label='git-extra')
+    _acquire_nested_submodules(stage, gitplan)
     # Git files must not be linked to CAS while Git may still mutate refs.
     envplan={};requirements_by_env=defaultdict(set);vcs=set()
     vcs_by_env=defaultdict(set);environment_pip_target={}
