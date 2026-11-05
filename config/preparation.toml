@@ -21,8 +21,12 @@ service_port = 3128
 timeout_seconds = 180
 job_timeout_hours = 24
 workers = 8
-# Reporting cadence for real Conda transfer counters (seconds).
+# Reporting cadence for real Conda/Pip transfer counters (seconds).
 progress_interval_seconds = 5
+# Pip solver budget per closure, including metadata/build hooks.
+# A stalled worker must not monopolize acquisition for hours.
+pip_total_timeout_seconds = 900
+pip_stall_timeout_seconds = 120
 
 [bootstrap]
 miniconda_archive = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"

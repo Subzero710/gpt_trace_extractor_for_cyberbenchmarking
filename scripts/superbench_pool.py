@@ -2384,9 +2384,22 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
         raise RuntimeError('unidentified interrupted dependency pool')
     # Check all paths before copying, including files we do not plan to reuse.
     # A mount/symlink/device may not redirect the trusted downloader elsewhere.
-    for path in old.rglob('*'):
-        if path.is_symlink() or path.is_mount() or not (path.is_dir() or path.is_file()):
-            raise RuntimeError('unsafe retained dependency entry: '+str(path))
+    for directory, subdirs, files in os.walk(old, topdown=True, followlinks=False):
+        parent = Path(directory)
+        for name in list(subdirs):
+            path = parent / name
+            # Disposable native build scratch is never salvaged. An aborted
+            # worker may leave symlinks inside its isolated Conda environment;
+            # examining those unrelated paths would incorrectly reject the CAS.
+            if parent == old and name.startswith('.native-pip-') and path.is_dir() and not path.is_symlink():
+                subdirs.remove(name)
+                continue
+            if path.is_symlink() or path.is_mount() or not path.is_dir():
+                raise RuntimeError('unsafe retained dependency entry: ' + str(path))
+        for name in files:
+            path = parent / name
+            if path.is_symlink() or path.is_mount() or not path.is_file():
+                raise RuntimeError('unsafe retained dependency entry: ' + str(path))
     old_cas=old/'objects'/'sha256'
     good={}
     count=0
@@ -2429,6 +2442,25 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
                 finally:os.close(descriptor)
                 conda_recovered+=1
             good[(raw.stat().st_dev,raw.stat().st_ino)]=(sha,target)
+    # pip's HTTP response cache is not a source of trusted dependency identities.
+    # It is only a performance hint: pip revalidates HTTP caching headers, and
+    # final artifacts still require SHA-256 from the native PyPI report. Copy
+    # rather than hardlink because the new pip worker can update cache entries.
+    old_cache = old / 'pip-http-cache'
+    if old_cache.is_dir():
+        new_cache = new / 'pip-http-cache'
+        for candidate in sorted(old_cache.rglob('*')):
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file() or candidate.is_symlink():
+                raise RuntimeError('unsafe persisted native pip cache entry')
+            destination = new_cache / candidate.relative_to(old_cache)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            before = digest(candidate)
+            shutil.copyfile(candidate, destination)
+            if digest(candidate) != before or digest(destination) != before:
+                raise RuntimeError('native pip cache changed during verified recovery')
+        print('[pool] restored native pip HTTP response cache', flush=True)
     # Git refs/packed objects can be mutated by a later fetch: COPY them, never
     # hardlink mutable Git objects to the failed stage.
     for kind in ('git','git-extra'):
@@ -3442,6 +3474,24 @@ def _resolver_runtime_identity():
     return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3]))}
 
 
+@functools.lru_cache(maxsize=1)
+def _native_pip_timeouts():
+    """Read operational deadlines from the staged, versioned preparation policy."""
+    path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing staged native pip timeout policy')
+    with path.open('rb') as stream:
+        policy = tomllib.load(stream).get('acquisition')
+    if not isinstance(policy, dict):
+        raise RuntimeError('invalid native pip acquisition controls')
+    total = policy.get('pip_total_timeout_seconds')
+    stall = policy.get('pip_stall_timeout_seconds')
+    if (type(total) is not int or total < 1 or type(stall) is not int
+            or stall < 1 or stall >= total):
+        raise RuntimeError('invalid native pip total/stall timeout controls')
+    return total, stall
+
+
 # Native pip is responsible for PyPI resolution; the surrounding pipeline still
 # owns immutable source selection, SHA-256 CAS, manifests and task provenance.
 _NATIVE_POOL_LOCK = threading.RLock()
@@ -3459,6 +3509,13 @@ def _native_pool_runtime(pool):
         root = Path(temporary.name)
         home = root / 'home'
         home.mkdir(mode=0o700)
+        # CacheControl's HTTP response cache is disposable, but must survive
+        # interrupted acquisition attempts. Its contents are never published as
+        # dependency artifacts: successful installs still require PyPI SHA-256.
+        pip_cache = pool.stage / 'pip-http-cache'
+        if pip_cache.is_symlink() or (pip_cache.exists() and not pip_cache.is_dir()):
+            raise RuntimeError('unsafe persistent native pip HTTP cache')
+        pip_cache.mkdir(mode=0o700, exist_ok=True)
         npm_configs = {name: root / ('npm-' + name + '.conf') for name in ('user', 'global')}
         for path in npm_configs.values():
             write_new(path, b'')
@@ -3468,7 +3525,7 @@ def _native_pool_runtime(pool):
             'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
             'PIP_CONFIG_FILE': '/dev/null', 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
             'PIP_NO_INPUT': '1', 'PIP_INDEX_URL': 'https://pypi.org/simple',
-            'PIP_CACHE_DIR': str(root / 'pip-cache'),
+            'PIP_CACHE_DIR': str(pip_cache),
             'CONDARC': '/dev/null', 'CONDA_PKGS_DIRS': str(root / 'conda-pkgs'),
             'CONDA_ENVS_DIRS': str(root / 'envs'),
             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
@@ -3479,6 +3536,86 @@ def _native_pool_runtime(pool):
                   'prefixes': {}, 'bootstrapped': False}
         pool._native_runtime = native
         return native
+
+
+def _native_seed_wheelhouse(pool, runtime):
+    """Expose only SHA-verified wheels from successful previous pip plans.
+
+    Native pip still chooses its own candidates from PyPI and --find-links;
+    this is an exact local copy of a previously authenticated artifact, not
+    a substituted version or an invented source URL.
+    """
+    with _NATIVE_POOL_LOCK:
+        folder = runtime['root'] / 'wheelhouse'
+        folder.mkdir(exist_ok=True)
+        seen = runtime.setdefault('wheelhouse_indexed_plans', set())
+        indexed = runtime.setdefault('wheelhouse_records', {})
+        for checkpoint in sorted((pool.stage / 'metadata').glob('pip-plan-*.json')):
+            if checkpoint.is_symlink() or not checkpoint.is_file():
+                raise RuntimeError('unsafe native wheelhouse checkpoint path')
+            if checkpoint.name in seen:
+                continue
+            key = checkpoint.name[len('pip-plan-'):-len('.json')]
+            plan = json.loads(checkpoint.read_bytes())
+            if plan.get('optional_failed'):
+                seen.add(checkpoint.name)
+                continue
+            # This validates the checkpoint tree, solver identity, and every
+            # pinned source/artifact record before any wheel is offered to pip.
+            records = _read_pip_plan_tree(pool.stage, key)
+            for record in records.values():
+                for artifact in record['packages']:
+                    if artifact['kind'] != 'wheel':
+                        continue
+                    filename, sha, url = (artifact.get('filename'), artifact.get('sha256'),
+                                          artifact.get('url'))
+                    if (not isinstance(filename, str) or Path(filename).name != filename
+                            or not filename.endswith('.whl') or not SHA.fullmatch(str(sha))
+                            or not isinstance(url, str)):
+                        raise RuntimeError('invalid reusable native pip wheel')
+                    origin = urllib.parse.urlsplit(url)
+                    if (origin.scheme != 'https' or origin.hostname != 'files.pythonhosted.org'
+                            or origin.username or origin.password or origin.fragment
+                            or urllib.parse.unquote(origin.path.rsplit('/', 1)[-1]) != filename):
+                        raise RuntimeError('untrusted reusable native pip wheel URL')
+                    pool.verify_object(sha)
+                    identity = (sha, url, bool(artifact.get('yanked', False)))
+                    prior = indexed.get(filename)
+                    if prior is not None and prior[:2] != identity[:2]:
+                        raise RuntimeError('ambiguous same-name native pip wheel artifact: ' + filename)
+                    indexed[filename] = (sha, url, bool(identity[2] or (prior[2] if prior else False)))
+                    destination = folder / filename
+                    source = pool.objects / sha[:2] / sha
+                    if not destination.exists():
+                        os.link(source, destination)
+                    elif destination.is_symlink() or not destination.samefile(source):
+                        raise RuntimeError('native pip wheelhouse file changed')
+            seen.add(checkpoint.name)
+        return folder
+
+
+def _native_report_origin(pool, runtime, reported_url, sha):
+    """Normalize an authenticated PyPI HTTPS URL or a verified local wheel."""
+    parsed = urllib.parse.urlsplit(reported_url)
+    if parsed.scheme == 'https' and parsed.hostname == 'files.pythonhosted.org':
+        if parsed.username or parsed.password or parsed.fragment:
+            raise RuntimeError('native pip reported an unsafe PyPI artifact URL')
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                                       parsed.query, '')), False
+    if parsed.scheme != 'file' or parsed.netloc or parsed.query or parsed.fragment:
+        raise RuntimeError('native pip plan has unpinned/non-PyPI artifact: ' + reported_url)
+    path = Path(urllib.parse.unquote(parsed.path))
+    wheelhouse = runtime['root'] / 'wheelhouse'
+    if path.parent != wheelhouse or path.is_symlink() or not path.is_file():
+        raise RuntimeError('native pip selected an untrusted local distribution')
+    expected = runtime.get('wheelhouse_records', {}).get(path.name)
+    if expected is None or expected[0] != sha:
+        raise RuntimeError('native pip local wheel lacks exact verified PyPI identity')
+    source = pool.objects / sha[:2] / sha
+    if not path.samefile(source):
+        raise RuntimeError('native pip local wheel differs from SHA-verified CAS object')
+    pool.verify_object(sha)
+    return expected[1], expected[2]
 
 
 class _NativePipByteProgress:
@@ -3584,20 +3721,30 @@ class _NativePipByteProgress:
 
 
 def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
-    """Stream pip raw progress; retain only a bounded diagnostic tail on errors."""
+    """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
+
+    A per-command total deadline prevents unbounded backtracking. An independent
+    no-observed-activity deadline prevents a worker from holding a slot through
+    silent network stalls. Both are configured, never inferred from task counts.
+    Only a small diagnostic tail is retained for failures.
+    """
     import signal
+    total_limit, stall_limit = _native_pip_timeouts()
+    total_limit = min(timeout, total_limit)
     with _NATIVE_POOL_LOCK:
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
             meter = _NativePipByteProgress(_conda_progress_interval())
             runtime['_pip_byte_progress'] = meter
-    # The command is unique across concurrently executed resolver groups. Also
-    # distinguish repeated commands from different thread workers.
     identity = hashlib.sha256(
         ('\0'.join(command) + '\0' + str(threading.get_ident())).encode()).hexdigest()[:12]
     meter.begin(identity)
     tail = bytearray()
     errors = []
+    activity_lock = threading.Lock()
+    started = time.monotonic()
+    last_activity = [started]
+    last_progress = [None]
     process = None
     try:
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
@@ -3607,7 +3754,16 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
         def consume():
             try:
                 for line in iter(process.stdout.readline, b''):
-                    if meter.observe(identity, line):
+                    is_progress = meter.observe(identity, line)
+                    with activity_lock:
+                        if is_progress:
+                            # Repeated identical byte counters are not progress.
+                            if last_progress[0] != line:
+                                last_progress[0] = line
+                                last_activity[0] = time.monotonic()
+                        elif line.strip():
+                            last_activity[0] = time.monotonic()
+                    if is_progress:
                         continue
                     tail.extend(line)
                     if len(tail) > 65536:
@@ -3620,18 +3776,39 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
         reader = threading.Thread(target=consume, daemon=True,
                                   name='native-pip-output-reader')
         reader.start()
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            # Kill pip AND children of its PEP 517 build environment; otherwise
-            # orphaned build subprocesses may survive the fetcher's deadline.
+        timed_out = None
+        while process.poll() is None:
+            now = time.monotonic()
+            with activity_lock:
+                idle = now - last_activity[0]
+            elapsed = now - started
+            if elapsed >= total_limit:
+                timed_out = ('total', total_limit)
+                break
+            if idle >= stall_limit:
+                timed_out = ('stall', stall_limit)
+                break
+            # Poll at the same versioned cadence as the progress display.
+            remaining = min(total_limit - elapsed, stall_limit - idle,
+                            _conda_progress_interval())
+            try:
+                process.wait(timeout=max(0.001, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+        if timed_out is not None:
+            # Kill the entire PEP 517 subprocess group, including nested hooks.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait()
             reader.join()
-            raise subprocess.TimeoutExpired(command, timeout, output=bytes(tail)) from exc
+            kind, limit = timed_out
+            if kind == 'stall':
+                diagnostic = tail[-5000:].decode(errors='replace')
+                raise RuntimeError('native pip emitted no new output/download bytes for '
+                                   + str(limit) + ' seconds; last output: ' + diagnostic)
+            raise subprocess.TimeoutExpired(command, limit, output=bytes(tail))
         reader.join()
         if errors:
             raise RuntimeError('pip output-reader failed: ' + str(errors[0])) from errors[0]
@@ -3839,7 +4016,9 @@ def _native_acquired_archive(pool,runtime,url,sha,category,key):
         return pool.reference(sha,category,key,already.stat().st_size)
     with _NATIVE_POOL_LOCK:
         index=runtime.setdefault('http_content_index',{})
-        cache_root=runtime['root']/'pip-cache'
+        cache_root=Path(runtime['env']['PIP_CACHE_DIR'])
+        if cache_root.is_symlink() or not cache_root.is_dir():
+            raise RuntimeError('unsafe native pip HTTP cache')
         for body in cache_root.rglob('*.body'):
             if body.is_symlink() or not body.is_file():
                 raise RuntimeError('unsafe pip HTTP cache body')
@@ -3917,8 +4096,12 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
             raise RuntimeError('golden target has no verified wheel platform')
         for platform_tag in platforms:
             argv.extend(['--platform', platform_tag])
-    argv.extend(['--dry-run', '--ignore-installed', '--report', report,
-                 '--requirement', requirements, '--constraint', constraints_file])
+    # Link prior SHA-verified PyPI wheels into a private local candidate index.
+    # Native pip still selects the compatible version and validates metadata.
+    wheelhouse = _native_seed_wheelhouse(pool, runtime)
+    argv.extend(['--dry-run', '--ignore-installed', '--find-links', wheelhouse,
+                 '--report', report, '--requirement', requirements,
+                 '--constraint', constraints_file])
     if no_deps:
         argv.append('--no-deps')
     # Each closure has its own report directory. Pip's HTTP cache is
@@ -3935,19 +4118,17 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
         origin = download.get('url')
         if not isinstance(origin, str):
             raise RuntimeError('native pip plan has no artifact URL')
-        parsed = urllib.parse.urlsplit(origin)
-        if parsed.scheme != 'https' or parsed.hostname != 'files.pythonhosted.org':
-            raise RuntimeError('native pip plan has unpinned/non-PyPI artifact: '+origin)
-        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ''))
-        filename = urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1])
-        if (not filename or Path(filename).name != filename or
-                not filename.endswith(('.whl', '.tar.gz', '.zip', '.tar.bz2'))):
-            raise RuntimeError('native pip plan has an invalid artifact filename')
         archive_info = download.get('archive_info') or {}
         hashes = archive_info.get('hashes') or {}
         sha = hashes.get('sha256')
         if not isinstance(sha, str) or not SHA.fullmatch(sha):
-            raise RuntimeError('native pip plan lacks authoritative SHA-256 for '+filename)
+            raise RuntimeError('native pip plan lacks an authoritative SHA-256')
+        url, cached_yanked = _native_report_origin(pool, runtime, origin, sha)
+        parsed = urllib.parse.urlsplit(url)
+        filename = urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1])
+        if (not filename or Path(filename).name != filename or
+                not filename.endswith(('.whl', '.tar.gz', '.zip', '.tar.bz2'))):
+            raise RuntimeError('native pip plan has an invalid artifact filename')
         name = metadata.get('name')
         version = metadata.get('version')
         if not isinstance(name, str) or not isinstance(version, str):
@@ -3971,7 +4152,7 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
             'name': name, 'version': version, 'filename': filename,
             'url': url, 'sha256': sha, 'requirements': sorted(set(requirements_rows)),
             'provides_extra': sorted(set(metadata.get('provides_extra') or [])),
-            'yanked': bool(installed.get('is_yanked', False)),
+            'yanked': bool(installed.get('is_yanked', False) or cached_yanked),
             'yanked_reason': None,
             **({'build_requirements': build_requirements} if not wheel else {})})
     plan = {'target': target.as_dict(), 'requested': sorted(set(reqs)),
@@ -4133,6 +4314,13 @@ def _native_close(pool):
             progress.close()
         runtime['context'].cleanup()
         pool._native_runtime = None
+    # Only the successful acquisition path calls _native_close. Do not carry
+    # disposable pip response-cache bytes into published dependency inventory.
+    cache = pool.stage / 'pip-http-cache'
+    if cache.is_symlink():
+        raise RuntimeError('unsafe native pip cache cleanup path')
+    if cache.is_dir():
+        shutil.rmtree(cache)
 
 def _validate_pip_plan_graph(plan):
     """Independently check the complete recorded graph before checkpoint/reuse."""
@@ -5197,8 +5385,11 @@ def _native_pip_group_locked(pool,key,group):
             group['constraints'],key,no_deps=group['no_deps'])
         build_plans = _native_acquire_build_dependencies(pool,target,packages)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        detail = str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired) and exc.output:
+            detail += '; last pip output: ' + exc.output[-5000:].decode(errors='replace')
         if group['required']:
-            raise RuntimeError('required native pip closure '+key+' failed: '+str(exc)) from exc
+            raise RuntimeError('required native pip closure '+key+' failed: '+detail) from exc
         write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
             'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
             'target':target.as_dict(),'python':target.python_full_version,
