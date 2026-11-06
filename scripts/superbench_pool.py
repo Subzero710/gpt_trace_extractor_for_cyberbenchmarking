@@ -118,27 +118,206 @@ def digest(path):
         os.close(fd)
 
 
+# A single progress owner prevents background workers and command logs from
+# competing for the same terminal. All counters describe completed, observed
+# work; we intentionally do not claim a global time/work percentage.
+_POOL_PROGRESS = None
+
+
+class _PoolProgress:
+    """Compact real-work progress for interactive and durable non-TTY logs.
+
+    TTY output is redrawn in place. A broker-owned append-only log receives
+    only stage changes, meaningful count milestones and material byte progress.
+    No timer generates an unchanged log record.
+    """
+    def __init__(self, stream=None, *, tty=None, interval=None):
+        self.stream = sys.stdout if stream is None else stream
+        self.tty = self.stream.isatty() if tty is None else tty
+        self.interval = _conda_progress_interval() if interval is None else interval
+        self.lock = threading.RLock()
+        self.stage = 'Preparation'
+        self.completed = None
+        self.total = None
+        self.unit = ''
+        self.details = ''
+        self.network_bytes = 0
+        self.transfers = {}
+        self.pip_bytes = 0
+        self.pip_active = 0
+        self.pip_file = None
+        self.last_time = time.monotonic()
+        self.last_bytes = 0
+        self.speed = 0.0
+        self.last_emit = 0.0
+        self.last_stage = None
+        self.last_count_bucket = None
+        self.last_report_bytes = 0
+        self.last_output = ''
+
+    @staticmethod
+    def _count_bucket(completed, total):
+        if completed is None or total is None or total == 0:
+            return None
+        # At most ten non-TTY records per known set, irrespective of its size.
+        return min(10, completed * 10 // total)
+
+    def _render(self):
+        message = '[pool] ' + self.stage
+        if self.completed is not None and self.total is not None:
+            message += ' %s/%s %s' % (self.completed, self.total, self.unit)
+        elif self.completed is not None:
+            message += ' %s %s' % (self.completed, self.unit)
+        if self.details:
+            message += ' | ' + self.details
+        observed = self.network_bytes + self.pip_bytes
+        if observed or self.transfers or self.pip_active:
+            message += ' | %.1f MiB reçus | %.2f MiB/s' % (
+                observed / 1048576, self.speed / 1048576)
+        if self.pip_active:
+            message += ' | %s pip actifs' % self.pip_active
+        known = [row for row in self.transfers.values()
+                 if row['total'] > 0 and row['current'] <= row['total']]
+        if self.pip_file is not None:
+            key, current, total = self.pip_file
+            if total > 0 and current <= total:
+                known.append({'name': 'pip-' + key, 'current': current, 'total': total})
+        if known:
+            selected = max(known, key=lambda row: (row['total'], row['current']))
+            current, total = selected['current'], selected['total']
+            filled = min(16, current * 16 // total)
+            message += ' | [%s%s] %.1f%% du fichier (%.1f/%.1f MiB)' % (
+                '#' * filled, '-' * (16 - filled), 100 * current / total,
+                current / 1048576, total / 1048576)
+        return message
+
+    def _emit(self, *, force=False, changed_stage=False):
+        now = time.monotonic()
+        total_bytes = self.network_bytes + self.pip_bytes
+        elapsed = now - self.last_time
+        if elapsed >= self.interval or force:
+            self.speed = max(0, total_bytes - self.last_bytes) / max(elapsed, 1e-6)
+            self.last_bytes = total_bytes
+            self.last_time = now
+        rendered = self._render()
+        if self.tty:
+            if not force and now - self.last_emit < 0.2:
+                return
+            self.stream.write('\r\x1b[K' + rendered)
+            if force:
+                self.stream.write('\n')
+            self.stream.flush()
+        else:
+            bucket = self._count_bucket(self.completed, self.total)
+            material_bytes = (total_bytes - self.last_report_bytes >= 64 * 1048576
+                              and now - self.last_emit >= self.interval)
+            milestone = (bucket is not None and bucket != self.last_count_bucket)
+            if not (force or changed_stage or milestone or material_bytes):
+                return
+            if rendered != self.last_output:
+                self.stream.write(rendered + '\n')
+                self.stream.flush()
+                self.last_output = rendered
+            self.last_count_bucket = bucket
+            self.last_report_bytes = total_bytes
+        self.last_emit = now
+
+    def update(self, stage, completed=None, total=None, unit='', details='', *, force=False):
+        if total is not None and (type(total) is not int or total < 0):
+            raise ValueError('invalid stage total')
+        if completed is not None and (type(completed) is not int or completed < 0):
+            raise ValueError('invalid stage progress')
+        with self.lock:
+            changed = stage != self.stage
+            if changed and self.tty and self.last_stage is not None:
+                self.stream.write('\n')
+            if changed:
+                self.last_count_bucket = None
+            self.stage = stage
+            self.completed, self.total = completed, total
+            self.unit, self.details = unit, details
+            self._emit(force=force, changed_stage=changed)
+            self.last_stage = stage
+
+    def network_start(self, key, label, total):
+        with self.lock:
+            if key in self.transfers:
+                raise RuntimeError('duplicate transfer identity')
+            self.transfers[key] = {'name': label, 'current': 0, 'total': total}
+            self._emit()
+
+    def network_advance(self, key, amount):
+        with self.lock:
+            self.transfers[key]['current'] += amount
+            self.network_bytes += amount
+            self._emit()
+
+    def network_end(self, key):
+        with self.lock:
+            self.transfers.pop(key)
+            self._emit()
+
+    def pip_update(self, snapshot):
+        with self.lock:
+            self.pip_bytes = snapshot['bytes']
+            self.pip_active = snapshot['jobs']
+            self.pip_file = snapshot['file']
+            self._emit()
+
+    def finish(self):
+        with self.lock:
+            self._emit(force=True)
+
+
+def _pool_progress(stage, completed=None, total=None, unit='', details='', *, force=False):
+    if _POOL_PROGRESS is not None:
+        _POOL_PROGRESS.update(stage, completed, total, unit, details, force=force)
+
+
 def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
     command = [str(v) for v in argv]
-    print('[pool]', ' '.join(command), flush=True)
-    try:
-        result = subprocess.run(command, cwd=cwd, env=env, check=True,
-                                text=True, stdout=subprocess.PIPE if capture else None, timeout=timeout)
-    except subprocess.CalledProcessError as exc:
-        # Captured stdout is otherwise lost from the durable preparation log.
-        # Some dependency tools report structured failure diagnostics there.
-        if capture and exc.stdout:
-            output = exc.stdout if len(exc.stdout) <= 65536 else exc.stdout[-65536:]
-            if len(output) != len(exc.stdout):
-                print('[pool] failed command stdout truncated to final 65536 characters',
-                      file=sys.stderr, flush=True)
-            print('[pool] failed command captured stdout:', file=sys.stderr, flush=True)
-            sys.stderr.write(output)
-            if not output.endswith('\n'):
-                sys.stderr.write('\n')
-            sys.stderr.flush()
-        raise
-    return result.stdout if capture else None
+    if _POOL_PROGRESS is None:
+        print('[pool]', ' '.join(command), flush=True)
+        try:
+            result = subprocess.run(command, cwd=cwd, env=env, check=True,
+                                    text=True, stdout=subprocess.PIPE if capture else None,
+                                    timeout=timeout)
+        except subprocess.CalledProcessError as exc:
+            if capture and exc.stdout:
+                output = exc.stdout[-65536:]
+                print('[pool] failed command captured stdout:', file=sys.stderr, flush=True)
+                sys.stderr.write(output + ('' if output.endswith('\n') else '\n'))
+                sys.stderr.flush()
+            raise
+        return result.stdout if capture else None
+
+    # A disk-backed command log means git/apt/npm output cannot bury
+    # useful progress. On errors only, retain the diagnostic tail.
+    with tempfile.TemporaryFile(mode='w+b') as log:
+        try:
+            result = subprocess.run(command, cwd=cwd, env=env, check=False,
+                                    stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            log.seek(max(0, log.tell() - 8192))
+            detail = log.read().decode(errors='replace')
+            print('[pool] command timeout: ' + ' '.join(command) + '\n' + detail,
+                  file=sys.stderr, flush=True)
+            if capture:
+                log.seek(0)
+                raise subprocess.TimeoutExpired(exc.cmd,exc.timeout,output=log.read().decode(errors='replace')) from exc
+            raise
+        if result.returncode != 0:
+            log.seek(max(0, log.tell() - 8192))
+            detail = log.read().decode(errors='replace')
+            print('[pool] command failed: ' + ' '.join(command) + '\n' + detail,
+                  file=sys.stderr, flush=True)
+            log.seek(0)
+            raise subprocess.CalledProcessError(result.returncode, command,
+                                                output=log.read().decode(errors='replace') if capture else None)
+        if capture:
+            log.seek(0)
+            return log.read().decode('utf-8')
+    return None
 
 
 def write_new(path, data):
@@ -414,15 +593,24 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
             h=hashlib.sha256(); size=0
             other_hashes={algorithm:hashlib.new(algorithm) for algorithm in ('sha384','sha512')} if integrity_digests is not None else {}
             checks=[(hashlib.new(algo),expected) for algo,expected in (sri_parts(sri) or ())]
-            with path.open('xb') as stream:
-                for block in iter(lambda:response.read(1048576),b''):
-                    size+=len(block)
-                    if size>limit: raise RuntimeError('download exceeds limit; partial retained')
-                    stream.write(block); h.update(block)
-                    if on_block is not None: on_block(len(block))
-                    for other in other_hashes.values(): other.update(block)
-                    for sri_hash,_ in checks: sri_hash.update(block)
-                stream.flush(); os.fsync(stream.fileno())
+            view = _POOL_PROGRESS
+            transfer_key = object()
+            declared = response.headers.get('Content-Length', '')
+            if view is not None:
+                view.network_start(transfer_key, path.name, int(declared) if declared.isdigit() else 0)
+            try:
+                with path.open('xb') as stream:
+                    for block in iter(lambda:response.read(1048576),b''):
+                        size+=len(block)
+                        if size>limit: raise RuntimeError('download exceeds limit; partial retained')
+                        stream.write(block); h.update(block)
+                        if on_block is not None: on_block(len(block))
+                        if view is not None: view.network_advance(transfer_key,len(block))
+                        for other in other_hashes.values(): other.update(block)
+                        for sri_hash,_ in checks: sri_hash.update(block)
+                    stream.flush(); os.fsync(stream.fileno())
+            finally:
+                if view is not None: view.network_end(transfer_key)
         length=response.headers.get('Content-Length','')
         if length.isdigit() and size!=int(length):
             raise MetadataDecodeError('truncated HTTPS artifact response')
@@ -634,7 +822,11 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
     # Git fetch performs pack inflation/indexing and filesystem writes, unlike the
     # metadata-only HTTP resolver. Bound Git concurrency by actual CPU capacity.
     workers=min(_acquisition_workers(),cpu_capacity,len(ordered))
-    print(f'[pool] {label} mirrors: {len(ordered)} repositories with {workers} workers',flush=True)
+    phase = 'Git mirrors: ' + label
+    if _POOL_PROGRESS is not None:
+        _pool_progress(phase,0,len(ordered),'repositories',f'{workers} workers')
+    else:
+        print(f'[pool] {label} mirrors: {len(ordered)} repositories with {workers} workers',flush=True)
     def acquire(repo,commits):
         mirror=mirror_commits(stage,repo,set(commits),label=label)
         refs=ensure_version_refs(mirror,repo,commits) if freeze_version_refs else {}
@@ -647,6 +839,7 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
             for future in concurrent.futures.as_completed(futures):
                 repo,mirror,version_refs=future.result()
                 results[repo]=mirror;refs[repo]=version_refs
+                _pool_progress(phase,len(results),len(ordered),'repositories',f'{workers} workers')
         except BaseException:
             for future in futures:future.cancel()
             raise
@@ -2694,11 +2887,15 @@ class _CondaTransferProgress:
             if not force and elapsed<self.interval:return
             rate=(self.network_bytes-self.last_bytes)/elapsed if elapsed>0 else 0
             total_rate=self.network_bytes/(now-self.started) if now>self.started else 0
-            print(f'[pool] Conda progress: {self.completed}/{self.total} verified, '
-                  f'{self.failed} failed, {self.active} active, '
-                  f'{self.network_bytes/1048576:.1f} MiB transferred, '
-                  f'{rate/1048576:.2f} MiB/s interval, '
-                  f'{total_rate/1048576:.2f} MiB/s average',flush=True)
+            if _POOL_PROGRESS is not None:
+                _pool_progress('Conda archives',self.completed,self.total,'verified',
+                               f'{self.failed} failed, {self.active} active')
+            else:
+                print(f'[pool] Conda progress: {self.completed}/{self.total} verified, '
+                      f'{self.failed} failed, {self.active} active, '
+                      f'{self.network_bytes/1048576:.1f} MiB transferred, '
+                      f'{rate/1048576:.2f} MiB/s interval, '
+                      f'{total_rate/1048576:.2f} MiB/s average',flush=True)
             self.last_time=now
             self.last_bytes=self.network_bytes
 
@@ -3703,7 +3900,10 @@ class _NativePipByteProgress:
             with self.lock:
                 running = bool(self.active)
             if running:
-                print('\r\x1b[K' + self._render(), end='', flush=True)
+                if _POOL_PROGRESS is not None:
+                    _POOL_PROGRESS.pip_update(self.snapshot())
+                else:
+                    print('\r\x1b[K' + self._render(), end='', flush=True)
 
     def end(self, identity):
         with self.lock:
@@ -3712,7 +3912,10 @@ class _NativePipByteProgress:
             self.active.pop(identity)
             remaining = bool(self.active)
         if not remaining:
-            print('\r\x1b[K' + self._render(), flush=True)
+            if _POOL_PROGRESS is not None:
+                _POOL_PROGRESS.pip_update(self.snapshot())
+            else:
+                print('\r\x1b[K' + self._render(), flush=True)
 
     def close(self):
         self.stop_event.set()
@@ -5074,7 +5277,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 # Logging every backtracking decision can itself become hundreds
                 # of thousands of small writes. Powers of two retain bounded
                 # progress visibility regardless of search size.
-                if stats['decisions'] & (stats['decisions']-1) == 0:
+                if _POOL_PROGRESS is None and stats['decisions'] & (stats['decisions']-1) == 0:
                     print(f"[pool] resolver {key}: decision {stats['decisions']} "
                           f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
                           f"selected={len(selected)}",flush=True)
@@ -5131,7 +5334,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
                            +(detail or 'root constraints conflict')+'; '+summary)
     solved=[result[name] for name in sorted(result)]
-    print(f"[pool] resolver {key}: solved {len(solved)} packages; "
+    if _POOL_PROGRESS is None: print(f"[pool] resolver {key}: solved {len(solved)} packages; "
           f"decisions={stats['decisions']} propagations={stats['propagations']} "
           f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
           f"learned_skips={stats['learned_skips']} forward_prunes={stats['forward_prunes']} "
@@ -5207,7 +5410,8 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
                 pool.reference(sha,category,dependency,size)
     except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError) as exc:
         raise RuntimeError('invalid retained pip checkpoint: '+str(exc)) from exc
-    print('[pool] reused verified pip closure '+key,flush=True);return True
+    if _POOL_PROGRESS is None: print('[pool] reused verified pip closure '+key,flush=True)
+    return True
 
 
 def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False,build_plans=None):
@@ -5414,16 +5618,21 @@ def acquire_pip_groups(pool, groups):
     if type(closure_workers) is not int or closure_workers < 1:
         raise RuntimeError('invalid configured pip closure concurrency')
     workers=min(closure_workers,len(ordered))
-    print('[pool] native Pip resolver: '+str(len(ordered))+' closures, '
-          +str(workers)+' workers; locked Python; host-only',flush=True)
+    if _POOL_PROGRESS is None:
+        print('[pool] native Pip resolver: '+str(len(ordered))+' closures, '
+              +str(workers)+' workers; locked Python; host-only',flush=True)
+    _pool_progress('Pip closures',0,len(ordered),'closures',f'{workers} workers')
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
             thread_name_prefix='native-pip') as executor:
         futures={executor.submit(acquire_pip_group,pool,key,group):key
                  for key,group in ordered}
         errors=[]
+        done=0
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
+                done+=1
+                _pool_progress('Pip closures',done,len(ordered),'closures',f'{workers} workers')
             except BaseException as exc:
                 errors.append((futures[future],exc))
                 for other in futures:
@@ -5598,7 +5807,10 @@ def _download_sri_closure(pool, urls, category, identity=None):
     ordered=sorted(urls.items())
     if not ordered:return {}
     workers=min(_acquisition_workers(),len(ordered))
-    print(f'[pool] {category} closure: {len(ordered)} unique archives with {workers} workers',flush=True)
+    phase = category.upper() + ' archives'
+    if _POOL_PROGRESS is None:
+        print(f'[pool] {category} closure: {len(ordered)} unique archives with {workers} workers',flush=True)
+    _pool_progress(phase,0,len(ordered),'archives',f'{workers} workers')
     def transfer(url,sri):
         return url,pool.download(url,category,url if identity is None else identity,sri=sri)
     results={}
@@ -5608,6 +5820,7 @@ def _download_sri_closure(pool, urls, category, identity=None):
         try:
             for future in concurrent.futures.as_completed(futures):
                 url,sha=future.result();results[url]=sha
+                _pool_progress(phase,len(results),len(ordered),'archives',f'{workers} workers')
         except BaseException:
             for future in futures:future.cancel()
             raise
@@ -5904,6 +6117,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
 
 
 def main(argv=None):
+    global _POOL_PROGRESS
     p=argparse.ArgumentParser()
     p.add_argument('--repo-root',required=True,type=Path)
     p.add_argument('--stage',required=True,type=Path)
@@ -5933,6 +6147,8 @@ def main(argv=None):
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
     write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
+    _POOL_PROGRESS = _PoolProgress()
+    _pool_progress('Verified recovery')
     verified=set()
     if args.reuse_from is not None:
         verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
@@ -5947,6 +6163,9 @@ def main(argv=None):
                    'version_refs':version_refs[repo]}
              for repo,commits in sorted(grouped.items())}
     submodule_commits=defaultdict(set)
+    inspected=0
+    total_commits=sum(len(commits) for commits in grouped.values())
+    _pool_progress('Inspecting Git submodules',0,total_commits,'commits')
     for repo,commits in sorted(grouped.items()):
         for commit in sorted(commits):
             # Preserve exact gitlinks generically. Scan locally first, then fetch
@@ -5957,6 +6176,8 @@ def main(argv=None):
                     raise RuntimeError('submodule path changes repository identity: '+repo+':'+path)
                 if sha not in previous['commits']:previous['commits'].append(sha)
                 submodule_commits[subrepo].add(sha)
+            inspected+=1
+            _pool_progress('Inspecting Git submodules',inspected,total_commits,'commits')
     _acquire_git_mirrors(stage,submodule_commits,label='git-extra')
     _acquire_nested_submodules(stage, gitplan)
     # Git files must not be linked to CAS while Git may still mutate refs.
@@ -5972,6 +6193,7 @@ def main(argv=None):
     for env,row in conda_lock['environments'].items():
         base_target_by_env[env]=transaction_targets[row['transactions'][0]['key']]
         final_target_by_env[env]=transaction_targets[row['transactions'][-1]['key']]
+    _pool_progress('Conda recipe analysis',0,len(environments),'environments')
     for i,(env,entry) in enumerate(sorted(environments.items()),1):
         script=entry['original_script']
         version=python_version(script);envplan[env]=version
@@ -5980,7 +6202,7 @@ def main(argv=None):
             raise RuntimeError('locked final Python differs from environment recipe: '+env)
         content=conda_yaml(script)
         pips=[]
-        print(f'[pool] Conda lock {i}/{len(environments)}, final Python {version}',flush=True)
+        _pool_progress('Conda recipe analysis',i,len(environments),'environments')
         if content:
             _,pips=conda_pip_split(content)
             # The official upstream Dask recipe removes the pip section before
@@ -6015,6 +6237,7 @@ def main(argv=None):
     spec.loader.exec_module(module)
     specs_table=module.MAP_REPO_VERSION_TO_SPECS
     task_plan={};groups={};apt_requested=set();apt_upgrade_tasks=set()
+    _pool_progress('Static task analysis',0,len(tasks),'recipes')
     for index,(logical,task) in enumerate(sorted(tasks.items()),1):
         repo=task['repo'];commit=task['base_commit'];mirror=mirrors[repo]
         version=envplan[task['env_hash']]
@@ -6212,8 +6435,7 @@ def main(argv=None):
                             # apt-get install packages are still acquired below.
                             'apt_upgrade_suppressed':logical in apt_upgrade_tasks}
         vcs.update(required_vcs);vcs.update(normalized_optional)
-        if index % max(1, len(tasks) // 10) == 0 or index == len(tasks):
-            print(f'[pool] Static task recipes {index}/{len(tasks)}',flush=True)
+        _pool_progress('Static task analysis',index,len(tasks),'recipes')
 
     write_new(stage/'metadata'/'apt-policy.json',json.dumps({
         'schema':1,'upgrade_policy':'suppress-on-frozen-golden',
@@ -6237,10 +6459,16 @@ def main(argv=None):
         for value in plan['vcs']:vcs_required_tasks[value].add(logical)
         for value in plan.get('optional_vcs',[]):vcs_optional_tasks[value].add(logical)
     pending=set(vcs)
+    visited_vcs=0
+    _pool_progress('VCS dependency resolution',0,None,'sources visited',
+                   f'{len(pending)} initially queued')
     while pending:
         if len(vcs_frozen) + len(pending) > MAX_VCS_CLOSURE:
             raise RuntimeError('VCS closure exceeds the audited finite bound')
         value=sorted(pending)[0];pending.remove(value)
+        visited_vcs+=1
+        _pool_progress('VCS dependency resolution',visited_vcs,None,'sources visited',
+                       f'{len(pending)} queued')
         if value in vcs_frozen:continue
         required=bool(vcs_required_tasks[value])
         def vcs_failure(detail):
@@ -6362,6 +6590,9 @@ def main(argv=None):
                 pool.put(path,kind,path.relative_to(stage/kind).parts[0])
     # NPM lockfiles pinned via Subresource Integrity; no package scripts execute.
     npm_urls={}
+    npm_done=0
+    npm_total=sum(map(len,grouped.values()))
+    _pool_progress('NPM lock analysis',0,npm_total,'commits')
     for repo,commits in sorted(grouped.items()):
         for commit in sorted(commits):
             for filename in git_files_named(mirrors[repo],commit,'package-lock.json'):
@@ -6382,6 +6613,8 @@ def main(argv=None):
                     if url in npm_urls and npm_urls[url]!=integ:
                         raise RuntimeError('conflicting npm lockfile integrity for '+url)
                     npm_urls[url]=integ
+            npm_done+=1
+            _pool_progress('NPM lock analysis',npm_done,npm_total,'commits')
     _download_sri_closure(pool,npm_urls,'npm')
     # A pinned recipe may request a global npm CLI update outside its lockfile.
     # Freeze that CLI as an immutable SRI-verified dependency as well.
@@ -6398,24 +6631,30 @@ def main(argv=None):
           isinstance(target,ast.Name) and target.id=='PACKAGES' for target in node.targets)]
     if len(rows)!=1:raise RuntimeError('missing pinned APT manifest')
     apt_requested.update(ast.literal_eval(rows[0]))
+    _pool_progress('Signed Kali APT resolution',details=f'{len(apt_requested)} requested packages')
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
         raise RuntimeError('required signed Kali closure unavailable: '+str(exc)) from exc
+    _pool_progress('Conda archive acquisition')
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
         raise RuntimeError('acquired Conda transaction identities differ from prevalidated lock')
     _native_close(pool)
     with (Path(__file__).resolve().parents[1] / 'config/preparation.toml').open('rb') as stream:
         bootstrap=tomllib.load(stream)['bootstrap']
+    _pool_progress('Miniconda bootstrap archive')
     pool.download('https://repo.anaconda.com/miniconda/' + bootstrap['miniconda_archive'],
                   'bootstrap', 'miniconda-installer', sha=bootstrap['miniconda_sha256'])
+    _pool_progress('Verifying final pool inventory')
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
                     conda_lock_sha256=conda_lock_sha256)
+    _pool_progress('Dependency acquisition complete',force=True)
 
 
 if __name__=='__main__':
     try:main()
     except BaseException as exc:
+        if _POOL_PROGRESS is not None: _POOL_PROGRESS.finish()
         print('[pool] FAILED; data retained, no automatic cleanup:',str(exc),file=sys.stderr,flush=True)
         raise
