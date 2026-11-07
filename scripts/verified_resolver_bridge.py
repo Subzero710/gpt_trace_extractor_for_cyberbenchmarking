@@ -201,9 +201,32 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     valid_cache = {}
     probe_lock = threading.Lock()
     candidate_lock = threading.Lock()
+    metadata_worker = threading.local()
+
+    def metadata_tasks(function, arguments):
+        """Use the verified metadata pool for CPU-independent PyPI I/O.
+
+        A callback already executing in this pool cannot submit work to itself:
+        recursive build-metadata closures must never deadlock a finite pool.
+        """
+        if executor is None or getattr(metadata_worker, 'active', False):
+            return [function(*args) for args in arguments]
+        def worker(args):
+            metadata_worker.active = True
+            try:
+                return function(*args)
+            finally:
+                metadata_worker.active = False
+        futures = [executor.submit(worker, args) for args in arguments]
+        try:
+            return [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
     def domain(name, requirements):
-        raw = tuple(requirements)
+        raw = tuple(sorted(requirements))
         cache_key = name, raw
         if cache_key in domain_cache:
             return domain_cache[cache_key]
@@ -267,6 +290,15 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             result.append(req)
         return result
 
+    if executor is not None:
+        # The Rust IPC decision loop requests each domain in order. Resolve
+        # independent root registries concurrently before starting that loop.
+        root_domains = {}
+        for requirement in roots:
+            name = host['_normalized_package_name'](requirement.name)
+            root_domains.setdefault(name, []).append(str(requirement))
+        metadata_tasks(domain, [(name, tuple(rows)) for name, rows in sorted(root_domains.items())])
+
     with tempfile.TemporaryFile(mode='w+b') as errors:
         child = subprocess.Popen([str(program)], cwd=target_root,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
@@ -300,7 +332,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 if op == b'D':
                     name, requirements = wire.string(), wire.strings()
                     def deliver_domain():
-                        refs = domain(name, requirements)
+                        refs = metadata_tasks(domain, [(name, requirements)])[0]
                         wire.send_int(len(refs))
                         for ref in refs:
                             candidate = candidate_by_id[ref]
@@ -330,15 +362,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('unbounded native metadata request')
                     references = [wire.number() for _ in range(count)]
                     def deliver_metadata():
-                        if executor is not None and len(references) > 1:
-                            pending = [executor.submit(record, ref) for ref in references]
-                            try:
-                                for future in pending: future.result()
-                            except BaseException:
-                                for future in pending: future.cancel()
-                                raise
-                        else:
-                            for ref in references: record(ref)
+                        metadata_tasks(record, [(ref,) for ref in references])
                     action = deliver_metadata
                 elif op == b'P':
                     ref, extras = wire.number(), wire.strings()

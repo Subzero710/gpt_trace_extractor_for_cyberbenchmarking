@@ -48,12 +48,32 @@ jobs:
       - name: Test CI discovery, syntax validation and gate behavior
         run: python -m pytest -q tests/ci
 
+  rust:
+    name: Native Rust resolver unit tests and release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Execute compiled Rust unit tests
+        run: cargo test --offline --locked --manifest-path rust/verified-resolver/Cargo.toml
+      - name: Verify native release binary compiles
+        run: cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml
+
   distributed:
     name: Distributed behavioral tests
     runs-on: ubuntu-latest
+    needs: rust
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build root-owned mandatory Rust solver before Python integration tests
+        run: |
+          cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml
+          sudo chown root:root rust/verified-resolver/target/release/verified-resolver
+          sudo chmod 0755 rust/verified-resolver/target/release/verified-resolver
+          sudo test -x rust/verified-resolver/target/release/verified-resolver
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -143,7 +163,7 @@ jobs:
   gate:
     name: CI gate
     if: always()
-    needs: [discover, validate, distributed, golden, services, docker, browser]
+    needs: [discover, validate, rust, distributed, golden, services, docker, browser]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

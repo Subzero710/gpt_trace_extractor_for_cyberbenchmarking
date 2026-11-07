@@ -36,7 +36,7 @@ def test_compiled_rust_backtracks_to_compatible_version():
          patch.object(pool,'_candidate_versions',side_effect=domain), \
          patch.object(pool,'_candidate_release_metadata',side_effect=metadata):
         plan=pool._resolve_registry_plan(
-            pool.Pool(Path(temp)),fixture_target(),{'root>=1','dep==1'},[],
+            pool.Pool(Path(temp)),fixture_target().as_dict(),{'root>=1','dep==1'},[],
             'native-rust-graph-test',materialize=False)
     assert [(row['name'],row['version']) for row in plan]==[('dep','1'),('root','1')]
 
@@ -56,5 +56,5 @@ def test_compiled_rust_unsat_cannot_claim_success():
          patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
          pytest.raises(RuntimeError,match='unsatisfiable'):
         pool._resolve_registry_plan(
-            pool.Pool(Path(temp)),fixture_target(),{'root==1'},[],
+            pool.Pool(Path(temp)),fixture_target().as_dict(),{'root==1'},[],
             'native-rust-unsat-test',materialize=False)

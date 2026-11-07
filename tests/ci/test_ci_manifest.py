@@ -29,6 +29,25 @@ def test_golden_validation_and_storage_fixture_remain_mandatory():
     assert service_test['env']['POSTGRES_PASSWORD']
 
 
+
+def test_rust_compilation_unit_tests_and_runtime_binary_are_ci_gated():
+    import yaml
+    workflow = yaml.safe_load((SOURCE.parents[1] / 'workflows/ci.yml').read_text())
+    jobs = workflow['jobs']
+    assert 'rust' in jobs['gate']['needs']
+    assert 'rust' in jobs['distributed']['needs']
+    rust_commands = '\n'.join(step.get('run', '') for step in jobs['rust']['steps'])
+    assert 'cargo test --offline --locked --manifest-path rust/verified-resolver/Cargo.toml' in rust_commands
+    assert 'cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml' in rust_commands
+    integration_commands = '\n'.join(step.get('run', '') for step in jobs['distributed']['steps'])
+    assert 'cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml' in integration_commands
+    assert 'sudo chown root:root rust/verified-resolver/target/release/verified-resolver' in integration_commands
+    assert 'sudo chmod 0755 rust/verified-resolver/target/release/verified-resolver' in integration_commands
+    native_source = (SOURCE.parents[2] / 'rust/verified-resolver/src/main.rs').read_text()
+    assert '#[cfg(test)]' in native_source
+    assert '#[test]' in native_source
+
+
 def create_project(root, name, *, has_tests):
     directory = root / "apps" / name
     directory.mkdir(parents=True)

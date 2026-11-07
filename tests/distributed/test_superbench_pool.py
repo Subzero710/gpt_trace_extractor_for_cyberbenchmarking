@@ -2509,21 +2509,36 @@ def run_setup():
             self.assertEqual(list((Path(tmp)/'npm').iterdir()), [])
             self.assertNotIn("invoke(['npm'", (ROOT/'scripts/superbench_pool.py').read_text())
 
-    def test_pip_parallelism_uses_versioned_io_capacity_not_cpu_affinity(self):
+    def test_pip_parallelism_bounds_cpu_without_throttling_io(self):
         controls=tomllib.loads((ROOT/'config/preparation.toml').read_text())
         configured=controls['acquisition']['workers']
         self.assertEqual(pool._metadata_prefetch_width(configured,configured),1)
-        with patch.object(pool.os,'sched_getaffinity',side_effect=AssertionError('CPU affinity must not throttle network I/O')):
-            self.assertEqual(pool._pip_worker_controls(),(configured,configured))
+        # The CPU worker limit must follow the live CPU allowance, while the
+        # separately configured I/O budget is unaffected by CPU affinity.
+        original_read_text=Path.read_text
+        def controlled_resources(path,*args,**kwargs):
+            if path==Path('/proc/meminfo'):
+                reserve=controls['build']['memory_reserve_mb']
+                per_worker=controls['acquisition']['pip_solver_worker_memory_mb']
+                return f'MemAvailable: {(reserve+2*per_worker)*1024} kB\n'
+            if path==Path('/proc/self/cgroup'):
+                return '0::/\n'
+            if path==Path('/sys/fs/cgroup/cpu.max'):
+                return 'max 100000\n'
+            if path==Path('/sys/fs/cgroup/memory.max'):
+                return 'max\n'
+            return original_read_text(path,*args,**kwargs)
+        with patch.object(pool.os,'sched_getaffinity',return_value={0}), \
+             patch.object(Path,'read_text',new=controlled_resources):
+            cpu_workers,metadata_workers=pool._pip_worker_controls()
+        self.assertEqual(cpu_workers,1)
+        self.assertEqual(metadata_workers,configured)
         source=(ROOT/'scripts/superbench_pool.py').read_text()
         self.assertIn("config/preparation.toml",source)
-        # HTTP acquisition capacity is configured independently from CPU affinity.
-        # Git mirror acquisition legitimately consults affinity for pack inflation,
-        # so a global source-string prohibition is incorrect.
         import inspect
-        io_functions=(pool._acquisition_workers,pool._pip_worker_controls,
-                      pool._metadata_prefetch_width,pool.acquire_locked_conda,
-                      pool.acquire_pip_groups,pool._download_sri_closure)
+        self.assertIn('sched_getaffinity',inspect.getsource(pool._pip_worker_controls))
+        io_functions=(pool._acquisition_workers,pool._metadata_prefetch_width,
+                      pool.acquire_locked_conda,pool._download_sri_closure)
         for function in io_functions:
             with self.subTest(function=function.__name__):
                 self.assertNotIn('sched_getaffinity',inspect.getsource(function))

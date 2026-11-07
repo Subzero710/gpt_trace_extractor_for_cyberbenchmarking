@@ -12,31 +12,31 @@ def target_markers(monkeypatch):
     monkeypatch.setattr(pool, '_target_marker_environment', lambda _target: env)
 
 
-def test_earlier_exact_pin_survives_later_unpinned_requirement():
+def test_earlier_exact_pin_is_preferred_by_later_unpinned_requirement():
     command = 'python -m pip install types-pkg-resources==0.1.3 pytest; pip install -r requirements-dev.txt'
     steps = pool.pip_commands([command])[-1]
     assert len(steps) == 2
     installed = pool._historical_exact_pip_pins(steps[0]['requirements'], object())
-    inherited = pool._historical_pip_constraints(
+    inherited = pool._historical_pip_preferences(
         installed, {'types-pkg_resources', 'pytest'}, set(), object())
     assert inherited == {'types-pkg-resources': 'types-pkg-resources==0.1.3'}
 
 
 def test_does_not_override_later_explicit_pin():
     pinned = pool._historical_exact_pip_pins({'demo-package==1.2.3'}, object())
-    assert pool._historical_pip_constraints(
+    assert pool._historical_pip_preferences(
         pinned, {'demo_package==4.5.6'}, [], object()) == {}
 
 
 def test_does_not_override_incompatible_later_constraints():
     pinned = pool._historical_exact_pip_pins({'some-package==1.2.3'}, object())
-    assert pool._historical_pip_constraints(
+    assert pool._historical_pip_preferences(
         pinned, {'some-package'}, {'some-package>=2'}, object()) == {}
 
 
 def test_upgrade_can_release_prior_pin():
     pinned = pool._historical_exact_pip_pins({'some-package==1.2.3'}, object())
-    assert pool._historical_pip_constraints(
+    assert pool._historical_pip_preferences(
         pinned, {'some-package'}, [], object(), upgrade=True) == {}
 
 
