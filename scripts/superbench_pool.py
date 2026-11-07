@@ -4651,37 +4651,53 @@ def _wheel_rank(filename,target):
 
 
 def _requires_python_compatible(raw, target_python):
-    """Evaluate an explicit Requires-Python constraint against the locked target.
+    """Check the target against PyPI's declared Requires-Python without guessing.
 
-    Historical PyPI releases sometimes declared a lower bound as ``>=3.5.*``.
-    The wildcard is invalid on ordered PEP 440 comparisons. Interpret only
-    this exact historical *inclusive lower-bound* spelling as ``>=3.5``;
-    preserve every other constraint and reject other invalid syntax loudly.
-    Never treat unparseable metadata as proof of incompatibility or accept it
-    by dropping the Requires-Python restriction.
+    Historical registries contain versions quoted as strings, e.g. >= '2.7',
+    and inclusive lower-bound wildcards such as >=3.5.*. Only these precise
+    *syntactic* anomalies are normalized. The full original conjunction is
+    then parsed and evaluated by packaging; any other invalidity is fatal.
     """
-    _,SpecifierSet,_,_,_=_packaging_symbols()
-    if not isinstance(raw,str) or not raw.strip():
-        raise RuntimeError('invalid Requires-Python metadata: '+repr(raw))
-    value=raw.strip()
+    _, SpecifierSet, _, _, _ = _packaging_symbols()
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError('invalid Requires-Python metadata: ' + repr(raw))
+    value = raw.strip()
     try:
-        spec=SpecifierSet(value)
+        spec = SpecifierSet(value)
     except ValueError as exc:
-        pieces=[];changed=False
+        pieces = []
+        changed = False
         for part in value.split(','):
-            token=part.strip()
-            lower=re.fullmatch(r'>=\s*(\d+(?:\.\d+)*)\.\*',token)
-            if lower is not None:
-                pieces.append('>='+lower.group(1));changed=True
-            else:
-                pieces.append(token)
+            token = part.strip()
+            # The quote must surround the *whole* version operand. Matching
+            # quotation marks and no embedded whitespace, escapes or extra
+            # suffixes prevent discarding meaningful constraints.
+            quoted = re.fullmatch(
+                r'''(===|~=|==|!=|<=|>=|<|>)\s*(['"])([^\s'"\\,]+)\2''', token)
+            if quoted is not None:
+                normalized = quoted.group(1) + quoted.group(3)
+                try:
+                    # A quoted operand is accepted ONLY if the unquoted
+                    # comparator has legitimate packaging syntax. The old
+                    # inclusive wildcard exception is checked separately.
+                    SpecifierSet(normalized)
+                except ValueError:
+                    if re.fullmatch(r'>=\s*\d+(?:\.\d+)*\.\*', normalized) is None:
+                        raise RuntimeError('invalid Requires-Python metadata: ' + repr(value)) from exc
+                token = normalized
+                changed = True
+            inclusive_lower = re.fullmatch(r'>=\s*(\d+(?:\.\d+)*)\.\*', token)
+            if inclusive_lower is not None:
+                token = '>=' + inclusive_lower.group(1)
+                changed = True
+            pieces.append(token)
         if not changed:
-            raise RuntimeError('invalid Requires-Python metadata: '+repr(value)) from exc
+            raise RuntimeError('invalid Requires-Python metadata: ' + repr(value)) from exc
         try:
-            spec=SpecifierSet(','.join(pieces))
+            spec = SpecifierSet(','.join(pieces))
         except ValueError as malformed:
-            raise RuntimeError('invalid Requires-Python metadata: '+repr(value)) from malformed
-    return spec.contains(target_python,prereleases=True)
+            raise RuntimeError('invalid Requires-Python metadata: ' + repr(value)) from malformed
+    return spec.contains(target_python, prereleases=True)
 
 
 def _release_artifacts(name,version,files,target,*,allow_yanked=False):
