@@ -18,6 +18,43 @@ def verify_host_requirements(root: Path) -> None:
     run([sys.executable, str(root / "scripts/host_requirements.py"), "--build"])
 
 
+def build_verified_resolver(root: Path) -> None:
+    """Reproducibly compile the mandatory Rust graph engine before broker admission.
+
+    No network, no dynamic package acquisition, no Python runtime substitution.
+    """
+    import os
+    import stat
+    cargo = shutil.which('cargo')
+    rustc = shutil.which('rustc')
+    if not cargo or not rustc:
+        raise RuntimeError('Rust toolchain required: install cargo and rustc with make requirements')
+    project = root / 'rust/verified-resolver'
+    manifest, lock = project / 'Cargo.toml', project / 'Cargo.lock'
+    for source in (manifest, lock, project / 'src/main.rs'):
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError('missing or unsafe mandatory Rust solver source: ' + str(source))
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+           'CARGO_HOME': os.environ.get('CARGO_HOME', str(root / '.cargo-host')),
+           'CARGO_TARGET_DIR': str(project / 'target'),
+           'RUSTFLAGS': '-C debuginfo=0'}
+    subprocess.run([cargo, 'test', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
+                   cwd=root, check=True, env=env)
+    subprocess.run([cargo, 'build', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
+                   cwd=root, check=True, env=env)
+    binary = project / 'target/release/verified-resolver'
+    if binary.is_symlink() or not binary.is_file():
+        raise RuntimeError('mandatory Rust binary was not produced')
+    info = binary.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError('mandatory Rust binary is not regular')
+    binary.chmod(0o555)
+    # The binary is hashed by pool_contract and sealed into each attempt snapshot.
+    # Broker ownership requires this file to be administratively root-owned.
+    if os.geteuid() != 0 or binary.stat().st_uid != 0:
+        raise RuntimeError('mandatory native resolver build must run as root on Fossil')
+
+
 def build_host_broker(root: Path) -> None:
     venv = root / ".venv-workstation-broker"
     python = venv / "bin/python"
@@ -40,6 +77,15 @@ def build_host_broker(root: Path) -> None:
          "-e", str(root / "apps/workstation-broker") + "[test]",
          "-e", str(root / "apps/kali-workstation") + "[test]"])
     run([str(test_python), "-m", "pip", "check"])
+    import os
+    test_env = dict(os.environ)
+    test_env['PYTHONPATH'] = os.pathsep.join([str(root / 'scripts'),
+        str(root / 'tests/distributed'), test_env.get('PYTHONPATH', '')])
+    subprocess.run([str(test_python), '-m', 'pytest', '-q',
+        'tests/distributed/test_rust_bridge_protocol.py',
+        'tests/distributed/test_rust_source_contract.py',
+        'tests/distributed/test_rust_solver_graph.py'],
+        cwd=root, env=test_env, check=True)
 
 
 def compose_service_image(root: Path, service: str) -> str:

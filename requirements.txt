@@ -9,6 +9,8 @@
 python3-venv
 python3-pip
 python3-packaging
+cargo
+rustc
 openssl
 qemu-system-x86
 qemu-utils

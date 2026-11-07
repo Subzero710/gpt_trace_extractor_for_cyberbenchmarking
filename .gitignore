@@ -23,3 +23,7 @@ exports/*.parquet
 .unified-source-patch-backups/
 state/distributed/
 .local-preparation-patch-backups/
+
+# Mandatory Rust solver is compiled on Fossil, never committed as a binary.
+/rust/verified-resolver/target/
+/.cargo-host/

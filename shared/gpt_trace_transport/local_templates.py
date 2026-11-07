@@ -27,6 +27,11 @@ TEMPLATE_ABI = 1
 TASK_RUNTIME_SCHEMA = 3
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
+    "scripts/verified_resolver_bridge.py",
+    "rust/verified-resolver/Cargo.toml",
+    "rust/verified-resolver/Cargo.lock",
+    "rust/verified-resolver/src/main.rs",
+    "rust/verified-resolver/target/release/verified-resolver",
     "config/preparation.toml",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",

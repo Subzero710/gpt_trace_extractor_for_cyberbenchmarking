@@ -124,7 +124,7 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
             raise RuntimeError('fetch source changed after admission: '+relative)
         target.write_bytes(data)
         os.chown(target, 0, 0)
-        target.chmod(0o444)
+        target.chmod(0o555 if relative == 'rust/verified-resolver/target/release/verified-resolver' else 0o444)
     dependency = golden_dependency_identity(manager.base, manager.source_root) if golden_dependency is None else golden_dependency
     if dependency != golden_dependency_identity(manager.base, manager.source_root):
         raise RuntimeError("golden dependency identity changed before fetch source staging")

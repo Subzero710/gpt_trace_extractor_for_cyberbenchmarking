@@ -337,7 +337,7 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None):
     replayed. An unreachable broker is not mistaken for a running worker or
     a successful fetch, even when its Cloudflare tunnel container is healthy.
     """
-    controls_path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    controls_path = ROOT / 'config/preparation.toml'
     if controls_path.is_symlink() or not controls_path.is_file():
         raise RuntimeError('missing versioned broker monitoring policy')
     with controls_path.open('rb') as handle:
@@ -898,6 +898,7 @@ def execution(cfg, action, args):
         if any(x.startswith("gpt-trace-ws-") for x in domains):
             raise RuntimeError("preserve existing attempts before installing broker/images")
         import build
+        build.build_verified_resolver(ROOT)
         build.build_host_broker(ROOT)
         build.build_workstation_base_image(ROOT)
         build.verify_workstation_image(ROOT)

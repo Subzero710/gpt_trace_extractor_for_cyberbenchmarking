@@ -27,6 +27,12 @@ progress_interval_seconds = 5
 # A stalled worker must not monopolize acquisition for hours.
 pip_total_timeout_seconds = 900
 pip_stall_timeout_seconds = 120
+# Native Rust graph search: CPU deadline applies to the whole closure.
+pip_solver_max_decisions = 1000000
+pip_solver_max_depth = 1024
+pip_solver_cache_max_bytes = 67108864
+pip_solver_max_frame_bytes = 16777216
+pip_solver_worker_memory_mb = 1024
 # All broker reads are read-only and bounded; tunnel outages are visible.
 broker_read_timeout_seconds = 15
 broker_outage_report_seconds = 30

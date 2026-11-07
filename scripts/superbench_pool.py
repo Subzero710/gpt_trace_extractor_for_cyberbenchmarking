@@ -3616,16 +3616,64 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 20
-PIP_RESOLVER_POLICY = 'verified-registry-backjump-native-sdist-metadata-soft-pins-v4'
+PIP_PLAN_SCHEMA = 21
+PIP_RESOLVER_POLICY = 'mandatory-native-rust-solver-v1-soft-pins'
 
 
 def _pip_worker_controls():
-    """Use the versioned acquisition I/O capacity for network-bound Pip work."""
-    workers=_acquisition_workers()
-    # Solver threads mostly wait on registry metadata/artifact I/O. CPU affinity
-    # must not reduce the already versioned acquisition concurrency budget.
-    return workers,workers
+    """CPU quota, cpuset, available memory and I/O concurrency are separate."""
+    io_workers=_acquisition_workers()
+    try:
+        cpu_capacity=len(os.sched_getaffinity(0))
+    except OSError as exc:
+        raise RuntimeError('CPU affinity unavailable for Rust graph solvers') from exc
+    if cpu_capacity < 1:
+        raise RuntimeError('empty CPU affinity for Rust graph solvers')
+    policy_path=Path(__file__).resolve().parents[1]/'config/preparation.toml'
+    if policy_path.is_symlink() or not policy_path.is_file():
+        raise RuntimeError('missing versioned Rust solver resource policy')
+    with policy_path.open('rb') as stream:
+        policy=tomllib.load(stream)
+    worker_mb=policy['acquisition'].get('pip_solver_worker_memory_mb')
+    reserve_mb=policy['build'].get('memory_reserve_mb')
+    if (type(worker_mb) is not int or worker_mb < 1
+            or type(reserve_mb) is not int or reserve_mb < 0):
+        raise RuntimeError('invalid versioned Rust solver memory policy')
+    info=Path('/proc/meminfo').read_text().splitlines()
+    available=[int(line.split()[1])*1024 for line in info if line.startswith('MemAvailable:')]
+    if len(available)!=1 or available[0] < 1:
+        raise RuntimeError('kernel MemAvailable is unavailable')
+    free_memory=available[0]
+    # Compute restrictions from the actual process cgroup and *all* ancestors.
+    scope=next((line.partition('::')[2] for line in Path('/proc/self/cgroup').read_text().splitlines()
+                if line.startswith('0::')),None)
+    if scope is not None:
+        root=Path('/sys/fs/cgroup')
+        current=root/scope.lstrip('/')
+        while True:
+            max_cpu=current/'cpu.max'
+            if max_cpu.is_file():
+                quota=max_cpu.read_text().split()
+                if len(quota)!=2:raise RuntimeError('invalid cgroup CPU quota')
+                if quota[0]!='max':
+                    q,p=map(int,quota)
+                    if q<=0 or p<=0:raise RuntimeError('invalid cgroup CPU quota')
+                    cpu_capacity=min(cpu_capacity,max(1,(q+p-1)//p))
+            max_mem=current/'memory.max'
+            if max_mem.is_file():
+                limit=max_mem.read_text().strip()
+                if limit!='max':
+                    used=int((current/'memory.current').read_text().strip())
+                    free_memory=min(free_memory,max(0,int(limit)-used))
+            if current==root:break
+            if current==current.parent or not current.is_relative_to(root):
+                raise RuntimeError('invalid cgroup resource ancestry')
+            current=current.parent
+    available_bytes=max(0,free_memory-reserve_mb*1048576)
+    if available_bytes < worker_mb*1048576:
+        raise RuntimeError('insufficient verified memory budget for one Rust Pip solver worker')
+    memory_capacity=available_bytes//(worker_mb*1048576)
+    return min(cpu_capacity,memory_capacity),io_workers
 
 
 def _metadata_prefetch_width(closure_workers,metadata_workers):
@@ -3693,9 +3741,14 @@ def pip_group_key(target, reqs, constraints=(), no_deps=False, *, preferred_vers
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
 
 
+@functools.lru_cache(maxsize=1)
 def _resolver_runtime_identity():
     import packaging
-    return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3]))}
+    binary = Path(__file__).resolve().parents[1] / 'rust/verified-resolver/target/release/verified-resolver'
+    if binary.is_symlink() or not binary.is_file():
+        raise RuntimeError('mandatory native Rust solver missing; run make build on Fossil')
+    return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3])),
+            'native_solver_sha256':digest(binary)}
 
 
 @functools.lru_cache(maxsize=1)
@@ -5099,358 +5152,22 @@ def _candidate_satisfies(candidate,requirements,constraints):
 
 
 def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None,materialize=True,preferred_versions=None):
-    """Resolve PyPI with propagation and conflict-directed backjumping.
+    """Mandatory production Rust graph search; no Python search path exists.
 
-    The solver never executes package code. Candidate metadata comes only from
-    compatible wheels or statically inspected source distributions. Requirements
-    carry the selected packages that caused them, allowing an impossible branch
-    to jump directly to a relevant decision instead of enumerating unrelated
-    version combinations.
+    Python retains the exact wheel/PEP-440/PEP-508/PEP-517 evidence oracle.
+    Every decision, backjump, state and nogood is owned by the Rust binary.
     """
-    target=_coerce_target(target);constraint_map=_constraint_map(constraints,target)
-    roots=[]
-    for raw in sorted(set(reqs)):
-        req=_parse_registry_requirement(raw)
-        if _marker_active(req,target):roots.append((req,frozenset()))
-    if not roots:return []
-    root_names=frozenset(_normalized_package_name(req.name) for req,_causes in roots)
-    resolver_cache={} if resolver_cache is None else resolver_cache
-    probe_cache=resolver_cache.setdefault('release_metadata',_SingleFlightCache())
-    artifact_cache=resolver_cache.setdefault('artifact_metadata',_SingleFlightCache())
-    release_cache=resolver_cache.setdefault('releases',_SingleFlightCache())
-    preferred_versions=(_canonical_pip_preferences(preferred_versions) if preferred_versions is not None
-                        else resolver_cache.get('preferred_versions'))
-    metadata_executor=resolver_cache.get('metadata_executor')
-    metadata_prefetch=resolver_cache.get('metadata_prefetch',1)
-    prefetch_controller=resolver_cache.get('prefetch_controller')
-    source_probe=resolver_cache.get('native_source_probe')
-    wheel_only=(resolver_cache.get('sources_require_locked_python') is True
-                and not target.python_artifact_sha256)
-    # Repeated sibling branches share identical immutable requirement tuples.
-    # Bound grouping memoization by the actual number of input roots, not a
-    # fixed machine assumption; eviction only loses an optional optimization.
-    grouping_cache_capacity=max(1,len(roots)*len(roots))
-    candidate_cache={};failed_states=set();learned_nogoods=defaultdict(set)
-    decision_packages=defaultdict(int)
-    observed_metadata=set();observed_metadata_lock=threading.Lock()
-    stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0,'learned_skips':0,'forward_prunes':0}
-    target_key=_target_fingerprint(target)
-
-    @functools.lru_cache(maxsize=grouping_cache_capacity)
-    def grouped(entries):
-        # Requirements and their causal sets are immutable, hashable values.
-        # Sibling decisions share the same input tuple; previously each sibling
-        # rebuilt and sorted the entire dependency grouping independently.
-        by_name=defaultdict(dict);extras=defaultdict(set)
-        for req,causes in entries:
-            name=_normalized_package_name(req.name);token=str(req)
-            previous=by_name[name].get(token)
-            combined=frozenset(causes if previous is None else previous[1]|causes)
-            by_name[name][token]=(req,combined);extras[name].update(req.extras)
-        rows={name:tuple(value for _,value in sorted(bucket.items()))
-              for name,bucket in by_name.items()}
-        return rows,extras
-
-    def causes(rows):
-        result=set()
-        for _req,origin in rows:result.update(origin)
-        return frozenset(result)
-
-    def state_key(requirements_by_name,selected,expanded):
-        requirements=tuple((name,tuple(str(row[0]) for row in rows))
-                           for name,rows in sorted(requirements_by_name.items()))
-        assignments=tuple((name,record['kind'],record['version'],record['filename'])
-                          for name,record in sorted(selected.items()))
-        extras=tuple((name,tuple(sorted(values))) for name,values in sorted(expanded.items()))
-        return requirements,assignments,extras
-
-    def domain(name,rows):
-        requirements=[row[0] for row in rows]
-        cache_key=(name,tuple(str(req) for req in requirements),
-                   tuple(sorted(str(req) for req in constraint_map.get(name,[]))),target_key)
-        if cache_key not in candidate_cache:
-            candidate_cache[cache_key]=_candidate_versions(
-                pool,name,requirements,constraint_map.get(name,[]),target,
-                release_cache=release_cache,preferred_versions=preferred_versions)
-        return candidate_cache[cache_key]
-
-    def candidate_record(candidate):
-        if candidate['kind'] == 'sdist' and source_probe is not None:
-            # Source metadata is always obtained from the selected target's
-            # actual PEP 517 hooks. No static approximation or silent fallback.
-            identity=('native-source',_candidate_probe_identity(candidate,target,no_deps))
-            artifact_identity=('native-source-artifact',_target_fingerprint(target),
-                               _candidate_artifact_identity(candidate)[0],candidate['filename'])
-            record=_memo_get_or_compute(probe_cache,identity,
-                lambda:_memo_get_or_compute(artifact_cache,artifact_identity,
-                    lambda:source_probe(pool,candidate,key,target)))
-        else:
-            record=_candidate_release_metadata(
-                pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
-        with observed_metadata_lock:
-            observed_metadata.add(_normalized_package_name(candidate['name']))
-        return record
-
-    def compatibility_conflict(name,record,rows,requirements_by_name,selected,extras_by_name):
-        """Prove a candidate impossible against requirements already in this state.
-
-        Never infer constraints from a different release. Unprobed candidate metadata
-        stays eligible, and the full registry domain is checked when a yanked
-        historical release could satisfy an otherwise empty intersection.
-        """
-        if no_deps:return None
-        active_extras=frozenset(extras_by_name.get(name,set()))
-        for raw in record['requirements']:
-            dep=_parse_registry_requirement(raw)
-            if not _marker_active(dep,target,active_extras):continue
-            dep_name=_normalized_package_name(dep.name)
-            if dep_name==name:
-                if not _candidate_satisfies(record,[dep],constraint_map.get(name,[])):
-                    return frozenset({name})|causes(rows),dep_name
-                continue
-            if dep_name in selected:
-                if not _candidate_satisfies(selected[dep_name],[dep],constraint_map.get(dep_name,[])):
-                    return (frozenset({name,dep_name})|causes(rows)
-                            |causes(requirements_by_name.get(dep_name,()))),dep_name
-                continue
-            if dep_name not in requirements_by_name:continue
-            prior=requirements_by_name[dep_name]
-            # The exact domain, including historical yanks permitted by policy,
-            # is computed using the new requirement, never guessed from the old
-            # active-only candidate set.
-            extended=(*prior,(dep,frozenset({name})|causes(rows)))
-            if not domain(dep_name,extended):
-                return (frozenset({name})|causes(rows)|causes(prior)),dep_name
-        return None
-
-    def cached_compatible(name,candidates,rows,requirements_by_name,selected,extras_by_name):
-        """Reuse discovered incompatibilities across independent version choices.
-
-        An earlier branch may already have fetched all releases of a second
-        package. Checking their immutable metadata against the current constraints
-        eliminates the cross-product without another network request or decision.
-        Unknown candidate metadata is never excluded.
-        """
-        with observed_metadata_lock:
-            if no_deps or name not in observed_metadata:
-                return candidates,frozenset(),None
-        survivors=[];conflict_names=set();first_detail=None
-        for candidate in candidates:
-            identity=_candidate_probe_identity(candidate,target,no_deps)
-            record=(probe_cache.peek(identity) if isinstance(probe_cache,_SingleFlightCache)
-                    else probe_cache.get(identity))
-            if record is None:
-                survivors.append(candidate)
-                continue
-            conflict=compatibility_conflict(
-                name,record,rows,requirements_by_name,selected,extras_by_name)
-            if conflict is None:
-                survivors.append(candidate)
-                continue
-            involved,dep_name=conflict
-            conflict_names.update(involved)
-            if first_detail is None:first_detail=dep_name
-            stats['forward_prunes']+=1
-        return survivors,frozenset(conflict_names),first_detail
-
-    def nogood_key_for(name,candidate,rows,active_extras):
-        return (name,candidate['kind'],candidate['version'],candidate['filename'],
-                tuple(str(row[0]) for row in rows),tuple(sorted(active_extras)))
-
-    def nogood_matches(clause,selected):
-        return all(package in selected
-                   and (selected[package]['kind'],selected[package]['version'],selected[package]['filename'])==identity
-                   for package,identity in clause)
-
-    def learn_nogood(cache_key,conflict,current_name,selected):
-        # Conflict sets already drive backjumping. Persist the same information
-        # as a compact assignment clause so revisiting an unrelated branch never
-        # re-enters the identical candidate conflict. An empty clause means the
-        # candidate is impossible for this requirement/extras context itself.
-        clause=tuple(sorted((package,(selected[package]['kind'],selected[package]['version'],
-                                      selected[package]['filename']))
-                            for package in conflict if package!=current_name and package in selected))
-        learned_nogoods[cache_key].add(clause)
-
-    def search(entries,selected,expanded):
-        entries=tuple(entries);selected=dict(selected);expanded=dict(expanded)
-        while True:
-            requirements_by_name,extras_by_name=grouped(entries)
-            current_state=state_key(requirements_by_name,selected,expanded)
-            if current_state in failed_states:
-                stats['memo_hits']+=1
-                return None,frozenset(selected),'memoized unsatisfiable resolver state'
-
-            # Constraint propagation against assignments already made.
-            for name,record in sorted(selected.items()):
-                rows=requirements_by_name.get(name,())
-                requirements=[row[0] for row in rows]
-                if not _candidate_satisfies(record,requirements,constraint_map.get(name,[])):
-                    conflict=frozenset({name})|causes(rows)
-                    failed_states.add(current_state)
-                    detail=('selected '+name+'=='+record['version']+' violates requirements '
-                            +repr(sorted(str(req) for req in requirements))+' constraints '
-                            +repr(sorted(str(req) for req in constraint_map.get(name,[]))))
-                    return None,conflict,detail
-
-            # Expand every selected package whose active extras changed. Doing
-            # all deterministic propagation in one frame avoids recursive churn.
-            additions=[];next_expanded=dict(expanded)
-            for name in sorted(selected):
-                active=frozenset(extras_by_name.get(name,set()))
-                if expanded.get(name)==active:continue
-                rows=requirements_by_name.get(name,())
-                origin=frozenset({name})|causes(rows)
-                raw_dependencies=selected[name]['requirements'] if not no_deps else []
-                for raw in raw_dependencies:
-                    dep=_parse_registry_requirement(raw)
-                    if _marker_active(dep,target,active):additions.append((dep,origin))
-                next_expanded[name]=active
-            if additions or next_expanded!=expanded:
-                entries=(*entries,*additions);expanded=next_expanded
-                stats['propagations']+=len(additions)
-                continue
-
-            unresolved=sorted(name for name in requirements_by_name if name not in selected)
-            if not unresolved:return selected,frozenset(),None
-
-            choices=[]
-            domain_futures={}
-            if metadata_executor is not None:
-                domain_futures={name:metadata_executor.submit(domain,name,requirements_by_name[name])
-                                for name in unresolved}
-            for name in unresolved:
-                rows=requirements_by_name[name]
-                future=domain_futures.get(name)
-                try:
-                    candidates=future.result() if future is not None else domain(name,rows)
-                except BaseException:
-                    for pending in domain_futures.values():pending.cancel()
-                    raise
-                if wheel_only:
-                    candidates=[row for row in candidates if row['kind']=='wheel']
-                if not candidates:
-                    for pending in domain_futures.values():pending.cancel()
-                    failed_states.add(current_state)
-                    conflict=causes(rows)
-                    detail=('no compatible release for '+name+' under requirements '
-                            +repr([str(row[0]) for row in rows])+' constraints '
-                            +repr(sorted(str(req) for req in constraint_map.get(name,[]))))
-                    return None,conflict,detail
-                survivors,known_conflict,conflicting_dep=cached_compatible(
-                    name,candidates,rows,requirements_by_name,selected,extras_by_name)
-                if not survivors:
-                    for pending in domain_futures.values():pending.cancel()
-                    failed_states.add(current_state)
-                    return (None,known_conflict,
-                            'all cached compatible releases of '+name+' conflict with '+str(conflicting_dep))
-                choices.append((len(survivors),name,survivors,rows))
-            # MRV remains the primary criterion. At equal domain sizes, choose a
-            # direct requirement before an inferred transitive dependency.
-            count,name,candidates,rows=min(choices,key=lambda row:(
-                row[0],row[1] not in root_names,row[1]))
-
-            # A singleton domain is forced; propagate it without creating a
-            # branch level. This is the dependency-solver equivalent of unit
-            # propagation in a SAT solver.
-            if count==1:
-                try:
-                    future=(metadata_executor.submit(candidate_record,candidates[0])
-                            if metadata_executor is not None else None)
-                    record=future.result() if future is not None else candidate_record(candidates[0])
-                except RuntimeError as exc:
-                    failed_states.add(current_state)
-                    raise RuntimeError('only compatible artifact for '+name+' has unusable metadata: '+str(exc)) from exc
-                selected[name]=record;stats['propagations']+=1
-                continue
-
-            branch_causes=causes(rows);combined_conflict=set();last_detail=None
-            active_extras=frozenset(extras_by_name.get(name,set()))
-            prefetched={}
-            def schedule_metadata(position):
-                if metadata_executor is None:return
-                width=(prefetch_controller.width() if prefetch_controller is not None else metadata_prefetch)
-                stop=min(len(candidates),position+width)
-                for offset in range(position,stop):
-                    if offset not in prefetched:
-                        prefetched[offset]=metadata_executor.submit(candidate_record,candidates[offset])
-            for index,candidate in enumerate(candidates,1):
-                learned_key=nogood_key_for(name,candidate,rows,active_extras)
-                clauses=learned_nogoods.get(learned_key,())
-                if any(nogood_matches(clause,selected) for clause in clauses):
-                    stats['learned_skips']+=1
-                    continue
-                stats['decisions']+=1;decision_packages[name]+=1
-                # Logging every backtracking decision can itself become hundreds
-                # of thousands of small writes. Powers of two retain bounded
-                # progress visibility regardless of search size.
-                if _POOL_PROGRESS is None and stats['decisions'] & (stats['decisions']-1) == 0:
-                    print(f"[pool] resolver {key}: decision {stats['decisions']} "
-                          f"{name}=={candidate['version']} ({index}/{len(candidates)}), "
-                          f"selected={len(selected)}",flush=True)
-                schedule_metadata(index-1)
-                try:
-                    future=prefetched.pop(index-1,None)
-                    record=future.result() if future is not None else candidate_record(candidate)
-                except RuntimeError as exc:
-                    for pending in prefetched.values():pending.cancel()
-                    raise RuntimeError('candidate metadata could not be validated; satisfiability is not established: '
-                                       +name+'=='+candidate['version']+': '+str(exc)) from exc
-
-                # Reject a candidate immediately when one of its active
-                # dependencies contradicts an assignment already made. This is
-                # the same conflict recursion would discover after expansion,
-                # but avoids constructing and memoizing a redundant child state.
-                lookahead=compatibility_conflict(
-                    name,record,rows,requirements_by_name,selected,extras_by_name)
-                if lookahead is not None:
-                    conflict,conflicting_dep=lookahead
-                    stats['forward_prunes']+=1
-                    detail=('candidate '+name+'=='+record['version']+
-                            ' leaves incompatible requirements for '+conflicting_dep)
-                    result=None
-                else:
-                    next_selected=dict(selected);next_selected[name]=record
-                    result,conflict,detail=search(entries,next_selected,expanded)
-                if result is not None:
-                    for pending in prefetched.values():pending.cancel()
-                    return result,frozenset(),None
-                last_detail=detail
-                if name in conflict:
-                    learn_nogood(learned_key,conflict,name,selected)
-                if name not in conflict:
-                    for pending in prefetched.values():pending.cancel()
-                    stats['backjumps']+=1
-                    failed_states.add(current_state)
-                    return None,conflict,detail
-                combined_conflict.update(conflict-{name})
-            for pending in prefetched.values():pending.cancel()
-            conflict=frozenset(combined_conflict|set(branch_causes))
-            failed_states.add(current_state)
-            detail=(last_detail or ('all compatible candidates exhausted for '+name))
-            return None,conflict,detail
-
-    result,conflict,detail=search(roots,{}, {})
-    hottest=(max(decision_packages.items(),key=lambda item:(item[1],item[0]))
-             if decision_packages else ('-',0))
-    if result is None:
-        summary=(f"solver decisions={stats['decisions']} propagations={stats['propagations']} "
-                 f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
-                 f"learned_skips={stats['learned_skips']} forward_prunes={stats['forward_prunes']} "
-                 f"hottest={hottest[0]}:{hottest[1]}")
-        raise RuntimeError('deterministic registry dependency resolution is unsatisfiable; '
-                           +(detail or 'root constraints conflict')+'; '+summary)
-    solved=[result[name] for name in sorted(result)]
-    if _POOL_PROGRESS is None: print(f"[pool] resolver {key}: solved {len(solved)} packages; "
-          f"decisions={stats['decisions']} propagations={stats['propagations']} "
-          f"backjumps={stats['backjumps']} memo_hits={stats['memo_hits']} "
-          f"learned_skips={stats['learned_skips']} forward_prunes={stats['forward_prunes']} "
-          f"hottest={hottest[0]}:{hottest[1]}; "
-          +( "materializing winning artifacts" if materialize
-             else "solution ready for verified artifact checkpoint"),flush=True)
-    return (_materialize_solution(pool,solved,key,target,artifact_cache,
-                                  executor=metadata_executor,source_probe=source_probe)
-            if materialize else solved)
+    bridge = Path(__file__).resolve().with_name('verified_resolver_bridge.py')
+    if bridge.is_symlink() or not bridge.is_file():
+        raise RuntimeError('missing sealed native Rust solver bridge')
+    spec = importlib.util.spec_from_file_location('verified_resolver_bridge', bridge)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('cannot load mandatory native resolver bridge')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.solve(globals(),pool,target,reqs,constraints,key,no_deps=no_deps,
+                        resolver_cache=resolver_cache,materialize=materialize,
+                        preferred_versions=preferred_versions)
 
 
 def _pip_plan_path(stage, key):
