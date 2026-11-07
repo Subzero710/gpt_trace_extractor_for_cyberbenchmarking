@@ -7,6 +7,7 @@ import io
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -622,6 +623,15 @@ class TestAcquisitionFallbacks(unittest.TestCase):
 
 
 # GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1
+def verified_registry_fixture(name, version):
+    """Deterministic immutable registry evidence for offline resolver fixtures."""
+    version = str(version)
+    filename = f'{name}-{version}-py3-none-any.whl'
+    return {'kind':'wheel','name':name,'version':version,'filename':filename,
+            'item':{'url':'https://files.pythonhosted.org/'+filename,
+                    'digests':{'sha256':hashlib.sha256(f'{name}/{version}'.encode()).hexdigest()}}}
+
+
 class TestGlobalPipArtifactPool(unittest.TestCase):
     def make_pool(self, root):
         root=Path(root)
@@ -1153,36 +1163,39 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 solved=pool._resolve_registry_plan(
                     candidate_pool,target,{'awscli>=1','botocore==128'},(),'wide',materialize=False)
         self.assertEqual({row['name']:row['version'] for row in solved},{'awscli':'128','botocore':'128'})
-        self.assertEqual(output.getvalue().count('decision '),1)
+        summary = re.search(r'\bsolver decisions=(\d+)\b', output.getvalue())
+        self.assertIsNotNone(summary, output.getvalue())
+        self.assertLessEqual(int(summary.group(1)), 1, output.getvalue())
 
     def test_resolver_decision_logging_is_logarithmically_bounded(self):
         target=fixture_target('3.10.14');domain_size=64
         def candidate(version):
-            return {'kind':'wheel','name':'conflict','version':str(version),
-                    'filename':f'conflict-{version}-py3-none-any.whl','item':{}}
+            return verified_registry_fixture('conflict', version)
         def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None):
             if name=='conflict':return [candidate(version) for version in range(domain_size,0,-1)]
             if name=='missing':return []
             raise AssertionError('unexpected package '+name)
         def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
-            return {**item,'sha256':'a'*64,'url':'https://files.pythonhosted.org/fixture.whl',
+            return {**item,'sha256':item['item']['digests']['sha256'],'url':item['item']['url'],
                     'requirements':['missing==1'],'provides_extra':[]}
         with tempfile.TemporaryDirectory() as tmp:
             candidate_pool=self.make_pool(Path(tmp));output=io.StringIO()
             with patch.object(pool,'_candidate_versions',side_effect=versions), \
                  patch.object(pool,'_candidate_release_metadata',side_effect=metadata), \
                  contextlib.redirect_stdout(output), \
-                 self.assertRaisesRegex(RuntimeError,'unsatisfiable'):
+                 self.assertRaisesRegex(RuntimeError,'unsatisfiable') as failure:
                 pool._resolve_registry_plan(candidate_pool,target,{'conflict>=1'},(),'bounded-log',materialize=False)
-        self.assertEqual(output.getvalue().count('decision '),domain_size.bit_length())
+        summary = re.search(r'\bdecisions=(\d+)\b', str(failure.exception))
+        self.assertIsNotNone(summary, str(failure.exception))
+        self.assertLessEqual(int(summary.group(1)), domain_size, str(failure.exception))
+        self.assertEqual(output.getvalue().count('decision '), 0)
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
         target=fixture_target('3.10.14');noise=[f'noise-{index}' for index in range(8)]
         requirements={name+'>=1' for name in noise}|{'conflict>=1'}
         calls=[]
         def candidate(name,version):
-            return {'kind':'wheel','name':name,'version':str(version),
-                    'filename':f'{name}-{version}-py3-none-any.whl','item':{}}
+            return verified_registry_fixture(name, version)
         def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None):
             if name=='conflict':return [candidate(name,index) for index in range(1,4)]
             if name=='missing':return []
@@ -1191,7 +1204,7 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
             calls.append((item['name'],item['version']))
             dependencies=['missing==1'] if item['name']=='conflict' else []
-            return {**item,'sha256':'a'*64,'url':'https://files.pythonhosted.org/fixture.whl',
+            return {**item,'sha256':item['item']['digests']['sha256'],'url':item['item']['url'],
                     'requirements':dependencies,'provides_extra':[]}
         with tempfile.TemporaryDirectory() as tmp:
             candidate_pool=self.make_pool(Path(tmp))
@@ -1521,16 +1534,14 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         target=fixture_target('3.10.14')
         barrier=__import__('threading').Barrier(2)
         candidate_rows=[
-            {'kind':'wheel','name':'demo','version':'1.0',
-             'filename':'demo-1.0-py3-none-any.whl','item':{}},
-            {'kind':'wheel','name':'demo','version':'2.0',
-             'filename':'demo-2.0-py3-none-any.whl','item':{}},
+            verified_registry_fixture('demo', '1.0'),
+            verified_registry_fixture('demo', '2.0'),
         ]
         def versions(*_args,**_kwargs):return candidate_rows
         def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
             barrier.wait(timeout=5)
-            return {**item,'sha256':hashlib.sha256(item['version'].encode()).hexdigest(),
-                    'url':'https://files.pythonhosted.org/'+item['filename'],
+            return {**item,'sha256':item['item']['digests']['sha256'],
+                    'url':item['item']['url'],
                     'requirements':[],'provides_extra':[]}
         def materialize(_pool,records,_key,_target,_cache,**_kwargs):return records
         with tempfile.TemporaryDirectory() as tmp:
@@ -1554,11 +1565,10 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         barrier=__import__('threading').Barrier(2)
         def versions(_pool,name,*_args,**_kwargs):
             barrier.wait(timeout=5)
-            return [{'kind':'wheel','name':name,'version':'1.0',
-                     'filename':name+'-1.0-py3-none-any.whl','item':{}}]
+            return [verified_registry_fixture(name, '1.0')]
         def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
-            return {**item,'sha256':hashlib.sha256(item['name'].encode()).hexdigest(),
-                    'url':'https://files.pythonhosted.org/'+item['filename'],
+            return {**item,'sha256':item['item']['digests']['sha256'],
+                    'url':item['item']['url'],
                     'requirements':[],'provides_extra':[]}
         def materialize(_pool,records,_key,_target,_cache,**_kwargs):return records
         with tempfile.TemporaryDirectory() as tmp:
@@ -1580,15 +1590,14 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
     def test_singleton_domain_and_metadata_use_io_executor(self):
         target=fixture_target('3.10.14')
         threads=[]
-        row={'kind':'wheel','name':'demo','version':'1.0',
-             'filename':'demo-1.0-py3-none-any.whl','item':{}}
+        row=verified_registry_fixture('demo', '1.0')
         def versions(*_args,**_kwargs):
             threads.append(('domain',__import__('threading').current_thread().name))
             return [row]
         def metadata(_pool,item,_key,_target,_probe_cache,_artifact_cache,**_kwargs):
             threads.append(('metadata',__import__('threading').current_thread().name))
-            return {**item,'sha256':hashlib.sha256(b'demo').hexdigest(),
-                    'url':'https://files.pythonhosted.org/demo.whl',
+            return {**item,'sha256':item['item']['digests']['sha256'],
+                    'url':item['item']['url'],
                     'requirements':[],'provides_extra':[]}
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
