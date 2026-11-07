@@ -3616,8 +3616,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 19
-PIP_RESOLVER_POLICY = 'verified-registry-backjump-native-sdist-metadata-v3'
+PIP_PLAN_SCHEMA = 20
+PIP_RESOLVER_POLICY = 'verified-registry-backjump-native-sdist-metadata-soft-pins-v4'
 
 
 def _pip_worker_controls():
@@ -3657,12 +3657,39 @@ def _target_fingerprint(target):
     return hashlib.sha256(json.dumps(target.as_dict(),sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
-def pip_group_key(target, reqs, constraints=(), no_deps=False):
+def _canonical_pip_preferences(values):
+    """Validated, stable target-local preferences. Never impose them as constraints."""
+    if values is None or values == {}:
+        return {}
+    if not isinstance(values, dict):
+        raise ValueError('invalid pip preference mapping')
+    _, _, Version, InvalidVersion, _ = _packaging_symbols()
+    clean = {}
+    for name, versions in sorted(values.items()):
+        if (not isinstance(name, str) or name != _normalized_package_name(name)
+                or not isinstance(versions, (tuple, list)) or not versions):
+            raise ValueError('invalid pip preferred project/version sequence')
+        checked = []
+        for raw in versions:
+            if not isinstance(raw, str) or not raw:
+                raise ValueError('invalid preferred release identity')
+            try:
+                version = str(Version(raw))
+            except InvalidVersion as exc:
+                raise ValueError('invalid preferred PEP 440 version') from exc
+            if version not in checked:
+                checked.append(version)
+        clean[name] = checked
+    return clean
+
+
+def pip_group_key(target, reqs, constraints=(), no_deps=False, *, preferred_versions=None):
     """Identity of a logical solve, including exact target and resolver policy."""
     target=_coerce_target(target)
     payload={'schema':PIP_PLAN_SCHEMA,'resolver':PIP_RESOLVER_POLICY,'runtime':_resolver_runtime_identity(),
              'target':target.as_dict(),'requirements':sorted(set(reqs)),
-             'constraints':sorted(set(constraints)),'no_deps':bool(no_deps)}
+             'constraints':sorted(set(constraints)),'no_deps':bool(no_deps),
+             'preferred_versions':_canonical_pip_preferences(preferred_versions)}
     return hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:20]
 
 
@@ -4364,7 +4391,7 @@ def _native_solver_cache(pool):
         return cache
 
 
-def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False):
+def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False, preferred_versions=None):
     """Resolve the whole graph using verified PyPI metadata, not pip backtracking.
 
     The existing conflict-directed backjump solver chooses one globally valid
@@ -4384,7 +4411,7 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
     try:
         return _resolve_registry_plan(pool, target, reqs, constraints, key,
                                       no_deps=no_deps, resolver_cache=cache,
-                                      materialize=True)
+                                      materialize=True, preferred_versions=preferred_versions)
     finally:
         if activity is not None:
             activity.leave()
@@ -4839,17 +4866,23 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
                   'for this target and active constraints; selecting a withdrawn '
                   'hash-addressed historical artifact (PEP 592)',flush=True)
     if not candidates:return []
+    # An earlier installed version is tried first if compatible. If a
+    # transitive dependency requires another version, the solver may change it.
+    explicit=set()
+    for text in (preferred_versions or {}).get(_normalized_package_name(name),()):
+        try:explicit.add(Version(text))
+        except InvalidVersion as exc:raise RuntimeError('invalid pip preferred version') from exc
     cached=set()
-    preferred=(_cached_python_versions(pool,name) if preferred_versions is None
-               else preferred_versions.get(_normalized_package_name(name),()))
-    for text in preferred:
+    for text in _cached_python_versions(pool,name):
         try:cached.add(Version(text))
         except InvalidVersion:continue
-    reused=[row for row in candidates if row[0] in cached]
-    if reused:
-        preferred=sorted(reused,key=lambda row:row[0],reverse=True)
-        rest=[row for row in reversed(candidates) if row[0] not in cached]
-        return [row[1] for row in [*preferred,*rest]]
+    reused=[row for row in candidates if row[0] in explicit]
+    reused=sorted(reused,key=lambda row:row[0],reverse=True)
+    cached_rows=sorted((row for row in candidates if row[0] in cached and row[0] not in explicit),
+                       key=lambda row:row[0],reverse=True)
+    if reused or cached_rows:
+        rest=[row for row in reversed(candidates) if row[0] not in cached and row[0] not in explicit]
+        return [row[1] for row in [*reused,*cached_rows,*rest]]
     # Pip prefers the newest compatible release for every non-exact range,
     # including a lone inclusive lower bound.  This is also essential for broad
     # historical requirements such as ``awscli>=...``: walking thousands of
@@ -5065,7 +5098,7 @@ def _candidate_satisfies(candidate,requirements,constraints):
                for req in [*requirements,*constraints])
 
 
-def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None,materialize=True):
+def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,resolver_cache=None,materialize=True,preferred_versions=None):
     """Resolve PyPI with propagation and conflict-directed backjumping.
 
     The solver never executes package code. Candidate metadata comes only from
@@ -5085,7 +5118,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     probe_cache=resolver_cache.setdefault('release_metadata',_SingleFlightCache())
     artifact_cache=resolver_cache.setdefault('artifact_metadata',_SingleFlightCache())
     release_cache=resolver_cache.setdefault('releases',_SingleFlightCache())
-    preferred_versions=resolver_cache.get('preferred_versions')
+    preferred_versions=(_canonical_pip_preferences(preferred_versions) if preferred_versions is not None
+                        else resolver_cache.get('preferred_versions'))
     metadata_executor=resolver_cache.get('metadata_executor')
     metadata_prefetch=resolver_cache.get('metadata_prefetch',1)
     prefetch_controller=resolver_cache.get('prefetch_controller')
@@ -5446,7 +5480,8 @@ def _read_pip_plan_tree(stage, key):
         if expected_target is not None and plan['target'] != expected_target:
             raise ValueError('pip build dependency target differs')
         if expected_target is not None and identity != pip_group_key(
-                plan['target'], plan['requested'], plan['constraints'], plan['no_deps']):
+                plan['target'], plan['requested'], plan['constraints'], plan['no_deps'],
+                preferred_versions=plan.get('preferred_versions', {})):
             raise ValueError('pip build checkpoint input identity differs')
         children = plan.get('build_plans', {})
         if not isinstance(children, dict) or any(not isinstance(sha, str) or not SHA.fullmatch(sha)
@@ -5463,7 +5498,7 @@ def _read_pip_plan_tree(stage, key):
     return records
 
 
-def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
+def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False,preferred_versions=None):
     """Reuse a verified completed logical plan without network or resolver work."""
     target=_coerce_target(target)
     path=pool.stage/'metadata'/('pip-plan-'+key+'.json')
@@ -5473,6 +5508,7 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
         if (plan.get('artifact_model')!=PIP_ARTIFACT_MODEL or plan.get('plan_schema')!=PIP_PLAN_SCHEMA
                 or plan.get('target')!=target.as_dict() or plan.get('requested')!=sorted(set(reqs))
                 or plan.get('constraints')!=sorted(set(constraints))
+                or plan.get('preferred_versions',{})!=_canonical_pip_preferences(preferred_versions)
                 or plan.get('no_deps') is not bool(no_deps)):
             return False
         plans = _read_pip_plan_tree(pool.stage, key)
@@ -5488,7 +5524,7 @@ def reuse_pip_plan(pool,target,reqs,key,*,constraints=(),no_deps=False):
     return True
 
 
-def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False,build_plans=None):
+def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False,build_plans=None,preferred_versions=None):
     target=_coerce_target(target);stage=pool.stage
     files=[{'filename':row['filename'],'sha256':row['sha256']} for row in packages if row['kind']=='wheel']
     sources=[{key_:row[key_] for key_ in ('name','version','filename','url','sha256','requirements','provides_extra')}
@@ -5498,6 +5534,7 @@ def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False
                              'runtime':_resolver_runtime_identity()},
           'target':target.as_dict(),'python':target.python_full_version,
           'requested':sorted(set(reqs)),'constraints':sorted(set(constraints)),
+          'preferred_versions':_canonical_pip_preferences(preferred_versions),
           'no_deps':bool(no_deps),'packages':packages,'files':files,'source_archives':sources,
           'build_plans':dict(sorted((build_plans or {}).items()))}
     try:_pip_plan_artifact_shas(plan)
@@ -5559,12 +5596,12 @@ def _historical_exact_pip_pins(requirements, target):
     return result
 
 
-def _historical_pip_constraints(prior, requirements, constraints, target, *, upgrade=False):
-    """Reconstruct pinned distributions present before the next pip command.
+def _historical_pip_preferences(prior, requirements, constraints, target, *, upgrade=False):
+    """Prefer earlier successful installs without forbidding needed changes.
 
-    Respect explicit newer constraints and intentional upgrades.  Never replace
-    an unavailable distribution with a different project, and never introduce
-    pins from unrelated tasks, environments or repositories.
+    A previous exact installation does not constrain the next Pip transaction.
+    Preserve its version as a verified, task-specific ordering preference.
+    Explicit subsequent requirements and constraints always take precedence.
     """
     Requirement, _SpecifierSet, Version, InvalidVersion, _env = _packaging_symbols()
     current_pins = _historical_exact_pip_pins(requirements, target)
@@ -5650,17 +5687,20 @@ def _native_pip_group_locked(pool,key,group):
             if (previous.get('target') != target.as_dict() or
                     previous.get('requested') != sorted(set(group['requirements'])) or
                     previous.get('constraints') != sorted(set(group['constraints'])) or
+                    previous.get('preferred_versions',{}) != _canonical_pip_preferences(group.get('preferred_versions')) or
                     previous.get('no_deps') is not group['no_deps']):
                 raise RuntimeError('optional pip outcome identity differs')
             if group['required']:
                 raise RuntimeError('required pip closure has only a recorded optional failure: '+key)
             return 'optional-failed'
     if reuse_pip_plan(pool,target,group['requirements'],key,
-                      constraints=group['constraints'],no_deps=group['no_deps']):
+                      constraints=group['constraints'],no_deps=group['no_deps'],
+                      preferred_versions=group.get('preferred_versions')):
         return 'reused'
     try:
         packages=_native_resolve_registry(pool,target,group['requirements'],
-            group['constraints'],key,no_deps=group['no_deps'])
+            group['constraints'],key,no_deps=group['no_deps'],
+            preferred_versions=group.get('preferred_versions'))
         build_plans = _native_acquire_build_dependencies(pool,target,packages)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         detail = str(exc)
@@ -5672,6 +5712,7 @@ def _native_pip_group_locked(pool,key,group):
             'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
             'target':target.as_dict(),'python':target.python_full_version,
             'requested':sorted(set(group['requirements'])),'constraints':sorted(set(group['constraints'])),
+            'preferred_versions':_canonical_pip_preferences(group.get('preferred_versions')),
             'no_deps':group['no_deps'],'optional_failed':str(exc),
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
@@ -5679,7 +5720,8 @@ def _native_pip_group_locked(pool,key,group):
     # recipe that permits its installer to fail. Never overwrite a completed
     # record with an optional-failure marker.
     _write_pip_plan(pool,target,group['requirements'],key,packages,
-                    constraints=group['constraints'],no_deps=group['no_deps'],build_plans=build_plans)
+                    constraints=group['constraints'],no_deps=group['no_deps'],build_plans=build_plans,
+                    preferred_versions=group.get('preferred_versions'))
     return 'acquired'
 
 
@@ -6395,12 +6437,13 @@ def main(argv=None):
 
         task_steps=[];environment_steps=[];optional_steps=[];optional_skips=[]
         def register(req, constraints, name, *, no_deps=False, optional=False,
-                     resolver_target=None, bucket='task'):
+                     resolver_target=None, bucket='task', preferred_versions=None):
             if not req:return None
             selected_target=_coerce_target(resolver_target or task_target)
-            key=pip_group_key(selected_target,req,constraints,no_deps)
+            preferred=_canonical_pip_preferences(preferred_versions)
+            key=pip_group_key(selected_target,req,constraints,no_deps,preferred_versions=preferred)
             group=groups.setdefault(key,{'target':selected_target.as_dict(),'requirements':sorted(req),
-                                          'constraints':sorted(constraints),'no_deps':no_deps,
+                                          'constraints':sorted(constraints),'preferred_versions':preferred,'no_deps':no_deps,
                                           'required':not optional,'tasks':[],'steps':[]})
             if not optional:group['required']=True
             if logical not in group['tasks']:group['tasks'].append(logical)
@@ -6415,9 +6458,9 @@ def main(argv=None):
         register(env_requirements,set(),'conda-environment-pip',
                  resolver_target=env_pip_target,bucket='environment')
 
-        # A later pip command runs in the SAME task environment as earlier
-        # required commands.  The resolver works in fresh --ignore-installed
-        # scratch prefixes, so carry exact earlier installs as constraints.
+        # Sequential commands can replace earlier installed versions.
+        # Retain earlier exact installs only as task-local ordering preferences;
+        # imposing them as constraints produces false UNSAT on transitive deps.
         historical_pins = {}
         for step in steps:
             dependencies=set(step['requirements']);step_constraints=set(inline_constraints)
@@ -6461,12 +6504,17 @@ def main(argv=None):
             # Python target with only task-local previously pinned distributions.
             upgrade = any(token in ('-U', '--upgrade')
                           for token in shlex.split(step['command']))
-            inherited = _historical_pip_constraints(
+            inherited = _historical_pip_preferences(
                 historical_pins, dependencies, step_constraints, task_target,
                 upgrade=upgrade)
-            step_constraints.update(inherited.values())
+            preferred = {}
+            for package, pinned in sorted(inherited.items()):
+                specifiers = tuple(_packaging_symbols()[0](pinned).specifier)
+                if len(specifiers) != 1 or specifiers[0].operator != '==':
+                    raise RuntimeError('invalid historical pip preference')
+                preferred[package] = [specifiers[0].version]
             register(dependencies,step_constraints,step['command'],
-                     no_deps=step['no_deps'],optional=step['optional'])
+                     no_deps=step['no_deps'],optional=step['optional'],preferred_versions=preferred)
             if not step['optional']:
                 # The explicit new installation overrides any previous exact
                 # pin for the same project; optional failures cannot establish
