@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 from ..tool_identity import stable_tool_name
@@ -207,16 +207,47 @@ def normalize_messages(
             if message_id:
                 calls_by_message[message_id].extend(call["id"] for call in calls)
 
-    # Provenance may know assistant-message membership even when the raw message
-    # format did not expose a standard tool_calls array.
+    # Preserve insertion order without repeatedly scanning the entire message.
+    # The historical behavior keeps the first occurrence of a call identity.
     for message_id, call_ids in message_to_calls.items():
+        members = set(calls_by_message[message_id])
         for call_id in call_ids:
-            if call_id not in calls_by_message[message_id]:
+            if call_id not in members:
                 calls_by_message[message_id].append(call_id)
+                members.add(call_id)
+
+    # Build an index of still-unused calls for parent-linked results. Each call
+    # is removed from its parent indexes at most once; repeated results no
+    # longer rescan every call belonging to a large assistant message.
+    parent_unconsumed = {
+        parent: Counter(call_ids)
+        for parent, call_ids in calls_by_message.items()
+    }
+    parent_by_name: dict[str, dict[str | None, int]] = {}
+    parents_for_call: dict[str, list[str]] = defaultdict(list)
+    parent_sizes: dict[str, int] = {}
+    for parent, call_counts in parent_unconsumed.items():
+        by_name: dict[str | None, int] = defaultdict(int)
+        for call_id, count in call_counts.items():
+            by_name[call_names.get(call_id)] += count
+            parents_for_call[call_id].append(parent)
+        parent_by_name[parent] = by_name
+        parent_sizes[parent] = sum(call_counts.values())
 
     out = []
-    unmatched: list[tuple[str, str, int]] = []
+    # Two append-only stacks replace the O(n) reverse scan and O(n) list
+    # reconstruction performed for every tool result. Stale consumed entries
+    # are discarded lazily, so an identity present in multiple call records
+    # can never be reused. Each stack entry is pushed and popped once.
+    unmatched_all: list[tuple[str, str]] = []
+    unmatched_by_name: dict[str, list[str]] = defaultdict(list)
     consumed: set[str] = set()
+
+    def latest_unmatched(name: str) -> str | None:
+        stack = unmatched_by_name[name] if name else unmatched_all
+        while stack and stack[-1][0] in consumed:
+            stack.pop()
+        return stack[-1][0] if stack else None
 
     for index, raw in enumerate(messages):
         if not isinstance(raw, dict):
@@ -225,9 +256,8 @@ def normalize_messages(
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
         role = _role(raw)
         calls = calls_by_index.get(index, [])
-        for call in calls:
-            unmatched.append((call["id"], call["name"], index))
-
+        # Calls belonging to the current message become eligible only after
+        # its result has been resolved; the old scan required call_index < index.
         raw_name = author.get("name") or raw.get("name")
         tool_call_id = raw.get("tool_call_id") or metadata.get("tool_call_id")
 
@@ -238,38 +268,32 @@ def normalize_messages(
 
             if not tool_call_id:
                 parent_id = str(metadata.get("parent_id") or "")
-                candidates = [
-                    cid
-                    for cid in calls_by_message.get(parent_id, [])
-                    if cid not in consumed
-                ]
+                remaining = parent_unconsumed.get(parent_id, {})
                 resolved_result_name = resolve_alias(raw_name)
-                same_name = [
-                    cid
-                    for cid in candidates
-                    if call_names.get(cid) == resolved_result_name
-                ]
-                if len(same_name) == 1:
-                    tool_call_id = same_name[0]
-                elif len(candidates) == 1:
-                    tool_call_id = candidates[0]
+                if parent_by_name.get(parent_id, {}).get(resolved_result_name, 0) == 1:
+                    tool_call_id = next(
+                        cid for cid in remaining
+                        if call_names.get(cid) == resolved_result_name
+                    )
+                elif parent_sizes.get(parent_id, 0) == 1:
+                    tool_call_id = next(iter(remaining))
 
             if not tool_call_id:
                 resolved_result_name = resolve_alias(raw_name)
-                for pos in range(len(unmatched) - 1, -1, -1):
-                    cid, name, call_index = unmatched[pos]
-                    if (
-                        call_index < index
-                        and cid not in consumed
-                        and (not resolved_result_name or name == resolved_result_name)
-                    ):
-                        tool_call_id = cid
-                        break
+                tool_call_id = latest_unmatched(resolved_result_name)
 
             if tool_call_id:
                 tool_call_id = str(tool_call_id)
                 consumed.add(tool_call_id)
-                unmatched = [item for item in unmatched if item[0] != tool_call_id]
+                for parent in parents_for_call.get(tool_call_id, ()):
+                    count = parent_unconsumed[parent].pop(tool_call_id, 0)
+                    parent_sizes[parent] -= count
+                    parent_by_name[parent][call_names.get(tool_call_id)] -= count
+
+        for call in calls:
+            entry = (call["id"], call["name"])
+            unmatched_all.append(entry)
+            unmatched_by_name[call["name"]].append(entry)
 
         normalized_name = None
         if role == "tool" and tool_call_id:

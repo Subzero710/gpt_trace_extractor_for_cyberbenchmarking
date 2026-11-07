@@ -5092,13 +5092,21 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     source_probe=resolver_cache.get('native_source_probe')
     wheel_only=(resolver_cache.get('sources_require_locked_python') is True
                 and not target.python_artifact_sha256)
+    # Repeated sibling branches share identical immutable requirement tuples.
+    # Bound grouping memoization by the actual number of input roots, not a
+    # fixed machine assumption; eviction only loses an optional optimization.
+    grouping_cache_capacity=max(1,len(roots)*len(roots))
     candidate_cache={};failed_states=set();learned_nogoods=defaultdict(set)
     decision_packages=defaultdict(int)
     observed_metadata=set();observed_metadata_lock=threading.Lock()
     stats={'decisions':0,'propagations':0,'backjumps':0,'memo_hits':0,'learned_skips':0,'forward_prunes':0}
     target_key=_target_fingerprint(target)
 
+    @functools.lru_cache(maxsize=grouping_cache_capacity)
     def grouped(entries):
+        # Requirements and their causal sets are immutable, hashable values.
+        # Sibling decisions share the same input tuple; previously each sibling
+        # rebuilt and sorted the entire dependency grouping independently.
         by_name=defaultdict(dict);extras=defaultdict(set)
         for req,causes in entries:
             name=_normalized_package_name(req.name);token=str(req)
