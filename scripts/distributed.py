@@ -330,29 +330,66 @@ def restore(cfg, directory):
 
 
 
-def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=3600):
-    """Retry read-only requests across tunnel outages; never replay mutations."""
+def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None):
+    """Read-only recovery with bounded latency and visible, actual outage time.
+
+    A lost read may be repeated. Mutations (e.g. prepare_templates) are never
+    replayed. An unreachable broker is not mistaken for a running worker or
+    a successful fetch, even when its Cloudflare tunnel container is healthy.
+    """
+    controls_path = ROOT / 'config/preparation.toml'
+    if controls_path.is_symlink() or not controls_path.is_file():
+        raise RuntimeError('missing versioned broker monitoring policy')
+    with controls_path.open('rb') as handle:
+        controls = tomllib.load(handle).get('acquisition')
+    if not isinstance(controls, dict):
+        raise RuntimeError('invalid broker monitoring policy')
+    request_limit = controls.get('broker_read_timeout_seconds')
+    report_interval = controls.get('broker_outage_report_seconds')
+    deadline = controls.get('broker_outage_timeout_seconds') if outage_seconds is None else outage_seconds
+    if (type(request_limit) is not int or request_limit < 1
+            or type(report_interval) is not int or report_interval < 1
+            or type(deadline) not in (int, float) or deadline <= 0
+            or report_interval >= deadline):
+        raise RuntimeError('invalid configured broker monitoring timeouts')
     started = time.monotonic()
-    retry = 0
+    last_report = started
+    retries = 0
+    last_error = ''
     while True:
+        elapsed = time.monotonic() - started
+        remaining = deadline - elapsed
+        if remaining <= 0:
+            raise RuntimeError('broker read link unavailable for %.0f seconds during %s '
+                               '(last error: %s); preparation outcome unconfirmed; '
+                               'state and workers retained; rerun the explicit fetch '
+                               'only after checking broker health' %
+                               (elapsed, action, last_error))
         try:
-            result = broker(cfg, action, payload, timeout=120)
+            result = broker(cfg, action, payload, timeout=min(request_limit,remaining))
         except (TransportFailure, RemoteFailure) as exc:
             if isinstance(exc, IdentityFailure):
                 raise
-            if isinstance(exc, RemoteFailure) and getattr(exc, "status", None) not in {
-                    502, 503, 504, 520, 521, 522, 523, 524}:
+            if (isinstance(exc, RemoteFailure) and getattr(exc, 'status', None)
+                    not in {502, 503, 504, 520, 521, 522, 523, 524}):
                 raise
-            if time.monotonic() - started >= outage_seconds:
-                raise RuntimeError("broker link unavailable for one hour; remote build outcome unconfirmed; "
-                                   "rerun fetch to rediscover the durable operation") from exc
-            if retry == 0:
-                print("broker connection interrupted; reconnecting without restarting any VM", flush=True)
-            time.sleep(min(30, 2 ** min(retry, 5)))
-            retry += 1
+            last_error = ('HTTP ' + str(exc.status) if isinstance(exc, RemoteFailure)
+                          else type(exc).__name__ + ': ' + str(exc))
+            elapsed = time.monotonic() - started
+            if retries == 0 or elapsed - (last_report-started) >= report_interval:
+                print('[broker] connexion interrompue pendant %.0fs | requête %s '
+                      '| essai %s | %s | aucune VM relancée' %
+                      (elapsed, action, retries+1, last_error), flush=True)
+                last_report = time.monotonic()
+            retries += 1
+            remaining = deadline - (time.monotonic() - started)
+            if remaining <= 0:
+                continue
+            time.sleep(min(remaining, request_limit, 2**min(retries,5)))
         else:
-            if retry:
-                print("broker reconnected; resumed preparation monitoring", flush=True)
+            if retries:
+                print('[broker] connexion rétablie après %.0fs | %s | %s essais' %
+                      (time.monotonic()-started, action, retries), flush=True)
             return result
 
 
@@ -847,6 +884,7 @@ def execution(cfg, action, args):
     paths = cfg["paths"]
     if action == "down":
         result = local_down(cfg)
+        run(['systemctl', 'disable', 'gpt-trace-distributed-broker.service'])
         execution_tunnel(cfg, 'down')
         return result
     if action == "requirements":
@@ -879,7 +917,7 @@ def execution(cfg, action, args):
         execution_environment(cfg)
         if (paths["base_image"].parent / "broker-drain.json").exists():
             run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=900)
-        run(["systemctl", "start", "gpt-trace-distributed-broker.service"])
+        run(["systemctl", "enable", "--now", "gpt-trace-distributed-broker.service"])
         deadline = time.monotonic() + 900
         while True:
             try:

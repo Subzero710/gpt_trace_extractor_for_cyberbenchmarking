@@ -27,6 +27,10 @@ progress_interval_seconds = 5
 # A stalled worker must not monopolize acquisition for hours.
 pip_total_timeout_seconds = 900
 pip_stall_timeout_seconds = 120
+# All broker reads are read-only and bounded; tunnel outages are visible.
+broker_read_timeout_seconds = 15
+broker_outage_report_seconds = 30
+broker_outage_timeout_seconds = 180
 
 [bootstrap]
 miniconda_archive = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"

@@ -3616,8 +3616,8 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 18
-PIP_RESOLVER_POLICY = 'native-pip-target-lock-build-closure-v2'
+PIP_PLAN_SCHEMA = 19
+PIP_RESOLVER_POLICY = 'verified-registry-backjump-native-sdist-metadata-v3'
 
 
 def _pip_worker_controls():
@@ -4269,103 +4269,125 @@ def _native_acquire_build_dependencies(pool,target,packages):
     return plans
 
 
-def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False):
-    """Use pip's native resolver and PEP 517 metadata hooks on the real target."""
+
+def _native_source_candidate_metadata(pool, candidate, key, target):
+    """Read the *real target* PEP 517 metadata for one SHA-verified sdist.
+
+    This path is used for every sdist under the verified graph solver. Wheels
+    instead use PyPI's hash-verified core-metadata sidecars or their own METADATA.
+    Neither the metadata hook nor the installer gets an unbounded mixed graph.
+    """
     target = _coerce_target(target)
+    if candidate['kind'] != 'sdist':
+        raise RuntimeError('native source hook requires a source distribution')
+    sha, url = _candidate_artifact_identity(candidate)
+    filename = candidate['filename']
+    parsed = urllib.parse.urlsplit(url)
+    if (not isinstance(filename, str) or Path(filename).name != filename
+            or filename in {'.', '..'}
+            or not filename.endswith(('.tar.gz', '.tar.bz2', '.zip'))
+            or parsed.scheme != 'https' or parsed.hostname != 'files.pythonhosted.org'
+            or urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1]) != filename
+            or parsed.username or parsed.password or parsed.fragment):
+        raise RuntimeError('untrusted native source archive identity')
+    # The CAS is authoritative: pip never gets a downloaded archive without
+    # verifying its expected digest and exact PyPI distribution provenance.
+    actual = pool.download(url, 'python-source', key, sha=sha)
+    if actual != sha:
+        raise RuntimeError('native source artifact identity differs')
+    pool.verify_object(sha)
     runtime = _native_pool_runtime(pool)
     python = _native_locked_python(pool, target)
-    root = runtime['root'] / 'plans' / key
+    if python is None:
+        raise RuntimeError('source metadata requires a locked target Python')
+    root = (runtime['root'] / 'source-metadata' /
+            _target_fingerprint(target) / sha)
     root.mkdir(parents=True, exist_ok=True)
-    requirements = root / 'requirements.txt'
-    requirements.write_text('\n'.join(sorted(set(reqs))) + '\n')
-    constraints_file = root / 'constraints.txt'
-    constraints_file.write_text('\n'.join(sorted(set(constraints))) + '\n')
+    source = pool.objects / sha[:2] / sha
+    archive = root / filename
+    if not archive.exists():
+        os.link(source, archive)
+    if archive.is_symlink() or not archive.is_file() or not archive.samefile(source):
+        raise RuntimeError('native source archive was replaced')
     report = root / 'pip-report.json'
-    if python is not None:
-        argv = [python, '-m', 'pip', 'install', '--use-pep517']
-    else:
-        # The golden system Python is recorded by the actual Kali interpreter,
-        # but is not part of a Conda transaction. Explicit wheel-only cross-target
-        # resolution is valid for its pipx application requirements.
-        argv = [sys.executable, '-m', 'pip', 'install', '--only-binary=:all:',
-                '--python-version', target.python_full_version,
-                '--implementation', 'cp', '--abi', target.abi]
-        platforms = []
-        for tag in target.tags:
-            parts = tag.split('-', 2)
-            if len(parts) == 3 and parts[2] != 'any' and parts[2] not in platforms:
-                platforms.append(parts[2])
-        if not platforms:
-            raise RuntimeError('golden target has no verified wheel platform')
-        for platform_tag in platforms:
-            argv.extend(['--platform', platform_tag])
-    # Link prior SHA-verified PyPI wheels into a private local candidate index.
-    # Native pip still selects the compatible version and validates metadata.
-    wheelhouse = _native_seed_wheelhouse(pool, runtime)
-    argv.extend(['--dry-run', '--ignore-installed', '--find-links', wheelhouse,
-                 '--report', report, '--requirement', requirements,
-                 '--constraint', constraints_file])
-    if no_deps:
-        argv.append('--no-deps')
-    # Each closure has its own report directory. Pip's HTTP cache is
-    # concurrency-safe; CAS publication still uses its content locks.
-    build_requirements = _native_metadata_command(argv, runtime, root)
-    data = json.loads(report.read_text())
+    command = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
+               '--ignore-installed', '--no-deps', '--report', report,
+               archive]
+    observed_builds = _native_metadata_command(command, runtime, root)
+    data = json.loads(report.read_bytes())
     installs = data.get('install')
-    if not isinstance(installs, list):
-        raise RuntimeError('native pip returned an invalid resolved closure: '+key)
-    result = []
-    for installed in installs:
-        metadata = installed.get('metadata') or {}
-        download = installed.get('download_info') or {}
-        origin = download.get('url')
-        if not isinstance(origin, str):
-            raise RuntimeError('native pip plan has no artifact URL')
-        archive_info = download.get('archive_info') or {}
-        hashes = archive_info.get('hashes') or {}
-        sha = hashes.get('sha256')
-        if not isinstance(sha, str) or not SHA.fullmatch(sha):
-            raise RuntimeError('native pip plan lacks an authoritative SHA-256')
-        url, cached_yanked = _native_report_origin(pool, runtime, origin, sha)
-        parsed = urllib.parse.urlsplit(url)
-        filename = urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1])
-        if (not filename or Path(filename).name != filename or
-                not filename.endswith(('.whl', '.tar.gz', '.zip', '.tar.bz2'))):
-            raise RuntimeError('native pip plan has an invalid artifact filename')
-        name = metadata.get('name')
-        version = metadata.get('version')
-        if not isinstance(name, str) or not isinstance(version, str):
-            raise RuntimeError('native pip plan lacks distribution identity')
-        wheel = filename.endswith('.whl')
-        if wheel:
-            from packaging.utils import parse_wheel_filename
-            from packaging.tags import parse_tag
-            wheel_name, wheel_version, _build, tags = parse_wheel_filename(filename)
-            if (_normalized_package_name(wheel_name) != _normalized_package_name(name)
-                    or wheel_version != _packaging_symbols()[2](version)
-                    or not {str(tag) for tag in tags}.intersection(target.tags)):
-                raise RuntimeError('native pip selected an incompatible wheel: '+filename)
-        stored = _native_acquired_archive(pool, runtime, url, sha, 'python' if wheel else 'python-source', key)
-        if stored != sha:
-            raise RuntimeError('native pip artifact digest differs')
-        requirements_rows = []
-        for requirement in metadata.get('requires_dist') or []:
-            requirements_rows.append(normalize_legacy_source_requirement(requirement))
-        result.append({'kind': 'wheel' if wheel else 'sdist',
-            'name': name, 'version': version, 'filename': filename,
-            'url': url, 'sha256': sha, 'requirements': sorted(set(requirements_rows)),
-            'provides_extra': sorted(set(metadata.get('provides_extra') or [])),
-            'yanked': bool(installed.get('is_yanked', False) or cached_yanked),
-            'yanked_reason': None,
-            **({'build_requirements': build_requirements} if not wheel else {})})
-    plan = {'target': target.as_dict(), 'requested': sorted(set(reqs)),
-            'constraints': sorted(set(constraints)), 'no_deps': bool(no_deps),
-            'packages': result,
-            'resolver_policy': {'schema': PIP_PLAN_SCHEMA, 'name': PIP_RESOLVER_POLICY,
-                                'target_fingerprint': _target_fingerprint(target),
-                                'runtime': _resolver_runtime_identity()}}
-    _validate_pip_plan_graph(plan)
-    return result
+    if not isinstance(installs, list) or len(installs) != 1:
+        raise RuntimeError('native single-source PEP 517 report is incomplete')
+    installed = installs[0]
+    metadata = installed.get('metadata')
+    download = installed.get('download_info') or {}
+    if not isinstance(metadata, dict) or not isinstance(download, dict):
+        raise RuntimeError('native single-source report has invalid metadata')
+    origin = download.get('url')
+    location = urllib.parse.urlsplit(origin) if isinstance(origin, str) else None
+    if (location is None or location.scheme != 'file' or location.netloc
+            or location.query or location.fragment
+            or Path(urllib.parse.unquote(location.path)) != archive):
+        raise RuntimeError('native single-source report differs from verified CAS input')
+    name = metadata.get('name')
+    version = metadata.get('version')
+    requirements = metadata.get('requires_dist') or []
+    extras = metadata.get('provides_extra') or []
+    if (not isinstance(name, str) or not isinstance(version, str)
+            or _normalized_package_name(name) != _normalized_package_name(candidate['name'])
+            or _packaging_symbols()[2](version) != _packaging_symbols()[2](candidate['version'])
+            or not isinstance(requirements, list) or not all(isinstance(item, str) for item in requirements)
+            or not isinstance(extras, list) or not all(isinstance(item, str) for item in extras)):
+        raise RuntimeError('native single-source package identity/requirements differ')
+    # The selected package's PEP 517 build environments were inspected before
+    # TMPDIR cleanup. Their exact distributions are recursively acquired later.
+    return {'kind': 'sdist', 'name': name, 'version': version,
+            'filename': filename, 'url': url, 'sha256': sha,
+            'requirements': sorted(set(normalize_legacy_source_requirement(row)
+                                       for row in requirements)),
+            'provides_extra': sorted(set(extras)),
+            'build_requirements': observed_builds,
+            **_candidate_yank_provenance(candidate)}
+
+
+def _native_solver_cache(pool):
+    """Share single-flight PyPI metadata and verified source results across groups."""
+    with pool._state_lock:
+        cache = getattr(pool, '_native_verified_solver_cache', None)
+        if cache is None:
+            cache = {'release_metadata': _SingleFlightCache(),
+                     'artifact_metadata': _SingleFlightCache(),
+                     'releases': _SingleFlightCache(),
+                     'native_source_probe': _native_source_candidate_metadata,
+                     'sources_require_locked_python': True}
+            pool._native_verified_solver_cache = cache
+        return cache
+
+
+def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False):
+    """Resolve the whole graph using verified PyPI metadata, not pip backtracking.
+
+    The existing conflict-directed backjump solver chooses one globally valid
+    candidate per distribution. Wheels are inspected without installation, and
+    each source distribution uses one isolated PEP 517 --no-deps metadata hook.
+    Large transitive graphs are never passed to a single pip install command.
+    The completed artifact graph is independently validated by _write_pip_plan.
+    """
+    target = _coerce_target(target)
+    if _POOL_PROGRESS is None:
+        print('[pool] verified registry graph: ' + key + ' (' +
+              str(len(set(reqs))) + ' direct requirements)', flush=True)
+    cache = _native_solver_cache(pool)
+    activity = cache.get('prefetch_controller')
+    if activity is not None:
+        activity.enter()
+    try:
+        return _resolve_registry_plan(pool, target, reqs, constraints, key,
+                                      no_deps=no_deps, resolver_cache=cache,
+                                      materialize=True)
+    finally:
+        if activity is not None:
+            activity.leave()
 
 
 def _native_project_requirements(metadata, target, extras):
@@ -4983,7 +5005,7 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
     return _memo_get_or_compute(probe_cache,identity,probe)
 
 
-def _materialize_solution(pool,records,key,target,artifact_cache,executor=None):
+def _materialize_solution(pool,records,key,target,artifact_cache,executor=None,source_probe=None):
     """Acquire winning artifacts concurrently and verify solve-time metadata exactly."""
     def materialize(expected):
         candidate={'kind':expected['kind'],'name':expected['name'],'version':expected['version'],
@@ -4991,9 +5013,21 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None):
                    'digests':{'sha256':expected['sha256']},
                    'yanked':expected.get('yanked',False),
                    'yanked_reason':expected.get('yanked_reason')}}
-        actual=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+        if expected['kind']=='sdist' and source_probe is not None:
+            # One verified source/target result is reused across solver probes
+            # and checkpoint materialization, without re-running build hooks.
+            identity=('native-source-artifact',_target_fingerprint(target),
+                      expected['sha256'],expected['filename'])
+            actual=_memo_get_or_compute(artifact_cache,identity,
+                lambda:source_probe(pool,candidate,key,target))
+            size=pool.verify_object(actual['sha256'])
+            pool.reference(actual['sha256'],'python-source',key,size)
+        else:
+            actual=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
         if (sorted(actual['requirements'])!=sorted(expected['requirements'])
                 or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])
+                or (expected['kind']=='sdist' and source_probe is not None
+                    and actual.get('build_requirements')!=expected.get('build_requirements'))
                 or _candidate_yank_provenance(candidate)!={
                     key:expected[key] for key in ('yanked','yanked_reason') if key in expected}):
             raise RuntimeError('PyPI release metadata differs from selected artifact metadata: '
@@ -5039,6 +5073,9 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     metadata_executor=resolver_cache.get('metadata_executor')
     metadata_prefetch=resolver_cache.get('metadata_prefetch',1)
     prefetch_controller=resolver_cache.get('prefetch_controller')
+    source_probe=resolver_cache.get('native_source_probe')
+    wheel_only=(resolver_cache.get('sources_require_locked_python') is True
+                and not target.python_artifact_sha256)
     candidate_cache={};failed_states=set();learned_nogoods=defaultdict(set)
     decision_packages=defaultdict(int)
     observed_metadata=set();observed_metadata_lock=threading.Lock()
@@ -5080,8 +5117,18 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
         return candidate_cache[cache_key]
 
     def candidate_record(candidate):
-        record=_candidate_release_metadata(
-            pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
+        if candidate['kind'] == 'sdist' and source_probe is not None:
+            # Source metadata is always obtained from the selected target's
+            # actual PEP 517 hooks. No static approximation or silent fallback.
+            identity=('native-source',_candidate_probe_identity(candidate,target,no_deps))
+            artifact_identity=('native-source-artifact',_target_fingerprint(target),
+                               _candidate_artifact_identity(candidate)[0],candidate['filename'])
+            record=_memo_get_or_compute(probe_cache,identity,
+                lambda:_memo_get_or_compute(artifact_cache,artifact_identity,
+                    lambda:source_probe(pool,candidate,key,target)))
+        else:
+            record=_candidate_release_metadata(
+                pool,candidate,key,target,probe_cache,artifact_cache,no_deps=no_deps)
         with observed_metadata_lock:
             observed_metadata.add(_normalized_package_name(candidate['name']))
         return record
@@ -5222,6 +5269,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
                 except BaseException:
                     for pending in domain_futures.values():pending.cancel()
                     raise
+                if wheel_only:
+                    candidates=[row for row in candidates if row['kind']=='wheel']
                 if not candidates:
                     for pending in domain_futures.values():pending.cancel()
                     failed_states.add(current_state)
@@ -5341,7 +5390,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
           f"hottest={hottest[0]}:{hottest[1]}; "
           +( "materializing winning artifacts" if materialize
              else "solution ready for verified artifact checkpoint"),flush=True)
-    return (_materialize_solution(pool,solved,key,target,artifact_cache,executor=metadata_executor)
+    return (_materialize_solution(pool,solved,key,target,artifact_cache,
+                                  executor=metadata_executor,source_probe=source_probe)
             if materialize else solved)
 
 
@@ -5610,36 +5660,51 @@ def _native_pip_group_locked(pool,key,group):
 
 
 def acquire_pip_groups(pool, groups):
-    """Native pip resolution with per-target interpreter reuse and CAS checkpoints."""
+    """Share bounded metadata I/O across concurrent verified closure solvers."""
     ordered=sorted(groups.items())
     if not ordered:
         return
-    closure_workers, _metadata_workers = _pip_worker_controls()
-    if type(closure_workers) is not int or closure_workers < 1:
-        raise RuntimeError('invalid configured pip closure concurrency')
+    closure_workers, metadata_workers = _pip_worker_controls()
+    if (type(closure_workers) is not int or closure_workers < 1
+            or type(metadata_workers) is not int or metadata_workers < 1):
+        raise RuntimeError('invalid configured pip solver concurrency')
     workers=min(closure_workers,len(ordered))
     if _POOL_PROGRESS is None:
-        print('[pool] native Pip resolver: '+str(len(ordered))+' closures, '
-              +str(workers)+' workers; locked Python; host-only',flush=True)
+        print('[pool] verified Pip graph solver: '+str(len(ordered))+
+              ' closures, '+str(workers)+' closure workers, '+str(metadata_workers)+
+              ' shared metadata workers; host-only', flush=True)
     _pool_progress('Pip closures',0,len(ordered),'closures',f'{workers} workers')
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
-            thread_name_prefix='native-pip') as executor:
-        futures={executor.submit(acquire_pip_group,pool,key,group):key
-                 for key,group in ordered}
-        errors=[]
-        done=0
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-                done+=1
-                _pool_progress('Pip closures',done,len(ordered),'closures',f'{workers} workers')
-            except BaseException as exc:
-                errors.append((futures[future],exc))
-                for other in futures:
-                    if not other.done():other.cancel()
-        if errors:
-            key,exc=min(errors,key=lambda row:row[0])
-            raise RuntimeError('native pip closure '+key+' failed: '+str(exc)) from exc
+    cache=_native_solver_cache(pool)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=metadata_workers,
+            thread_name_prefix='verified-pypi-metadata') as io_executor:
+        with pool._state_lock:
+            cache['metadata_executor']=io_executor
+            cache['metadata_prefetch']=_metadata_prefetch_width(workers,metadata_workers)
+            cache['prefetch_controller']=_ResolverActivity(metadata_workers)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+                    thread_name_prefix='verified-pip-closure') as executor:
+                futures={executor.submit(acquire_pip_group,pool,key,group):key
+                         for key,group in ordered}
+                errors=[];done=0
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                        done+=1
+                        _pool_progress('Pip closures',done,len(ordered),'closures',
+                                       f'{workers} workers')
+                    except BaseException as exc:
+                        errors.append((futures[future],exc))
+                        for other in futures:
+                            if not other.done():other.cancel()
+                if errors:
+                    key,exc=min(errors,key=lambda row:row[0])
+                    raise RuntimeError('verified pip closure '+key+' failed: '+str(exc)) from exc
+        finally:
+            with pool._state_lock:
+                cache.pop('metadata_executor',None)
+                cache.pop('metadata_prefetch',None)
+                cache.pop('prefetch_controller',None)
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):
     """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""
