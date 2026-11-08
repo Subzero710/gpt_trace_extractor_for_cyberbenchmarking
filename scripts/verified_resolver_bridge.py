@@ -19,6 +19,53 @@ from pathlib import Path
 
 
 
+class _BoundedPrefetch:
+    """Reuse verified metadata across backtracking without unbounded HTTP queues.
+
+    Outstanding speculative futures are capped by the live fairness-controller
+    allocation. Running requests are never claimed to be cancellable: they keep
+    their slot until completion. Pending obsolete requests can be cancelled.
+    Completed validated metadata stays in the ordinary resolver caches.
+    """
+    def __init__(self, executor, probe):
+        self.executor = executor
+        self.probe = probe
+        self.futures = {}
+
+    def schedule(self, references, width, completed):
+        if type(width) is not int or width < 1:
+            raise RuntimeError('invalid adaptive Rust metadata prefetch allocation')
+        if len(references) != len(set(references)):
+            raise RuntimeError('duplicate native Rust prefetch candidate')
+        desired = set(references)
+        # Remove requests already present in the validated record cache.
+        # Keep completed failures that are still requested so their exact
+        # exception is delivered when Rust asks for the candidate.
+        for ref, future in tuple(self.futures.items()):
+            if future.cancelled() or (future.done() and ref in completed):
+                self.futures.pop(ref)
+            elif ref not in desired:
+                if future.cancel() or future.done():
+                    self.futures.pop(ref)
+        if self.executor is None:
+            return
+        # Running older requests occupy real executor slots and are retained.
+        # Do not submit replacements that would exceed the current allocation.
+        for ref in references:
+            if len(self.futures) >= width:
+                break
+            if ref not in self.futures and ref not in completed:
+                self.futures[ref] = self.executor.submit(self.probe, ref)
+
+    def take(self, ref):
+        return self.futures.pop(ref, None)
+
+    def close(self):
+        for future in self.futures.values():
+            future.cancel()
+        self.futures.clear()
+
+
 def _uint(number, width):
     if type(number) is not int or number < 0 or number >= 1 << (width * 8):
         raise RuntimeError('invalid verified resolver IPC integer')
@@ -215,21 +262,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     candidate_lock = threading.Lock()
     observed_lock = threading.Lock()
     observed_metadata = set()
-    prefetch_futures = {}
-
-    def retain_prefetch(references):
-        """Only the current Rust candidate window may keep queued metadata work.
-
-        Completed probes remain in the validated single-flight/record caches,
-        while unneeded pending futures are canceled, not silently waited for.
-        """
-        keep = set(references)
-        if len(keep) != len(references):
-            raise RuntimeError('duplicate native Rust prefetch candidate')
-        for ref in tuple(prefetch_futures):
-            if ref not in keep:
-                prefetch_futures.pop(ref).cancel()
-
     def domain(name, requirements):
         raw = tuple(requirements)
         cache_key = name, raw
@@ -289,6 +321,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         with observed_lock:
             observed_metadata.add(host['_normalized_package_name'](candidate['name']))
         return value
+
+    prefetch = _BoundedPrefetch(executor, record)
 
     def active_dependencies(ref, extras):
         result = []
@@ -406,22 +440,14 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('unbounded Rust metadata prefetch')
                     references = [wire.number() for _ in range(count)]
                     def deliver_prefetch():
-                        # Validate the whole window before touching existing work.
+                        # Reject invalid references before changing scheduled work.
                         for ref in references:
                             if ref not in candidate_by_id:
                                 raise RuntimeError('unknown Rust metadata prefetch candidate')
-                        retain_prefetch(references)
-                        if executor is not None:
-                            for ref in references:
-                                if ref not in prefetch_futures and ref not in record_by_id:
-                                    prefetch_futures[ref] = executor.submit(record, ref)
+                        width = (prefetch_controller.width()
+                                 if prefetch_controller is not None else prefetch_width)
+                        prefetch.schedule(references, width, record_by_id)
                     action = deliver_prefetch
-                elif op == b'X':
-                    # Entering another search branch abandons speculative work
-                    # from the previous branch, not its completed verified cache.
-                    def deliver_prefetch_clear():
-                        retain_prefetch(())
-                    action = deliver_prefetch_clear
                 elif op == b'C':
                     ref, requirements = wire.number(), wire.strings()
                     def deliver_check():
@@ -445,7 +471,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     references = [wire.number() for _ in range(count)]
                     def deliver_metadata():
                         for ref in references:
-                            future = prefetch_futures.pop(ref, None)
+                            future = prefetch.take(ref)
                             if future is None:
                                 record(ref)
                             else:
@@ -514,8 +540,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 raise RuntimeError(str(exc) + '; Rust stderr: ' + text) from exc
             raise
         finally:
-            for future in prefetch_futures.values():
-                future.cancel()
+            prefetch.close()
             if child.stdin is not None and not child.stdin.closed:
                 child.stdin.close()
             if child.stdout is not None and not child.stdout.closed:

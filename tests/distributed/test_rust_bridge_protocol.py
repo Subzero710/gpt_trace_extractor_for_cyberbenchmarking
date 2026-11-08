@@ -90,3 +90,55 @@ def test_bridge_versions_use_pep440_not_string_spelling():
     assert bridge._same_pep440_version(host, '1.0', '1.0.0')
     assert not bridge._same_pep440_version(host, '1.0', '1.0.1')
     assert not bridge._same_pep440_version(host, 'invalid', '1.0')
+
+
+def test_adaptive_prefetch_preserves_running_work_without_unbounded_queue():
+    import concurrent.futures
+    class DeferredExecutor:
+        def __init__(self):
+            self.submitted = {}
+        def submit(self, fn, ref):
+            future = concurrent.futures.Future()
+            self.submitted[ref] = future
+            return future
+    location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_bounded_prefetch_test', location)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    executor = DeferredExecutor()
+    prefetch = bridge._BoundedPrefetch(executor, lambda ref: ref)
+    verified = {}
+    prefetch.schedule((1, 2), 2, verified)
+    assert set(prefetch.futures) == {1, 2}
+    assert executor.submitted[1].set_running_or_notify_cancel()
+    prefetch.schedule((3, 4), 2, verified)
+    assert executor.submitted[2].cancelled()
+    assert set(prefetch.futures) == {1, 3}
+    assert 4 not in executor.submitted
+    assert prefetch.take(1) is executor.submitted[1]
+    executor.submitted[3].set_result('verified')
+    verified[3] = 'verified'
+    prefetch.schedule((3, 4), 2, verified)
+    assert 4 in prefetch.futures
+    assert prefetch.take(4) is executor.submitted[4]
+    prefetch.close()
+
+
+def test_adaptive_prefetch_retains_current_completed_failure_until_consumed():
+    import concurrent.futures
+    location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_prefetch_failure_test', location)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    class DeferredExecutor:
+        def submit(self, fn, ref):
+            return concurrent.futures.Future()
+    prefetch = bridge._BoundedPrefetch(DeferredExecutor(), lambda ref: ref)
+    prefetch.schedule((1,), 1, {})
+    pending = prefetch.futures[1]
+    pending.set_exception(RuntimeError('metadata error'))
+    prefetch.schedule((1,), 1, {})
+    import pytest
+    with pytest.raises(RuntimeError, match='metadata error'):
+        prefetch.take(1).result()
+    prefetch.close()

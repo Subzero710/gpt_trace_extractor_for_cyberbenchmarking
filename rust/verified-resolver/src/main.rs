@@ -276,14 +276,6 @@ impl Solver {
         self.wire.flush()?;
         self.wire.ack()
     }
-    fn clear_prefetch(&mut self) -> Result<(), String> {
-        // Do not keep speculative metadata requests of an abandoned decision
-        // scope alive while exploring another dependency branch.
-        self.wire.send_u8(b'X')?;
-        self.wire.flush()?;
-        self.wire.ack()
-    }
-
     fn check(&mut self, candidate: &Candidate, rows: &[Entry]) -> Result<bool,String> {
         self.validate_time()?;
         self.wire.send_u8(b'C')?; self.wire.send_u32(candidate.id)?;
@@ -504,7 +496,8 @@ impl Solver {
                 } else {
                     let mut next=state.clone();
                     next.selected.insert(name.clone(),candidate.clone());
-                    self.clear_prefetch()?;
+                    // Preserve useful sibling probes while the child explores its
+                    // graph. The host keeps only a live, bounded prefetch set.
                     self.search(next,depth+1)?
                 };
                 match result {

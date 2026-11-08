@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from workstation_broker import preparation as jobs
+from gpt_trace_transport import local_templates as templates
 
 
 def _source_tree(root: Path) -> None:
@@ -24,6 +25,12 @@ def _source_tree(root: Path) -> None:
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(relative.encode())
         executable.chmod(0o555)
+    # The fixture must satisfy the real attestation contract rather than
+    # bypassing the production check or copying a machine-specific binary.
+    identity = root / jobs.fetch_runtime_build_identity_path(root)
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_bytes(templates.canonical(templates.fetch_runtime_build_identity(root)) + b"\n")
+    identity.chmod(0o444)
 
 
 def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path, monkeypatch):
@@ -96,6 +103,13 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
         assert executable.read_bytes() == (private / relative).read_bytes()
         assert executable.stat().st_uid == 0
         assert stat.S_IMODE(executable.stat().st_mode) == 0o555
+    identity_relative = jobs.fetch_runtime_build_identity_path(private)
+    original_identity = private / identity_relative
+    staged_identity = source_root / identity_relative
+    assert staged_identity.read_bytes() == original_identity.read_bytes()
+    assert staged_identity.stat().st_uid == 0
+    assert stat.S_IMODE(staged_identity.stat().st_mode) == 0o444
+    assert jobs.verify_fetch_runtime_build_identity(source_root) == templates.fetch_runtime_build_identity(private)
     staged_dependency = source_root / "golden-dependency.json"
     assert staged_dependency.read_bytes() == jobs.canonical(dependency) + b"\n"
     assert staged_dependency.stat().st_uid == 0
@@ -155,3 +169,16 @@ def test_retained_stage_score_prefers_existing_cas_over_newer_empty_stage(tmp_pa
     newer = rich.stat().st_mtime_ns + 10_000_000
     os.utime(empty, ns=(newer, newer))
     assert jobs._retained_stage_score(rich) > jobs._retained_stage_score(empty)
+
+
+def test_fetch_snapshot_rejects_stale_rust_build_attestation(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip("root ownership is required for build attestation")
+    private = tmp_path / "private-repo"
+    private.mkdir(mode=0o700)
+    _source_tree(private)
+    rust_source = next(relative for relative in jobs.FETCH_SOURCE_FILES if relative.endswith('.rs'))
+    source = private / rust_source
+    source.write_bytes(source.read_bytes() + b"\nmodified after build attestation\n")
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        jobs.verify_fetch_runtime_build_identity(private)
