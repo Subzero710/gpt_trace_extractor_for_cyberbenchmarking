@@ -131,10 +131,27 @@ fn grouped(entries: &[Entry]) -> Grouped {
 fn causes(rows: &[Entry]) -> BTreeSet<String> {
     rows.iter().flat_map(|r| r.causes.iter().cloned()).collect()
 }
-fn current_state_key(state: &State, group: &Grouped) -> String {
-    // Every entry's causal provenance participates in the memoization key:
-    // sharing an UNSAT result across different causes would break backjumping.
-    format!("{:?}|{:?}|{:?}", group.rows, state.selected.iter().map(|(n,c)| (n,c.id)).collect::<Vec<_>>(), state.expanded)
+type StateKey = (Vec<(String, Vec<String>)>,
+                 Vec<(String, String, String, String)>,
+                 Vec<(String, Vec<String>)>);
+type NogoodKey = (String, String, String, String, Vec<String>, Vec<String>);
+type Clause = Vec<(String, (String, String, String))>;
+
+fn current_state_key(state: &State, group: &Grouped) -> StateKey {
+    // Literal port of Python state_key: the requirement strings, the selected
+    // artifact (kind/version/filename), and expanded extras form the key.
+    // Causal provenance is intentionally NOT part of Python's memo identity.
+    let requirements = group.rows.iter().map(|(name, rows)|
+        (name.clone(), rows.iter().map(|row| row.requirement.clone()).collect())
+    ).collect();
+    let assignments = state.selected.iter().map(|(name, candidate)|
+        (name.clone(), candidate.kind.clone(), candidate.version.clone(),
+         candidate.filename.clone())
+    ).collect();
+    let extras = state.expanded.iter().map(|(name, values)|
+        (name.clone(), values.iter().cloned().collect())
+    ).collect();
+    (requirements, assignments, extras)
 }
 #[derive(Clone)]
 struct Failure { conflict: BTreeSet<String>, detail: String }
@@ -144,7 +161,7 @@ struct Solver {
     wire: Wire,
     no_deps: bool,
     roots: BTreeSet<String>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     max_decisions: u64,
     max_depth: usize,
     max_cache_bytes: usize,
@@ -153,16 +170,19 @@ struct Solver {
     candidate_domains: HashMap<(String,Vec<String>),Vec<Candidate>>,
     metadata_seen: HashSet<u32>,
     expanded_cache: HashMap<(u32,Vec<String>),Vec<Entry>>,
-    failed_states: HashSet<String>,
-    failed_fifo: VecDeque<String>,
+    failed_states: HashSet<StateKey>,
+    failed_fifo: VecDeque<StateKey>,
     failed_bytes: usize,
-    nogoods: HashMap<String,Vec<Vec<(String,u32)>>>,
+    nogoods: HashMap<NogoodKey,Vec<Clause>>,
     nogood_bytes: usize,
 }
 impl Solver {
     fn validate_time(&self) -> Result<(), String> {
-        if Instant::now() >= self.deadline { Err("native Rust dependency solve exceeded configured deadline".into()) }
-        else { Ok(()) }
+        // No wall-clock cap for a complete closure. Each host I/O / build
+        // operation is bounded by its own independently configured deadline.
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            Err("native Rust dependency solve exceeded configured deadline".into())
+        } else { Ok(()) }
     }
     fn read_candidate(&mut self) -> Result<Candidate,String> {
         let id = self.wire.raw_u32()?;
@@ -186,6 +206,75 @@ impl Solver {
         for _ in 0..count { candidates.push(self.read_candidate()?); }
         self.candidate_domains.insert(key, candidates.clone());
         Ok(candidates)
+    }
+    fn domains(&mut self, unresolved: &[String], group: &Grouped)
+        -> Result<BTreeMap<String, Vec<Candidate>>, String> {
+        let mut missing = Vec::new();
+        let mut answers = BTreeMap::new();
+        for name in unresolved {
+            let rows = &group.rows[name];
+            let requirements: Vec<String> = rows.iter().map(|r| r.requirement.clone()).collect();
+            let key = (name.clone(), requirements.clone());
+            if let Some(cached) = self.candidate_domains.get(&key) {
+                answers.insert(name.clone(), cached.clone());
+            } else {
+                missing.push((name.clone(), requirements));
+            }
+        }
+        if !missing.is_empty() {
+            self.validate_time()?;
+            self.wire.send_u8(b'B')?;
+            self.wire.send_len(missing.len())?;
+            for (name, requirements) in &missing {
+                self.wire.send_string(name)?;
+                self.wire.strings(requirements)?;
+            }
+            self.wire.flush()?;
+            self.wire.ack()?;
+            let count = self.wire.raw_u32()? as usize;
+            if count != missing.len() { return Err("batch domain count differs".into()); }
+            for (name, requirements) in missing {
+                let size = self.wire.raw_u32()? as usize;
+                if size > self.wire.max_frame { return Err("domain candidate count exceeds IPC limit".into()); }
+                let mut candidates = Vec::with_capacity(size);
+                for _ in 0..size { candidates.push(self.read_candidate()?); }
+                self.candidate_domains.insert((name.clone(), requirements), candidates.clone());
+                answers.insert(name, candidates);
+            }
+        }
+        Ok(answers)
+    }
+    fn known_metadata(&mut self, candidates: &[Candidate]) -> Result<BTreeSet<u32>, String> {
+        if candidates.is_empty() || self.no_deps { return Ok(BTreeSet::new()); }
+        self.wire.send_u8(b'K')?;
+        self.wire.send_len(candidates.len())?;
+        for candidate in candidates { self.wire.send_u32(candidate.id)?; }
+        self.wire.flush()?;
+        self.wire.ack()?;
+        let mut known = BTreeSet::new();
+        for candidate in candidates {
+            match self.wire.raw_u8()? {
+                1 => { known.insert(candidate.id); },
+                0 => {},
+                _ => return Err("invalid metadata-known bit".into()),
+            }
+        }
+        Ok(known)
+    }
+    fn prefetch(&mut self, candidates: &[Candidate], index: usize) -> Result<(), String> {
+        // Python's schedule_metadata submits futures without awaiting them.
+        // The Python host recomputes its live fairness-adjusted width.
+        self.wire.send_u8(b'W')?;
+        self.wire.flush()?;
+        self.wire.ack()?;
+        let width = self.wire.raw_u32()? as usize;
+        if width == 0 { return Err("invalid live Rust prefetch width".into()); }
+        let stop = std::cmp::min(candidates.len(), index.saturating_add(width));
+        self.wire.send_u8(b'A')?;
+        self.wire.send_len(stop - index)?;
+        for candidate in &candidates[index..stop] { self.wire.send_u32(candidate.id)?; }
+        self.wire.flush()?;
+        self.wire.ack()
     }
     fn check(&mut self, candidate: &Candidate, rows: &[Entry]) -> Result<bool,String> {
         self.validate_time()?;
@@ -255,35 +344,40 @@ impl Solver {
         }
         Ok(None)
     }
-    fn failed(&mut self, key: String) {
-        if key.len() > self.max_cache_bytes { return; }
-        while self.failed_bytes.saturating_add(key.len()) > self.max_cache_bytes {
+    fn failed(&mut self, key: StateKey) {
+        let size = format!("{:?}", key).len();
+        if size > self.max_cache_bytes { return; }
+        while self.failed_bytes.saturating_add(size) > self.max_cache_bytes {
             if let Some(old) = self.failed_fifo.pop_front() {
-                self.failed_bytes = self.failed_bytes.saturating_sub(old.len());
+                self.failed_bytes = self.failed_bytes.saturating_sub(format!("{:?}", old).len());
                 self.failed_states.remove(&old);
             } else { break; }
         }
         if self.failed_states.insert(key.clone()) {
-            self.failed_bytes = self.failed_bytes.saturating_add(key.len());
+            self.failed_bytes = self.failed_bytes.saturating_add(size);
             self.failed_fifo.push_back(key);
         }
     }
-    fn nogood_key(name: &str,c: &Candidate,rows: &[Entry],extras: &BTreeSet<String>) -> String {
-        format!("{}|{}|{}|{}|{:?}|{:?}",name,c.kind,c.version,c.filename,
-                rows.iter().map(|r| &r.requirement).collect::<Vec<_>>(),extras)
+    fn nogood_key(name: &str,c: &Candidate,rows: &[Entry],extras: &BTreeSet<String>) -> NogoodKey {
+        (name.to_string(),c.kind.clone(),c.version.clone(),c.filename.clone(),
+         rows.iter().map(|r| r.requirement.clone()).collect(),
+         extras.iter().cloned().collect())
     }
-    fn nogood_matches(&self, key: &str, selected: &BTreeMap<String,Candidate>) -> bool {
+    fn nogood_matches(&self, key: &NogoodKey, selected: &BTreeMap<String,Candidate>) -> bool {
         self.nogoods.get(key).map(|clauses| clauses.iter().any(|clause| {
-            clause.iter().all(|(name,id)| selected.get(name).map(|c| c.id)==Some(*id))
+            clause.iter().all(|(name,identity)| selected.get(name).map(|c|
+                (&c.kind,&c.version,&c.filename) == (&identity.0,&identity.1,&identity.2)
+            ).unwrap_or(false))
         })).unwrap_or(false)
     }
-    fn learn_nogood(&mut self,key: String, conflict: &BTreeSet<String>, name: &str,
+    fn learn_nogood(&mut self,key: NogoodKey, conflict: &BTreeSet<String>, name: &str,
                     selected: &BTreeMap<String,Candidate>) {
-        let clause: Vec<(String,u32)> = conflict.iter()
+        let clause: Clause = conflict.iter()
             .filter(|n| n.as_str()!=name)
-            .filter_map(|n| selected.get(n).map(|c| (n.clone(),c.id)))
+            .filter_map(|n| selected.get(n).map(|c|
+                (n.clone(),(c.kind.clone(),c.version.clone(),c.filename.clone()))))
             .collect();
-        let size = key.len() + clause.iter().map(|(n,_)|n.len()+std::mem::size_of::<u32>()).sum::<usize>();
+        let size = format!("{:?}{:?}", key, clause).len();
         if size > self.max_cache_bytes { return; }
         if self.nogood_bytes.saturating_add(size) > self.max_cache_bytes {
             self.nogoods.clear(); self.nogood_bytes=0;
@@ -307,7 +401,7 @@ impl Solver {
                 if !self.check(c,rows)? {
                     let mut conflict=causes(rows); conflict.insert(name.clone());
                     let detail=format!("selected {}=={} violates required constraints",name,c.version);
-                    self.failed(key);
+                    self.failed(key.clone());
                     return Ok(Outcome::Failed(Failure{conflict,detail}));
                 }
             }
@@ -332,11 +426,12 @@ impl Solver {
             let unresolved: Vec<String> = group.rows.keys().filter(|name|!state.selected.contains_key(*name)).cloned().collect();
             if unresolved.is_empty() { return Ok(Outcome::Solved(state.selected)); }
             let mut choices: Vec<(usize,bool,String,Vec<Candidate>)> = Vec::new();
+            let domains = self.domains(&unresolved, &group)?;
             for name in unresolved {
                 let rows=&group.rows[&name];
-                let candidates=self.domain(&name,rows)?;
+                let candidates=domains[&name].clone();
                 if candidates.is_empty() {
-                    self.failed(key);
+                    self.failed(key.clone());
                     return Ok(Outcome::Failed(Failure {conflict: causes(rows),
                         detail:format!("no compatible release for {} under requirements {:?}",name,
                                        rows.iter().map(|r|r.requirement.as_str()).collect::<Vec<_>>())}));
@@ -344,8 +439,9 @@ impl Solver {
                 let mut survivors=Vec::new();
                 let mut known_conflict=BTreeSet::new();
                 let mut first_detail=None;
+                let known = self.known_metadata(&candidates)?;
                 for c in candidates {
-                    if self.metadata_seen.contains(&c.id) {
+                    if known.contains(&c.id) {
                         if let Some((involved,dep_name))=self.lookahead(&name,&c,rows,&group,&state.selected)? {
                             known_conflict.extend(involved);
                             if first_detail.is_none() { first_detail=Some(dep_name); }
@@ -356,7 +452,7 @@ impl Solver {
                     survivors.push(c);
                 }
                 if survivors.is_empty() {
-                    self.failed(key);
+                    self.failed(key.clone());
                     return Ok(Outcome::Failed(Failure{conflict:known_conflict,
                         detail:format!("all cached compatible releases of {} conflict with {}",name,
                             first_detail.unwrap_or_default())}));
@@ -387,11 +483,10 @@ impl Solver {
                     return Err("native Rust solver exceeded configured decision budget".into());
                 }
                 *self.stats.decisions_by_name.entry(name.clone()).or_default()+=1;
-                // Metadata for several candidate releases is fetched concurrently
-                // by the host's verified metadata I/O pool, not by Rust's CPU loop.
-                let end=std::cmp::min(candidates.len(),idx.saturating_add(self.prefetch_width));
-                let ids:Vec<u32>=candidates[idx..end].iter().map(|c|c.id).collect();
-                self.metadata_batch(&ids)?;
+                // Submit, do not wait for the entire metadata prefetch window.
+                // Only the current candidate must finish before lookahead.
+                self.prefetch(&candidates, idx)?;
+                self.metadata_batch(&[candidate.id])?;
                 let conflict=self.lookahead(&name,candidate,rows,&group,&state.selected)?;
                 let result=if let Some((involved,dep_name))=conflict {
                     self.stats.forward_prunes+=1;
@@ -411,7 +506,7 @@ impl Solver {
                             self.learn_nogood(nogood,&failure.conflict,&name,&state.selected);
                         } else {
                             self.stats.backjumps+=1;
-                            self.failed(key);
+                            self.failed(key.clone());
                             return Ok(Outcome::Failed(failure));
                         }
                         combined_conflict.extend(failure.conflict.into_iter().filter(|n|n!=&name));
@@ -419,7 +514,7 @@ impl Solver {
                 }
             }
             combined_conflict.extend(branch_causes);
-            self.failed(key);
+            self.failed(key.clone());
             if last_detail.is_empty() { last_detail=format!("all compatible candidates exhausted for {}",name); }
             return Ok(Outcome::Failed(Failure{conflict:combined_conflict,detail:last_detail}));
         }
@@ -437,7 +532,7 @@ fn process(wire: &mut Wire) -> Result<(),String> {
     let deadline_seconds=wire.raw_u64()?;
     let prefetch_width=usize::try_from(wire.raw_u64()?).map_err(err)?;
     let no_deps=wire.raw_u8()? != 0;
-    if max_decisions==0 || max_depth==0 || max_cache_bytes==0 || deadline_seconds==0 || prefetch_width==0 {
+    if max_decisions==0 || max_depth==0 || max_cache_bytes==0 || prefetch_width==0 {
         return Err("invalid versioned solver resource policy".into());
     }
     let count=wire.raw_u32()? as usize;
@@ -454,8 +549,10 @@ fn process(wire: &mut Wire) -> Result<(),String> {
         roots.insert(name.clone());
         entries.push(Entry{name,requirement,extras,causes:BTreeSet::new()});
     }
-    let deadline=Instant::now().checked_add(Duration::from_secs(deadline_seconds))
-        .ok_or_else(||"invalid resolver deadline".to_string())?;
+    let deadline=if deadline_seconds==0 { None } else {
+        Some(Instant::now().checked_add(Duration::from_secs(deadline_seconds))
+            .ok_or_else(||"invalid resolver deadline".to_string())?)
+    };
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
         candidate_domains:HashMap::new(),metadata_seen:HashSet::new(),
@@ -494,13 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn state_identity_includes_provenance_and_assignments() {
+    fn state_identity_matches_python_requirement_and_assignment_semantics() {
         let a=Entry{name:"dependency".into(),requirement:"dependency<2".into(),
             extras:BTreeSet::new(),causes:BTreeSet::from(["left".into()])};
         let b=Entry{causes:BTreeSet::from(["right".into()]),..a.clone()};
         let left=State{entries:vec![a],selected:BTreeMap::new(),expanded:BTreeMap::new()};
         let right=State{entries:vec![b],selected:BTreeMap::new(),expanded:BTreeMap::new()};
-        assert_ne!(current_state_key(&left,&grouped(&left.entries)),
+        // Python's state_key intentionally excludes causal provenance.
+        assert_eq!(current_state_key(&left,&grouped(&left.entries)),
                    current_state_key(&right,&grouped(&right.entries)));
     }
 

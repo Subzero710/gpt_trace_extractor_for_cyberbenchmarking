@@ -201,32 +201,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     valid_cache = {}
     probe_lock = threading.Lock()
     candidate_lock = threading.Lock()
-    metadata_worker = threading.local()
-
-    def metadata_tasks(function, arguments):
-        """Use the verified metadata pool for CPU-independent PyPI I/O.
-
-        A callback already executing in this pool cannot submit work to itself:
-        recursive build-metadata closures must never deadlock a finite pool.
-        """
-        if executor is None or getattr(metadata_worker, 'active', False):
-            return [function(*args) for args in arguments]
-        def worker(args):
-            metadata_worker.active = True
-            try:
-                return function(*args)
-            finally:
-                metadata_worker.active = False
-        futures = [executor.submit(worker, args) for args in arguments]
-        try:
-            return [future.result() for future in futures]
-        except BaseException:
-            for future in futures:
-                future.cancel()
-            raise
+    observed_lock = threading.Lock()
+    observed_metadata = set()
+    prefetch_futures = {}
 
     def domain(name, requirements):
-        raw = tuple(sorted(requirements))
+        raw = tuple(requirements)
         cache_key = name, raw
         if cache_key in domain_cache:
             return domain_cache[cache_key]
@@ -258,6 +238,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         with probe_lock:
             value = record_by_id.get(ref)
             if value is not None:
+                with observed_lock:
+                    observed_metadata.add(host['_normalized_package_name'](value['name']))
                 return value
         candidate = candidate_by_id[ref]
         if candidate['kind'] == 'sdist' and source_probe is not None:
@@ -279,6 +261,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             raise RuntimeError('verified candidate metadata differs from chosen release')
         with probe_lock:
             record_by_id[ref] = value
+        with observed_lock:
+            observed_metadata.add(host['_normalized_package_name'](candidate['name']))
         return value
 
     def active_dependencies(ref, extras):
@@ -290,25 +274,13 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             result.append(req)
         return result
 
-    if executor is not None:
-        # The Rust IPC decision loop requests each domain in order. Resolve
-        # independent root registries concurrently before starting that loop.
-        root_domains = {}
-        for requirement in roots:
-            name = host['_normalized_package_name'](requirement.name)
-            root_domains.setdefault(name, []).append(str(requirement))
-        metadata_tasks(domain, [(name, tuple(rows)) for name, rows in sorted(root_domains.items())])
-
     with tempfile.TemporaryFile(mode='w+b') as errors:
         child = subprocess.Popen([str(program)], cwd=target_root,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
                 close_fds=True, start_new_session=True)
         wire = _Wire(child, policy['pip_solver_max_frame_bytes'])
-        # The per-closure configured wall-clock budget applies to Rust CPU work,
-        # registry metadata, native source hooks, and IPC alike.
-        timer = threading.Timer(policy['pip_total_timeout_seconds'], child.kill)
-        timer.daemon = True
-        timer.start()
+        # A complete closure has no artificial wall-clock deadline. Native
+        # metadata requests and isolated build hooks enforce their own limits.
         result = None
         outcome = None
         summary = None
@@ -317,7 +289,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             wire.send_int(policy['pip_solver_max_decisions'], 8)
             wire.send_int(policy['pip_solver_max_depth'], 8)
             wire.send_int(policy['pip_solver_cache_max_bytes'], 8)
-            wire.send_int(policy['pip_total_timeout_seconds'], 8)
+            wire.send_int(0, 8)  # Rust protocol: no global deadline for a closure.
             wire.send_int(prefetch_width, 8)
             wire.send_int(int(bool(no_deps)), 1)
             wire.send_int(len(roots))
@@ -332,7 +304,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 if op == b'D':
                     name, requirements = wire.string(), wire.strings()
                     def deliver_domain():
-                        refs = metadata_tasks(domain, [(name, requirements)])[0]
+                        refs = domain(name, requirements)
                         wire.send_int(len(refs))
                         for ref in refs:
                             candidate = candidate_by_id[ref]
@@ -340,6 +312,82 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                             for field in ('kind', 'version', 'filename'):
                                 wire.send_string(candidate[field])
                     action = deliver_domain
+                elif op == b'B':
+                    # Mirror Python domain_futures: fetch every unresolved
+                    # requirement domain concurrently, collect in sorted order.
+                    count = wire.number()
+                    if count > wire.limit:
+                        raise RuntimeError('unbounded native domain batch')
+                    requests = [(wire.string(), tuple(wire.strings())) for _ in range(count)]
+                    def deliver_domains():
+                        if executor is None:
+                            results = [domain(name, rows) for name, rows in requests]
+                        else:
+                            pending = [executor.submit(domain, name, rows)
+                                       for name, rows in requests]
+                            try:
+                                results = [future.result() for future in pending]
+                            except BaseException:
+                                for future in pending:
+                                    future.cancel()
+                                raise
+                        wire.send_int(len(results))
+                        for refs in results:
+                            wire.send_int(len(refs))
+                            for ref in refs:
+                                candidate = candidate_by_id[ref]
+                                wire.send_int(ref)
+                                for field in ('kind', 'version', 'filename'):
+                                    wire.send_string(candidate[field])
+                    action = deliver_domains
+                elif op == b'K':
+                    # Match Python cached_compatible: only inspected,
+                    # immutable metadata may justify forward pruning.
+                    count = wire.number()
+                    if count > wire.limit:
+                        raise RuntimeError('unbounded native cache-inspection batch')
+                    references = [wire.number() for _ in range(count)]
+                    def deliver_known():
+                        for ref in references:
+                            candidate = candidate_by_id.get(ref)
+                            if candidate is None:
+                                raise RuntimeError('unknown Rust metadata-cache candidate')
+                            name = host['_normalized_package_name'](candidate['name'])
+                            with observed_lock:
+                                observed = name in observed_metadata
+                            if no_deps or not observed:
+                                known = False
+                            else:
+                                identity = host['_candidate_probe_identity'](
+                                    candidate, target, no_deps)
+                                entry = (probe_cache.peek(identity)
+                                         if isinstance(probe_cache, host['_SingleFlightCache'])
+                                         else probe_cache.get(identity))
+                                known = entry is not None
+                            wire.send_int(int(known), 1)
+                    action = deliver_known
+                elif op == b'W':
+                    # The fairness controller is re-evaluated for each
+                    # candidate, as in Python schedule_metadata(position).
+                    def deliver_width():
+                        width = (prefetch_controller.width()
+                                 if prefetch_controller is not None
+                                 else prefetch_width)
+                        wire.send_int(width)
+                    action = deliver_width
+                elif op == b'A':
+                    count = wire.number()
+                    if count > wire.limit:
+                        raise RuntimeError('unbounded Rust metadata prefetch')
+                    references = [wire.number() for _ in range(count)]
+                    def deliver_prefetch():
+                        if executor is not None:
+                            for ref in references:
+                                if ref not in candidate_by_id:
+                                    raise RuntimeError('unknown Rust metadata prefetch candidate')
+                                if ref not in prefetch_futures:
+                                    prefetch_futures[ref] = executor.submit(record, ref)
+                    action = deliver_prefetch
                 elif op == b'C':
                     ref, requirements = wire.number(), wire.strings()
                     def deliver_check():
@@ -362,7 +410,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('unbounded native metadata request')
                     references = [wire.number() for _ in range(count)]
                     def deliver_metadata():
-                        metadata_tasks(record, [(ref,) for ref in references])
+                        for ref in references:
+                            future = prefetch_futures.pop(ref, None)
+                            if future is None:
+                                record(ref)
+                            else:
+                                future.result()
                     action = deliver_metadata
                 elif op == b'P':
                     ref, extras = wire.number(), wire.strings()
@@ -427,7 +480,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 raise RuntimeError(str(exc) + '; Rust stderr: ' + text) from exc
             raise
         finally:
-            timer.cancel()
+            for future in prefetch_futures.values():
+                future.cancel()
             if child.stdin is not None and not child.stdin.closed:
                 child.stdin.close()
             if child.stdout is not None and not child.stdout.closed:

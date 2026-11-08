@@ -15,7 +15,15 @@ def _source_tree(root: Path) -> None:
     for relative in jobs.FETCH_SOURCE_FILES:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative + "\n")
+        if relative.endswith('/Cargo.toml'):
+            path.write_bytes((Path(__file__).resolve().parents[3] / relative).read_bytes())
+        else:
+            path.write_text(relative + "\n")
+    for relative in jobs.fetch_runtime_executables(root):
+        executable = root / relative
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_bytes(relative.encode())
+        executable.chmod(0o555)
 
 
 def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path, monkeypatch):
@@ -83,6 +91,11 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
         assert staged.read_bytes() == original.read_bytes()
         assert staged.stat().st_uid == 0
         assert stat.S_IMODE(staged.stat().st_mode) == 0o444
+    for relative in jobs.fetch_runtime_executables(private):
+        executable = source_root / relative
+        assert executable.read_bytes() == (private / relative).read_bytes()
+        assert executable.stat().st_uid == 0
+        assert stat.S_IMODE(executable.stat().st_mode) == 0o555
     staged_dependency = source_root / "golden-dependency.json"
     assert staged_dependency.read_bytes() == jobs.canonical(dependency) + b"\n"
     assert staged_dependency.stat().st_uid == 0

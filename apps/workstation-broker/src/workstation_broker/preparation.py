@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
-    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, pool_contract, seal,
+    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, pool_contract, seal,
     sync_directory)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
@@ -124,7 +124,41 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
             raise RuntimeError('fetch source changed after admission: '+relative)
         target.write_bytes(data)
         os.chown(target, 0, 0)
-        target.chmod(0o555 if relative == 'rust/verified-resolver/target/release/verified-resolver' else 0o444)
+        target.chmod(0o444)
+    # Fossil-only native executable: sourced from its installed build, not
+    # from Acer's cross-machine acquisition source contract.
+    for relative in fetch_runtime_executables(repository):
+        executable = repository / relative
+        if executable.is_symlink() or not executable.is_file():
+            raise RuntimeError('mandatory Fossil Rust executable is missing: ' + relative)
+        resolved = executable.resolve(strict=True)
+        if not resolved.is_relative_to(repository):
+            raise RuntimeError('Fossil Rust executable escapes source repository')
+        info = executable.stat()
+        if (info.st_uid != 0 or not stat.S_ISREG(info.st_mode)
+                or not (info.st_mode & 0o111) or info.st_mode & 0o022):
+            raise RuntimeError('mandatory Fossil Rust executable has untrusted permissions')
+        target = snapshot / relative
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        descriptor = os.open(executable, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            if (before.st_uid != 0 or not stat.S_ISREG(before.st_mode)
+                    or not (before.st_mode & 0o111) or before.st_mode & 0o022):
+                raise RuntimeError('Fossil Rust executable changed permissions before staging')
+            with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+                data = stream.read()
+            after = os.fstat(descriptor)
+            if ((before.st_dev, before.st_ino, before.st_size,
+                 before.st_mtime_ns, before.st_ctime_ns) !=
+                (after.st_dev, after.st_ino, after.st_size,
+                 after.st_mtime_ns, after.st_ctime_ns)):
+                raise RuntimeError('Fossil Rust executable changed while staging')
+        finally:
+            os.close(descriptor)
+        target.write_bytes(data)
+        os.chown(target, 0, 0)
+        target.chmod(0o555)
     dependency = golden_dependency_identity(manager.base, manager.source_root) if golden_dependency is None else golden_dependency
     if dependency != golden_dependency_identity(manager.base, manager.source_root):
         raise RuntimeError("golden dependency identity changed before fetch source staging")

@@ -31,7 +31,6 @@ FETCH_SOURCE_FILES = (
     "rust/verified-resolver/Cargo.toml",
     "rust/verified-resolver/Cargo.lock",
     "rust/verified-resolver/src/main.rs",
-    "rust/verified-resolver/target/release/verified-resolver",
     "config/preparation.toml",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/pins.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
@@ -40,6 +39,28 @@ FETCH_SOURCE_FILES = (
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
 )
+def fetch_runtime_executables(source_root=ROOT):
+    """Derive Fossil-only executables from the versioned Rust crate manifest.
+
+    They deliberately are NOT fetch source contract inputs: Acer never builds
+    or stores a native Fossil binary. The source+lock identity is shared.
+    """
+    import re
+    import tomllib
+    crate = Path('rust/verified-resolver')
+    manifest = Path(source_root) / crate / 'Cargo.toml'
+    if manifest.is_symlink() or not manifest.is_file():
+        raise RuntimeError('missing mandatory Rust resolver manifest')
+    with manifest.open('rb') as stream:
+        package = tomllib.load(stream).get('package')
+    if not isinstance(package, dict):
+        raise RuntimeError('invalid mandatory Rust resolver manifest')
+    name = package.get('name')
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+        raise RuntimeError('invalid mandatory Rust resolver executable name')
+    return (str(crate / 'target' / 'release' / name),)
+
+
 def golden_source_pins(source_root=ROOT):
     builder = golden_builder(source_root)
     return frozenset({(builder.SOURCE + builder.ARCHIVE, builder.ARCHIVE_SHA256)})

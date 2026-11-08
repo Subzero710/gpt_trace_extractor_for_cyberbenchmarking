@@ -3744,11 +3744,17 @@ def pip_group_key(target, reqs, constraints=(), no_deps=False, *, preferred_vers
 @functools.lru_cache(maxsize=1)
 def _resolver_runtime_identity():
     import packaging
-    binary = Path(__file__).resolve().parents[1] / 'rust/verified-resolver/target/release/verified-resolver'
-    if binary.is_symlink() or not binary.is_file():
-        raise RuntimeError('mandatory native Rust solver missing; run make build on Fossil')
-    return {'packaging':packaging.__version__,'python':'.'.join(map(str,sys.version_info[:3])),
-            'native_solver_sha256':digest(binary)}
+    # Source identity is identical on Acer and Fossil. The actual executable is
+    # separately sealed on Fossil and checked by the mandatory Rust bridge.
+    root = Path(__file__).resolve().parents[1]
+    source_files = ('rust/verified-resolver/Cargo.toml',
+                    'rust/verified-resolver/Cargo.lock',
+                    'rust/verified-resolver/src/main.rs',
+                    'scripts/verified_resolver_bridge.py')
+    return {'packaging': packaging.__version__,
+            'python': '.'.join(map(str, sys.version_info[:3])),
+            'native_solver_source_sha256': {
+                relative: digest(root / relative) for relative in source_files}}
 
 
 @functools.lru_cache(maxsize=1)

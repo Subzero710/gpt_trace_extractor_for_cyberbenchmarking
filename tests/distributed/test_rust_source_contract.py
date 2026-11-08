@@ -10,15 +10,17 @@ def test_native_engine_is_the_only_graph_search_path():
     assert 'module.solve(globals(),' in body
     assert 'def search(' not in body
     assert 'ThreadPoolExecutor' not in body
-    assert 'native_solver_sha256' in source
+    assert 'native_solver_source_sha256' in source
 
 
 def test_worker_snapshot_includes_executable_binary_and_source_contract():
     contract=(ROOT/'shared/gpt_trace_transport/local_templates.py').read_text()
     staging=(ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
     source='rust/verified-resolver/target/release/verified-resolver'
-    assert source in contract
-    assert 'target.chmod(0o555 if relative ==' in staging
+    assert source not in contract.split('FETCH_SOURCE_FILES = (', 1)[1].split('\n)', 1)[0]
+    assert 'def fetch_runtime_executables(' in contract
+    assert 'for relative in fetch_runtime_executables(repository):' in staging
+    assert 'target.chmod(0o555)' in staging
     assert 'expected_sources=current[\'fetch_sources\']' in staging
 
 
