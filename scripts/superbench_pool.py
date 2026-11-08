@@ -625,6 +625,127 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
     return _network_retry(label, transfer, cleanup=lambda:_discard_partial_download(path))
 
 
+class _StaticGitReadCache:
+    """Per-fetch Git tree/blob single-flight cache, bounded by the I/O worker budget.
+
+    Git tree lookups remain scoped to the exact pinned mirror and commit. Blob
+    bytes are shared across commits within that mirror only when the Git object
+    identity is identical. Failures are propagated, never replaced by a guess.
+    """
+    def __init__(self, workers):
+        from collections import OrderedDict
+        if type(workers) is not int or workers < 1:
+            raise RuntimeError('invalid static metadata worker capacity')
+        self.lock = threading.RLock()
+        self.trees = {}
+        self.blobs = OrderedDict()
+        self.blob_futures = {}
+        self.blob_bytes = 0
+        self.max_blob_bytes = MAX_SOURCE * workers
+
+    def _tree_oid(self, mirror, commit, path):
+        key = (str(mirror), commit, path)
+        with self.lock:
+            pending = self.trees.get(key)
+            owner = pending is None
+            if owner:
+                pending = concurrent.futures.Future()
+                self.trees[key] = pending
+        if owner:
+            try:
+                raw = invoke(['git', '--git-dir', mirror, 'ls-tree', commit, '--', path],
+                             capture=True).strip()
+                if not raw:
+                    oid = None
+                else:
+                    matched = re.fullmatch(r'100(?:644|755) blob ([0-9a-f]{40})\t.+', raw)
+                    if matched is None:
+                        raise RuntimeError('dependency source is not a regular Git file: ' + path)
+                    oid = matched.group(1)
+            except BaseException as exc:
+                with self.lock:
+                    self.trees.pop(key, None)
+                pending.set_exception(exc)
+            else:
+                pending.set_result(oid)
+        return pending.result()
+
+    def _blob(self, mirror, oid):
+        key = (str(mirror), oid)
+        with self.lock:
+            if key in self.blobs:
+                self.blobs.move_to_end(key)
+                return self.blobs[key]
+            pending = self.blob_futures.get(key)
+            owner = pending is None
+            if owner:
+                pending = concurrent.futures.Future()
+                self.blob_futures[key] = pending
+        if owner:
+            try:
+                raw = subprocess.check_output(
+                    ['git', '--git-dir', str(mirror), 'cat-file', 'blob', oid], timeout=60)
+                if len(raw) > MAX_SOURCE:
+                    raise RuntimeError('source metadata too large for Git object: ' + oid)
+                content = raw.decode('utf-8')
+            except BaseException as exc:
+                with self.lock:
+                    self.blob_futures.pop(key, None)
+                pending.set_exception(exc)
+            else:
+                with self.lock:
+                    self.blob_futures.pop(key, None)
+                    size = len(raw)
+                    if size <= self.max_blob_bytes:
+                        while self.blobs and self.blob_bytes + size > self.max_blob_bytes:
+                            _removed, old = self.blobs.popitem(last=False)
+                            self.blob_bytes -= len(old.encode('utf-8'))
+                        self.blobs[key] = content
+                        self.blob_bytes += size
+                pending.set_result(content)
+        return pending.result()
+
+    def read(self, mirror, commit, path, *, required=False):
+        path = path.removeprefix('./')
+        if not path or path.startswith('/') or '\\' in path or '\x00' in path or '..' in Path(path).parts:
+            raise ValueError('unsafe Git dependency file: ' + path)
+        oid = self._tree_oid(mirror, commit, path)
+        if oid is None:
+            if required:
+                raise RuntimeError('missing source input ' + path + ' @ ' + commit)
+            return None
+        return self._blob(mirror, oid)
+
+
+def _merge_static_task_result(result, task_plan, groups, apt_requested, apt_upgrade_tasks,
+                              vcs, issues):
+    """Preserve the old sorted-task aggregation order, without shared worker writes."""
+    logical, plan, own_groups, own_apt, own_upgrades, own_vcs, own_issues = result
+    if logical in task_plan:
+        raise RuntimeError('duplicate static analysis task identity: ' + logical)
+    task_plan[logical] = plan
+    for key, group in own_groups.items():
+        previous = groups.get(key)
+        if previous is None:
+            groups[key] = group
+            continue
+        if (previous['target'] != group['target']
+                or previous['requirements'] != group['requirements']
+                or previous['constraints'] != group['constraints']
+                or previous['preferred_versions'] != group['preferred_versions']
+                or previous['no_deps'] is not group['no_deps']):
+            raise RuntimeError('inconsistent static pip closure identity: ' + key)
+        previous['required'] = previous['required'] or group['required']
+        for task in group['tasks']:
+            if task not in previous['tasks']:
+                previous['tasks'].append(task)
+        previous['steps'].extend(group['steps'])
+    apt_requested.update(own_apt)
+    apt_upgrade_tasks.update(own_upgrades)
+    vcs.update(own_vcs)
+    issues.extend(own_issues)
+
+
 def git_file(mirror, commit, path, *, required=False):
     path=path.removeprefix('./')
     if not path or path.startswith('/') or '\\' in path or '\x00' in path or '..' in Path(path).parts:
@@ -4617,6 +4738,19 @@ def _native_local_metadata(pool,target,mirror,commit,commands,extras):
     completed[identity] = (frozenset(dependencies), frozenset(remote))
     return dependencies,remote
 
+_STATIC_LOCAL_METADATA_LOCK = threading.Lock()
+
+
+def _static_native_local_metadata(*args):
+    """Serialize local PEP 517 scratch mutations, not their own internal I/O workers.
+
+    A separate lock is essential: holding _NATIVE_POOL_LOCK while invoking a
+    resolver would deadlock its metadata executor when it needs that lock.
+    """
+    with _STATIC_LOCAL_METADATA_LOCK:
+        return _native_local_metadata(*args)
+
+
 def _native_close(pool):
     runtime = getattr(pool, '_native_runtime', None)
     if runtime is not None:
@@ -6091,8 +6225,21 @@ def main(argv=None):
     spec.loader.exec_module(module)
     specs_table=module.MAP_REPO_VERSION_TO_SPECS
     task_plan={};groups={};apt_requested=set();apt_upgrade_tasks=set()
-    _pool_progress('Static task analysis',0,len(tasks),'recipes')
-    for index,(logical,task) in enumerate(sorted(tasks.items()),1):
+    # One immutable Git read cache for this acquisition attempt; results from
+    # independent tasks are merged only by the main thread in logical task order.
+    ordered_tasks=sorted(tasks.items())
+    static_workers=min(_acquisition_workers(),len(ordered_tasks))
+    source_cache=_StaticGitReadCache(static_workers)
+    _pool_progress('Static task analysis',0,len(ordered_tasks),'recipes')
+
+    def analyze_static_task(item):
+        logical,task=item
+        # The existing recipe evaluator below is preserved verbatim except for
+        # isolated mutable accumulators, Git cache access and native isolation.
+        task_plan={};groups={};apt_requested=set();apt_upgrade_tasks=set();vcs=set()
+        own_issues=[]
+        def issue(where,description):
+            own_issues.append(f'{where}: {description}')
         repo=task['repo'];commit=task['base_commit'];mirror=mirrors[repo]
         version=envplan[task['env_hash']]
         commands=list(task['repo_script_list'])
@@ -6102,13 +6249,13 @@ def main(argv=None):
         commands.extend(spec.get('eval_commands',[]))
         for package in spec.get('pip_packages',[]):commands.append('pip install '+shlex.quote(package))
         get_file = lambda path,required=False: transformed_source(
-            repo, path, git_file(mirror,commit,path,required=required), commands)
+            repo, path, source_cache.read(mirror,commit,path,required=required), commands)
         for command in list(commands):
             for match in re.finditer(r'(?<![\w-])make\s+(init|install)\b',command):
                 try:
                     makefile=get_file('Makefile',required=True)
                     commands.extend(make_commands(makefile,match.group(1)))
-                except (ValueError,RuntimeError) as exc:pool.issue(logical,str(exc))
+                except (ValueError,RuntimeError) as exc:issue(logical,str(exc))
         env_hash=task['env_hash'];task_target=final_target_by_env[env_hash]
         env_pip_target=environment_pip_target.get(env_hash,task_target)
         env_requirements=set(requirements_by_env[env_hash]);env_vcs=set(vcs_by_env[env_hash])
@@ -6119,13 +6266,13 @@ def main(argv=None):
             if 'PIP_CONSTRAINT' in command:
                 inline_constraints.update(re.findall(
                     r"echo\s+['\"]([A-Za-z0-9_.-]+[<>=!~][^'\"]+)['\"]\s*>", command))
-        for problem in problems:pool.issue(logical,problem)
+        for problem in problems:issue(logical,problem)
         # Project metadata is read at the pinned commit and after the recipe's
         # explicitly supported textual transformations.
         # Native metadata is authoritative for actual local installations,
         # including static projects and --no-deps build-time requirements.
         if any(step['local_project'] for step in steps):
-            reqs, vcs_task = _native_local_metadata(
+            reqs, vcs_task = _static_native_local_metadata(
                 pool, task_target, mirror, commit, commands, extras)
         else:
             raw=get_file('pyproject.toml')
@@ -6135,15 +6282,15 @@ def main(argv=None):
                     reqs.update(dep);vcs_task.update(git)
                     dynamic={issue for issue in problem if issue.startswith('dynamic PEP621 ')}
                     if dynamic:
-                        native_deps,native_vcs=_native_local_metadata(
+                        native_deps,native_vcs=_static_native_local_metadata(
                             pool,task_target,mirror,commit,commands,extras)
                         reqs.update(native_deps);vcs_task.update(native_vcs)
                     for ptext in problem:
-                        if ptext not in dynamic:pool.issue(logical,ptext)
-                except (ValueError,TypeError) as exc:pool.issue(logical,'invalid pyproject.toml: '+str(exc))
+                        if ptext not in dynamic:issue(logical,ptext)
+                except (ValueError,TypeError) as exc:issue(logical,'invalid pyproject.toml: '+str(exc))
             cfg_deps,cfg_problems=setup_cfg_static(get_file('setup.cfg'),extras=extras)
             reqs.update(cfg_deps)
-            for ptext in cfg_problems:pool.issue(logical,ptext)
+            for ptext in cfg_problems:issue(logical,ptext)
             setup=get_file('setup.py')
             setup_deps=set();setup_remote=set();setup_problems=[]
             for setup_argv in setup_script_invocations(commands):
@@ -6153,7 +6300,7 @@ def main(argv=None):
                 setup_deps.update(deps);setup_remote.update(remote);setup_problems.extend(problems)
             reqs.update(setup_deps);vcs_task.update(setup_remote)
             if setup_problems:
-                native_deps,native_vcs=_native_local_metadata(
+                native_deps,native_vcs=_static_native_local_metadata(
                     pool,task_target,mirror,commit,commands,extras)
                 reqs.update(native_deps)
                 vcs_task.update(native_vcs)
@@ -6200,7 +6347,7 @@ def main(argv=None):
                     if step['optional']:
                         optional_skips.append(step['command']+' ['+str(exc)+']')
                         skip=True;break
-                    pool.issue(logical,str(exc))
+                    issue(logical,str(exc))
             if skip: continue
             for filename in sorted(step['constraints']):
                 try:
@@ -6215,7 +6362,7 @@ def main(argv=None):
                     if step['optional']:
                         optional_skips.append(step['command']+' ['+str(exc)+']')
                         skip=True;break
-                    pool.issue(logical,str(exc))
+                    issue(logical,str(exc))
             if skip: continue
             (vcs_optional if step['optional'] else vcs_task).update(step_vcs)
             # Local editable/develop is a separate installation against the
@@ -6255,7 +6402,7 @@ def main(argv=None):
             apt_requested.update(packages)
             if upgrades:apt_upgrade_tasks.add(logical)
         except RuntimeError as exc:
-            pool.issue(logical,str(exc))
+            issue(logical,str(exc))
         for command in commands:
             for match in re.finditer(r'\bpipx\s+install\s+([\w.-]+)',command):
                 # pipx creates its application venv from Kali's system Python,
@@ -6265,7 +6412,7 @@ def main(argv=None):
             if re.search(r'\bpdm\s+add\s+pre-commit',command):
                 register({'pre-commit'},set(),'pdm-add')
             if re.search(r'\b(?:curl|wget)\b\s+https?://',command):
-                pool.issue(logical,'shell download needs explicit pinned hash: '+command[:90])
+                issue(logical,'shell download needs explicit pinned hash: '+command[:90])
 
         primary=register(reqs,set(),'declarative-project-metadata')
         normalized_vcs={vcs_reference(item) or item for item in vcs_task}
@@ -6295,7 +6442,15 @@ def main(argv=None):
                             # apt-get install packages are still acquired below.
                             'apt_upgrade_suppressed':logical in apt_upgrade_tasks}
         vcs.update(required_vcs);vcs.update(normalized_optional)
-        _pool_progress('Static task analysis',index,len(tasks),'recipes')
+        return (logical,task_plan[logical],groups,apt_requested,
+                apt_upgrade_tasks,vcs,own_issues)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=static_workers,
+            thread_name_prefix='static-task-analysis') as executor:
+        for index,result in enumerate(executor.map(analyze_static_task,ordered_tasks),1):
+            _merge_static_task_result(result,task_plan,groups,apt_requested,
+                                      apt_upgrade_tasks,vcs,pool.issues)
+            _pool_progress('Static task analysis',index,len(ordered_tasks),'recipes')
 
     write_new(stage/'metadata'/'apt-policy.json',json.dumps({
         'schema':1,'upgrade_policy':'suppress-on-frozen-golden',
