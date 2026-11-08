@@ -137,6 +137,20 @@ type StateKey = (Vec<(String, Vec<String>)>,
 type NogoodKey = (String, String, String, String, Vec<String>, Vec<String>);
 type Clause = Vec<(String, (String, String, String))>;
 
+// Learned exclusions are conditional on selected ancestors. Their provenance
+// must contribute to conflict-directed backjumping when an option is skipped.
+fn matched_nogood_causes(clauses: &[Clause], selected: &BTreeMap<String, Candidate>)
+    -> Option<BTreeSet<String>> {
+    clauses.iter().find_map(|clause| {
+        if clause.iter().all(|(name, identity)| selected.get(name).map(|candidate|
+            (&candidate.kind, &candidate.version, &candidate.filename)
+                == (&identity.0, &identity.1, &identity.2)
+        ).unwrap_or(false)) {
+            Some(clause.iter().map(|(name, _)| name.clone()).collect())
+        } else { None }
+    })
+}
+
 fn current_state_key(state: &State, group: &Grouped) -> StateKey {
     // Literal port of Python state_key: the requirement strings, the selected
     // artifact (kind/version/filename), and expanded extras form the key.
@@ -363,12 +377,9 @@ impl Solver {
          rows.iter().map(|r| r.requirement.clone()).collect(),
          extras.iter().cloned().collect())
     }
-    fn nogood_matches(&self, key: &NogoodKey, selected: &BTreeMap<String,Candidate>) -> bool {
-        self.nogoods.get(key).map(|clauses| clauses.iter().any(|clause| {
-            clause.iter().all(|(name,identity)| selected.get(name).map(|c|
-                (&c.kind,&c.version,&c.filename) == (&identity.0,&identity.1,&identity.2)
-            ).unwrap_or(false))
-        })).unwrap_or(false)
+    fn nogood_conflict(&self, key: &NogoodKey, selected: &BTreeMap<String,Candidate>)
+        -> Option<BTreeSet<String>> {
+        self.nogoods.get(key).and_then(|clauses| matched_nogood_causes(clauses, selected))
     }
     fn learn_nogood(&mut self,key: NogoodKey, conflict: &BTreeSet<String>, name: &str,
                     selected: &BTreeMap<String,Candidate>) {
@@ -425,7 +436,10 @@ impl Solver {
             }
             let unresolved: Vec<String> = group.rows.keys().filter(|name|!state.selected.contains_key(*name)).cloned().collect();
             if unresolved.is_empty() { return Ok(Outcome::Solved(state.selected)); }
-            let mut choices: Vec<(usize,bool,String,Vec<Candidate>)> = Vec::new();
+            // Retain the ancestor provenance of every forward-pruned option.
+            // Otherwise a later exhaustion can incorrectly backjump past a
+            // relevant ancestor and report a satisfiable graph as UNSAT.
+            let mut choices: Vec<(usize,bool,String,Vec<Candidate>,BTreeSet<String>)> = Vec::new();
             let domains = self.domains(&unresolved, &group)?;
             for name in unresolved {
                 let rows=&group.rows[&name];
@@ -453,15 +467,20 @@ impl Solver {
                 }
                 if survivors.is_empty() {
                     self.failed(key.clone());
-                    return Ok(Outcome::Failed(Failure{conflict:known_conflict,
+                    // The unresolved project itself is not an ancestor decision.
+                    let conflict=known_conflict.into_iter().filter(|cause| cause!=&name).collect();
+                    return Ok(Outcome::Failed(Failure{conflict,
                         detail:format!("all cached compatible releases of {} conflict with {}",name,
                             first_detail.unwrap_or_default())}));
                 }
-                choices.push((survivors.len(),!self.roots.contains(&name),name,survivors));
+                choices.push((survivors.len(),!self.roots.contains(&name),name,survivors,known_conflict));
             }
             choices.sort_by(|a,b| (a.0,a.1,&a.2).cmp(&(b.0,b.1,&b.2)));
-            let (count,_is_transitive,name,candidates)=choices.remove(0);
-            if count == 1 {
+            let (count,_is_transitive,name,candidates,pruned_conflicts)=choices.remove(0);
+            // A singleton obtained by *conditional* forward pruning is not an
+            // unconditional unit: it must enter the branch path so rejections
+            // of other candidates remain attached to their ancestor decisions.
+            if count == 1 && pruned_conflicts.is_empty() {
                 self.metadata_batch(&[candidates[0].id])?;
                 state.selected.insert(name,candidates[0].clone());
                 self.stats.propagations+=1;
@@ -470,13 +489,18 @@ impl Solver {
             let rows=&group.rows[&name];
             let branch_causes=causes(rows);
             let extras=group.extras.get(&name).cloned().unwrap_or_default();
-            let mut combined_conflict=BTreeSet::new();
+            let mut combined_conflict: BTreeSet<String> = pruned_conflicts.into_iter()
+                .filter(|cause| cause!=&name).collect();
             let mut last_detail=String::new();
             for (idx,candidate) in candidates.iter().enumerate() {
                 self.validate_time()?;
                 let nogood=Self::nogood_key(&name,candidate,rows,&extras);
-                if self.nogood_matches(&nogood,&state.selected) {
-                    self.stats.learned_skips+=1; continue;
+                if let Some(involved)=self.nogood_conflict(&nogood,&state.selected) {
+                    self.stats.learned_skips+=1;
+                    // The exclusion is valid only while these ancestors have
+                    // the recorded assignments; never lose that dependency.
+                    combined_conflict.extend(involved);
+                    continue;
                 }
                 self.stats.decisions+=1;
                 if self.stats.decisions>self.max_decisions {
@@ -602,6 +626,33 @@ mod tests {
         // Python's state_key intentionally excludes causal provenance.
         assert_eq!(current_state_key(&left,&grouped(&left.entries)),
                    current_state_key(&right,&grouped(&right.entries)));
+    }
+
+    #[test]
+    fn learned_clause_match_preserves_ancestor_provenance() {
+        let selected = BTreeMap::from([("ancestor".to_string(), Candidate {
+            id: 9, kind: "wheel".into(), version: "1".into(), filename: "ancestor.whl".into(),
+        })]);
+        let clause = vec![("ancestor".to_string(),
+            ("wheel".to_string(), "1".to_string(), "ancestor.whl".to_string()))];
+        assert_eq!(matched_nogood_causes(&[clause.clone()], &selected),
+            Some(BTreeSet::from(["ancestor".to_string()])));
+        assert_eq!(matched_nogood_causes(&[clause], &BTreeMap::new()), None);
+        assert_eq!(matched_nogood_causes(&[Vec::new()], &selected),
+            Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn forward_pruned_ancestors_remain_after_exhausting_survivors() {
+        // "chosen" was the candidate being explored; the eliminated
+        // alternative required a specific "ancestor" selection.
+        let name="chosen".to_string();
+        let pruned=BTreeSet::from([name.clone(), "ancestor".to_string()]);
+        let mut combined: BTreeSet<String> = pruned.into_iter()
+            .filter(|cause| cause!=&name).collect();
+        combined.extend(BTreeSet::from(["other-ancestor".to_string()]));
+        assert_eq!(combined, BTreeSet::from([
+            "ancestor".to_string(), "other-ancestor".to_string()]));
     }
 
     #[test]

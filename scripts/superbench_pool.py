@@ -5564,6 +5564,18 @@ def _native_pip_group_locked(pool,key,group):
         if isinstance(exc, subprocess.TimeoutExpired) and exc.output:
             detail += '; last pip output: ' + exc.output[-5000:].decode(errors='replace')
         if group['required']:
+            evidence={
+                'closure':key,
+                'requirements':sorted(set(group['requirements'])),
+                'constraints':sorted(set(group['constraints'])),
+                'preferred_versions':_canonical_pip_preferences(group.get('preferred_versions')),
+                'no_deps':group['no_deps'],
+                'tasks':sorted(set(group['tasks'])),
+                'target':target.as_dict(),
+            }
+            print('[pool] required pip closure input evidence: '
+                  +json.dumps(evidence,sort_keys=True,ensure_ascii=False),
+                  file=sys.stderr,flush=True)
             raise RuntimeError('required native pip closure '+key+' failed: '+detail) from exc
         write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
             'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,

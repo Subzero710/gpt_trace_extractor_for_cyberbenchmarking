@@ -58,3 +58,76 @@ def test_compiled_rust_unsat_cannot_claim_success():
         pool._resolve_registry_plan(
             pool.Pool(Path(temp)),fixture_target().as_dict(),{'root==1'},[],
             'native-rust-unsat-test',materialize=False)
+
+
+
+def _offline_graph(name_versions, dependencies, roots, target):
+    """Run the real mandatory Rust search over a fully deterministic PyPI oracle."""
+    from packaging.version import Version
+    universes={name:[_versioned(name,str(index)) for index in range(count)]
+               for name,count in name_versions.items()}
+
+    def domain(_pool,name,requirements,constraints,_target,**_kwargs):
+        return [candidate for candidate in universes[name]
+                if all(not req.specifier or req.specifier.contains(
+                    Version(candidate['version']),prereleases=True)
+                    for req in [*requirements,*constraints])]
+
+    def metadata(_pool,candidate,key,_target,probe_cache,artifact_cache,*,no_deps=False):
+        identity=pool._candidate_probe_identity(candidate,_target,no_deps)
+        def compute():
+            return {**candidate, 'sha256':candidate['item']['digests']['sha256'],
+                    'url':candidate['item']['url'],
+                    'requirements':dependencies.get((candidate['name'],candidate['version']),[]),
+                    'provides_extra':[]}
+        return pool._memo_get_or_compute(probe_cache,identity,compute)
+
+    with tempfile.TemporaryDirectory() as temp, \
+         patch.object(pool,'_candidate_versions',side_effect=domain), \
+         patch.object(pool,'_candidate_release_metadata',side_effect=metadata):
+        solution=pool._resolve_registry_plan(
+            pool.Pool(Path(temp)),target.as_dict(),roots,[],
+            'native-rust-learned-clause-provenance-test',materialize=False)
+    return {candidate['name']:int(candidate['version']) for candidate in solution}
+
+
+def test_compiled_rust_keeps_causes_of_forward_pruned_alternatives():
+    # A previously inspected candidate may be ruled out by the current B.
+    # Discarding its conflict while exploring the surviving A releases makes
+    # the old Rust code incorrectly backjump past B==0 and report global UNSAT.
+    deps={
+        ('a','0'):['b==1'],
+        ('a','1'):['a<2','c>=1'],
+        ('c','0'):['c>=1'],
+        ('c','1'):['b==1'],
+        ('c','2'):['a<2','b==1','c!=1'],
+    }
+    result=_offline_graph({'a':3,'b':2,'c':3},deps,{'a','b','c'},fixture_target())
+    assert result['b']==1 and result['c']==1
+    assert result['a'] in (0,1,2)
+
+
+def test_compiled_rust_preserves_guards_of_skipped_learned_clauses():
+    # Two learned exclusions under B==0 must NOT become unconditional when
+    # this package is revisited under another unrelated decision.
+    deps={
+        ('a','0'):['a<=1','b>=1'],
+        ('a','1'):['a>=9','b>=1','d==2'],
+        ('b','1'):['a<=1'],
+        ('c','0'):['a<=1','c<=1','d>=1'],
+        ('c','1'):['a>=9','b==0'],
+        ('d','0'):['c==0'],
+        ('e','0'):['c==0','d!=1','e==1'],
+        ('e','1'):['c<=1'],
+        ('e','2'):['a==0'],
+    }
+    result=_offline_graph({'a':2,'b':3,'c':2,'d':3,'e':3},deps,
+                          {'b','d','e'},fixture_target())
+    assert result['b'] in (0,1,2)
+    for (name,version), requirements in deps.items():
+        if result.get(name)!=int(version):
+            continue
+        from packaging.requirements import Requirement
+        for raw in requirements:
+            req=Requirement(raw)
+            assert req.name in result and req.specifier.contains(str(result[req.name]))
