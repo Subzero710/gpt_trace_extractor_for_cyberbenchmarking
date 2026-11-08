@@ -28,6 +28,7 @@ TASK_RUNTIME_SCHEMA = 3
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "scripts/verified_resolver_bridge.py",
+    "shared/gpt_trace_transport/local_templates.py",
     "rust/verified-resolver/Cargo.toml",
     "rust/verified-resolver/Cargo.lock",
     "rust/verified-resolver/src/main.rs",
@@ -52,13 +53,88 @@ def fetch_runtime_executables(source_root=ROOT):
     if manifest.is_symlink() or not manifest.is_file():
         raise RuntimeError('missing mandatory Rust resolver manifest')
     with manifest.open('rb') as stream:
-        package = tomllib.load(stream).get('package')
+        parsed = tomllib.load(stream)
+    package = parsed.get('package')
     if not isinstance(package, dict):
         raise RuntimeError('invalid mandatory Rust resolver manifest')
     name = package.get('name')
     if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', name):
         raise RuntimeError('invalid mandatory Rust resolver executable name')
+    # Cargo permits a single explicitly named [[bin]], otherwise the package name is used.
+    target_bins = parsed.get('bin', [])
+    if target_bins:
+        if (not isinstance(target_bins, list) or len(target_bins) != 1
+                or not isinstance(target_bins[0], dict)
+                or not isinstance(target_bins[0].get('name'), str)
+                or not re.fullmatch(r'[A-Za-z0-9_-]+', target_bins[0]['name'])):
+            raise RuntimeError('mandatory Rust resolver must expose one named binary')
+        name = target_bins[0]['name']
     return (str(crate / 'target' / 'release' / name),)
+
+
+def fetch_runtime_build_inputs(source_root=ROOT):
+    """Every local Rust input affecting the mandatory crate, bound to staged source bytes."""
+    source_root = Path(source_root)
+    crate = Path('rust/verified-resolver')
+    tracked = {relative for relative in FETCH_SOURCE_FILES
+               if relative.startswith(crate.as_posix() + '/')}
+    mandatory = {str(crate / 'Cargo.toml'), str(crate / 'Cargo.lock')}
+    actual = mandatory | {path.relative_to(source_root).as_posix()
+                          for path in (source_root / crate).rglob('*.rs')
+                          if 'target' not in path.relative_to(source_root / crate).parts}
+    if actual != tracked or not any(name.endswith('.rs') for name in actual):
+        raise RuntimeError('Rust crate input set differs from the sealed Fossil/Acer source contract')
+    return {name: digest(source_root / name) for name in sorted(actual)}
+
+
+def fetch_runtime_build_identity_path(source_root=ROOT):
+    binary = Path(fetch_runtime_executables(source_root)[0])
+    return binary.with_name(binary.name + '.build-identity.json').as_posix()
+
+
+def fetch_runtime_build_identity(source_root=ROOT):
+    """Bind source/lock digests to the actual executable bytes without exporting them to Acer."""
+    source_root = Path(source_root)
+    relative = fetch_runtime_executables(source_root)[0]
+    executable = source_root / relative
+    if executable.is_symlink() or not executable.is_file():
+        raise RuntimeError('mandatory Fossil Rust executable is absent or unsafe')
+    info = executable.stat()
+    if (info.st_uid != 0 or not stat.S_ISREG(info.st_mode)
+            or not (info.st_mode & 0o111) or info.st_mode & 0o022):
+        raise RuntimeError('mandatory Fossil Rust executable has untrusted permissions')
+    return {'schema': 1,
+            'binary': {'path': relative, 'sha256': digest(executable), 'size': info.st_size},
+            'inputs': fetch_runtime_build_inputs(source_root)}
+
+
+def verify_fetch_runtime_build_identity(source_root=ROOT):
+    """Fail closed on stale binaries, modified crate sources, or replaced executables."""
+    source_root = Path(source_root)
+    path = source_root / fetch_runtime_build_identity_path(source_root)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing mandatory Fossil Rust build identity; run make build on Fossil')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_uid != 0 or not stat.S_ISREG(before.st_mode)
+                or before.st_mode & 0o222):
+            raise RuntimeError('Fossil Rust build identity has untrusted permissions')
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            raw = stream.read()
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise RuntimeError('Fossil Rust build identity changed while being read')
+    finally:
+        os.close(descriptor)
+    try:
+        recorded = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError('invalid mandatory Rust build identity') from exc
+    if recorded != fetch_runtime_build_identity(source_root):
+        raise RuntimeError('Fossil Rust binary/source identity mismatch; run make build on Fossil')
+    return recorded
 
 
 def golden_source_pins(source_root=ROOT):

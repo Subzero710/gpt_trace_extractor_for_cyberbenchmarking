@@ -25,7 +25,8 @@ from types import SimpleNamespace
 
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
-    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, pool_contract, seal,
+    verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, fetch_runtime_build_identity_path,
+    verify_fetch_runtime_build_identity, pool_contract, seal,
     sync_directory)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
@@ -125,27 +126,33 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
         target.write_bytes(data)
         os.chown(target, 0, 0)
         target.chmod(0o444)
-    # Fossil-only native executable: sourced from its installed build, not
-    # from Acer's cross-machine acquisition source contract.
-    for relative in fetch_runtime_executables(repository):
+    # Fossil-only artifact and build attestation: neither is required on Acer.
+    # Re-derive the source and executable digests in the installed tree.
+    verify_fetch_runtime_build_identity(repository)
+    binaries = fetch_runtime_executables(repository)
+    identity_relative = fetch_runtime_build_identity_path(repository)
+    for relative in (*binaries, identity_relative):
         executable = repository / relative
         if executable.is_symlink() or not executable.is_file():
-            raise RuntimeError('mandatory Fossil Rust executable is missing: ' + relative)
+            raise RuntimeError('mandatory Fossil Rust build artifact is missing: ' + relative)
         resolved = executable.resolve(strict=True)
         if not resolved.is_relative_to(repository):
-            raise RuntimeError('Fossil Rust executable escapes source repository')
+            raise RuntimeError('Fossil Rust build artifact escapes source repository')
         info = executable.stat()
+        is_binary = relative in binaries
         if (info.st_uid != 0 or not stat.S_ISREG(info.st_mode)
-                or not (info.st_mode & 0o111) or info.st_mode & 0o022):
-            raise RuntimeError('mandatory Fossil Rust executable has untrusted permissions')
+                or info.st_mode & 0o022 or (is_binary and not info.st_mode & 0o111)
+                or (not is_binary and info.st_mode & 0o222)):
+            raise RuntimeError('mandatory Fossil Rust build artifact has untrusted permissions')
         target = snapshot / relative
         target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         descriptor = os.open(executable, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             before = os.fstat(descriptor)
-            if (before.st_uid != 0 or not stat.S_ISREG(before.st_mode)
-                    or not (before.st_mode & 0o111) or before.st_mode & 0o022):
-                raise RuntimeError('Fossil Rust executable changed permissions before staging')
+            if ((before.st_uid != 0 or not stat.S_ISREG(before.st_mode)
+                 or before.st_mode & 0o022 or (is_binary and not before.st_mode & 0o111)
+                 or (not is_binary and before.st_mode & 0o222))):
+                raise RuntimeError('Fossil Rust build artifact changed permissions before staging')
             with os.fdopen(descriptor, 'rb', closefd=False) as stream:
                 data = stream.read()
             after = os.fstat(descriptor)
@@ -153,12 +160,13 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
                  before.st_mtime_ns, before.st_ctime_ns) !=
                 (after.st_dev, after.st_ino, after.st_size,
                  after.st_mtime_ns, after.st_ctime_ns)):
-                raise RuntimeError('Fossil Rust executable changed while staging')
+                raise RuntimeError('Fossil Rust build artifact changed while staging')
         finally:
             os.close(descriptor)
         target.write_bytes(data)
         os.chown(target, 0, 0)
-        target.chmod(0o555)
+        target.chmod(0o555 if is_binary else 0o444)
+    verify_fetch_runtime_build_identity(snapshot)
     dependency = golden_dependency_identity(manager.base, manager.source_root) if golden_dependency is None else golden_dependency
     if dependency != golden_dependency_identity(manager.base, manager.source_root):
         raise RuntimeError("golden dependency identity changed before fetch source staging")

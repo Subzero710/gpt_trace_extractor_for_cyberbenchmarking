@@ -7,18 +7,16 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import importlib.util
 import io
 import json
 import os
-import stat
 import struct
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
 
-
-BINARY = Path('rust/verified-resolver/target/release/verified-resolver')
 
 
 def _uint(number, width):
@@ -110,16 +108,30 @@ def _policy(root):
 
 
 def _binary(root):
-    resolved = root / BINARY
-    if resolved.is_symlink() or not resolved.is_file():
-        raise RuntimeError('mandatory verified Rust solver binary missing: run make build on Fossil')
-    info = resolved.stat()
-    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111 or info.st_mode & 0o022:
-        raise RuntimeError('mandatory Rust solver binary is nonexecutable/untrusted')
-    if info.st_uid != 0:
-        raise RuntimeError('mandatory Rust solver binary must be root-owned')
-    return resolved
+    # One source of truth: the sealed, versioned Cargo manifest and the common
+    # Fossil/Acer build identity contract. Never infer a binary from an Acer path.
+    module_path = root / 'shared/gpt_trace_transport/local_templates.py'
+    if module_path.is_symlink() or not module_path.is_file():
+        raise RuntimeError('missing sealed runtime identity contract')
+    spec = importlib.util.spec_from_file_location('verified_resolver_local_identity', module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('invalid sealed runtime identity contract')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.verify_fetch_runtime_build_identity(root)
+    return root / module.fetch_runtime_executables(root)[0]
 
+
+
+def _same_pep440_version(host, observed, expected):
+    """Version spelling is not a release identity: compare PEP 440 values."""
+    if not isinstance(observed, str) or not isinstance(expected, str):
+        return False
+    _, _, Version, InvalidVersion, _ = host['_packaging_symbols']()
+    try:
+        return Version(observed) == Version(expected)
+    except InvalidVersion:
+        return False
 
 
 def _verify_solution(host, target, roots, constraints_by_name, records, *, no_deps):
@@ -205,6 +217,19 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     observed_metadata = set()
     prefetch_futures = {}
 
+    def retain_prefetch(references):
+        """Only the current Rust candidate window may keep queued metadata work.
+
+        Completed probes remain in the validated single-flight/record caches,
+        while unneeded pending futures are canceled, not silently waited for.
+        """
+        keep = set(references)
+        if len(keep) != len(references):
+            raise RuntimeError('duplicate native Rust prefetch candidate')
+        for ref in tuple(prefetch_futures):
+            if ref not in keep:
+                prefetch_futures.pop(ref).cancel()
+
     def domain(name, requirements):
         raw = tuple(requirements)
         cache_key = name, raw
@@ -255,7 +280,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         if (not isinstance(value, dict) or
                 value.get('kind') != candidate['kind'] or
                 host['_normalized_package_name'](value.get('name', '')) != host['_normalized_package_name'](candidate['name']) or
-                value.get('version') != candidate['version'] or
+                not _same_pep440_version(host, value.get('version'), candidate['version']) or
                 not isinstance(value.get('requirements'), list) or
                 not all(isinstance(item, str) for item in value['requirements'])):
             raise RuntimeError('verified candidate metadata differs from chosen release')
@@ -381,13 +406,22 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('unbounded Rust metadata prefetch')
                     references = [wire.number() for _ in range(count)]
                     def deliver_prefetch():
+                        # Validate the whole window before touching existing work.
+                        for ref in references:
+                            if ref not in candidate_by_id:
+                                raise RuntimeError('unknown Rust metadata prefetch candidate')
+                        retain_prefetch(references)
                         if executor is not None:
                             for ref in references:
-                                if ref not in candidate_by_id:
-                                    raise RuntimeError('unknown Rust metadata prefetch candidate')
-                                if ref not in prefetch_futures:
+                                if ref not in prefetch_futures and ref not in record_by_id:
                                     prefetch_futures[ref] = executor.submit(record, ref)
                     action = deliver_prefetch
+                elif op == b'X':
+                    # Entering another search branch abandons speculative work
+                    # from the previous branch, not its completed verified cache.
+                    def deliver_prefetch_clear():
+                        retain_prefetch(())
+                    action = deliver_prefetch_clear
                 elif op == b'C':
                     ref, requirements = wire.number(), wire.strings()
                     def deliver_check():

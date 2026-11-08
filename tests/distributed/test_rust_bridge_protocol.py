@@ -8,6 +8,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 from packaging.requirements import Requirement
+from packaging.version import Version, InvalidVersion
 
 
 def test_verified_ipc_serves_real_candidate_then_returns_identity(monkeypatch, tmp_path):
@@ -60,6 +61,7 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
     host={
         '__file__':str(root/'scripts/superbench_pool.py'),
         '_coerce_target':lambda v:v,
+        '_packaging_symbols':lambda :(None, None, Version, InvalidVersion, None),
         '_constraint_map':lambda c,t:{},
         '_SingleFlightCache':lambda :{},
         '_parse_registry_requirement':Requirement,
@@ -75,3 +77,16 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
     }
     target=SimpleNamespace(python_artifact_sha256='a'*64)
     assert bridge.solve(host,None,target,{'demo==1.0'},set(),'group',materialize=False)==[result]
+
+
+def test_bridge_versions_use_pep440_not_string_spelling():
+    from packaging.version import Version, InvalidVersion
+    import importlib.util
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_pep440_policy_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    host = {'_packaging_symbols': lambda: (None, None, Version, InvalidVersion, None)}
+    assert bridge._same_pep440_version(host, '1.0', '1.0.0')
+    assert not bridge._same_pep440_version(host, '1.0', '1.0.1')
+    assert not bridge._same_pep440_version(host, 'invalid', '1.0')

@@ -16,11 +16,12 @@ def test_native_engine_is_the_only_graph_search_path():
 def test_worker_snapshot_includes_executable_binary_and_source_contract():
     contract=(ROOT/'shared/gpt_trace_transport/local_templates.py').read_text()
     staging=(ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py').read_text()
-    source='rust/verified-resolver/target/release/verified-resolver'
-    assert source not in contract.split('FETCH_SOURCE_FILES = (', 1)[1].split('\n)', 1)[0]
     assert 'def fetch_runtime_executables(' in contract
-    assert 'for relative in fetch_runtime_executables(repository):' in staging
-    assert 'target.chmod(0o555)' in staging
+    assert 'def fetch_runtime_build_inputs(' in contract
+    assert 'def verify_fetch_runtime_build_identity(' in contract
+    assert 'verify_fetch_runtime_build_identity(repository)' in staging
+    assert 'verify_fetch_runtime_build_identity(snapshot)' in staging
+    assert 'target.chmod(0o555 if is_binary else 0o444)' in staging
     assert 'expected_sources=current[\'fetch_sources\']' in staging
 
 

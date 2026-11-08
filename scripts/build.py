@@ -18,20 +18,73 @@ def verify_host_requirements(root: Path) -> None:
     run([sys.executable, str(root / "scripts/host_requirements.py"), "--build"])
 
 
-def build_verified_resolver(root: Path) -> None:
-    """Reproducibly compile the mandatory Rust graph engine before broker admission.
+def _verified_resolver_contract(root: Path):
+    """Read the same versioned identity policy used by the Fossil broker and worker."""
+    import importlib.util
+    source = root / 'shared/gpt_trace_transport/local_templates.py'
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('missing authoritative Fossil/Acer runtime identity module')
+    spec = importlib.util.spec_from_file_location('gpt_trace_verified_build_identity', source)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('invalid authoritative runtime identity module')
+    contract = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(contract)
+    return contract
 
-    No network, no dynamic package acquisition, no Python runtime substitution.
-    """
+
+def seal_verified_resolver_build(root: Path, *, expected_inputs=None) -> None:
+    """Bind root-owned release bytes to crate inputs, after successful Cargo compilation."""
     import os
     import stat
+    import tempfile
+    contract = _verified_resolver_contract(root)
+    inputs = contract.fetch_runtime_build_inputs(root)
+    if expected_inputs is not None and inputs != expected_inputs:
+        raise RuntimeError('Rust source/lock changed while building the mandatory resolver')
+    binary = root / contract.fetch_runtime_executables(root)[0]
+    if binary.is_symlink() or not binary.is_file():
+        raise RuntimeError('mandatory Rust binary was not produced')
+    info = binary.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError('mandatory Rust binary is not regular')
+    if os.geteuid() != 0 or info.st_uid != 0:
+        raise RuntimeError('mandatory native resolver build must run as root on Fossil')
+    binary.chmod(0o555)
+    identity = contract.fetch_runtime_build_identity(root)
+    if identity['inputs'] != inputs:
+        raise RuntimeError('Rust source/lock changed while sealing the resolver build')
+    target = root / contract.fetch_runtime_build_identity_path(root)
+    descriptor, temporary = tempfile.mkstemp(prefix='.' + target.name + '-', dir=target.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            os.fchmod(stream.fileno(), 0o444)
+            stream.write(contract.canonical(identity) + b'\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    contract.verify_fetch_runtime_build_identity(root)
+
+
+def build_verified_resolver(root: Path) -> None:
+    """Compile and attest the mandatory offline Rust resolver before broker admission."""
+    import os
+    contract = _verified_resolver_contract(root)
+    initial_inputs = contract.fetch_runtime_build_inputs(root)
     cargo = shutil.which('cargo')
     rustc = shutil.which('rustc')
     if not cargo or not rustc:
         raise RuntimeError('Rust toolchain required: install cargo and rustc with make requirements')
     project = root / 'rust/verified-resolver'
-    manifest, lock = project / 'Cargo.toml', project / 'Cargo.lock'
-    for source in (manifest, lock, project / 'src/main.rs'):
+    manifest = project / 'Cargo.toml'
+    for relative in initial_inputs:
+        source = root / relative
         if source.is_symlink() or not source.is_file():
             raise RuntimeError('missing or unsafe mandatory Rust solver source: ' + str(source))
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
@@ -42,17 +95,7 @@ def build_verified_resolver(root: Path) -> None:
                    cwd=root, check=True, env=env)
     subprocess.run([cargo, 'build', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
                    cwd=root, check=True, env=env)
-    binary = project / 'target/release/verified-resolver'
-    if binary.is_symlink() or not binary.is_file():
-        raise RuntimeError('mandatory Rust binary was not produced')
-    info = binary.stat()
-    if not stat.S_ISREG(info.st_mode):
-        raise RuntimeError('mandatory Rust binary is not regular')
-    binary.chmod(0o555)
-    # The binary is hashed by pool_contract and sealed into each attempt snapshot.
-    # Broker ownership requires this file to be administratively root-owned.
-    if os.geteuid() != 0 or binary.stat().st_uid != 0:
-        raise RuntimeError('mandatory native resolver build must run as root on Fossil')
+    seal_verified_resolver_build(root, expected_inputs=initial_inputs)
 
 
 def build_host_broker(root: Path) -> None:

@@ -71,9 +71,10 @@ jobs:
       - name: Build root-owned mandatory Rust solver before Python integration tests
         run: |
           cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml
-          sudo chown root:root rust/verified-resolver/target/release/verified-resolver
-          sudo chmod 0755 rust/verified-resolver/target/release/verified-resolver
-          sudo test -x rust/verified-resolver/target/release/verified-resolver
+          BINARY="$(python3 -c 'from pathlib import Path; from scripts.build import _verified_resolver_contract; print(_verified_resolver_contract(Path.cwd()).fetch_runtime_executables(Path.cwd())[0])')"
+          sudo chown root:root "$BINARY"
+          sudo python3 -c 'from pathlib import Path; from scripts.build import seal_verified_resolver_build; seal_verified_resolver_build(Path.cwd())'
+          sudo test -x "$BINARY"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
