@@ -4317,10 +4317,49 @@ def _native_build_requirements(scratch):
     return [list(group) for group in sorted(groups)]
 
 
+def _native_interpreter_has_stdlib_distutils(runtime, interpreter):
+    """Probe the *locked interpreter's* CCompiler export, not the host Python.
+
+    Modern setuptools' vendored distutils.ccompiler no longer exports CCompiler
+    through ``from distutils.ccompiler import *``. Historical build backends
+    require this name. When the target CPython still provides its own distutils,
+    use that implementation for isolated PEP 517 hooks. Newer CPython releases
+    without stdlib distutils retain their normal setuptools backend unchanged.
+    """
+    identity = str(interpreter)
+    with _NATIVE_POOL_LOCK:
+        cache = runtime.setdefault('native_stdlib_distutils', {})
+        if identity in cache:
+            return cache[identity]
+        script = ("import pathlib, sysconfig\n"
+                  "source = pathlib.Path(sysconfig.get_path('stdlib')) / 'distutils' / 'ccompiler.py'\n"
+                  "if not source.is_file():\n"
+                  "    print('absent')\n"
+                  "else:\n"
+                  "    from distutils.ccompiler import *\n"
+                  "    print('usable' if 'CCompiler' in globals() else 'broken')\n")
+        probe = {**runtime, 'env': {**runtime['env'], 'SETUPTOOLS_USE_DISTUTILS': 'stdlib'}}
+        result = _native_run([interpreter, '-c', script], probe, interpreter=interpreter)
+        outcome = result.decode('utf-8').strip().splitlines()[-1:]
+        if outcome == ['broken']:
+            raise RuntimeError('locked CPython stdlib distutils does not export CCompiler')
+        if outcome not in (['usable'], ['absent']):
+            raise RuntimeError('cannot verify locked CPython stdlib distutils capability')
+        cache[identity] = outcome == ['usable']
+        return cache[identity]
+
+
 def _native_metadata_command(argv, runtime, directory):
     """Execute the production pip command and capture its build-time closure."""
+    # Scope the distutils selection to this isolated metadata subprocess only.
+    # Do not modify the CAS, project build requirements, pip constraints or
+    # other native commands. The build-isolation subprocess inherits the flag.
+    use_stdlib = _native_interpreter_has_stdlib_distutils(runtime, argv[0])
     with tempfile.TemporaryDirectory(prefix='build-metadata-', dir=directory) as temporary:
-        local = {**runtime, 'env': {**runtime['env'], 'TMPDIR': temporary}}
+        environment = {**runtime['env'], 'TMPDIR': temporary}
+        if use_stdlib:
+            environment['SETUPTOOLS_USE_DISTUTILS'] = 'stdlib'
+        local = {**runtime, 'env': environment}
         _native_run([*argv, '--no-clean'], local, interpreter=argv[0])
         return _native_build_requirements(temporary)
 
