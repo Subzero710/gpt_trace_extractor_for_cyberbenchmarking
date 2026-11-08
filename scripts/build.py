@@ -98,6 +98,22 @@ def build_verified_resolver(root: Path) -> None:
     seal_verified_resolver_build(root, expected_inputs=initial_inputs)
 
 
+def runner_test_requirements(root: Path) -> tuple[str, ...]:
+    """Only runner test extras, never runner runtime dependencies, on Fossil."""
+    import tomllib
+
+    manifest = root / "apps/runner/pyproject.toml"
+    if manifest.is_symlink() or not manifest.is_file():
+        raise RuntimeError("missing trusted runner test dependency manifest")
+    with manifest.open("rb") as stream:
+        metadata = tomllib.load(stream)
+    tests = metadata.get("project", {}).get("optional-dependencies", {}).get("test")
+    if (not isinstance(tests, list) or not tests
+            or any(type(item) is not str or not item.strip() for item in tests)):
+        raise RuntimeError("runner test dependencies must be a nonempty list of requirements")
+    return tuple(tests)
+
+
 def build_host_broker(root: Path) -> None:
     venv = root / ".venv-workstation-broker"
     python = venv / "bin/python"
@@ -118,7 +134,8 @@ def build_host_broker(root: Path) -> None:
     run([str(test_python), "-m", "pip", "install", "--disable-pip-version-check",
          "-e", str(root / "shared"),
          "-e", str(root / "apps/workstation-broker") + "[test]",
-         "-e", str(root / "apps/kali-workstation") + "[test]"])
+         "-e", str(root / "apps/kali-workstation") + "[test]",
+         *runner_test_requirements(root)])
     run([str(test_python), "-m", "pip", "check"])
     import os
     test_env = dict(os.environ)
