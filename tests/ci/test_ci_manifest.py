@@ -41,8 +41,15 @@ def test_rust_compilation_unit_tests_and_runtime_binary_are_ci_gated():
     assert 'cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml' in rust_commands
     integration_commands = '\n'.join(step.get('run', '') for step in jobs['distributed']['steps'])
     assert 'cargo build --offline --locked --release --manifest-path rust/verified-resolver/Cargo.toml' in integration_commands
-    assert 'sudo chown root:root rust/verified-resolver/target/release/verified-resolver' in integration_commands
-    assert 'sudo chmod 0755 rust/verified-resolver/target/release/verified-resolver' in integration_commands
+    # The binary path is derived from Cargo.toml, not duplicated in CI tests.
+    assert 'from scripts.build import _verified_resolver_contract' in integration_commands
+    assert '.fetch_runtime_executables(Path.cwd())' in integration_commands
+    assert 'sudo chown root:root "$BINARY"' in integration_commands
+    assert 'from scripts.build import seal_verified_resolver_build' in integration_commands
+    assert 'sudo test -x "$BINARY"' in integration_commands
+    build_source = (SOURCE.parents[2] / 'scripts/build.py').read_text()
+    assert 'binary.chmod(0o555)' in build_source
+    assert 'contract.verify_fetch_runtime_build_identity(root)' in build_source
     native_source = (SOURCE.parents[2] / 'rust/verified-resolver/src/main.rs').read_text()
     assert '#[cfg(test)]' in native_source
     assert '#[test]' in native_source

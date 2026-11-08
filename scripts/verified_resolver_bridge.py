@@ -363,7 +363,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 if op == b'D':
                     name, requirements = wire.string(), wire.strings()
                     def deliver_domain():
-                        refs = domain(name, requirements)
+                        # Even a singleton propagation must use the shared I/O pool.
+                        # The resolver loop must not perform PyPI work itself.
+                        if executor is None:
+                            refs = domain(name, requirements)
+                        else:
+                            refs = executor.submit(domain, name, requirements).result()
                         wire.send_int(len(refs))
                         for ref in refs:
                             candidate = candidate_by_id[ref]
@@ -470,12 +475,25 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('unbounded native metadata request')
                     references = [wire.number() for _ in range(count)]
                     def deliver_metadata():
-                        for ref in references:
-                            future = prefetch.take(ref)
-                            if future is None:
-                                record(ref)
-                            else:
+                        # Singleton propagation bypasses Rust's speculative prefetch.
+                        # Submit every outstanding metadata probe to the I/O pool,
+                        # reusing speculative futures without duplicating requests.
+                        pending = []
+                        try:
+                            for ref in references:
+                                future = prefetch.take(ref)
+                                if future is not None:
+                                    pending.append(future)
+                                elif executor is None:
+                                    record(ref)
+                                else:
+                                    pending.append(executor.submit(record, ref))
+                            for future in pending:
                                 future.result()
+                        except BaseException:
+                            for future in pending:
+                                future.cancel()
+                            raise
                     action = deliver_metadata
                 elif op == b'P':
                     ref, extras = wire.number(), wire.strings()
