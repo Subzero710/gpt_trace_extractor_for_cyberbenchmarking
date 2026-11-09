@@ -182,6 +182,7 @@ struct Solver {
     prefetch_width: usize,
     stats: Stats,
     candidate_domains: HashMap<(String,Vec<String>),Vec<Candidate>>,
+    registered_candidates: HashSet<u32>,
     // Only positive cache observations are monotonic; unobserved metadata may
     // arrive asynchronously through Python's speculative PEP 517/HTTP probes.
     metadata_known: HashSet<u32>,
@@ -212,6 +213,7 @@ impl Solver {
         let version = self.wire.raw_string()?;
         let filename = self.wire.raw_string()?;
         if kind != "wheel" && kind != "sdist" { return Err("unrecognized candidate kind".into()); }
+        self.registered_candidates.insert(id);
         Ok(Candidate {id,kind,version,filename})
     }
     fn domain(&mut self, name: &str, rows: &[Entry]) -> Result<Vec<Candidate>,String> {
@@ -267,32 +269,34 @@ impl Solver {
         Ok(answers)
     }
     fn known_metadata(&mut self, domains: &BTreeMap<String, Vec<Candidate>>)
-        -> Result<BTreeSet<u32>, String> {
-        if self.no_deps { return Ok(BTreeSet::new()); }
-        // One IPC per search state, NOT one IPC for every unresolved project.
-        // Previously verified metadata is immutable; unverified metadata must
-        // be rechecked, because an in-flight probe may have completed.
-        let mut requested = BTreeSet::new();
-        let mut known: BTreeSet<u32> = self.metadata_known.iter().copied().collect();
-        for candidates in domains.values() {
-            for candidate in candidates {
-                if !known.contains(&candidate.id) { requested.insert(candidate.id); }
-            }
-        }
-        if requested.is_empty() { return Ok(known); }
+        -> Result<(), String> {
+        if self.no_deps { return Ok(()); }
+        // Python owns artifact evidence. Its observed-name filter avoids
+        // inspecting candidates for projects whose metadata has never been
+        // probed. Ask for names rather than retransmitting every candidate ID
+        // on every search iteration; newly verified candidates are returned
+        // by ID, and only positive observations remain cached in Rust.
+        let observed_projects: Vec<&String> = domains.iter()
+            .filter(|(_, candidates)| candidates.iter()
+                .any(|candidate| !self.metadata_known.contains(&candidate.id)))
+            .map(|(name, _)| name).collect();
+        if observed_projects.is_empty() { return Ok(()); }
         self.wire.send_u8(b'K')?;
-        self.wire.send_len(requested.len())?;
-        for id in &requested { self.wire.send_u32(*id)?; }
+        self.wire.send_len(observed_projects.len())?;
+        for name in observed_projects { self.wire.send_string(name)?; }
         self.wire.flush()?;
         self.wire.ack()?;
-        for id in requested {
-            match self.wire.raw_u8()? {
-                1 => { self.metadata_known.insert(id); known.insert(id); },
-                0 => {},
-                _ => return Err("invalid metadata-known bit".into()),
+        let count = self.wire.raw_u32()? as usize;
+        if count > self.wire.max_frame || count > self.registered_candidates.len() {
+            return Err("metadata-known count exceeds IPC safety limit".into());
+        }
+        for _ in 0..count {
+            let id = self.wire.raw_u32()?;
+            if !self.registered_candidates.contains(&id) || !self.metadata_known.insert(id) {
+                return Err("unrecognized or duplicate verified metadata candidate".into());
             }
         }
-        Ok(known)
+        Ok(())
     }
     fn prefetch(&mut self, candidates: &[Candidate], index: usize, depth: usize) -> Result<(), String> {
         // Python's schedule_metadata submits futures without awaiting them.
@@ -503,7 +507,7 @@ impl Solver {
             // relevant ancestor and report a satisfiable graph as UNSAT.
             let mut choices: Vec<(usize,bool,String,Vec<Candidate>,BTreeSet<String>)> = Vec::new();
             let domains = self.domains(&unresolved, &group)?;
-            let known = self.known_metadata(&domains)?;
+            self.known_metadata(&domains)?;
             for name in unresolved {
                 let rows=&group.rows[&name];
                 let candidates=domains[&name].clone();
@@ -517,7 +521,7 @@ impl Solver {
                 let mut known_conflict=BTreeSet::new();
                 let mut first_detail=None;
                 for c in candidates {
-                    if known.contains(&c.id) {
+                    if self.metadata_known.contains(&c.id) {
                         if let Some((involved,dep_name))=self.lookahead(&name,&c,rows,&group,&state.selected)? {
                             known_conflict.extend(involved);
                             if first_detail.is_none() { first_detail=Some(dep_name); }
@@ -658,7 +662,8 @@ fn process(wire: &mut Wire) -> Result<(),String> {
     };
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
-        candidate_domains:HashMap::new(),metadata_known:HashSet::new(),
+        candidate_domains:HashMap::new(),registered_candidates:HashSet::new(),
+        metadata_known:HashSet::new(),
         compatibility:HashMap::new(),compatibility_bytes:0,
         metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
         expanded_cache:HashMap::new(),failed_states:HashSet::new(),failed_fifo:VecDeque::new(),

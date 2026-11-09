@@ -197,7 +197,6 @@ def test_nested_prefetch_prioritizes_child_without_canceling_running_probes():
 
 def test_compiled_resolver_avoids_quadratic_python_callbacks(monkeypatch, tmp_path):
     import collections
-    import shutil
     from packaging.requirements import Requirement
     from packaging.version import Version, InvalidVersion
 
@@ -205,10 +204,9 @@ def test_compiled_resolver_avoids_quadratic_python_callbacks(monkeypatch, tmp_pa
     spec = importlib.util.spec_from_file_location('resolver_ipc_scaling_test', source)
     bridge = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge)
-    rust = source.parents[1] / 'rust/verified-resolver/src/main.rs'
-    binary = tmp_path / 'verified-resolver'
-    subprocess.run([shutil.which('rustc') or 'rustc', '--edition=2021', '-O',
-                    str(rust), '-o', str(binary)], check=True)
+    # The distributed CI job already built and sealed the release binary.
+    # Use that exact identity-verified artifact, not a second compilation.
+    binary = bridge._binary(source.parents[1])
     monkeypatch.setattr(bridge, '_binary', lambda _: binary)
     (tmp_path / 'scripts').mkdir()
     (tmp_path / 'config').mkdir()

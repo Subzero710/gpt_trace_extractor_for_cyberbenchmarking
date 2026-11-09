@@ -272,10 +272,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         return []
 
     candidate_by_id = {}
+    candidate_ids_by_name = {}
     id_by_identity = {}
     record_by_id = {}
     domain_cache = {}
     valid_cache = {}
+    reported_metadata = set()
     probe_lock = threading.Lock()
     candidate_lock = threading.Lock()
     observed_lock = threading.Lock()
@@ -303,6 +305,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         raise RuntimeError('native Rust candidate reference overflow')
                     id_by_identity[identity] = ref
                     candidate_by_id[ref] = candidate
+                    canonical_name = host['_normalized_package_name'](candidate['name'])
+                    candidate_ids_by_name.setdefault(canonical_name, set()).add(ref)
             ids.append(ref)
         domain_cache[cache_key] = ids
         return ids
@@ -423,30 +427,37 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                     wire.send_string(candidate[field])
                     action = deliver_domains
                 elif op == b'K':
-                    # Match Python cached_compatible: only inspected,
-                    # immutable metadata may justify forward pruning.
+                    # Candidate identities are already registered by B/D.
+                    # A name-only query avoids O(projects * candidates * states)
+                    # transfer and Python probes for never-observed projects.
                     count = wire.number()
                     if count > wire.limit:
                         raise RuntimeError('unbounded native cache-inspection batch')
-                    references = [wire.number() for _ in range(count)]
+                    names = [wire.string() for _ in range(count)]
                     def deliver_known():
-                        for ref in references:
-                            candidate = candidate_by_id.get(ref)
-                            if candidate is None:
-                                raise RuntimeError('unknown Rust metadata-cache candidate')
-                            name = host['_normalized_package_name'](candidate['name'])
-                            with observed_lock:
-                                observed = name in observed_metadata
-                            if no_deps or not observed:
-                                known = False
-                            else:
-                                identity = host['_candidate_probe_identity'](
-                                    candidate, target, no_deps)
-                                entry = (probe_cache.peek(identity)
-                                         if isinstance(probe_cache, host['_SingleFlightCache'])
-                                         else probe_cache.get(identity))
-                                known = entry is not None
-                            wire.send_int(int(known), 1)
+                        if no_deps:
+                            wire.send_int(0)
+                            return
+                        with observed_lock:
+                            observed_names = set(names).intersection(observed_metadata)
+                        with candidate_lock:
+                            references = {ref for name in observed_names
+                                          for ref in candidate_ids_by_name.get(name, ())}
+                        newly_verified = []
+                        for ref in sorted(references - reported_metadata):
+                            candidate = candidate_by_id[ref]
+                            identity = host['_candidate_probe_identity'](
+                                candidate, target, no_deps)
+                            entry = (probe_cache.peek(identity)
+                                     if isinstance(probe_cache, host['_SingleFlightCache'])
+                                     else probe_cache.get(identity))
+                            if entry is not None:
+                                newly_verified.append(ref)
+                        # Publish only complete, independently verified metadata.
+                        wire.send_int(len(newly_verified))
+                        for ref in newly_verified:
+                            wire.send_int(ref)
+                        reported_metadata.update(newly_verified)
                     action = deliver_known
                 elif op == b'W':
                     # The fairness controller is re-evaluated for each

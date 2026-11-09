@@ -164,7 +164,8 @@ def test_compiled_rust_backtracks_after_proven_invalid_target_source():
          patch.object(pool, '_candidate_release_metadata', side_effect=wheel):
         plan = pool._resolve_registry_plan(
             pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],
-            'invalid-target-source-regression', materialize=False)
+            'invalid-target-source-regression', materialize=False,
+            resolver_cache={'native_source_probe': pool._native_source_candidate_metadata})
 
     assert [(row['name'], row['version']) for row in plan] == [('example', '1')]
     assert probed == ['0.5']
@@ -189,4 +190,5 @@ def test_compiled_rust_does_not_reinterpret_metadata_infrastructure_failure():
          pytest.raises(RuntimeError, match='verified metadata network unavailable'):
         pool._resolve_registry_plan(
             pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],
-            'invalid-target-source-infra-regression', materialize=False)
+            'invalid-target-source-infra-regression', materialize=False,
+            resolver_cache={'native_source_probe': pool._native_source_candidate_metadata})
