@@ -2553,6 +2553,9 @@ class Pool:
         # Pip closures run concurrently. Mutable provenance/CAS indexes remain
         # process-local and are protected independently from network transfer.
         self._state_lock = threading.RLock()
+        # Retained pip version indexing must never hold the CAS/download lock
+        # while walking checkpoint files or fsyncing a newly published plan.
+        self._cached_version_lock = threading.RLock()
         self._download_locks = {}
         # One ephemeral pip HTTP cache for the whole worker. It is deliberately
         # outside the staged pool and therefore can never become a published
@@ -3491,32 +3494,122 @@ def _parse_sdist_filename(value):
     return parse_sdist_filename(value)
 
 
+def _cached_version_file_identity(path):
+    """Identify a regular, non-symlinked index input without reading its contents."""
+    if path.is_symlink() or not path.is_file():
+        return None
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _cached_version_directory_identity(path):
+    """Detect additions/removals without re-reading every historical checkpoint."""
+    if not path.is_dir():
+        return None
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _cached_version_plan_rows(pool, plan):
+    """Index the same candidate evidence as the historical per-package scan."""
+    if not isinstance(plan, dict):
+        return set()
+    rows = (plan.get('packages', []) if isinstance(plan.get('packages'), list)
+            else plan.get('source_archives', []))
+    result = set()
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('name'), str)
+                or not isinstance(row.get('version'), str)
+                or not SHA.fullmatch(str(row.get('sha256', '')))):
+            continue
+        sha = row['sha256']
+        result.add((_normalized_package_name(row['name']), row['version'],
+                    pool.objects / sha[:2] / sha))
+    return result
+
+
+def _cached_version_replace(index, kind, path, identity, rows):
+    """Replace only one changed input, keeping evidence from other plans intact."""
+    files = index['files'][kind]
+    prior = files.pop(path, None)
+    if prior is not None:
+        for name, version, artifact in prior[1]:
+            by_version = index['versions'][name]
+            sources = by_version[version]
+            sources.remove((path, artifact))
+            if not sources:
+                del by_version[version]
+            if not by_version:
+                del index['versions'][name]
+    if identity is None:
+        return
+    rows = frozenset(rows)
+    files[path] = identity, rows
+    for name, version, artifact in rows:
+        index['versions'].setdefault(name, {}).setdefault(version, set()).add((path, artifact))
+
+
+def _cached_version_refresh(pool, index):
+    """Refresh the index only when a relevant directory was modified.
+
+    Existing JSON files are not decoded again unless their file identity changed.
+    New CAS objects need no refresh: existence is checked at the point of use.
+    The caller holds the Pool's dedicated version-index lock.
+    """
+    inputs = (
+        ('wheels', pool.stage / 'wheels' / 'shared', '*.whl'),
+        ('plans', pool.stage / 'metadata', 'pip-plan-*.json'),
+    )
+    for kind, directory, pattern in inputs:
+        signature = _cached_version_directory_identity(directory)
+        if signature == index['directories'].get(kind):
+            continue
+        current = set(directory.glob(pattern)) if signature is not None else set()
+        for path in set(index['files'][kind]).difference(current):
+            _cached_version_replace(index, kind, path, None, ())
+        for path in current:
+            identity = _cached_version_file_identity(path)
+            previous = index['files'][kind].get(path)
+            if previous is not None and previous[0] == identity:
+                continue
+            if identity is None:
+                rows = ()
+            elif kind == 'wheels':
+                try:
+                    name, version, _, _ = _parse_wheel_filename(path.name)
+                    rows = ((_normalized_package_name(name), str(version), path),)
+                except Exception:
+                    rows = ()
+            else:
+                try:
+                    plan = json.loads(path.read_bytes())
+                except (OSError, ValueError, TypeError):
+                    rows = ()
+                else:
+                    rows = _cached_version_plan_rows(pool, plan)
+            _cached_version_replace(index, kind, path, identity, rows)
+        index['directories'][kind] = signature
+
+
 def _cached_python_versions(pool, name):
-    """Return exact Python-package versions already represented by the pip pool."""
-    normalized=_normalized_package_name(name);found=set()
-    shared=pool.stage/'wheels'/'shared'
-    if shared.is_dir():
-        for wheel in shared.glob('*.whl'):
-            if wheel.is_symlink() or not wheel.is_file():continue
-            try:wheel_name,version,_,_=_parse_wheel_filename(wheel.name)
-            except Exception:continue
-            if _normalized_package_name(wheel_name)==normalized:found.add(str(version))
-    metadata=pool.stage/'metadata'
-    if metadata.is_dir():
-        for path in metadata.glob('pip-plan-*.json'):
-            if path.is_symlink() or not path.is_file():continue
-            try:plan=json.loads(path.read_bytes())
-            except (OSError,ValueError,TypeError):continue
-            rows=(plan.get('packages',[]) if isinstance(plan,dict) and isinstance(plan.get('packages'),list)
-                  else plan.get('source_archives',[]) if isinstance(plan,dict) else ())
-            for row in rows:
-                if (not isinstance(row,dict) or _normalized_package_name(row.get('name',''))!=normalized
-                        or not isinstance(row.get('version'),str)
-                        or not SHA.fullmatch(str(row.get('sha256','')))):
-                    continue
-                target=pool.objects/row['sha256'][:2]/row['sha256']
-                if target.is_file() and not target.is_symlink():found.add(row['version'])
-    return found
+    """Find retained versions by indexed evidence, without repeated full scans.
+
+    A Pool owns one concurrency-safe index. Published plans are incorporated
+    atomically, and external directory additions are discovered incrementally.
+    Cached artifact paths are still checked for existence and symlink replacement
+    at every read, preserving the original reuse eligibility rule.
+    """
+    normalized = _normalized_package_name(name)
+    with pool._cached_version_lock:
+        index = getattr(pool, '_cached_python_version_index', None)
+        if index is None:
+            index = {'directories': {}, 'files': {'wheels': {}, 'plans': {}},
+                     'versions': {}}
+            pool._cached_python_version_index = index
+        _cached_version_refresh(pool, index)
+        return {version for version, sources in index['versions'].get(normalized, {}).items()
+                if any(artifact.is_file() and not artifact.is_symlink()
+                       for _origin, artifact in sources)}
 
 
 def _cached_python_versions_snapshot(pool):
@@ -5602,10 +5695,27 @@ def _write_pip_plan(pool,target,reqs,key,packages,*,constraints=(),no_deps=False
     for directory in sorted({(pool.objects/row['sha256'][:2]) for row in packages}):
         _sync_directory(directory)
     _sync_directory(pool.objects)
-    write_new(stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps(plan,sort_keys=True,separators=(',',':')))
-    fd=os.open(stage/'metadata',os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:os.fsync(fd)
-    finally:os.close(fd)
+    # Serialize publication with preference lookups. Readers must not see a
+    # partially published plan, and the index must not miss a new checkpoint.
+    with pool._cached_version_lock:
+        metadata = stage / 'metadata'
+        previous = _cached_version_directory_identity(metadata)
+        path = metadata / ('pip-plan-' + key + '.json')
+        write_new(path, json.dumps(plan, sort_keys=True, separators=(',', ':')))
+        fd = os.open(metadata, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        index = getattr(pool, '_cached_python_version_index', None)
+        if index is not None and index['directories'].get('plans') == previous:
+            _cached_version_replace(index, 'plans', path,
+                                    _cached_version_file_identity(path),
+                                    _cached_version_plan_rows(pool, plan))
+            index['directories']['plans'] = _cached_version_directory_identity(metadata)
+        # If unrelated files changed the directory first, leave the old
+        # signature intact: the next lookup discovers every new entry.
+
 
 
 def pip_closure(pool,target,reqs,key,*,constraints=(),no_deps=False,resolver_cache=None):
