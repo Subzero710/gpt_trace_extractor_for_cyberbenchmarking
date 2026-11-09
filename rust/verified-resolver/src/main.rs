@@ -182,6 +182,13 @@ struct Solver {
     prefetch_width: usize,
     stats: Stats,
     candidate_domains: HashMap<(String,Vec<String>),Vec<Candidate>>,
+    // Only positive cache observations are monotonic; unobserved metadata may
+    // arrive asynchronously through Python's speculative PEP 517/HTTP probes.
+    metadata_known: HashSet<u32>,
+    // Python remains the PEP 440 authority. Memoize its immutable answers in
+    // the native search rather than re-entering Python on every propagation.
+    compatibility: HashMap<(u32,Vec<String>),bool>,
+    compatibility_bytes: usize,
     metadata_seen: HashSet<u32>,
     rejected_source: HashMap<u32,String>,
     expanded_cache: HashMap<(u32,Vec<String>),Vec<Entry>>,
@@ -259,24 +266,35 @@ impl Solver {
         }
         Ok(answers)
     }
-    fn known_metadata(&mut self, candidates: &[Candidate]) -> Result<BTreeSet<u32>, String> {
-        if candidates.is_empty() || self.no_deps { return Ok(BTreeSet::new()); }
+    fn known_metadata(&mut self, domains: &BTreeMap<String, Vec<Candidate>>)
+        -> Result<BTreeSet<u32>, String> {
+        if self.no_deps { return Ok(BTreeSet::new()); }
+        // One IPC per search state, NOT one IPC for every unresolved project.
+        // Previously verified metadata is immutable; unverified metadata must
+        // be rechecked, because an in-flight probe may have completed.
+        let mut requested = BTreeSet::new();
+        let mut known: BTreeSet<u32> = self.metadata_known.iter().copied().collect();
+        for candidates in domains.values() {
+            for candidate in candidates {
+                if !known.contains(&candidate.id) { requested.insert(candidate.id); }
+            }
+        }
+        if requested.is_empty() { return Ok(known); }
         self.wire.send_u8(b'K')?;
-        self.wire.send_len(candidates.len())?;
-        for candidate in candidates { self.wire.send_u32(candidate.id)?; }
+        self.wire.send_len(requested.len())?;
+        for id in &requested { self.wire.send_u32(*id)?; }
         self.wire.flush()?;
         self.wire.ack()?;
-        let mut known = BTreeSet::new();
-        for candidate in candidates {
+        for id in requested {
             match self.wire.raw_u8()? {
-                1 => { known.insert(candidate.id); },
+                1 => { self.metadata_known.insert(id); known.insert(id); },
                 0 => {},
                 _ => return Err("invalid metadata-known bit".into()),
             }
         }
         Ok(known)
     }
-    fn prefetch(&mut self, candidates: &[Candidate], index: usize) -> Result<(), String> {
+    fn prefetch(&mut self, candidates: &[Candidate], index: usize, depth: usize) -> Result<(), String> {
         // Python's schedule_metadata submits futures without awaiting them.
         // The Python host recomputes its live fairness-adjusted width.
         self.wire.send_u8(b'W')?;
@@ -286,6 +304,7 @@ impl Solver {
         if width == 0 { return Err("invalid live Rust prefetch width".into()); }
         let stop = std::cmp::min(candidates.len(), index.saturating_add(width));
         self.wire.send_u8(b'A')?;
+        self.wire.send_len(depth)?;
         self.wire.send_len(stop - index)?;
         for candidate in &candidates[index..stop] { self.wire.send_u32(candidate.id)?; }
         self.wire.flush()?;
@@ -293,10 +312,30 @@ impl Solver {
     }
     fn check(&mut self, candidate: &Candidate, rows: &[Entry]) -> Result<bool,String> {
         self.validate_time()?;
+        let requirements: Vec<String> = rows.iter().map(|e| e.requirement.clone()).collect();
+        let key = (candidate.id, requirements);
+        if let Some(&value) = self.compatibility.get(&key) { return Ok(value); }
         self.wire.send_u8(b'C')?; self.wire.send_u32(candidate.id)?;
-        self.wire.strings(&rows.iter().map(|e| e.requirement.clone()).collect::<Vec<_>>())?;
+        self.wire.strings(&key.1)?;
         self.wire.flush()?; self.wire.ack()?;
-        match self.wire.raw_u8()? { 0 => Ok(false), 1 => Ok(true), _ => Err("invalid candidate compatibility response".into()) }
+        let value = match self.wire.raw_u8()? {
+            0 => false, 1 => true,
+            _ => return Err("invalid candidate compatibility response".into()),
+        };
+        // Bound the additional native memo by the existing versioned cache
+        // budget. Eviction does not change the authoritative Python result.
+        let size = std::mem::size_of::<(u32,Vec<String>,bool)>()
+            .saturating_add(key.1.iter().fold(0usize, |total, row|
+                total.saturating_add(std::mem::size_of::<String>()).saturating_add(row.len())));
+        if size <= self.max_cache_bytes {
+            if self.compatibility_bytes.saturating_add(size) > self.max_cache_bytes {
+                self.compatibility.clear();
+                self.compatibility_bytes = 0;
+            }
+            self.compatibility.insert(key, value);
+            self.compatibility_bytes += size;
+        }
+        Ok(value)
     }
     fn metadata_batch(&mut self, ids: &[u32]) -> Result<Option<String>,String> {
         self.validate_time()?;
@@ -464,6 +503,7 @@ impl Solver {
             // relevant ancestor and report a satisfiable graph as UNSAT.
             let mut choices: Vec<(usize,bool,String,Vec<Candidate>,BTreeSet<String>)> = Vec::new();
             let domains = self.domains(&unresolved, &group)?;
+            let known = self.known_metadata(&domains)?;
             for name in unresolved {
                 let rows=&group.rows[&name];
                 let candidates=domains[&name].clone();
@@ -476,7 +516,6 @@ impl Solver {
                 let mut survivors=Vec::new();
                 let mut known_conflict=BTreeSet::new();
                 let mut first_detail=None;
-                let known = self.known_metadata(&candidates)?;
                 for c in candidates {
                     if known.contains(&c.id) {
                         if let Some((involved,dep_name))=self.lookahead(&name,&c,rows,&group,&state.selected)? {
@@ -539,7 +578,7 @@ impl Solver {
                 *self.stats.decisions_by_name.entry(name.clone()).or_default()+=1;
                 // Submit, do not wait for the entire metadata prefetch window.
                 // Only the current candidate must finish before lookahead.
-                self.prefetch(&candidates, idx)?;
+                self.prefetch(&candidates, idx, depth)?;
                 let rejection = self.metadata_batch(&[candidate.id])?;
                 let conflict = if rejection.is_none() {
                     self.lookahead(&name,candidate,rows,&group,&state.selected)?
@@ -619,7 +658,9 @@ fn process(wire: &mut Wire) -> Result<(),String> {
     };
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
-        candidate_domains:HashMap::new(),metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
+        candidate_domains:HashMap::new(),metadata_known:HashSet::new(),
+        compatibility:HashMap::new(),compatibility_bytes:0,
+        metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
         expanded_cache:HashMap::new(),failed_states:HashSet::new(),failed_fifo:VecDeque::new(),
         failed_bytes:0,nogoods:HashMap::new(),nogood_bytes:0};
     solver.wire.max_frame=limit;

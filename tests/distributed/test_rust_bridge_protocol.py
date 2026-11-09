@@ -142,3 +142,121 @@ def test_adaptive_prefetch_retains_current_completed_failure_until_consumed():
     with pytest.raises(RuntimeError, match='metadata error'):
         prefetch.take(1).result()
     prefetch.close()
+
+
+def test_nested_prefetch_preserves_live_parent_siblings_and_prioritizes_child():
+    import concurrent.futures
+    class DeferredExecutor:
+        def __init__(self):
+            self.futures = {}
+        def submit(self, fn, ref):
+            future = concurrent.futures.Future()
+            self.futures[ref] = future
+            return future
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_nested_prefetch_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    executor = DeferredExecutor()
+    prefetch = bridge._BoundedPrefetch(executor, lambda ref: ref)
+    prefetch.schedule((1, 2), 3, {}, depth=1)
+    assert set(prefetch.futures) == {1, 2}
+    prefetch.schedule((3,), 3, {}, depth=2)
+    assert set(prefetch.futures) == {1, 2, 3}
+    # Returning from a child invalidates its pending probe, not the parent's.
+    prefetch.schedule((2,), 3, {}, depth=1)
+    assert set(prefetch.futures) == {2}
+    assert executor.futures[1].cancelled()
+    assert executor.futures[3].cancelled()
+    prefetch.close()
+
+
+def test_nested_prefetch_prioritizes_child_without_canceling_running_probes():
+    import concurrent.futures
+    class DeferredExecutor:
+        def __init__(self):
+            self.futures = {}
+        def submit(self, fn, ref):
+            future = concurrent.futures.Future()
+            self.futures[ref] = future
+            return future
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_child_priority_prefetch_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    executor = DeferredExecutor()
+    prefetch = bridge._BoundedPrefetch(executor, lambda ref: ref)
+    prefetch.schedule((1, 2), 2, {}, depth=0)
+    assert executor.futures[1].set_running_or_notify_cancel()
+    prefetch.schedule((3,), 2, {}, depth=1)
+    assert set(prefetch.futures) == {1, 3}
+    assert executor.futures[2].cancelled()
+    assert not executor.futures[1].cancelled()
+    prefetch.close()
+
+
+def test_compiled_resolver_avoids_quadratic_python_callbacks(monkeypatch, tmp_path):
+    import collections
+    import shutil
+    from packaging.requirements import Requirement
+    from packaging.version import Version, InvalidVersion
+
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_ipc_scaling_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    rust = source.parents[1] / 'rust/verified-resolver/src/main.rs'
+    binary = tmp_path / 'verified-resolver'
+    subprocess.run([shutil.which('rustc') or 'rustc', '--edition=2021', '-O',
+                    str(rust), '-o', str(binary)], check=True)
+    monkeypatch.setattr(bridge, '_binary', lambda _: binary)
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config/preparation.toml').write_text('''[acquisition]
+pip_solver_max_decisions = 1000000
+pip_solver_max_depth = 1024
+pip_solver_cache_max_bytes = 67108864
+pip_solver_max_frame_bytes = 16777216
+pip_total_timeout_seconds = 900
+''')
+    (tmp_path / 'scripts/superbench_pool.py').write_text('# fixture path\n')
+    names = {f'pkg{index:05d}' for index in range(80)}
+    candidates = {name: {'name': name, 'kind': 'wheel', 'version': '1.0',
+                         'filename': f'{name}-1.0.whl', 'item': {'url': f'https://example.org/{name}.whl',
+                         'digests': {'sha256': 'a' * 64}}} for name in names}
+    inspected = collections.Counter()
+    original = bridge._Wire.exact
+    def track(self, count):
+        value = original(self, count)
+        if count == 1 and value in (b'C', b'K', b'B', b'M', b'P'):
+            inspected[value] += 1
+        return value
+    monkeypatch.setattr(bridge._Wire, 'exact', track)
+    host = {
+        '__file__': str(tmp_path / 'scripts/superbench_pool.py'),
+        '_coerce_target': lambda target: target,
+        '_packaging_symbols': lambda: (None, None, Version, InvalidVersion, None),
+        '_constraint_map': lambda constraints, target: {},
+        '_SingleFlightCache': lambda: {},
+        '_parse_registry_requirement': Requirement,
+        '_marker_active': lambda *args: True,
+        '_normalized_package_name': lambda name: name.lower(),
+        '_candidate_versions': lambda _pool, name, *_args, **_kwargs: [candidates[name]],
+        '_candidate_artifact_identity': lambda candidate: (candidate['item']['digests']['sha256'], candidate['item']['url']),
+        '_candidate_probe_identity': lambda candidate, target, no_deps: (candidate['name'], candidate['version'], no_deps),
+        '_candidate_release_metadata': lambda _pool, candidate, *_args, **_kwargs: {**candidate, 'requirements': []},
+        '_candidate_satisfies': lambda candidate, requirements, constraints: all(
+            not req.specifier or req.specifier.contains(candidate['version'], prereleases=True)
+            for req in [*requirements, *constraints]),
+        '_POOL_PROGRESS': True,
+    }
+    target = SimpleNamespace(python_artifact_sha256='a' * 64)
+    result = bridge.solve(host, None, target, {name + '==1.0' for name in names}, [],
+                          'ipc-budget-test', materialize=False)
+    assert len(result) == len(names)
+    # Originally: 6,480 C and 3,240 K round trips for 80 roots.
+    assert inspected[b'C'] == len(names)
+    assert inspected[b'K'] == len(names)
+    assert inspected[b'B'] == 1
+    assert inspected[b'M'] == len(names)
+    assert inspected[b'P'] == len(names)

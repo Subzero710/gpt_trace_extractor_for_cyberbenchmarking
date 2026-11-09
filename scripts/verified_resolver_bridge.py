@@ -31,26 +31,36 @@ class _BoundedPrefetch:
         self.executor = executor
         self.probe = probe
         self.futures = {}
+        self.scopes = {}
 
-    def schedule(self, references, width, completed):
+    def schedule(self, references, width, completed, *, depth=0):
         if type(width) is not int or width < 1:
             raise RuntimeError('invalid adaptive Rust metadata prefetch allocation')
+        if type(depth) is not int or depth < 0:
+            raise RuntimeError('invalid native Rust prefetch search depth')
         if len(references) != len(set(references)):
             raise RuntimeError('duplicate native Rust prefetch candidate')
-        desired = set(references)
-        # Remove requests already present in the validated record cache.
-        # Keep completed failures that are still requested so their exact
-        # exception is delivered when Rust asks for the candidate.
+        # Nested search does not invalidate its ancestor's sibling candidates.
+        # Revisiting a search depth invalidates only that depth and descendants.
+        self.scopes = {level: refs for level, refs in self.scopes.items() if level < depth}
+        self.scopes[depth] = set(references)
+        desired = set().union(*self.scopes.values())
+        # Keep completed failures still needed by an ancestor: their original
+        # exceptions must be propagated when the candidate is consumed.
         for ref, future in tuple(self.futures.items()):
             if future.cancelled() or (future.done() and ref in completed):
                 self.futures.pop(ref)
-            elif ref not in desired:
-                if future.cancel() or future.done():
-                    self.futures.pop(ref)
+            elif ref not in desired and (future.cancel() or future.done()):
+                self.futures.pop(ref)
         if self.executor is None:
             return
-        # Running older requests occupy real executor slots and are retained.
-        # Do not submit replacements that would exceed the current allocation.
+        # A deeper branch has priority over queued speculative ancestor work.
+        # Running probes cannot be cancelled and continue using their real slots.
+        for ref, future in tuple(self.futures.items()):
+            if len(self.futures) < width:
+                break
+            if ref not in references and future.cancel():
+                self.futures.pop(ref)
         for ref in references:
             if len(self.futures) >= width:
                 break
@@ -64,6 +74,7 @@ class _BoundedPrefetch:
         for future in self.futures.values():
             future.cancel()
         self.futures.clear()
+        self.scopes.clear()
 
 
 def _uint(number, width):
@@ -447,8 +458,9 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         wire.send_int(width)
                     action = deliver_width
                 elif op == b'A':
+                    depth = wire.number()
                     count = wire.number()
-                    if count > wire.limit:
+                    if depth > policy['pip_solver_max_depth'] or count > wire.limit:
                         raise RuntimeError('unbounded Rust metadata prefetch')
                     references = [wire.number() for _ in range(count)]
                     def deliver_prefetch():
@@ -458,7 +470,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                 raise RuntimeError('unknown Rust metadata prefetch candidate')
                         width = (prefetch_controller.width()
                                  if prefetch_controller is not None else prefetch_width)
-                        prefetch.schedule(references, width, record_by_id)
+                        prefetch.schedule(references, width, record_by_id, depth=depth)
                     action = deliver_prefetch
                 elif op == b'C':
                     ref, requirements = wire.number(), wire.strings()
