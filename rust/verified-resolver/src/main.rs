@@ -183,6 +183,7 @@ struct Solver {
     stats: Stats,
     candidate_domains: HashMap<(String,Vec<String>),Vec<Candidate>>,
     metadata_seen: HashSet<u32>,
+    rejected_source: HashMap<u32,String>,
     expanded_cache: HashMap<(u32,Vec<String>),Vec<Entry>>,
     failed_states: HashSet<StateKey>,
     failed_fifo: VecDeque<StateKey>,
@@ -297,19 +298,41 @@ impl Solver {
         self.wire.flush()?; self.wire.ack()?;
         match self.wire.raw_u8()? { 0 => Ok(false), 1 => Ok(true), _ => Err("invalid candidate compatibility response".into()) }
     }
-    fn metadata_batch(&mut self, ids: &[u32]) -> Result<(),String> {
+    fn metadata_batch(&mut self, ids: &[u32]) -> Result<Option<String>,String> {
         self.validate_time()?;
+        for id in ids {
+            if let Some(reason) = self.rejected_source.get(id) {
+                return Ok(Some(reason.clone()));
+            }
+        }
         let missing: Vec<u32> = ids.iter().copied().filter(|id| !self.metadata_seen.contains(id)).collect();
-        if missing.is_empty() { return Ok(()); }
+        if missing.is_empty() { return Ok(None); }
+        // Each candidate requires a separate authoritative source check, so
+        // only one can be rejected in a response without ambiguity.
+        if missing.len() != 1 { return Err("source metadata request must identify one candidate".into()); }
         self.wire.send_u8(b'M')?; self.wire.send_len(missing.len())?;
         for id in &missing { self.wire.send_u32(*id)?; }
-        self.wire.flush()?; self.wire.ack()?;
-        for id in missing { self.metadata_seen.insert(id); }
-        Ok(())
+        self.wire.flush()?;
+        match self.wire.raw_u8()? {
+            1 => {
+                self.metadata_seen.insert(missing[0]);
+                Ok(None)
+            },
+            2 => {
+                let reason = self.wire.raw_string()?;
+                if reason.is_empty() { return Err("empty rejected-source evidence".into()); }
+                self.rejected_source.insert(missing[0], reason.clone());
+                Ok(Some(reason))
+            },
+            0 => Err(self.wire.raw_string()?),
+            _ => Err("invalid source metadata IPC acknowledgement".into()),
+        }
     }
     fn expand(&mut self, candidate: &Candidate, extras: &BTreeSet<String>) -> Result<Vec<Entry>,String> {
         if self.no_deps { return Ok(Vec::new()); }
-        self.metadata_batch(&[candidate.id])?;
+        if self.metadata_batch(&[candidate.id])?.is_some() {
+            return Err("rejected source was selected before metadata verification".into());
+        }
         let extras_key: Vec<String> = extras.iter().cloned().collect();
         let key = (candidate.id, extras_key.clone());
         if let Some(rows) = self.expanded_cache.get(&key) { return Ok(rows.clone()); }
@@ -481,7 +504,14 @@ impl Solver {
             // unconditional unit: it must enter the branch path so rejections
             // of other candidates remain attached to their ancestor decisions.
             if count == 1 && pruned_conflicts.is_empty() {
-                self.metadata_batch(&[candidates[0].id])?;
+                if let Some(reason) = self.metadata_batch(&[candidates[0].id])? {
+                    self.failed(key.clone());
+                    return Ok(Outcome::Failed(Failure {
+                        conflict: causes(&group.rows[&name]),
+                        detail: format!("source candidate {}=={} invalid for target: {}",
+                                        name, candidates[0].version, reason),
+                    }));
+                }
                 state.selected.insert(name,candidates[0].clone());
                 self.stats.propagations+=1;
                 continue;
@@ -510,9 +540,17 @@ impl Solver {
                 // Submit, do not wait for the entire metadata prefetch window.
                 // Only the current candidate must finish before lookahead.
                 self.prefetch(&candidates, idx)?;
-                self.metadata_batch(&[candidate.id])?;
-                let conflict=self.lookahead(&name,candidate,rows,&group,&state.selected)?;
-                let result=if let Some((involved,dep_name))=conflict {
+                let rejection = self.metadata_batch(&[candidate.id])?;
+                let conflict = if rejection.is_none() {
+                    self.lookahead(&name,candidate,rows,&group,&state.selected)?
+                } else { None };
+                let result=if let Some(reason)=rejection {
+                    // The artifact itself is unusable, independently of any
+                    // ancestor selection. Try the next allowed candidate.
+                    Outcome::Failed(Failure {conflict: BTreeSet::from([name.clone()]),
+                        detail:format!("source candidate {}=={} invalid for target: {}",
+                                       name,candidate.version,reason)})
+                } else if let Some((involved,dep_name))=conflict {
                     self.stats.forward_prunes+=1;
                     Outcome::Failed(Failure {conflict:involved,
                         detail:format!("candidate {}=={} leaves incompatible requirements for {}",
@@ -581,7 +619,7 @@ fn process(wire: &mut Wire) -> Result<(),String> {
     };
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
-        candidate_domains:HashMap::new(),metadata_seen:HashSet::new(),
+        candidate_domains:HashMap::new(),metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
         expanded_cache:HashMap::new(),failed_states:HashSet::new(),failed_fifo:VecDeque::new(),
         failed_bytes:0,nogoods:HashMap::new(),nogood_bytes:0};
     solver.wire.max_frame=limit;

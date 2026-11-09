@@ -131,3 +131,62 @@ def test_compiled_rust_preserves_guards_of_skipped_learned_clauses():
         for raw in requirements:
             req=Requirement(raw)
             assert req.name in result and req.specifier.contains(str(result[req.name]))
+
+
+def test_compiled_rust_backtracks_after_proven_invalid_target_source():
+    # An old cached sdist with Python-2-only setup.py cannot be used by the
+    # locked target. Its exact syntax rejection must not abort the whole graph.
+    bad = _versioned('example', '0.5')
+    bad['kind'] = 'sdist'
+    bad['filename'] = 'example-0.5.tar.gz'
+    good = _versioned('example', '1')
+    probed = []
+
+    def domain(_pool, name, requirements, constraints, target, **_kwargs):
+        from packaging.version import Version
+        assert name == 'example'
+        return [candidate for candidate in (bad, good)
+                if all(not req.specifier or req.specifier.contains(Version(candidate['version']), prereleases=True)
+                       for req in [*requirements, *constraints])]
+
+    def source(_pool, candidate, key, target):
+        probed.append(candidate['version'])
+        raise pool._IncompatibleSourceSyntax('verified setup.py is Python 2 syntax under target Python 3')
+
+    def wheel(_pool, candidate, key, target, *_args, **_kwargs):
+        assert candidate is good
+        return {**candidate, 'sha256': candidate['item']['digests']['sha256'],
+                'url': candidate['item']['url'], 'requirements': [], 'provides_extra': []}
+
+    with tempfile.TemporaryDirectory() as temp, \
+         patch.object(pool, '_candidate_versions', side_effect=domain), \
+         patch.object(pool, '_native_source_candidate_metadata', side_effect=source), \
+         patch.object(pool, '_candidate_release_metadata', side_effect=wheel):
+        plan = pool._resolve_registry_plan(
+            pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],
+            'invalid-target-source-regression', materialize=False)
+
+    assert [(row['name'], row['version']) for row in plan] == [('example', '1')]
+    assert probed == ['0.5']
+
+
+def test_compiled_rust_does_not_reinterpret_metadata_infrastructure_failure():
+    bad = _versioned('example', '0.5')
+    bad['kind'] = 'sdist'
+    bad['filename'] = 'example-0.5.tar.gz'
+    good = _versioned('example', '1')
+
+    def domain(_pool, name, requirements, constraints, target, **_kwargs):
+        return [bad, good]
+
+    def source(_pool, candidate, key, target):
+        raise RuntimeError('verified metadata network unavailable')
+
+    import pytest
+    with tempfile.TemporaryDirectory() as temp, \
+         patch.object(pool, '_candidate_versions', side_effect=domain), \
+         patch.object(pool, '_native_source_candidate_metadata', side_effect=source), \
+         pytest.raises(RuntimeError, match='verified metadata network unavailable'):
+        pool._resolve_registry_plan(
+            pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],
+            'invalid-target-source-infra-regression', materialize=False)

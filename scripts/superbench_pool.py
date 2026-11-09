@@ -34,6 +34,8 @@ import urllib.parse
 import urllib.request
 import http.client
 import ssl
+import tarfile
+import zipfile
 import urllib.error
 from collections import defaultdict
 from pathlib import Path
@@ -4572,6 +4574,100 @@ def _native_acquire_build_dependencies(pool,target,packages):
 
 
 
+class _IncompatibleSourceSyntax(RuntimeError):
+    """Verified sdist has a setuptools setup.py that cannot parse on target CPython.
+
+    Only this proven artifact-level incompatibility is a candidate rejection;
+    build failures, network errors, metadata-integrity errors remain fatal.
+    """
+
+
+def _check_legacy_setup_syntax(archive, interpreter):
+    """Compile, never execute, setuptools' setup.py with the LOCKED target Python.
+
+    Read only the archive members at its distribution root; no extraction or
+    import of untrusted package code. Do not preflight non-setuptools backends.
+    """
+    archive = Path(archive)
+    entries = {}
+    if archive.name.endswith('.zip'):
+        with zipfile.ZipFile(archive) as source:
+            for item in source.infolist():
+                name = item.filename
+                parts = name.split('/')
+                if (len(parts) in (1, 2) and name and not item.is_dir()
+                        and parts[-1] in {'setup.py', 'pyproject.toml'}
+                        and all(part not in ('', '.', '..') for part in parts)):
+                    if name in entries:
+                        raise RuntimeError('duplicate verified source root metadata member')
+                    if item.file_size > MAX_SOURCE:
+                        raise RuntimeError('verified source setup metadata exceeds size limit')
+                    with source.open(item) as stream:
+                        raw = stream.read(MAX_SOURCE + 1)
+                    if len(raw) > MAX_SOURCE:
+                        raise RuntimeError('verified source setup metadata exceeds size limit')
+                    entries[name] = raw
+    else:
+        with tarfile.open(archive, mode='r:*') as source:
+            for item in source:
+                name = item.name.removeprefix('./')
+                parts = name.split('/')
+                if (len(parts) in (1, 2) and item.isfile()
+                        and parts[-1] in {'setup.py', 'pyproject.toml'}
+                        and all(part not in ('', '.', '..') for part in parts)):
+                    if name in entries:
+                        raise RuntimeError('duplicate verified source root metadata member')
+                    if item.size > MAX_SOURCE:
+                        raise RuntimeError('verified source setup metadata exceeds size limit')
+                    stream = source.extractfile(item)
+                    if stream is None:
+                        raise RuntimeError('verified source root metadata unreadable')
+                    with stream:
+                        raw = stream.read(MAX_SOURCE + 1)
+                    if len(raw) > MAX_SOURCE:
+                        raise RuntimeError('verified source setup metadata exceeds size limit')
+                    entries[name] = raw
+    setup_names = [name for name in entries if name.split('/')[-1] == 'setup.py']
+    if not setup_names:
+        return
+    if len(setup_names) != 1:
+        raise RuntimeError('ambiguous verified source root setup.py')
+    setup_name = setup_names[0]
+    parent = setup_name.rpartition('/')[0]
+    project_name = parent + '/pyproject.toml' if parent else 'pyproject.toml'
+    if project_name in entries:
+        import tomllib
+        spec = tomllib.loads(entries[project_name].decode('utf-8'))
+        build_system = spec.get('build-system', {})
+        backend = build_system.get('build-backend', 'setuptools.build_meta:__legacy__')
+        if not isinstance(backend, str):
+            raise RuntimeError('invalid source PEP 517 build backend')
+        if backend.split(':', 1)[0] != 'setuptools.build_meta':
+            return
+    # Exact target grammar and source encoding, not the controller's Python.
+    # Bytes preserve PEP 263 encoding declarations; compile() runs no setup.py.
+    script = ("import sys\n"
+              "try:\n"
+              "    compile(sys.stdin.buffer.read(), 'setup.py', 'exec')\n"
+              "except SyntaxError as exc:\n"
+              "    print('invalid:' + str(exc.lineno))\n"
+              "else:\n"
+              "    print('valid')\n")
+    completed = subprocess.run([str(interpreter), '-I', '-B', '-c', script],
+                               input=entries[setup_name], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=_native_pip_timeouts()[0])
+    if completed.returncode != 0:
+        raise RuntimeError('locked target Python setup.py syntax probe failed: '
+                           + completed.stderr[-1000:].decode(errors='replace'))
+    outcome = completed.stdout.decode('ascii', errors='strict').strip()
+    if outcome.startswith('invalid:') and outcome.removeprefix('invalid:').isdigit():
+        raise _IncompatibleSourceSyntax('verified source setup.py cannot compile on '
+                                        + str(interpreter) + ' at line '
+                                        + outcome.removeprefix('invalid:'))
+    if outcome != 'valid':
+        raise RuntimeError('invalid locked Python setup.py syntax-probe response')
+
+
 def _native_source_candidate_metadata(pool, candidate, key, target):
     """Read the *real target* PEP 517 metadata for one SHA-verified sdist.
 
@@ -4611,6 +4707,7 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
         os.link(source, archive)
     if archive.is_symlink() or not archive.is_file() or not archive.samefile(source):
         raise RuntimeError('native source archive was replaced')
+    _check_legacy_setup_syntax(archive, python)
     report = root / 'pip-report.json'
     command = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
                '--ignore-installed', '--no-deps', '--report', report,

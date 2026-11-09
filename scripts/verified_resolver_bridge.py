@@ -135,6 +135,13 @@ class _Wire:
         self.send_string(type(exc).__name__ + ': ' + str(exc))
         self.writer.flush()
 
+    def rejected_source(self, exc):
+        # Distinct protocol status: definitively invalid target-language source.
+        # Other errors MUST still abort the solver.
+        self.writer.write(b'\x02')
+        self.send_string(str(exc))
+        self.writer.flush()
+
 
 
 def _policy(root):
@@ -527,9 +534,13 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 try:
                     wire.response(action)
                 except BaseException as exc:
-                    wire.error(exc)
-                    # The Rust solver receives the exact failure and exits; it
-                    # cannot reinterpret missing PyPI evidence as UNSAT.
+                    rejected = host.get('_IncompatibleSourceSyntax')
+                    if (op == b'M' and len(references) == 1
+                            and isinstance(rejected, type) and isinstance(exc, rejected)):
+                        wire.rejected_source(exc)
+                    else:
+                        wire.error(exc)
+                        # Infrastructure and unverified metadata remain fatal.
             wire.writer.close()
             status = child.wait(timeout=30)
             if status != 0 and outcome == 'success':
