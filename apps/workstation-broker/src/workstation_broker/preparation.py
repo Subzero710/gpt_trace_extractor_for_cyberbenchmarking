@@ -428,11 +428,60 @@ class PreparationManager:
     def _write(self, state):
         atomic_json(self._path(state["operation_id"]), {**state, "updated_at": time.time()}, 0o600)
 
+    def _progress(self, state):
+        """Read a bounded atomic snapshot, never parse or relay worker stdout."""
+        attempt = state.get('attempt')
+        operation_id = state.get('operation_id')
+        if type(attempt) is not int or attempt < 1 or not isinstance(operation_id, str):
+            return None
+        stage = self.base.parent/'dependency-pool'/('incoming-'+identifier(operation_id)+'-'+str(attempt))
+        metadata = stage/'metadata'
+        if (not stage.is_dir() or stage.is_symlink()
+                or not metadata.is_dir() or metadata.is_symlink()):
+            return None
+        path = metadata/'fetch-progress.json'
+        if path.is_symlink():
+            raise RuntimeError('untrusted fetch progress symlink')
+        if not path.exists():
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != stage.stat().st_uid
+                    or info.st_mode & 0o077 or info.st_size > 8192):
+                raise RuntimeError('untrusted fetch progress snapshot')
+            with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+                value = stream.read(8193)
+        finally:
+            os.close(descriptor)
+        if not value or len(value) > 8192:
+            raise RuntimeError('invalid fetch progress snapshot size')
+        data = json.loads(value)
+        if (not isinstance(data, dict) or set(data) != {
+                'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
+                'network_bytes', 'pip_bytes', 'pip_active'}
+                or data['schema'] != 1 or data['operation_id'] != operation_id
+                or not isinstance(data['stage'], str) or not 0 < len(data['stage']) <= 160
+                or not isinstance(data['unit'], str) or len(data['unit']) > 64
+                or any(ord(ch) < 32 for ch in data['stage'] + data['unit'])
+                or any(type(data[key]) is not int or data[key] < 0
+                       for key in ('network_bytes', 'pip_bytes', 'pip_active'))
+                or any(data[key] is not None and (type(data[key]) is not int or data[key] < 0)
+                       for key in ('completed', 'total'))
+                or (data['completed'] is not None and data['total'] is not None
+                    and data['completed'] > data['total'])):
+            raise RuntimeError('invalid verified fetch progress data')
+        return data
+
     def _public(self, state):
         if state['phase'] == 'ready' and (JobScope.members(state) or self._containers(state)):
             state = {**state, 'phase': 'validating'}  # Wait for the finite worker/helpers to exit.
         result = {k: state[k] for k in ("operation_id", "phase", "attempt", "created_at", "updated_at",
             "result", "error", "deployment") if k in state}
+        progress = self._progress(state)
+        if progress is not None:
+            result["progress"] = progress
         # Read-only, bounded tail of the durable child log. No mutations, no
         # additional RPC, and no guessed progress based on wall-clock time.
         if isinstance(state.get("attempt"), int):

@@ -330,7 +330,7 @@ def restore(cfg, directory):
 
 
 
-def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None):
+def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None, quiet=False):
     """Read-only recovery with bounded latency and visible, actual outage time.
 
     A lost read may be repeated. Mutations (e.g. prepare_templates) are never
@@ -376,7 +376,7 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None):
             last_error = ('HTTP ' + str(exc.status) if isinstance(exc, RemoteFailure)
                           else type(exc).__name__ + ': ' + str(exc))
             elapsed = time.monotonic() - started
-            if retries == 0 or elapsed - (last_report-started) >= report_interval:
+            if not quiet and (retries == 0 or elapsed - (last_report-started) >= report_interval):
                 print('[broker] connexion interrompue pendant %.0fs | requête %s '
                       '| essai %s | %s | aucune VM relancée' %
                       (elapsed, action, retries+1, last_error), flush=True)
@@ -387,7 +387,7 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None):
                 continue
             time.sleep(min(remaining, request_limit, 2**min(retries,5)))
         else:
-            if retries:
+            if retries and not quiet:
                 print('[broker] connexion rétablie après %.0fs | %s | %s essais' %
                       (time.monotonic()-started, action, retries), flush=True)
             return result
@@ -446,11 +446,93 @@ def doctor_tests(role):
     raise ValueError("unknown doctor test role")
 
 
+class _FetchBar:
+    """One terminal line, derived exclusively from actual broker counters."""
+    def __init__(self, stream=None):
+        self.stream = sys.stdout if stream is None else stream
+        self.tty = bool(getattr(self.stream, 'isatty', lambda: False)())
+        self.previous = None
+        self.last = None
+
+    def reset(self):
+        self.last = None
+        self.previous = None
+
+    def update(self, phase, progress=None):
+        if progress is not None:
+            if (not isinstance(progress, dict) or progress.get('schema') != 1
+                    or not isinstance(progress.get('stage'), str)):
+                raise RuntimeError('invalid broker progress record')
+            self.last = progress
+        if phase == 'validating':
+            stage, completed, total, unit = 'Validation finale', None, None, ''
+        elif phase in ('failed', 'interrupted', 'canceled'):
+            stage, completed, total, unit = 'Préparation interrompue', None, None, ''
+        elif self.last is not None:
+            stage = self.last['stage']
+            completed, total = self.last['completed'], self.last['total']
+            unit = self.last['unit']
+        else:
+            stage, completed, total, unit = 'Préparation', None, None, ''
+        if type(completed) is int and type(total) is int and total > 0:
+            proportion = min(1.0, completed / total)
+            label = f'{completed}/{total} {unit} ({100 * proportion:.1f}%)'
+            filled = int(24 * proportion)
+        elif type(completed) is int and total == 0:
+            label = f'{completed}/0 {unit}'
+            filled = 24
+        else:
+            label = 'phase active — total non mesuré'
+            filled = 0
+        bar = '[' + '#' * filled + '-' * (24 - filled) + ']'
+        text = f'fetch | {stage} {bar} {label}'
+        if self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+            transferred = self.last['network_bytes'] + self.last['pip_bytes']
+            if transferred:
+                text += f' | {transferred / 1048576:.1f} MiB reçus'
+        if self.tty:
+            columns = shutil.get_terminal_size((100, 24)).columns
+            text = text[:max(1, columns - 1)]
+            if text != self.previous:
+                self.stream.write('\r\x1b[2K' + text)
+                self.stream.flush()
+        self.previous = text
+
+    def finish(self, success):
+        label = 'TERMINÉ' if success else 'ÉCHEC — journal de préparation conservé sur Fossil'
+        text = (self.previous + ' | ' if self.previous else 'fetch | ') + label
+        if self.tty:
+            columns = shutil.get_terminal_size((100, 24)).columns
+            if len(text) >= columns:
+                text = 'fetch | ' + label
+            self.stream.write('\r\x1b[2K' + text + '\n')
+        else:
+            self.stream.write(text + '\n')
+        self.stream.flush()
+
+
+def _record_fetch_failure(exc):
+    """Full local failure record, never print the exception in fetch terminal."""
+    import traceback
+    directory = ROOT/'state'/'distributed'
+    if directory.is_symlink():
+        raise RuntimeError('untrusted fetch diagnostics directory')
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory/'fetch-failures.log'
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(handle, 'a', encoding='utf-8') as out:
+            out.write(''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            out.write('\n')
+    except BaseException:
+        raise
+
 def preparation_fetch(cfg):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
     from gpt_trace_transport.local_templates import pool_contract, atomic_json
-    broker_read_resilient(cfg, "probe")
-    identified = broker_read_resilient(cfg, "template_preparation_probe", {"source_contract": pool_contract(ROOT)})
+    view = _FetchBar()
+    broker_read_resilient(cfg, "probe", quiet=True)
+    identified = broker_read_resilient(cfg, "template_preparation_probe", {"source_contract": pool_contract(ROOT)}, quiet=True)
     operation_id = identified.get("operation_id")
     deployment = {key: cfg["deployment"][key] for key in ("control_id", "execution_id")}
     if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
@@ -485,45 +567,21 @@ def preparation_fetch(cfg):
         if parent.is_symlink(): raise ValueError("unsafe local preparation journal")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_json(directory / ("preparation-" + operation_id + ".json"), identified, 0o600)
-    print("execution host local preparation: " + operation_id, flush=True)
     started = False
-    last_phase = None
-    last_log_attempt = None
-    last_log_offset = 0
+    last_attempt = None
     try:
         while True:
-            status = broker_read_resilient(cfg, "template_preparation_status", {"operation_id": operation_id})
+            status = broker_read_resilient(cfg, "template_preparation_status", {"operation_id": operation_id}, quiet=True)
             if status.get("operation_id") != operation_id or status.get("deployment") != deployment:
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
-            live = status.get("live_log")
-            attempt = status.get("attempt")
-            if attempt != last_log_attempt:
-                last_log_attempt = attempt
-                last_log_offset = 0
-            if isinstance(live, dict):
-                start, end, encoded = live.get("start"), live.get("end"), live.get("content_b64")
-                if (type(start) is int and type(end) is int and isinstance(encoded, str)
-                        and start >= 0 and end >= start):
-                    if last_log_offset < start:
-                        print("[fetch] log advanced before polling; earlier output remains on execution host", flush=True)
-                    if end > last_log_offset:
-                        # The backend returns a bounded suffix; do not duplicate
-                        # already printed log bytes when a poll repeats a status.
-                        import base64
-                        raw = base64.b64decode(encoded, validate=True)
-                        if len(raw) != end - start:
-                            raise RuntimeError("invalid remote fetch log byte range")
-                        data = raw[max(0, last_log_offset - start):]
-                        sys.stdout.write(data.decode("utf-8", errors="replace"))
-                        sys.stdout.flush()
-                        last_log_offset = end
-            if phase != last_phase:
-                print("preparation " + operation_id + ": attempt=" +
-                      str(status.get("attempt", "?")) + ", phase=" + str(phase), flush=True)
-                if phase in {"failed", "interrupted", "canceled"} and status.get("error"):
-                    print("preparation previous error: " + str(status["error"]), flush=True)
-                last_phase = phase
+            attempt = status.get('attempt')
+            if attempt != last_attempt:
+                view.reset()
+                last_attempt = attempt
+            # The broker reports atomic worker counters. Its raw process log
+            # remains on Fossil and is never forwarded to the Acer terminal.
+            view.update(phase, status.get('progress'))
             if phase == "ready":
                 result = status.get("result")
                 coverage=recipe.get("coverage") or {}
@@ -535,7 +593,7 @@ def preparation_fetch(cfg):
                         or not isinstance(result.get("generation"), str)):
                     raise RuntimeError("broker reported no fully integrated offline SWE-Gym generation")
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)
-                print("SWE-Gym Lite immutable generation READY for offline runtime", flush=True)
+                view.finish(True)
                 return result
             if phase in {"not_started", "failed", "interrupted", "canceled"}:
                 if started:
@@ -567,7 +625,6 @@ def preparation_fetch(cfg):
                     if isinstance(exc, RemoteFailure) and getattr(exc, "status", None) not in {
                             502, 503, 504, 520, 521, 522, 523, 524}:
                         raise
-                    print("preparation start outcome unconfirmed; rediscovering without duplicate start", flush=True)
             elif phase not in {"starting", "running", "validating"}:
                 raise RuntimeError("unknown preparation phase: " + str(phase))
             time.sleep(2)
@@ -970,5 +1027,9 @@ def main(argv=None):
 if __name__ == "__main__":
     try: main()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyError) as exc:
-        print("distributed operation failed: " + str(exc), file=sys.stderr)
+        if len(sys.argv) > 1 and sys.argv[1] == 'superbench-fetch':
+            _record_fetch_failure(exc)
+            _FetchBar().finish(False)
+        else:
+            print("distributed operation failed: " + str(exc), file=sys.stderr)
         raise SystemExit(1)

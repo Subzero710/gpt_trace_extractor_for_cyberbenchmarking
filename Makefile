@@ -46,7 +46,7 @@ reset-recovery:
 	python3 scripts/distributed.py reset-recovery $(if $(TASK),--task "$(TASK)",)
 
 superbench-fetch:
-	python3 scripts/distributed.py superbench-fetch $(if $(ADAPTER),--adapter "$(ADAPTER)",)
+	@python3 scripts/distributed.py superbench-fetch $(if $(ADAPTER),--adapter "$(ADAPTER)",)
 
 export-parquet:
 	python3 scripts/distributed.py export-parquet

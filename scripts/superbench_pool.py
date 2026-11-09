@@ -131,7 +131,13 @@ class _PoolProgress:
     only stage changes, meaningful count milestones and material byte progress.
     No timer generates an unchanged log record.
     """
-    def __init__(self, stream=None, *, tty=None, interval=None):
+    def __init__(self, stream=None, *, tty=None, interval=None, progress_path=None, operation_id=None):
+        if (progress_path is None) != (operation_id is None):
+            raise ValueError("progress snapshot requires both its path and operation identity")
+        self.progress_path = None if progress_path is None else Path(progress_path)
+        self.operation_id = operation_id
+        self.last_snapshot = 0.0
+        self.last_snapshot_value = None
         self.stream = sys.stdout if stream is None else stream
         self.tty = self.stream.isatty() if tty is None else tty
         self.interval = _conda_progress_interval() if interval is None else interval
@@ -191,6 +197,53 @@ class _PoolProgress:
                 current / 1048576, total / 1048576)
         return message
 
+    def _publish_snapshot(self, now, *, force=False):
+        """Atomic, durable stage counters for broker polling. No estimates."""
+        if self.progress_path is None:
+            return
+        current = self.completed
+        total = self.total
+        if (current is not None and (type(current) is not int or current < 0)
+                or total is not None and (type(total) is not int or total < 0)
+                or current is not None and total is not None and current > total):
+            raise RuntimeError('invalid verified progress counters')
+        payload = {
+            'schema': 1, 'operation_id': self.operation_id,
+            'stage': self.stage, 'completed': current, 'total': total,
+            'unit': self.unit, 'network_bytes': self.network_bytes,
+            'pip_bytes': self.pip_bytes, 'pip_active': self.pip_active,
+        }
+        value = json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                           ensure_ascii=False).encode('utf-8') + b'\n'
+        if len(value) > 8192:
+            raise RuntimeError('verified progress snapshot exceeds fixed protocol bound')
+        # Publish every observed stage/count transition immediately; sample raw
+        # byte changes no more often than the configured reporting interval.
+        prior = self.last_snapshot_value
+        semantic = (payload['stage'], current, total, payload['unit'], payload['pip_active'])
+        old_semantic = None if prior is None else (
+            prior['stage'], prior['completed'], prior['total'], prior['unit'], prior['pip_active'])
+        if not (force or prior is None or semantic != old_semantic
+                or now - self.last_snapshot >= self.interval):
+            return
+        if payload == prior:
+            return
+        path = self.progress_path
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            raise RuntimeError('untrusted verified progress directory')
+        descriptor, temporary = tempfile.mkstemp(prefix='.fetch-progress-', dir=path.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            self.last_snapshot = now
+            self.last_snapshot_value = payload
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
     def _emit(self, *, force=False, changed_stage=False):
         now = time.monotonic()
         total_bytes = self.network_bytes + self.pip_bytes
@@ -202,6 +255,7 @@ class _PoolProgress:
         rendered = self._render()
         if self.tty:
             if not force and now - self.last_emit < 0.2:
+                self._publish_snapshot(now, force=changed_stage)
                 return
             self.stream.write('\r\x1b[K' + rendered)
             if force:
@@ -213,6 +267,7 @@ class _PoolProgress:
                               and now - self.last_emit >= self.interval)
             milestone = (bucket is not None and bucket != self.last_count_bucket)
             if not (force or changed_stage or milestone or material_bytes):
+                self._publish_snapshot(now)
                 return
             if rendered != self.last_output:
                 self.stream.write(rendered + '\n')
@@ -221,6 +276,7 @@ class _PoolProgress:
             self.last_count_bucket = bucket
             self.last_report_bytes = total_bytes
         self.last_emit = now
+        self._publish_snapshot(now, force=force or changed_stage)
 
     def update(self, stage, completed=None, total=None, unit='', details='', *, force=False):
         if total is not None and (type(total) is not int or total < 0):
@@ -6186,7 +6242,8 @@ def main(argv=None):
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
     write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
-    _POOL_PROGRESS = _PoolProgress()
+    _POOL_PROGRESS = _PoolProgress(
+        progress_path=stage/'metadata'/'fetch-progress.json', operation_id=args.operation_id)
     _pool_progress('Verified recovery')
     verified=set()
     if args.reuse_from is not None:
