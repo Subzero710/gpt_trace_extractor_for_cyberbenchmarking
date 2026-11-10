@@ -86,8 +86,10 @@ def test_group_merge_keeps_original_sorted_task_step_order():
                                        plans, groups, apt, upgrades, vcs, issues)
 
 
-def test_native_local_metadata_is_serialized_without_holding_native_runtime_lock():
-    import time
+def test_native_local_metadata_wrapper_does_not_serialize_independent_calls():
+    # The former global lock was intentionally removed. A barrier proves all
+    # configured workers can enter independent metadata operations together.
+    reached = threading.Barrier(3, timeout=5)
     active = 0
     peak = 0
     guard = threading.Lock()
@@ -97,7 +99,7 @@ def test_native_local_metadata_is_serialized_without_holding_native_runtime_lock
         with guard:
             active += 1
             peak = max(peak, active)
-        time.sleep(0.01)
+        reached.wait()
         with guard:
             active -= 1
         return set(), set()
@@ -106,4 +108,4 @@ def test_native_local_metadata_is_serialized_without_holding_native_runtime_lock
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             results = list(executor.map(pool._static_native_local_metadata, range(6)))
     assert results == [(set(), set())] * 6
-    assert peak == 1
+    assert peak == 3

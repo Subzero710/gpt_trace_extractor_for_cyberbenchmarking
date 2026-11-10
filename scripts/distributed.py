@@ -459,7 +459,9 @@ class _FetchBar:
         self.stream = sys.stdout if stream is None else stream
         self.tty = bool(getattr(self.stream, 'isatty', lambda: False)())
         if window_seconds is None:
-            policy = ROOT / 'config/preparation.toml'
+            # Read versioned progress controls beside the actual module, not the
+            # mutable deployment ROOT used for state and test fixtures.
+            policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
             if policy.is_symlink() or not policy.is_file():
                 raise RuntimeError('missing versioned fetch progress controls')
             with policy.open('rb') as handle:
