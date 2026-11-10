@@ -13,6 +13,7 @@ import importlib.util
 import concurrent.futures
 import contextlib
 import functools
+import heapq
 import base64
 import gzip
 import configparser
@@ -3955,6 +3956,104 @@ def _metadata_prefetch_width(closure_workers,metadata_workers):
     return max(1,(metadata_workers+closure_workers-1)//closure_workers)
 
 
+class _PriorityMetadataExecutor(concurrent.futures.Executor):
+    """Work-conserving shared metadata pool with priority for pending work.
+
+    Ordinary domain checks, required source metadata and materialization
+    outrank queued speculative probes. All slots remain usable for prefetch
+    when no required work is waiting. Running builds are never preempted.
+    A speculative future is promoted, not resubmitted, when Rust requests it.
+    """
+
+    def __init__(self, max_workers):
+        if type(max_workers) is not int or max_workers < 1:
+            raise ValueError('invalid priority metadata worker capacity')
+        self._condition = threading.Condition()
+        self._jobs = []
+        self._pending = {}
+        self._order = 0
+        self._shutdown = False
+        self._threads = []
+        try:
+            for index in range(max_workers):
+                thread = threading.Thread(target=self._worker,
+                                          name='verified-pypi-metadata-' + str(index))
+                thread.start()
+                self._threads.append(thread)
+        except BaseException:
+            self.shutdown(wait=True, cancel_futures=True)
+            raise
+
+    def _enqueue(self, priority, fn, args, kwargs):
+        future = concurrent.futures.Future()
+        with self._condition:
+            if self._shutdown:
+                raise RuntimeError('cannot submit to shutdown metadata executor')
+            order = self._order
+            self._order += 1
+            self._pending[future] = (priority, order, 0, fn, args, kwargs)
+            heapq.heappush(self._jobs, (priority, order, 0, future))
+            self._condition.notify()
+        return future
+
+    def submit(self, fn, /, *args, **kwargs):
+        return self._enqueue(0, fn, args, kwargs)
+
+    def submit_speculative(self, fn, /, *args, **kwargs):
+        return self._enqueue(1, fn, args, kwargs)
+
+    def promote(self, future):
+        """Elevate an already queued prefetch without executing it twice."""
+        with self._condition:
+            item = self._pending.get(future)
+            if item is None or item[0] == 0 or future.cancelled():
+                return
+            _priority, order, generation, fn, args, kwargs = item
+            generation += 1
+            self._pending[future] = (0, order, generation, fn, args, kwargs)
+            heapq.heappush(self._jobs, (0, order, generation, future))
+            self._condition.notify()
+
+    def _worker(self):
+        while True:
+            with self._condition:
+                while not self._jobs and not self._shutdown:
+                    self._condition.wait()
+                if not self._jobs:
+                    return
+                _priority, _order, generation, future = heapq.heappop(self._jobs)
+                item = self._pending.get(future)
+                if item is None or item[2] != generation:
+                    continue  # Stale priority entry after promotion.
+                self._pending.pop(future)
+                _priority, _order, _generation, fn, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        cancelled = ()
+        with self._condition:
+            self._shutdown = True
+            if cancel_futures:
+                cancelled = tuple(self._pending)
+                self._pending.clear()
+                self._jobs.clear()
+            self._condition.notify_all()
+        # Future callbacks may submit more work; never run them under the
+        # scheduling lock, including during exception-path shutdown.
+        for future in cancelled:
+            future.cancel()
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+
 class _ResolverActivity:
     """Grow per-closure prefetch automatically as the resolver batch drains."""
     def __init__(self,metadata_workers):
@@ -5912,10 +6011,11 @@ def acquire_pip_groups(pool, groups):
               ' shared metadata workers; host-only', flush=True)
     _pool_progress('Pip closures',0,len(ordered),'closures',f'{workers} workers')
     cache=_native_solver_cache(pool)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=metadata_workers,
-            thread_name_prefix='verified-pypi-metadata') as io_executor:
+    with _PriorityMetadataExecutor(metadata_workers) as io_executor:
         with pool._state_lock:
             cache['metadata_executor']=io_executor
+            cache['metadata_speculative_submit']=io_executor.submit_speculative
+            cache['metadata_promote']=io_executor.promote
             cache['metadata_prefetch']=_metadata_prefetch_width(workers,metadata_workers)
             cache['prefetch_controller']=_ResolverActivity(metadata_workers)
         try:
@@ -5940,6 +6040,8 @@ def acquire_pip_groups(pool, groups):
         finally:
             with pool._state_lock:
                 cache.pop('metadata_executor',None)
+                cache.pop('metadata_speculative_submit',None)
+                cache.pop('metadata_promote',None)
                 cache.pop('metadata_prefetch',None)
                 cache.pop('prefetch_controller',None)
 

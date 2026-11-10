@@ -28,9 +28,14 @@ class _BoundedPrefetch:
     their slot until completion. Pending obsolete requests can be cancelled.
     Completed validated metadata stays in the ordinary resolver caches.
     """
-    def __init__(self, executor, probe):
+    def __init__(self, executor, probe, *, speculative_submit=None, promote=None):
         self.executor = executor
         self.probe = probe
+        # Only the production shared metadata pool supplies an ordered
+        # speculative queue; standalone protocol tests may use a bare executor.
+        self.speculative_submit = (executor.submit if speculative_submit is None and executor is not None
+                                   else speculative_submit)
+        self.promote = promote
         self.futures = {}
         self.scopes = {}
 
@@ -66,10 +71,15 @@ class _BoundedPrefetch:
             if len(self.futures) >= width:
                 break
             if ref not in self.futures and ref not in completed:
-                self.futures[ref] = self.executor.submit(self.probe, ref)
+                self.futures[ref] = self.speculative_submit(self.probe, ref)
 
     def take(self, ref):
-        return self.futures.pop(ref, None)
+        future = self.futures.pop(ref, None)
+        if future is not None and self.promote is not None:
+            # Rust is about to block on this metadata: elevate its *existing*
+            # queue entry rather than duplicating the same PEP 517 hook.
+            self.promote(future)
+        return future
 
     def close(self):
         for future in self.futures.values():
@@ -370,7 +380,9 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             observed_metadata.add(host['_normalized_package_name'](candidate['name']))
         return value
 
-    prefetch = _BoundedPrefetch(executor, record)
+    prefetch = _BoundedPrefetch(executor, record,
+                               speculative_submit=resolver_cache.get('metadata_speculative_submit'),
+                               promote=resolver_cache.get('metadata_promote'))
 
     def active_dependencies(ref, extras):
         result = []
