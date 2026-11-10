@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -158,8 +159,11 @@ def test_live_download_rate_fits_normal_terminal(monkeypatch):
             return True
     clock = [100.0]
     monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
-    monkeypatch.setattr(dispatcher.shutil, 'get_terminal_size',
-                        lambda default: __import__('os').terminal_size((100, 24)))
+    # Rebind only the dispatcher's module reference: pytest also uses the
+    # global shutil module, including get_terminal_size(fallback=...).
+    monkeypatch.setattr(dispatcher, 'shutil', SimpleNamespace(
+        get_terminal_size=lambda *args, **kwargs:
+            __import__('os').terminal_size((100, 24))))
     stream = Terminal()
     view = dispatcher._FetchBar(stream, window_seconds=10)
     initial = dict(_state('Pip closures', 'a'*64), completed=27,

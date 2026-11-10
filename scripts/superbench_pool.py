@@ -776,6 +776,25 @@ class _StaticGitReadCache:
         return self._blob(mirror, oid)
 
 
+@contextlib.contextmanager
+def _static_task_completions(ordered_tasks, workers, analyze):
+    """Publish actual completions without changing deterministic merge order."""
+    completed = 0
+    progress_lock = threading.Lock()
+
+    def tracked(item):
+        nonlocal completed
+        result = analyze(item)
+        with progress_lock:
+            completed += 1
+            _pool_progress('Static task analysis', completed, len(ordered_tasks), 'recipes')
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+            thread_name_prefix='static-task-analysis') as executor:
+        yield executor.map(tracked, ordered_tasks)
+
+
 def _merge_static_task_result(result, task_plan, groups, apt_requested, apt_upgrade_tasks,
                               vcs, issues):
     """Preserve the old sorted-task aggregation order, without shared worker writes."""
@@ -4187,7 +4206,9 @@ def _native_pool_runtime(pool):
             'NPM_CONFIG_GLOBALCONFIG': str(npm_configs['global']),
         }
         native = {'context': temporary, 'root': root, 'env': environ,
-                  'prefixes': {}, 'bootstrapped': False}
+                  'prefixes': {}, 'bootstrapped': False,
+                  'submodule_lock': threading.RLock(),
+                  'conda_install_lock': threading.RLock()}
         pool._native_runtime = native
         return native
 
@@ -4644,7 +4665,12 @@ def _native_bootstrap(pool, runtime):
 
 
 def _native_locked_python(pool, target):
-    """Obtain actual CPython from the checked lock, not the Ubuntu host Python."""
+    """Single-flight exact CPython provisioning with concurrent CAS acquisitions.
+
+    Artifact downloads for different targets have disjoint immutable hardlink
+    trees. Conda bootstrap and package-cache mutation remain serialized: only
+    their expensive network downloads are allowed to overlap.
+    """
     target = _coerce_target(target)
     runtime = _native_pool_runtime(pool)
     sha = target.python_artifact_sha256
@@ -4653,30 +4679,40 @@ def _native_locked_python(pool, target):
     if not SHA.fullmatch(sha):
         raise RuntimeError('target Python does not have a locked package identity')
     with _NATIVE_POOL_LOCK:
-        if sha in runtime['prefixes']:
-            return runtime['prefixes'][sha]
-        candidates = []
-        lock = pool.conda_lock
-        for env in lock['environments'].values():
-            for transaction in env['transactions']:
-                packages = transaction['packages']
-                if sha in packages:
-                    candidates.append((len(packages), transaction['key'], packages))
-        if not candidates:
-            raise RuntimeError('locked target interpreter artifact absent from Conda transactions: '+sha)
-        _length, key, packages = min(candidates, key=lambda row: (row[0], row[1]))
-        if lock['artifacts'][sha]['version'] != target.python_full_version:
+        if pool.conda_lock['artifacts'][sha]['version'] != target.python_full_version:
             raise RuntimeError('locked native Python differs from target identity')
-        conda = _native_bootstrap(pool, runtime)
-        archive_root = runtime['root'] / 'archives'
-        archive_root.mkdir(exist_ok=True)
+        cached = runtime['prefixes'].get(sha)
+        if cached is not None:
+            return cached
+        pending_by_sha = runtime.setdefault('locked_python_inflight', {})
+        pending = pending_by_sha.get(sha)
+        owner = pending is None
+        if owner:
+            candidates = []
+            for env in pool.conda_lock['environments'].values():
+                for transaction in env['transactions']:
+                    packages = transaction['packages']
+                    if sha in packages:
+                        candidates.append((len(packages), transaction['key'], packages))
+            if not candidates:
+                raise RuntimeError('locked target interpreter artifact absent from Conda transactions: ' + sha)
+            _length, key, packages = min(candidates, key=lambda row: (row[0], row[1]))
+            pending = concurrent.futures.Future()
+            pending_by_sha[sha] = pending
+    if not owner:
+        return pending.result()
+    try:
+        # Each target has its own hardlink directory and explicit transaction.
+        # Overlapping immutable archives consume no duplicate CAS data blocks.
+        archive_root = runtime['root'] / 'archives' / sha
+        archive_root.mkdir(parents=True, exist_ok=True)
         explicit = []
         for package_sha in packages:
-            item = lock['artifacts'][package_sha]
+            item = pool.conda_lock['artifacts'][package_sha]
             pool.download(item['url'], 'conda', key, sha=package_sha)
             filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
-            if (not filename or Path(filename).name != filename or
-                    not filename.endswith(('.conda', '.tar.bz2'))):
+            if (not filename or Path(filename).name != filename
+                    or not filename.endswith(('.conda', '.tar.bz2'))):
                 raise RuntimeError('invalid locked Conda artifact filename')
             archive = archive_root / package_sha / filename
             archive.parent.mkdir(parents=True, exist_ok=True)
@@ -4688,22 +4724,32 @@ def _native_locked_python(pool, target):
         explicit_file = runtime['root'] / ('python-' + sha + '.explicit')
         explicit_file.write_text('@EXPLICIT\n' + '\n'.join(explicit) + '\n')
         prefix = runtime['root'] / 'envs' / sha
-        # Conda's installed entry-point shebang may use /usr/bin/env for a
-        # long prefix. Invoke its own interpreter explicitly, independent of
-        # the fetch host's PATH and kernel shebang length constraints.
-        _native_run([conda.parent / 'python', '-m', 'conda',
-                     'create', '--offline', '--yes', '--prefix', prefix,
-                     '--file', explicit_file], runtime, timeout=14400,
-                     interpreter=conda.parent / 'python')
+        # Conda modifies a shared package cache. Never run two Conda creates
+        # against it simultaneously, even for different pinned interpreters.
+        with runtime['conda_install_lock']:
+            conda = _native_bootstrap(pool, runtime)
+            _native_run([conda.parent / 'python', '-m', 'conda',
+                         'create', '--offline', '--yes', '--prefix', prefix,
+                         '--file', explicit_file], runtime, timeout=14400,
+                         interpreter=conda.parent / 'python')
         python = prefix / 'bin' / 'python'
         version = _native_run([python, '-c',
-             'import platform; print(platform.python_version())'], runtime, interpreter=python).decode().strip()
+             'import platform; print(platform.python_version())'], runtime,
+             interpreter=python).decode().strip()
         if version != target.python_full_version:
             raise RuntimeError('materialized locked interpreter has the wrong patch version')
         _native_run([python, '-m', 'pip', '--version'], runtime, interpreter=python)
-        runtime['prefixes'][sha] = python
+    except BaseException as error:
+        # Do not retry a partially created prefix during the same acquisition.
+        # Preserve the exact failing result for every concurrent waiter.
+        pending.set_exception(error)
+        raise
+    else:
+        with _NATIVE_POOL_LOCK:
+            runtime['prefixes'][sha] = python
+            pending_by_sha.pop(sha, None)
+        pending.set_result(python)
         return python
-
 
 
 def _native_acquired_archive(pool,runtime,url,sha,category,key):
@@ -5071,68 +5117,89 @@ def _native_populate_submodules(pool, runtime, mirror, commit, checkout, ancestr
             raise RuntimeError('materialized Git submodule differs from pinned gitlink: ' + path)
         _native_populate_submodules(pool, runtime, source, sha, destination, (*ancestry, node))
 
-def _native_local_metadata(pool,target,mirror,commit,commands,extras):
-    """Run the pinned local project's real build backend for metadata only.
+def _native_local_metadata(pool, target, mirror, commit, commands, extras):
+    """Evaluate exact pinned local build metadata, concurrently per source identity.
 
-    This replaces attempting to emulate arbitrary setup.py dataflow. The source
-    checkout is private to an unprivileged host process; it cannot alter the
-    original immutable Git mirror or the system's Python environments.
+    Immutable checkouts, pip reports and PEP 517 TMPDIRs are identity-private.
+    Share only fully successful results. Identical concurrent requests wait on
+    one owner; failures are propagated to waiters but never cached as results.
     """
-    target=_coerce_target(target)
-    runtime=_native_pool_runtime(pool)
-    python=_native_locked_python(pool,target)
-    if python is None:
-        raise RuntimeError('local project metadata requires a locked target interpreter')
-    identity=hashlib.sha256(json.dumps({
-        'mirror':str(mirror),'commit':commit,'target':target.as_dict(),
-        'commands':commands,'extras':sorted(extras)},sort_keys=True).encode()).hexdigest()
-    completed = runtime.setdefault('local_metadata', {})
-    if identity in completed:
-        dependencies, remote = completed[identity]
+    target = _coerce_target(target)
+    runtime = _native_pool_runtime(pool)
+    identity = hashlib.sha256(json.dumps({
+        'mirror': str(mirror), 'commit': commit, 'target': target.as_dict(),
+        'commands': commands, 'extras': sorted(extras)}, sort_keys=True).encode()).hexdigest()
+    with _NATIVE_POOL_LOCK:
+        completed = runtime.setdefault('local_metadata', {})
+        cached = completed.get(identity)
+        if cached is not None:
+            return set(cached[0]), set(cached[1])
+        inflight = runtime.setdefault('local_metadata_inflight', {})
+        pending = inflight.get(identity)
+        owner = pending is None
+        if owner:
+            pending = concurrent.futures.Future()
+            inflight[identity] = pending
+    if not owner:
+        dependencies, remote = pending.result()
         return set(dependencies), set(remote)
-    checkout=runtime['root']/'local-sources'/identity
-    checkout.parent.mkdir(exist_ok=True)
-    _native_run(['git','clone','--quiet','--shared','--no-checkout',str(mirror),str(checkout)],runtime)
-    _native_run(['git','-C',str(checkout),'checkout','--quiet','--detach',commit],runtime)
-    _native_populate_submodules(pool, runtime, mirror, commit, checkout)
-    from pathlib import Path
-    for entry in checkout.rglob('*'):
-        if (not entry.is_file() or entry.is_symlink() or entry.stat().st_size>12*1024*1024
-                or entry.name not in {'setup.py','setup.cfg','pyproject.toml'}):
-            continue
-        # Exact supported textual setup transformations, never shell execution.
-        rel=entry.relative_to(checkout).as_posix()
-        try:old=entry.read_text()
-        except UnicodeError:continue
-        updated=transformed_source('metadata',rel,old,commands)
-        if updated is not None and updated!=old:
-            entry.write_text(updated)
-    report=runtime['root']/'plans'/('local-'+identity+'.json')
-    report.parent.mkdir(parents=True, exist_ok=True)
-    argv=[python,'-m','pip','install','--use-pep517','--dry-run','--ignore-installed','--no-deps',
-          '--report',report,str(checkout)+('['+','.join(sorted(extras))+']' if extras else '')]
-    observed = _native_metadata_command(argv, runtime, report.parent)
-    _native_acquire_build_dependencies(pool, target, [
-        {'kind': 'sdist', 'build_requirements': observed}])
-    result=json.loads(report.read_text())
-    installs=result.get('install') or []
-    if len(installs)!=1:
-        raise RuntimeError('local project metadata produced an ambiguous plan')
-    dependencies, remote = _native_project_requirements(installs[0]['metadata'], target, extras)
-    completed[identity] = (frozenset(dependencies), frozenset(remote))
-    return dependencies,remote
-
-_STATIC_LOCAL_METADATA_LOCK = threading.Lock()
+    try:
+        # The locked interpreter may be prepared by another task. Its Conda
+        # package-cache mutations remain serialized by conda_install_lock.
+        python = _native_locked_python(pool, target)
+        if python is None:
+            raise RuntimeError('local project metadata requires a locked target interpreter')
+        checkout = runtime['root'] / 'local-sources' / identity
+        checkout.parent.mkdir(exist_ok=True)
+        _native_run(['git', 'clone', '--quiet', '--shared', '--no-checkout', str(mirror), str(checkout)], runtime)
+        _native_run(['git', '-C', str(checkout), 'checkout', '--quiet', '--detach', commit], runtime)
+        # Submodule discovery mutates shared mirror and per-runtime indices.
+        # Serialize only that mutation, never unrelated pip metadata builds.
+        with runtime['submodule_lock']:
+            _native_populate_submodules(pool, runtime, mirror, commit, checkout)
+        for entry in checkout.rglob('*'):
+            if (not entry.is_file() or entry.is_symlink() or entry.stat().st_size > MAX_SOURCE
+                    or entry.name not in {'setup.py', 'setup.cfg', 'pyproject.toml'}):
+                continue
+            rel = entry.relative_to(checkout).as_posix()
+            try:
+                old = entry.read_text()
+            except UnicodeError:
+                continue
+            updated = transformed_source('metadata', rel, old, commands)
+            if updated is not None and updated != old:
+                entry.write_text(updated)
+        report = runtime['root'] / 'plans' / ('local-' + identity + '.json')
+        report.parent.mkdir(parents=True, exist_ok=True)
+        argv = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
+                '--ignore-installed', '--no-deps', '--report', report,
+                str(checkout) + ('[' + ','.join(sorted(extras)) + ']' if extras else '')]
+        observed = _native_metadata_command(argv, runtime, report.parent)
+        _native_acquire_build_dependencies(pool, target, [
+            {'kind': 'sdist', 'build_requirements': observed}])
+        result = json.loads(report.read_text())
+        installs = result.get('install') or []
+        if len(installs) != 1:
+            raise RuntimeError('local project metadata produced an ambiguous plan')
+        dependencies, remote = _native_project_requirements(installs[0]['metadata'], target, extras)
+        frozen = (frozenset(dependencies), frozenset(remote))
+    except BaseException as error:
+        # Preserve the failing Future for the rest of this acquisition attempt.
+        # Restarting an identical failed checkout in-place would collide with
+        # its existing scratch and could disguise the original failure.
+        pending.set_exception(error)
+        raise
+    else:
+        with _NATIVE_POOL_LOCK:
+            completed[identity] = frozen
+            inflight.pop(identity, None)
+        pending.set_result(frozen)
+        return set(frozen[0]), set(frozen[1])
 
 
 def _static_native_local_metadata(*args):
-    """Serialize local PEP 517 scratch mutations, not their own internal I/O workers.
-
-    A separate lock is essential: holding _NATIVE_POOL_LOCK while invoking a
-    resolver would deadlock its metadata executor when it needs that lock.
-    """
-    with _STATIC_LOCAL_METADATA_LOCK:
-        return _native_local_metadata(*args)
+    """Share identity-private native metadata builds without a global I/O lock."""
+    return _native_local_metadata(*args)
 
 
 def _native_close(pool):
@@ -6862,12 +6929,12 @@ def main(argv=None):
         return (logical,task_plan[logical],groups,apt_requested,
                 apt_upgrade_tasks,vcs,own_issues)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=static_workers,
-            thread_name_prefix='static-task-analysis') as executor:
-        for index,result in enumerate(executor.map(analyze_static_task,ordered_tasks),1):
+    # Completion counters advance as each worker finishes, not as the first
+    # sorted Future unblocks. Aggregation itself retains the original order.
+    with _static_task_completions(ordered_tasks, static_workers, analyze_static_task) as results:
+        for result in results:
             _merge_static_task_result(result,task_plan,groups,apt_requested,
                                       apt_upgrade_tasks,vcs,pool.issues)
-            _pool_progress('Static task analysis',index,len(ordered_tasks),'recipes')
 
     write_new(stage/'metadata'/'apt-policy.json',json.dumps({
         'schema':1,'upgrade_policy':'suppress-on-frozen-golden',
