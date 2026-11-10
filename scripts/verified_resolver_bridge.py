@@ -6,6 +6,7 @@ No Python backtracking or alternative solver is available on any failure.
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
 import hashlib
 import importlib.util
 import io
@@ -155,6 +156,21 @@ class _Wire:
 
 
 
+def _send_candidate(wire, ref, candidate_by_id, transmitted):
+    """Register an immutable release once; send only its ID on later domains."""
+    candidate = candidate_by_id.get(ref)
+    if candidate is None:
+        raise RuntimeError('unknown native candidate reference during domain encoding')
+    wire.send_int(ref)
+    if ref in transmitted:
+        wire.send_int(0, 1)
+        return
+    wire.send_int(1, 1)
+    for field in ('kind', 'version', 'filename'):
+        wire.send_string(candidate[field])
+    transmitted.add(ref)
+
+
 def _policy(root):
     import tomllib
     source = root / 'config/preparation.toml'
@@ -200,7 +216,13 @@ def _same_pep440_version(host, observed, expected):
 
 
 def _verify_solution(host, target, roots, constraints_by_name, records, *, no_deps):
-    """Independent Python packaging audit of the Rust solution, no second solve."""
+    """Independently audit the complete Rust solution without re-solving it.
+
+    Worklist propagation checks each affected distribution only when a new
+    requirement/extras context arrives. Previously every newly expanded
+    distribution rechecked *all* previously reached distributions, producing
+    O(N^2) PEP 440 callbacks even for a simple linear dependency chain.
+    """
     names = [host['_normalized_package_name'](row['name']) for row in records]
     if names != sorted(set(names)):
         raise RuntimeError('native Rust solution has duplicate or unordered projects')
@@ -211,32 +233,33 @@ def _verify_solution(host, target, roots, constraints_by_name, records, *, no_de
         name = host['_normalized_package_name'](root.name)
         required.setdefault(name, []).append(root)
         extras_by_name.setdefault(name, set()).update(root.extras)
+    pending = deque(sorted(required))
+    queued = set(required)
     expanded = {}
-    while True:
-        for name, checks in required.items():
-            record = selected.get(name)
-            if record is None or not host['_candidate_satisfies'](
-                    record, checks, constraints_by_name.get(name, [])):
-                raise RuntimeError('Rust solution fails independent PEP 440 audit for ' + name)
+    while pending:
+        name = pending.popleft()
+        queued.remove(name)
+        checks = required[name]
+        record = selected.get(name)
+        if record is None or not host['_candidate_satisfies'](
+                record, checks, constraints_by_name.get(name, [])):
+            raise RuntimeError('Rust solution fails independent PEP 440 audit for ' + name)
         if no_deps:
-            break
-        grew = False
-        for name in sorted(required):
-            active = frozenset(extras_by_name.get(name, ()))
-            if expanded.get(name) == active:
+            continue
+        active = frozenset(extras_by_name.get(name, ()))
+        if expanded.get(name) == active:
+            continue
+        for raw in record['requirements']:
+            dep = host['_parse_registry_requirement'](raw)
+            if not host['_marker_active'](dep, target, active):
                 continue
-            record = selected[name]
-            for raw in record['requirements']:
-                dep = host['_parse_registry_requirement'](raw)
-                if not host['_marker_active'](dep, target, active):
-                    continue
-                dep_name = host['_normalized_package_name'](dep.name)
-                required.setdefault(dep_name, []).append(dep)
-                extras_by_name.setdefault(dep_name, set()).update(dep.extras)
-            expanded[name] = active
-            grew = True
-        if not grew:
-            break
+            dep_name = host['_normalized_package_name'](dep.name)
+            required.setdefault(dep_name, []).append(dep)
+            extras_by_name.setdefault(dep_name, set()).update(dep.extras)
+            if dep_name not in queued:
+                pending.append(dep_name)
+                queued.add(dep_name)
+        expanded[name] = active
     if set(selected) != set(required):
         raise RuntimeError('Rust solution contains unreachable or undeclared distributions')
 
@@ -272,6 +295,9 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         return []
 
     candidate_by_id = {}
+    # The Rust resolver keeps each immutable candidate identity once. Domain
+    # responses after its first appearance transmit only the stable u32 ID.
+    transmitted_candidates = set()
     candidate_ids_by_name = {}
     id_by_identity = {}
     record_by_id = {}
@@ -393,10 +419,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                             refs = executor.submit(domain, name, requirements).result()
                         wire.send_int(len(refs))
                         for ref in refs:
-                            candidate = candidate_by_id[ref]
-                            wire.send_int(ref)
-                            for field in ('kind', 'version', 'filename'):
-                                wire.send_string(candidate[field])
+                            _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
                     action = deliver_domain
                 elif op == b'B':
                     # Mirror Python domain_futures: fetch every unresolved
@@ -421,10 +444,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         for refs in results:
                             wire.send_int(len(refs))
                             for ref in refs:
-                                candidate = candidate_by_id[ref]
-                                wire.send_int(ref)
-                                for field in ('kind', 'version', 'filename'):
-                                    wire.send_string(candidate[field])
+                                _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
                     action = deliver_domains
                 elif op == b'K':
                     # Candidate identities are already registered by B/D.

@@ -47,7 +47,13 @@ assert roots==[('demo','demo==1.0',[])]
 o.write(b'D');sendstr('demo');sendnum(1);sendstr('demo==1.0');o.flush()
 assert read(1)==b'\\x01'
 assert num()==1
-candidate=num(); assert string()=='wheel';assert string()=='1.0';assert string()=='demo-1.0.whl'
+candidate=num();assert num(1)==1
+assert string()=='wheel';assert string()=='1.0';assert string()=='demo-1.0.whl'
+o.write(b'D');sendstr('demo');sendnum(1);sendstr('demo>=1.0');o.flush()
+assert read(1)==b'\x01'
+assert num()==1
+assert num()==candidate
+assert num(1)==0  # immutable candidate identity was already registered
 o.write(b'M');sendnum(1);sendnum(candidate);o.flush()
 assert read(1)==b'\\x01'
 o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flush()
@@ -258,3 +264,91 @@ pip_total_timeout_seconds = 900
     assert inspected[b'B'] == 1
     assert inspected[b'M'] == len(names)
     assert inspected[b'P'] == len(names)
+
+
+def test_candidate_identity_is_interned_once_per_python_bridge():
+    import io
+    import pytest
+
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_compact_candidate_protocol', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    output = io.BytesIO()
+    wire = bridge._Wire(SimpleNamespace(stdout=io.BytesIO(), stdin=output), 1 << 20)
+    candidates = {7: {'kind': 'wheel', 'version': '1.2', 'filename': 'example-1.2.whl'}}
+    transmitted = set()
+    bridge._send_candidate(wire, 7, candidates, transmitted)
+    initial = output.getvalue()
+    assert initial[:5] == (7).to_bytes(4, 'big') + b'\x01'
+    assert b'example-1.2.whl' in initial
+    bridge._send_candidate(wire, 7, candidates, transmitted)
+    assert output.getvalue()[len(initial):] == (7).to_bytes(4, 'big') + b'\x00'
+    assert transmitted == {7}
+    with pytest.raises(RuntimeError, match='unknown native candidate'):
+        bridge._send_candidate(wire, 8, candidates, transmitted)
+
+
+def test_solution_audit_verifies_linear_dependency_chain_once_per_distribution():
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_linear_audit_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    package_count = 450
+    records = [
+        {'name': f'pkg{index:04d}', 'version': '1.0',
+         'requirements': ([f'pkg{index + 1:04d}>=1'] if index + 1 < package_count else [])}
+        for index in range(package_count)
+    ]
+    checks = []
+    def satisfies(candidate, requirements, constraints):
+        checks.append(candidate['name'])
+        return all(not requirement.specifier or requirement.specifier.contains(
+            candidate['version'], prereleases=True) for requirement in (*requirements, *constraints))
+    host = {
+        '_normalized_package_name': str.lower,
+        '_candidate_satisfies': satisfies,
+        '_parse_registry_requirement': Requirement,
+        '_marker_active': lambda requirement, target, extras=(): True,
+    }
+    bridge._verify_solution(host, None, [Requirement('pkg0000>=1')], {}, records, no_deps=False)
+    assert len(checks) == package_count
+    broken = records[:-1]
+    import pytest
+    with pytest.raises(RuntimeError, match='independent PEP 440 audit'):
+        bridge._verify_solution(host, None, [Requirement('pkg0000>=1')], {}, broken, no_deps=False)
+
+
+def test_solution_audit_reexpands_project_when_new_extra_arrives():
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_extra_audit_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+
+    def marker_active(req, _target, extras=()):
+        if req.marker is None:
+            return True
+        return any(req.marker.evaluate({'extra': extra, 'python_version': '3.10'})
+                   for extra in {'', *extras})
+
+    host = {
+        '_normalized_package_name': str.lower,
+        '_candidate_satisfies': lambda candidate, reqs, constraints: all(
+            not req.specifier or req.specifier.contains(candidate['version'], prereleases=True)
+            for req in (*reqs, *constraints)),
+        '_parse_registry_requirement': Requirement,
+        '_marker_active': marker_active,
+    }
+    # Project 'a' is initially visited without extras. The 'z' dependency
+    # activates its feature, so 'a' must be visited again to reach 'b'.
+    records = [
+        {'name': 'a', 'version': '1.0', 'requirements': ['b>=1; extra == "feature"']},
+        {'name': 'b', 'version': '1.0', 'requirements': []},
+        {'name': 'z', 'version': '1.0', 'requirements': ['a[feature]>=1']},
+    ]
+    bridge._verify_solution(host, None, [Requirement('a>=1'), Requirement('z>=1')],
+                            {}, records, no_deps=False)
+    import pytest
+    with pytest.raises(RuntimeError, match='unreachable or undeclared'):
+        bridge._verify_solution(host, None, [Requirement('a>=1')],
+                                {}, records, no_deps=False)

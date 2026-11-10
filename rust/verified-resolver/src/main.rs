@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 
@@ -57,7 +58,7 @@ impl Wire {
         for s in values { self.send_string(s)?; }
         Ok(())
     }
-    fn finish_success(&mut self, selected: &BTreeMap<String, Candidate>, stats: &Stats) -> Result<(), String> {
+    fn finish_success(&mut self, selected: &BTreeMap<String, Arc<Candidate>>, stats: &Stats) -> Result<(), String> {
         self.send_u8(b'S')?; self.send_len(selected.len())?;
         for candidate in selected.values() { self.send_u32(candidate.id)?; }
         self.send_string(&stats.render())?; self.flush()
@@ -105,8 +106,8 @@ impl Stats {
 }
 #[derive(Clone)]
 struct State {
-    entries: Vec<Entry>,
-    selected: BTreeMap<String, Candidate>,
+    entries: Arc<Vec<Entry>>,
+    selected: BTreeMap<String, Arc<Candidate>>,
     expanded: BTreeMap<String, BTreeSet<String>>,
 }
 struct Grouped {
@@ -139,7 +140,7 @@ type Clause = Vec<(String, (String, String, String))>;
 
 // Learned exclusions are conditional on selected ancestors. Their provenance
 // must contribute to conflict-directed backjumping when an option is skipped.
-fn matched_nogood_causes(clauses: &[Clause], selected: &BTreeMap<String, Candidate>)
+fn matched_nogood_causes(clauses: &[Clause], selected: &BTreeMap<String, Arc<Candidate>>)
     -> Option<BTreeSet<String>> {
     clauses.iter().find_map(|clause| {
         if clause.iter().all(|(name, identity)| selected.get(name).map(|candidate|
@@ -169,7 +170,7 @@ fn current_state_key(state: &State, group: &Grouped) -> StateKey {
 }
 #[derive(Clone)]
 struct Failure { conflict: BTreeSet<String>, detail: String }
-enum Outcome { Solved(BTreeMap<String, Candidate>), Failed(Failure) }
+enum Outcome { Solved(BTreeMap<String, Arc<Candidate>>), Failed(Failure) }
 
 struct Solver {
     wire: Wire,
@@ -181,8 +182,11 @@ struct Solver {
     max_cache_bytes: usize,
     prefetch_width: usize,
     stats: Stats,
-    candidate_domains: HashMap<(String,Vec<String>),Vec<Candidate>>,
-    registered_candidates: HashSet<u32>,
+    // The host assigns stable IDs. Keep immutable candidate metadata once,
+    // and cache domains as compact ID vectors shared between search states.
+    // No domain/state contains duplicate strings for the same PyPI release.
+    candidate_domains: HashMap<(String,Vec<String>),Arc<Vec<u32>>>,
+    registered_candidates: HashMap<u32,Arc<Candidate>>,
     // Only positive cache observations are monotonic; unobserved metadata may
     // arrive asynchronously through Python's speculative PEP 517/HTTP probes.
     metadata_known: HashSet<u32>,
@@ -207,16 +211,30 @@ impl Solver {
             Err("native Rust dependency solve exceeded configured deadline".into())
         } else { Ok(()) }
     }
-    fn read_candidate(&mut self) -> Result<Candidate,String> {
+    fn read_candidate(&mut self) -> Result<u32,String> {
         let id = self.wire.raw_u32()?;
-        let kind = self.wire.raw_string()?;
-        let version = self.wire.raw_string()?;
-        let filename = self.wire.raw_string()?;
-        if kind != "wheel" && kind != "sdist" { return Err("unrecognized candidate kind".into()); }
-        self.registered_candidates.insert(id);
-        Ok(Candidate {id,kind,version,filename})
+        // A reference introduced by Python must be accompanied by its immutable
+        // identity exactly once. Reused references carry just the numeric ID.
+        match self.wire.raw_u8()? {
+            0 if self.registered_candidates.contains_key(&id) => Ok(id),
+            0 => Err("unknown previously registered candidate ID".into()),
+            1 => {
+                if self.registered_candidates.contains_key(&id) {
+                    return Err("duplicate candidate identity registration".into());
+                }
+                let kind = self.wire.raw_string()?;
+                let version = self.wire.raw_string()?;
+                let filename = self.wire.raw_string()?;
+                if kind != "wheel" && kind != "sdist" {
+                    return Err("unrecognized candidate kind".into());
+                }
+                self.registered_candidates.insert(id,Arc::new(Candidate{id,kind,version,filename}));
+                Ok(id)
+            },
+            _ => Err("invalid candidate registration status".into()),
+        }
     }
-    fn domain(&mut self, name: &str, rows: &[Entry]) -> Result<Vec<Candidate>,String> {
+    fn domain(&mut self, name: &str, rows: &[Entry]) -> Result<Arc<Vec<u32>>,String> {
         self.validate_time()?;
         let requirements: Vec<String> = rows.iter().map(|e| e.requirement.clone()).collect();
         let key = (name.to_string(), requirements.clone());
@@ -228,11 +246,12 @@ impl Solver {
         if count > self.wire.max_frame { return Err("candidate count exceeds IPC safety limit".into()); }
         let mut candidates = Vec::with_capacity(count);
         for _ in 0..count { candidates.push(self.read_candidate()?); }
-        self.candidate_domains.insert(key, candidates.clone());
-        Ok(candidates)
+        let shared = Arc::new(candidates);
+        self.candidate_domains.insert(key, Arc::clone(&shared));
+        Ok(shared)
     }
     fn domains(&mut self, unresolved: &[String], group: &Grouped)
-        -> Result<BTreeMap<String, Vec<Candidate>>, String> {
+        -> Result<BTreeMap<String, Arc<Vec<u32>>>, String> {
         let mut missing = Vec::new();
         let mut answers = BTreeMap::new();
         for name in unresolved {
@@ -262,13 +281,14 @@ impl Solver {
                 if size > self.wire.max_frame { return Err("domain candidate count exceeds IPC limit".into()); }
                 let mut candidates = Vec::with_capacity(size);
                 for _ in 0..size { candidates.push(self.read_candidate()?); }
-                self.candidate_domains.insert((name.clone(), requirements), candidates.clone());
-                answers.insert(name, candidates);
+                let shared = Arc::new(candidates);
+                self.candidate_domains.insert((name.clone(), requirements), Arc::clone(&shared));
+                answers.insert(name, shared);
             }
         }
         Ok(answers)
     }
-    fn known_metadata(&mut self, domains: &BTreeMap<String, Vec<Candidate>>)
+    fn known_metadata(&mut self, domains: &BTreeMap<String, Arc<Vec<u32>>>)
         -> Result<(), String> {
         if self.no_deps { return Ok(()); }
         // Python owns artifact evidence. Its observed-name filter avoids
@@ -278,7 +298,7 @@ impl Solver {
         // by ID, and only positive observations remain cached in Rust.
         let observed_projects: Vec<&String> = domains.iter()
             .filter(|(_, candidates)| candidates.iter()
-                .any(|candidate| !self.metadata_known.contains(&candidate.id)))
+                .any(|id| !self.metadata_known.contains(id)))
             .map(|(name, _)| name).collect();
         if observed_projects.is_empty() { return Ok(()); }
         self.wire.send_u8(b'K')?;
@@ -292,13 +312,13 @@ impl Solver {
         }
         for _ in 0..count {
             let id = self.wire.raw_u32()?;
-            if !self.registered_candidates.contains(&id) || !self.metadata_known.insert(id) {
+            if !self.registered_candidates.contains_key(&id) || !self.metadata_known.insert(id) {
                 return Err("unrecognized or duplicate verified metadata candidate".into());
             }
         }
         Ok(())
     }
-    fn prefetch(&mut self, candidates: &[Candidate], index: usize, depth: usize) -> Result<(), String> {
+    fn prefetch(&mut self, candidate_ids: &[u32], index: usize, depth: usize) -> Result<(), String> {
         // Python's schedule_metadata submits futures without awaiting them.
         // The Python host recomputes its live fairness-adjusted width.
         self.wire.send_u8(b'W')?;
@@ -306,11 +326,11 @@ impl Solver {
         self.wire.ack()?;
         let width = self.wire.raw_u32()? as usize;
         if width == 0 { return Err("invalid live Rust prefetch width".into()); }
-        let stop = std::cmp::min(candidates.len(), index.saturating_add(width));
+        let stop = std::cmp::min(candidate_ids.len(), index.saturating_add(width));
         self.wire.send_u8(b'A')?;
         self.wire.send_len(depth)?;
         self.wire.send_len(stop - index)?;
-        for candidate in &candidates[index..stop] { self.wire.send_u32(candidate.id)?; }
+        for &id in &candidate_ids[index..stop] { self.wire.send_u32(id)?; }
         self.wire.flush()?;
         self.wire.ack()
     }
@@ -397,7 +417,7 @@ impl Solver {
         Ok(entries)
     }
     fn lookahead(&mut self, name: &str, candidate: &Candidate, rows: &[Entry],
-                 group: &Grouped, selected: &BTreeMap<String,Candidate>)
+                 group: &Grouped, selected: &BTreeMap<String,Arc<Candidate>>)
        -> Result<Option<(BTreeSet<String>,String)>,String> {
         if self.no_deps { return Ok(None); }
         let extras = group.extras.get(name).cloned().unwrap_or_default();
@@ -443,12 +463,12 @@ impl Solver {
          rows.iter().map(|r| r.requirement.clone()).collect(),
          extras.iter().cloned().collect())
     }
-    fn nogood_conflict(&self, key: &NogoodKey, selected: &BTreeMap<String,Candidate>)
+    fn nogood_conflict(&self, key: &NogoodKey, selected: &BTreeMap<String,Arc<Candidate>>)
         -> Option<BTreeSet<String>> {
         self.nogoods.get(key).and_then(|clauses| matched_nogood_causes(clauses, selected))
     }
     fn learn_nogood(&mut self,key: NogoodKey, conflict: &BTreeSet<String>, name: &str,
-                    selected: &BTreeMap<String,Candidate>) {
+                    selected: &BTreeMap<String,Arc<Candidate>>) {
         let clause: Clause = conflict.iter()
             .filter(|n| n.as_str()!=name)
             .filter_map(|n| selected.get(n).map(|c|
@@ -467,18 +487,25 @@ impl Solver {
         loop {
             self.validate_time()?;
             let group = grouped(&state.entries);
-            let key = current_state_key(&state,&group);
-            if self.failed_states.contains(&key) {
-                self.stats.memo_hits+=1;
-                let conflict = state.selected.keys().cloned().collect();
-                return Ok(Outcome::Failed(Failure {conflict, detail:"memoized unsatisfiable resolver state".into()}));
-            }
+            // A successful path does not memoize or revisit failed states.
+            // Avoid allocating and sorting a full graph signature on each
+            // propagation/decision until at least one failure exists.
+            let key = if self.failed_states.is_empty() { None } else {
+                let candidate_key = current_state_key(&state,&group);
+                if self.failed_states.contains(&candidate_key) {
+                    self.stats.memo_hits+=1;
+                    let conflict = state.selected.keys().cloned().collect();
+                    return Ok(Outcome::Failed(Failure {conflict,
+                        detail:"memoized unsatisfiable resolver state".into()}));
+                }
+                Some(candidate_key)
+            };
             for (name,c) in &state.selected {
                 let rows = group.rows.get(name).map(|x|x.as_slice()).unwrap_or(&[]);
                 if !self.check(c,rows)? {
                     let mut conflict=causes(rows); conflict.insert(name.clone());
                     let detail=format!("selected {}=={} violates required constraints",name,c.version);
-                    self.failed(key.clone());
+                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
                     return Ok(Outcome::Failed(Failure{conflict,detail}));
                 }
             }
@@ -496,7 +523,7 @@ impl Solver {
             }
             if !additions.is_empty() || next_expanded!=state.expanded {
                 self.stats.propagations+=additions.len() as u64;
-                state.entries.extend(additions);
+                Arc::make_mut(&mut state.entries).extend(additions);
                 state.expanded=next_expanded;
                 continue;
             }
@@ -505,57 +532,67 @@ impl Solver {
             // Retain the ancestor provenance of every forward-pruned option.
             // Otherwise a later exhaustion can incorrectly backjump past a
             // relevant ancestor and report a satisfiable graph as UNSAT.
-            let mut choices: Vec<(usize,bool,String,Vec<Candidate>,BTreeSet<String>)> = Vec::new();
+            // Complete domains contain immutable candidate IDs, not clones of
+            // wheel filenames/kinds/versions. An unfiltered choice needs no
+            // survivor array at all: it simply refers to the whole domain.
+            let mut choices: Vec<(usize,bool,String,Arc<Vec<u32>>,Option<Vec<usize>>,BTreeSet<String>)> = Vec::new();
             let domains = self.domains(&unresolved, &group)?;
             self.known_metadata(&domains)?;
             for name in unresolved {
                 let rows=&group.rows[&name];
-                let candidates=domains[&name].clone();
+                let candidates=Arc::clone(&domains[&name]);
                 if candidates.is_empty() {
-                    self.failed(key.clone());
+                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
                     return Ok(Outcome::Failed(Failure {conflict: causes(rows),
                         detail:format!("no compatible release for {} under requirements {:?}",name,
                                        rows.iter().map(|r|r.requirement.as_str()).collect::<Vec<_>>())}));
                 }
-                let mut survivors=Vec::new();
+                let mut survivors: Option<Vec<usize>>=None;
                 let mut known_conflict=BTreeSet::new();
                 let mut first_detail=None;
-                for c in candidates {
-                    if self.metadata_known.contains(&c.id) {
-                        if let Some((involved,dep_name))=self.lookahead(&name,&c,rows,&group,&state.selected)? {
+                for (position,&id) in candidates.iter().enumerate() {
+                    if self.metadata_known.contains(&id) {
+                        let candidate=Arc::clone(self.registered_candidates.get(&id)
+                            .ok_or_else(||"missing registered metadata candidate".to_string())?);
+                        if let Some((involved,dep_name))=self.lookahead(&name,&candidate,rows,&group,&state.selected)? {
+                            if survivors.is_none() { survivors=Some((0..position).collect()); }
                             known_conflict.extend(involved);
                             if first_detail.is_none() { first_detail=Some(dep_name); }
                             self.stats.forward_prunes+=1;
                             continue;
                         }
                     }
-                    survivors.push(c);
+                    if let Some(indices)=survivors.as_mut() { indices.push(position); }
                 }
-                if survivors.is_empty() {
-                    self.failed(key.clone());
+                let count=survivors.as_ref().map_or(candidates.len(),|indices|indices.len());
+                if count==0 {
+                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
                     // The unresolved project itself is not an ancestor decision.
                     let conflict=known_conflict.into_iter().filter(|cause| cause!=&name).collect();
                     return Ok(Outcome::Failed(Failure{conflict,
                         detail:format!("all cached compatible releases of {} conflict with {}",name,
                             first_detail.unwrap_or_default())}));
                 }
-                choices.push((survivors.len(),!self.roots.contains(&name),name,survivors,known_conflict));
+                choices.push((count,!self.roots.contains(&name),name,candidates,survivors,known_conflict));
             }
             choices.sort_by(|a,b| (a.0,a.1,&a.2).cmp(&(b.0,b.1,&b.2)));
-            let (count,_is_transitive,name,candidates,pruned_conflicts)=choices.remove(0);
+            let (count,_is_transitive,name,candidates,filtered,pruned_conflicts)=choices.remove(0);
+            let positions=filtered.unwrap_or_else(|| (0..count).collect());
             // A singleton obtained by *conditional* forward pruning is not an
             // unconditional unit: it must enter the branch path so rejections
             // of other candidates remain attached to their ancestor decisions.
             if count == 1 && pruned_conflicts.is_empty() {
-                if let Some(reason) = self.metadata_batch(&[candidates[0].id])? {
-                    self.failed(key.clone());
+                let singleton=Arc::clone(self.registered_candidates.get(&candidates[positions[0]])
+                    .ok_or_else(||"missing registered singleton candidate".to_string())?);
+                if let Some(reason) = self.metadata_batch(&[singleton.id])? {
+                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
                     return Ok(Outcome::Failed(Failure {
                         conflict: causes(&group.rows[&name]),
                         detail: format!("source candidate {}=={} invalid for target: {}",
-                                        name, candidates[0].version, reason),
+                                        name, singleton.version, reason),
                     }));
                 }
-                state.selected.insert(name,candidates[0].clone());
+                state.selected.insert(name,singleton);
                 self.stats.propagations+=1;
                 continue;
             }
@@ -565,9 +602,12 @@ impl Solver {
             let mut combined_conflict: BTreeSet<String> = pruned_conflicts.into_iter()
                 .filter(|cause| cause!=&name).collect();
             let mut last_detail=String::new();
-            for (idx,candidate) in candidates.iter().enumerate() {
+            let candidate_ids: Vec<u32> = positions.iter().map(|&i| candidates[i]).collect();
+            for (idx,&id) in candidate_ids.iter().enumerate() {
                 self.validate_time()?;
-                let nogood=Self::nogood_key(&name,candidate,rows,&extras);
+                let candidate=Arc::clone(self.registered_candidates.get(&id)
+                    .ok_or_else(||"missing registered branch candidate".to_string())?);
+                let nogood=Self::nogood_key(&name,&candidate,rows,&extras);
                 if let Some(involved)=self.nogood_conflict(&nogood,&state.selected) {
                     self.stats.learned_skips+=1;
                     // The exclusion is valid only while these ancestors have
@@ -582,10 +622,10 @@ impl Solver {
                 *self.stats.decisions_by_name.entry(name.clone()).or_default()+=1;
                 // Submit, do not wait for the entire metadata prefetch window.
                 // Only the current candidate must finish before lookahead.
-                self.prefetch(&candidates, idx, depth)?;
+                self.prefetch(&candidate_ids, idx, depth)?;
                 let rejection = self.metadata_batch(&[candidate.id])?;
                 let conflict = if rejection.is_none() {
-                    self.lookahead(&name,candidate,rows,&group,&state.selected)?
+                    self.lookahead(&name,&candidate,rows,&group,&state.selected)?
                 } else { None };
                 let result=if let Some(reason)=rejection {
                     // The artifact itself is unusable, independently of any
@@ -600,7 +640,7 @@ impl Solver {
                                        name,candidate.version,dep_name)})
                 } else {
                     let mut next=state.clone();
-                    next.selected.insert(name.clone(),candidate.clone());
+                    next.selected.insert(name.clone(),Arc::clone(&candidate));
                     // Preserve useful sibling probes while the child explores its
                     // graph. The host keeps only a live, bounded prefetch set.
                     self.search(next,depth+1)?
@@ -613,7 +653,7 @@ impl Solver {
                             self.learn_nogood(nogood,&failure.conflict,&name,&state.selected);
                         } else {
                             self.stats.backjumps+=1;
-                            self.failed(key.clone());
+                            self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
                             return Ok(Outcome::Failed(failure));
                         }
                         combined_conflict.extend(failure.conflict.into_iter().filter(|n|n!=&name));
@@ -621,7 +661,7 @@ impl Solver {
                 }
             }
             combined_conflict.extend(branch_causes);
-            self.failed(key.clone());
+            self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
             if last_detail.is_empty() { last_detail=format!("all compatible candidates exhausted for {}",name); }
             return Ok(Outcome::Failed(Failure{conflict:combined_conflict,detail:last_detail}));
         }
@@ -662,14 +702,14 @@ fn process(wire: &mut Wire) -> Result<(),String> {
     };
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
-        candidate_domains:HashMap::new(),registered_candidates:HashSet::new(),
+        candidate_domains:HashMap::new(),registered_candidates:HashMap::new(),
         metadata_known:HashSet::new(),
         compatibility:HashMap::new(),compatibility_bytes:0,
         metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
         expanded_cache:HashMap::new(),failed_states:HashSet::new(),failed_fifo:VecDeque::new(),
         failed_bytes:0,nogoods:HashMap::new(),nogood_bytes:0};
     solver.wire.max_frame=limit;
-    let state=State{entries,selected:BTreeMap::new(),expanded:BTreeMap::new()};
+    let state=State{entries:Arc::new(entries),selected:BTreeMap::new(),expanded:BTreeMap::new()};
     let result=solver.search(state,0);
     match result {
         Ok(Outcome::Solved(selected))=>solver.wire.finish_success(&selected,&solver.stats),
@@ -705,8 +745,8 @@ mod tests {
         let a=Entry{name:"dependency".into(),requirement:"dependency<2".into(),
             extras:BTreeSet::new(),causes:BTreeSet::from(["left".into()])};
         let b=Entry{causes:BTreeSet::from(["right".into()]),..a.clone()};
-        let left=State{entries:vec![a],selected:BTreeMap::new(),expanded:BTreeMap::new()};
-        let right=State{entries:vec![b],selected:BTreeMap::new(),expanded:BTreeMap::new()};
+        let left=State{entries:Arc::new(vec![a]),selected:BTreeMap::new(),expanded:BTreeMap::new()};
+        let right=State{entries:Arc::new(vec![b]),selected:BTreeMap::new(),expanded:BTreeMap::new()};
         // Python's state_key intentionally excludes causal provenance.
         assert_eq!(current_state_key(&left,&grouped(&left.entries)),
                    current_state_key(&right,&grouped(&right.entries)));
@@ -714,9 +754,9 @@ mod tests {
 
     #[test]
     fn learned_clause_match_preserves_ancestor_provenance() {
-        let selected = BTreeMap::from([("ancestor".to_string(), Candidate {
+        let selected = BTreeMap::from([("ancestor".to_string(), Arc::new(Candidate {
             id: 9, kind: "wheel".into(), version: "1".into(), filename: "ancestor.whl".into(),
-        })]);
+        }))]);
         let clause = vec![("ancestor".to_string(),
             ("wheel".to_string(), "1".to_string(), "ancestor.whl".to_string()))];
         assert_eq!(matched_nogood_causes(&[clause.clone()], &selected),
@@ -724,6 +764,22 @@ mod tests {
         assert_eq!(matched_nogood_causes(&[clause], &BTreeMap::new()), None);
         assert_eq!(matched_nogood_causes(&[Vec::new()], &selected),
             Some(BTreeSet::new()));
+    }
+
+    #[test]
+    fn recursive_search_state_shares_candidate_metadata_and_immutable_roots() {
+        let candidate=Arc::new(Candidate{id:17,kind:"wheel".into(),
+            version:"1.0".into(),filename:"package-1.0.whl".into()});
+        let state=State {
+            entries:Arc::new(vec![Entry{name:"package".into(),
+                requirement:"package>=1".into(),extras:BTreeSet::new(),
+                causes:BTreeSet::new()}]),
+            selected:BTreeMap::from([("package".into(),candidate)]),
+            expanded:BTreeMap::new(),
+        };
+        let child=state.clone();
+        assert!(Arc::ptr_eq(&state.entries,&child.entries));
+        assert!(Arc::ptr_eq(&state.selected["package"],&child.selected["package"]));
     }
 
     #[test]
