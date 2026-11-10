@@ -15,7 +15,6 @@ from pathlib import Path
 import subprocess
 import shutil
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -301,9 +300,33 @@ def test_real_npm_uses_isolated_configuration_and_lock_only_mode(tmp_path, monke
         pytest.skip('real npm and Node.js executables are unavailable')
     package = Path(npm).resolve().parents[1]
     metadata = json.loads((package/'package.json').read_bytes())
-    archive = tmp_path/'cli.tgz'
-    with tarfile.open(archive, 'w:gz', dereference=True) as output:
-        output.add(package, arcname='package')
+    # npm's own offline packer uses the distribution's declared package files
+    # and bundled dependencies. Archiving a distro-installed directory with
+    # tarfile(dereference=True) instead traverses system manpage links, including
+    # dangling links that are unrelated to the runnable CLI.
+    user_config = tmp_path/'pack-user.npmrc'
+    global_config = tmp_path/'pack-global.npmrc'
+    user_config.write_bytes(b'')
+    global_config.write_bytes(b'')
+    pack_env = {name: value for name, value in os.environ.items()
+                if not name.lower().startswith('npm_config_')}
+    pack_env.update({
+        'HOME': str(tmp_path),
+        'NPM_CONFIG_USERCONFIG': str(user_config),
+        'NPM_CONFIG_GLOBALCONFIG': str(global_config),
+        'NPM_CONFIG_CACHE': str(tmp_path/'pack-cache'),
+    })
+    packed = subprocess.run([
+        npm, 'pack', str(package), '--offline', '--ignore-scripts', '--json',
+        '--pack-destination', str(tmp_path), '--no-audit', '--no-fund',
+    ], check=True, capture_output=True, text=True, env=pack_env)
+    entries = json.loads(packed.stdout)
+    assert (len(entries) == 1 and entries[0]['name'] == metadata['name']
+            and entries[0]['version'] == metadata['version'])
+    filename = entries[0]['filename']
+    assert isinstance(filename, str) and Path(filename).name == filename
+    archive = tmp_path/filename
+    assert archive.is_file() and not archive.is_symlink()
     with isolated_pool() as candidate:
         sha = candidate.put(archive, 'contract', 'observed-npm-cli')
         # Acquisition metadata is the explicit unit boundary. The actual host
