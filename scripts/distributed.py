@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
@@ -447,23 +448,89 @@ def doctor_tests(role):
 
 
 class _FetchBar:
-    """One terminal line, derived exclusively from actual broker counters."""
-    def __init__(self, stream=None):
+    """One terminal line using observed broker bytes and completed work only.
+
+    Byte throughput is the aggregate number of actual received bytes over the
+    latest window of broker observations, NOT a whole-fetch average or an ETA.
+    The window spans two configured worker publication intervals so that the
+    worker's throttled snapshots cannot produce spurious zero-speed pulses.
+    """
+    def __init__(self, stream=None, *, window_seconds=None):
         self.stream = sys.stdout if stream is None else stream
         self.tty = bool(getattr(self.stream, 'isatty', lambda: False)())
-        self.previous = None
-        self.last = None
+        if window_seconds is None:
+            policy = ROOT / 'config/preparation.toml'
+            if policy.is_symlink() or not policy.is_file():
+                raise RuntimeError('missing versioned fetch progress controls')
+            with policy.open('rb') as handle:
+                seconds = tomllib.load(handle)['acquisition']['progress_interval_seconds']
+            if type(seconds) is not int or seconds < 1:
+                raise RuntimeError('invalid versioned fetch progress interval')
+            window_seconds = seconds * 2
+        if (type(window_seconds) not in (int, float) or not 0 < window_seconds < float('inf')):
+            raise ValueError('invalid fetch rate measurement window')
+        self.window_seconds = window_seconds
+        self.reset()
 
     def reset(self):
         self.last = None
         self.previous = None
+        self.observed_stage = None
+        self.observed_operation = None
+        self.stage_started = None
+        self.byte_samples = deque()
+        self.work_samples = deque()
+
+    @staticmethod
+    def _rate(samples):
+        if len(samples) < 2:
+            return 0.0
+        elapsed = samples[-1][0] - samples[0][0]
+        return ((samples[-1][1] - samples[0][1]) / elapsed
+                if elapsed > 0 else 0.0)
+
+    def _observe(self, progress, now):
+        stage, operation = progress['stage'], progress['operation_id']
+        network, pip = progress['network_bytes'], progress['pip_bytes']
+        done = progress['completed']
+        if (any(type(value) is not int or value < 0 for value in (network, pip))
+                or done is not None and (type(done) is not int or done < 0)):
+            raise RuntimeError('invalid fetch transfer or work counters')
+        if self.observed_operation is not None and operation != self.observed_operation:
+            raise RuntimeError('fetch progress changed operation without an attempt reset')
+        if stage != self.observed_stage:
+            self.observed_stage = stage
+            self.stage_started = now
+            self.byte_samples.clear()
+            self.work_samples.clear()
+        self.observed_operation = operation
+        received = network + pip
+        # A byte-counter reset invalidates the old sampling window rather than
+        # manufacturing positive throughput from a discontinuous counter.
+        if self.byte_samples and received < self.byte_samples[-1][1]:
+            self.byte_samples.clear()
+        self.byte_samples.append((now, received))
+        if done is not None:
+            if self.work_samples and done < self.work_samples[-1][1]:
+                raise RuntimeError('fetch completed-work counter went backwards')
+            self.work_samples.append((now, done))
+        while self.byte_samples and now - self.byte_samples[0][0] > self.window_seconds:
+            self.byte_samples.popleft()
+        while self.work_samples and now - self.work_samples[0][0] > self.window_seconds:
+            self.work_samples.popleft()
 
     def update(self, phase, progress=None):
+        now = time.monotonic()
         if progress is not None:
             if (not isinstance(progress, dict) or progress.get('schema') != 1
                     or not isinstance(progress.get('stage'), str)):
                 raise RuntimeError('invalid broker progress record')
+            if phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+                self._observe(progress, now)
             self.last = progress
+        elif self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+            # A missed broker snapshot is still an observation of no new bytes.
+            self._observe(self.last, now)
         if phase == 'validating':
             stage, completed, total, unit = 'Validation finale', None, None, ''
         elif phase in ('failed', 'interrupted', 'canceled'):
@@ -484,14 +551,41 @@ class _FetchBar:
         else:
             label = 'phase active — total non mesuré'
             filled = 0
-        bar = '[' + '#' * filled + '-' * (24 - filled) + ']'
-        text = f'fetch | {stage} {bar} {label}'
+
+        metric = ''
+        suffix = ''
         if self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
             transferred = self.last['network_bytes'] + self.last['pip_bytes']
+            bytes_per_second = max(0.0, self._rate(self.byte_samples))
+            units_per_minute = max(0.0, self._rate(self.work_samples) * 60)
+            # Prefer the actual network speed while bytes are flowing or pip
+            # has in-flight work; otherwise show completed work per minute.
+            if bytes_per_second > 0 or self.last['pip_active']:
+                metric = f' | {bytes_per_second / 1048576:.2f} MiB/s'
+            elif completed is not None and unit:
+                metric = f' | {units_per_minute:.1f} {unit}/min'
+            elif transferred:
+                metric = ' | 0.00 MiB/s'
             if transferred:
-                text += f' | {transferred / 1048576:.1f} MiB reçus'
+                suffix = f' | {transferred / 1048576:.1f} MiB reçus'
+        if not metric and self.stage_started is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+            elapsed = max(0, int(now - self.stage_started))
+            metric = f' | {elapsed // 60}m{elapsed % 60:02d}s écoulées'
+
+        # Keep the live rate visible even on ordinary 100-column terminals.
+        width = 24
         if self.tty:
             columns = shutil.get_terminal_size((100, 24)).columns
+            excess = max(0, len(f'fetch | {stage} ' + '[' + '-' * width + '] '
+                                + label + metric + suffix) - (columns - 1))
+            width = max(8, width - excess)
+            if total and type(total) is int and type(completed) is int:
+                filled = min(width, int(width * min(1.0, completed / total)))
+            else:
+                filled = width if total == 0 and type(completed) is int else 0
+        bar = '[' + '#' * filled + '-' * (width - filled) + ']'
+        text = f'fetch | {stage} {bar} {label}{metric}{suffix}'
+        if self.tty:
             text = text[:max(1, columns - 1)]
             if text != self.previous:
                 self.stream.write('\r\x1b[2K' + text)

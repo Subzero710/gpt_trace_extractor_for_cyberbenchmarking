@@ -91,3 +91,107 @@ def test_unknown_total_has_no_fake_global_percent():
     assert 'total non mesuré' in output.getvalue()
     assert '%' not in output.getvalue()
     assert 'TERMINÉ' in output.getvalue()
+
+
+def test_fetch_download_speed_is_recent_observed_throughput(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
+    view = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+    initial = dict(_state('Pip closures', 'e'*64), network_bytes=0,
+                   pip_bytes=0, completed=0, pip_active=2)
+    view.update('running', initial)
+    assert '0.00 MiB/s' in view.previous
+    clock[0] += 5
+    transferred = dict(initial, network_bytes=8*1048576)
+    view.update('running', transferred)
+    assert '1.60 MiB/s' in view.previous
+    assert '8.0 MiB reçus' in view.previous
+    clock[0] += 2
+    view.update('running', transferred)
+    assert '1.14 MiB/s' in view.previous
+    clock[0] += 12
+    view.update('running', transferred)
+    assert '0.00 MiB/s' in view.previous
+
+
+def test_fetch_rate_uses_completed_work_when_no_download_is_active(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
+    view = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+    initial = dict(_state('Static task analysis', 'f'*64), completed=0,
+                   total=230, unit='recipes', network_bytes=0, pip_bytes=0,
+                   pip_active=0)
+    view.update('running', initial)
+    clock[0] += 5
+    view.update('running', dict(initial, completed=4))
+    assert '48.0 recipes/min' in view.previous
+    assert '4/230 recipes' in view.previous
+    clock[0] += 12
+    view.update('running', dict(initial, completed=4))
+    assert '0.0 recipes/min' in view.previous
+    view.update('running', dict(initial, completed=5, stage='VCS dependency resolution'))
+    assert '48.0 recipes/min' not in view.previous
+    assert len(view.work_samples) == 1
+
+
+def test_fetch_rate_resets_on_new_attempt_and_rejects_other_operation(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
+    view = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+    initial = dict(_state('Pip closures', 'a'*64), completed=0,
+                   network_bytes=0, pip_bytes=0, pip_active=1)
+    view.update('running', initial)
+    clock[0] += 5
+    view.update('running', dict(initial, network_bytes=10*1048576))
+    assert '2.00 MiB/s' in view.previous
+    with pytest.raises(RuntimeError, match='changed operation'):
+        view.update('running', dict(initial, operation_id='b'*64))
+    view.reset()
+    view.update('running', dict(initial, operation_id='b'*64))
+    assert '0.00 MiB/s' in view.previous
+    assert '2.00 MiB/s' not in view.previous
+
+
+def test_live_download_rate_fits_normal_terminal(monkeypatch):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+    clock = [100.0]
+    monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(dispatcher.shutil, 'get_terminal_size',
+                        lambda default: __import__('os').terminal_size((100, 24)))
+    stream = Terminal()
+    view = dispatcher._FetchBar(stream, window_seconds=10)
+    initial = dict(_state('Pip closures', 'a'*64), completed=27,
+                   pip_bytes=0, network_bytes=0, pip_active=1)
+    view.update('running', initial)
+    clock[0] += 5
+    view.update('running', dict(initial, network_bytes=42*1048576))
+    assert '8.40 MiB/s' in view.previous
+    assert '42.0 MiB reçus' in view.previous
+    assert '27/296 closures (9.1%)' in view.previous
+    assert len(view.previous) <= 99
+
+
+def test_fetch_rate_counts_both_transfer_sources_without_estimates(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(dispatcher.time, 'monotonic', lambda: clock[0])
+    view = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+    first = dict(_state('Pip closures', 'a'*64), network_bytes=0,
+                 pip_bytes=0, completed=0, pip_active=1)
+    view.update('running', first)
+    clock[0] += 5
+    view.update('running', dict(first, network_bytes=2*1048576,
+                                pip_bytes=3*1048576))
+    assert '1.00 MiB/s' in view.previous
+    assert '5.0 MiB reçus' in view.previous
+    clock[0] += 12
+    view.update('running', None)
+    assert '0.00 MiB/s' in view.previous
+    clock[0] += 5
+    view.update('running', dict(first, network_bytes=2*1048576,
+                                pip_bytes=3*1048576,
+                                stage='Verifying final pool inventory',
+                                completed=None, total=None, pip_active=0))
+    assert '1.00 MiB/s' not in view.previous
+    assert len(view.byte_samples) == 1
