@@ -53,12 +53,16 @@ inp=sys.stdin.buffer;out=sys.stdout.buffer
 def read(n):
  d=inp.read(n); assert len(d)==n;return d
 def num(n=4):return int.from_bytes(read(n),'big')
-def string():return read(num()).decode()
+def string():
+ length=num()
+ assert length <= frame_limit, 'fake Rust worker received an oversized IPC string'
+ return read(length).decode()
 def strings():return [string() for _ in range(num())]
 def sendnum(n,size=4):out.write(n.to_bytes(size,'big'))
 def sendstr(s):
  b=s.encode();sendnum(len(b));out.write(b)
 _=[num(8) for _ in range(6)]
+frame_limit=_[0]
 no_deps=num(1)
 assert no_deps==1
 assert num()==1
@@ -66,8 +70,8 @@ assert (string(),string(),strings())==('demo','demo>=0.5',[])
 out.write(b'D');sendstr('demo');sendnum(1);sendstr('demo>=0.5');out.flush()
 assert read(1)==b'\\x01'
 assert num()==2
-old=num();assert string()=='sdist';assert string()=='0.5';assert string()=='demo-0.5.tar.gz'
-new=num();assert string()=='wheel';assert string()=='1';assert string()=='demo-1-py3-none-any.whl'
+old=num();assert num(1)==1;assert string()=='sdist';assert string()=='0.5';assert string()=='demo-0.5.tar.gz'
+new=num();assert num(1)==1;assert string()=='wheel';assert string()=='1';assert string()=='demo-1-py3-none-any.whl'
 out.write(b'M');sendnum(1);sendnum(old);out.flush()
 status=read(1)
 assert status==b'\\x02', (status, string())

@@ -83,7 +83,7 @@ jobs:
           python -m pip install -e ./shared -e './apps/workstation-broker[test]' -e './apps/runner[test]' cryptography
       - name: Exercise offline recovery, CAS, network and transport behavior
         run: |
-          sudo "$(command -v python)" -m coverage run --branch --source=scripts,shared/gpt_trace_transport,apps/workstation-broker/src -m pytest -q -rs tests/distributed --ignore=tests/distributed/test_golden_resume.py
+          sudo "$(command -v python)" -m coverage run --branch --source=scripts,shared/gpt_trace_transport,apps/workstation-broker/src -m pytest -vv -rs tests/distributed --ignore=tests/distributed/test_golden_resume.py
           python -m coverage report
       - name: Exercise real package acquisition and native locked interpreters
         run: GPT_TRACE_NETWORK_TESTS=1 python -m pytest -q -rs tests/distributed/test_pipeline_external.py
