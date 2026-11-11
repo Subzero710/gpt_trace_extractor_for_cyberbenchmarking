@@ -482,6 +482,7 @@ class _FetchBar:
         self.stage_started = None
         self.byte_samples = deque()
         self.work_samples = deque()
+        self.stage_has_transfer = False
 
     @staticmethod
     def _rate(samples):
@@ -505,8 +506,12 @@ class _FetchBar:
             self.stage_started = now
             self.byte_samples.clear()
             self.work_samples.clear()
+            self.stage_has_transfer = False
         self.observed_operation = operation
         received = network + pip
+        # Once a stage has displayed download throughput, keep that metric
+        # visible even when a burst finishes or pip_active returns to zero.
+        self.stage_has_transfer |= received > 0 or progress['pip_active'] > 0
         # A byte-counter reset invalidates the old sampling window rather than
         # manufacturing positive throughput from a discontinuous counter.
         if self.byte_samples and received < self.byte_samples[-1][1]:
@@ -518,7 +523,10 @@ class _FetchBar:
             self.work_samples.append((now, done))
         while self.byte_samples and now - self.byte_samples[0][0] > self.window_seconds:
             self.byte_samples.popleft()
-        while self.work_samples and now - self.work_samples[0][0] > self.window_seconds:
+        # A per-minute rate is measured over the trailing minute. Using the
+        # shorter byte-transfer window made bursty recipe completions swing
+        # between zero and extreme extrapolated rates every few seconds.
+        while self.work_samples and now - self.work_samples[0][0] > 60:
             self.work_samples.popleft()
 
     def update(self, phase, progress=None):
@@ -560,28 +568,37 @@ class _FetchBar:
             transferred = self.last['network_bytes'] + self.last['pip_bytes']
             bytes_per_second = max(0.0, self._rate(self.byte_samples))
             units_per_minute = max(0.0, self._rate(self.work_samples) * 60)
-            # Prefer the actual network speed while bytes are flowing or pip
-            # has in-flight work; otherwise show completed work per minute.
-            if bytes_per_second > 0 or self.last['pip_active']:
-                metric = f' | {bytes_per_second / 1048576:.2f} MiB/s'
-            elif completed is not None and unit:
-                metric = f' | {units_per_minute:.1f} {unit}/min'
-            elif transferred:
-                metric = ' | 0.00 MiB/s'
+            # These are different quantities, never interchangeable rates.
+            # Show both independently when a stage produces work AND downloads.
+            if self.stage_has_transfer:
+                metric += f' | {bytes_per_second / 1048576:.2f} MiB/s'
+            if completed is not None and unit:
+                metric += f' | {units_per_minute:.1f} {unit}/min'
             if transferred:
                 suffix = f' | {transferred / 1048576:.1f} MiB reçus'
         if not metric and self.stage_started is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
             elapsed = max(0, int(now - self.stage_started))
             metric = f' | {elapsed // 60}m{elapsed % 60:02d}s écoulées'
 
-        # Keep the live rate visible even on ordinary 100-column terminals.
+        # On narrow terminals, shorten duplicated labels and the optional
+        # received-volume suffix before sacrificing either rate's units.
         width = 24
         if self.tty:
             columns = shutil.get_terminal_size((100, 24)).columns
-            excess = max(0, len(f'fetch | {stage} ' + '[' + '-' * width + '] '
-                                + label + metric + suffix) - (columns - 1))
-            width = max(8, width - excess)
-            if total and type(total) is int and type(completed) is int:
+            available = max(1, columns - 1)
+            def bar_capacity():
+                return available - len(f'fetch | {stage} [] {label}{metric}{suffix}')
+            if bar_capacity() < 2 and type(completed) is int and type(total) is int and total > 0 and unit:
+                # The work-rate metric already identifies the unit.
+                label = f'{completed}/{total} ({100 * min(1.0, completed / total):.1f}%)'
+            if bar_capacity() < 2:
+                suffix = suffix.removesuffix(' reçus')
+            if bar_capacity() < 2:
+                suffix = ''
+            if bar_capacity() < 2 and type(completed) is int and type(total) is int:
+                label = f'{completed}/{total}'
+            width = min(24, max(2, bar_capacity()))
+            if type(total) is int and total > 0 and type(completed) is int:
                 filled = min(width, int(width * min(1.0, completed / total)))
             else:
                 filled = width if total == 0 and type(completed) is int else 0
