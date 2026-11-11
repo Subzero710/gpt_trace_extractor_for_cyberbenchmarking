@@ -4429,6 +4429,74 @@ class _NativePipByteProgress:
             self.thread.join()
 
 
+def _native_process_tree_snapshot(root_pid):
+    """Capture observed Linux process state before a timed-out pip group is killed."""
+    observed = {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            line = (entry / 'stat').read_text()
+            fields = line.rsplit(') ', 1)[1].split()
+            pid = int(entry.name)
+            row = {'pid': pid, 'ppid': int(fields[1]), 'state': fields[0],
+                   'start_ticks': int(fields[19]),
+                   'cpu_ticks': int(fields[11]) + int(fields[12])}
+        except (OSError, IndexError, ValueError):
+            continue  # The process exited while procfs was being sampled.
+        observed[pid] = row
+    selected = {root_pid}
+    while True:
+        children = {pid for pid, row in observed.items() if row['ppid'] in selected}
+        extended = selected | children
+        if extended == selected:
+            break
+        selected = extended
+    results = []
+    for pid in sorted(selected):
+        if pid not in observed:
+            continue
+        row = observed[pid]
+        path = Path('/proc') / str(pid)
+        try:
+            row['command'] = (path / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace').strip()
+        except OSError as exc:
+            row['command_read_error'] = str(exc)
+        try:
+            row['wait_channel'] = (path / 'wchan').read_text().strip()
+        except OSError as exc:
+            row['wait_channel_read_error'] = str(exc)
+        try:
+            values = {}
+            for line in (path / 'io').read_text().splitlines():
+                key, separator, value = line.partition(':')
+                if separator and key in ('read_bytes', 'write_bytes'):
+                    values[key] = int(value.strip())
+            row.update(values)
+        except (OSError, ValueError) as exc:
+            row['io_read_error'] = str(exc)
+        results.append(row)
+    return results
+
+
+def _native_process_activity(before, after, sample_seconds):
+    """Report actual deltas only for process identities present at both samples."""
+    previous = {(row['pid'], row['start_ticks']): row for row in before}
+    ticks_per_second = os.sysconf('SC_CLK_TCK')
+    result = []
+    for row in after:
+        prior = previous.get((row['pid'], row['start_ticks']))
+        if prior is None:
+            continue
+        item = {'pid': row['pid'], 'sample_seconds': sample_seconds,
+                'cpu_seconds': (row['cpu_ticks'] - prior['cpu_ticks']) / ticks_per_second}
+        for name in ('read_bytes', 'write_bytes'):
+            if name in row and name in prior:
+                item[name + '_delta'] = row[name] - prior[name]
+        result.append(item)
+    return result
+
+
 def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
     """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
 
@@ -4455,6 +4523,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
     last_activity = [started]
     last_progress = [None]
     process = None
+    silent_sample = None
     try:
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -4491,6 +4560,9 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             with activity_lock:
                 idle = now - last_activity[0]
             elapsed = now - started
+            if (silent_sample is None and idle >= max(0, stall_limit -
+                    2 * _conda_progress_interval())):
+                silent_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
             if elapsed >= total_limit:
                 timed_out = ('total', total_limit)
                 break
@@ -4505,6 +4577,19 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             except subprocess.TimeoutExpired:
                 pass
         if timed_out is not None:
+            # Capture the live process state before destroying the only evidence.
+            observed_at = time.monotonic()
+            snapshot = _native_process_tree_snapshot(process.pid)
+            sample_time, sample = silent_sample if silent_sample is not None else (observed_at, [])
+            diagnostic = {'timeout': timed_out[0], 'limit_seconds': timed_out[1],
+                          'elapsed_seconds': observed_at - started,
+                          'silent_seconds': observed_at - last_activity[0],
+                          'command': command, 'source': runtime.get('_native_source_context'),
+                          'processes': snapshot,
+                          'process_activity': _native_process_activity(
+                              sample, snapshot, observed_at - sample_time)}
+            print('[pool] native pip timeout diagnostic: '
+                  + json.dumps(diagnostic, sort_keys=True), file=sys.stderr, flush=True)
             # Kill the entire PEP 517 subprocess group, including nested hooks.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -4972,7 +5057,11 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
     command = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
                '--ignore-installed', '--no-deps', '--report', report,
                archive]
-    observed_builds = _native_metadata_command(command, runtime, root)
+    source_context = {'kind': 'pypi-sdist', 'name': candidate['name'],
+                      'version': candidate['version'], 'sha256': sha,
+                      'target_python': target.python_full_version}
+    observed_builds = _native_metadata_command(
+        command, {**runtime, '_native_source_context': source_context}, root)
     data = json.loads(report.read_bytes())
     installs = data.get('install')
     if not isinstance(installs, list) or len(installs) != 1:
@@ -5139,7 +5228,7 @@ def _native_populate_submodules(pool, runtime, mirror, commit, checkout, ancestr
             raise RuntimeError('materialized Git submodule differs from pinned gitlink: ' + path)
         _native_populate_submodules(pool, runtime, source, sha, destination, (*ancestry, node))
 
-def _native_local_metadata(pool, target, mirror, commit, commands, extras):
+def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, task_id=None):
     """Evaluate exact pinned local build metadata, concurrently per source identity.
 
     Immutable checkouts, pip reports and PEP 517 TMPDIRs are identity-private.
@@ -5196,7 +5285,29 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras):
         argv = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
                 '--ignore-installed', '--no-deps', '--report', report,
                 str(checkout) + ('[' + ','.join(sorted(extras)) + ']' if extras else '')]
-        observed = _native_metadata_command(argv, runtime, report.parent)
+        source_context = {
+            'kind': 'pinned-git-checkout', 'mirror': str(mirror), 'commit': commit,
+            'source_identity': identity, 'initiating_task': task_id}
+        backend_file = checkout / 'pyproject.toml'
+        if backend_file.is_symlink():
+            source_context['pyproject_status'] = 'symlink'
+        elif backend_file.is_file():
+            try:
+                if backend_file.stat().st_size > MAX_SOURCE:
+                    source_context['pyproject_status'] = 'exceeds_source_size_limit'
+                else:
+                    metadata = tomllib.loads(backend_file.read_text())
+                    build_system = metadata.get('build-system')
+                    if isinstance(build_system, dict):
+                        source_context['declared_backend'] = build_system.get('build-backend')
+                    else:
+                        source_context['build_system_declaration'] = type(build_system).__name__
+            except (OSError, ValueError, UnicodeError) as exc:
+                source_context['pyproject_read_error'] = str(exc)
+        else:
+            source_context['declared_backend'] = None
+        observed = _native_metadata_command(
+            argv, {**runtime, '_native_source_context': source_context}, report.parent)
         _native_acquire_build_dependencies(pool, target, [
             {'kind': 'sdist', 'build_requirements': observed}])
         result = json.loads(report.read_text())
@@ -5219,9 +5330,9 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras):
         return set(frozen[0]), set(frozen[1])
 
 
-def _static_native_local_metadata(*args):
+def _static_native_local_metadata(*args, **kwargs):
     """Share identity-private native metadata builds without a global I/O lock."""
-    return _native_local_metadata(*args)
+    return _native_local_metadata(*args, **kwargs)
 
 
 def _native_close(pool):
@@ -6779,7 +6890,8 @@ def main(argv=None):
         # including static projects and --no-deps build-time requirements.
         if any(step['local_project'] for step in steps):
             reqs, vcs_task = _static_native_local_metadata(
-                pool, task_target, mirror, commit, commands, extras)
+                pool, task_target, mirror, commit, commands, extras,
+                task_id=logical)
         else:
             raw=get_file('pyproject.toml')
             if raw:
@@ -6789,7 +6901,8 @@ def main(argv=None):
                     dynamic={issue for issue in problem if issue.startswith('dynamic PEP621 ')}
                     if dynamic:
                         native_deps,native_vcs=_static_native_local_metadata(
-                            pool,task_target,mirror,commit,commands,extras)
+                            pool,task_target,mirror,commit,commands,extras,
+                            task_id=logical)
                         reqs.update(native_deps);vcs_task.update(native_vcs)
                     for ptext in problem:
                         if ptext not in dynamic:issue(logical,ptext)
@@ -6807,7 +6920,8 @@ def main(argv=None):
             reqs.update(setup_deps);vcs_task.update(setup_remote)
             if setup_problems:
                 native_deps,native_vcs=_static_native_local_metadata(
-                    pool,task_target,mirror,commit,commands,extras)
+                    pool,task_target,mirror,commit,commands,extras,
+                    task_id=logical)
                 reqs.update(native_deps)
                 vcs_task.update(native_vcs)
 

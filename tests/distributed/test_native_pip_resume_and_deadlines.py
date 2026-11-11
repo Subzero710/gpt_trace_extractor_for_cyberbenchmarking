@@ -64,7 +64,7 @@ def test_cached_http_body_is_reused_and_not_published(tmp_path):
 
 def test_native_pip_detects_stall_and_keeps_tail(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\nprint("fixture started",flush=True)\ntime.sleep(15)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 1))
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 3))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         with pytest.raises(RuntimeError, match='no new output/download bytes') as result:
@@ -78,7 +78,7 @@ def test_native_pip_active_bytes_reset_stall_budget(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\nfor i in range(1,8):\n'
                                  ' print(f"Progress {i} of 7", flush=True)\n'
                                  ' time.sleep(0.35)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (6, 1))
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (6, 3))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
@@ -90,7 +90,7 @@ def test_native_pip_active_bytes_reset_stall_budget(tmp_path, monkeypatch):
 
 def test_native_pip_total_deadline_retains_tail(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\nprint("fixture total limit", flush=True)\ntime.sleep(15)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (1, 10))
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (3, 10))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         with pytest.raises(subprocess.TimeoutExpired) as caught:
@@ -162,3 +162,31 @@ def test_seeded_wheel_is_selected_offline_with_original_pypi_provenance(tmp_path
     with pytest.raises(RuntimeError, match='lacks exact verified'):
         pool._native_report_origin(winner, runtime, candidate['url'], '0' * 64)
     winner._pip_cache_context.cleanup()
+
+
+def test_native_pip_timeout_records_source_process_tree_and_cpu(tmp_path, monkeypatch, capsys):
+    import json
+    runtime = _fake_pip(tmp_path,
+        'import subprocess,sys\n'
+        'child = subprocess.Popen([sys.executable, "-c", "while True: pass"])\n'
+        'print("PEP 517 hook started", flush=True)\n'
+        'child.wait()\n')
+    source = {'kind': 'pinned-git-checkout', 'mirror': '/test/verified.git',
+              'commit': 'verified-pinned-commit', 'declared_backend': 'setuptools.build_meta'}
+    runtime['_native_source_context'] = source
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    with pytest.raises(RuntimeError, match='no new output/download bytes'):
+        pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'], runtime, timeout=8)
+    runtime['_pip_byte_progress'].close()
+    stderr = capsys.readouterr().err
+    prefix = '[pool] native pip timeout diagnostic: '
+    assert prefix in stderr
+    line = next(line for line in stderr.splitlines() if line.startswith(prefix))
+    observed = json.loads(line.removeprefix(prefix))
+    assert observed['source'] == source
+    assert observed['timeout'] == 'stall'
+    assert observed['silent_seconds'] >= 2
+    assert len(observed['processes']) >= 2
+    assert any(item['cpu_seconds'] > 0 for item in observed['process_activity'])
+    assert 'PEP 517 hook started' not in stderr  # Tail stays in the raised exception.
