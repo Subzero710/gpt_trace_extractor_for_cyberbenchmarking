@@ -57,6 +57,7 @@ def test_native_metadata_uses_real_interpreter_capability_only(available, expect
             assert environment.get('SETUPTOOLS_USE_DISTUTILS') == expected_flag
             assert Path(environment['TMPDIR']).name.startswith('build-metadata-')
             assert _argv[-1] == '--no-clean'
+            assert '--verbose' in _argv
         assert runtime['env'] == original
 
 
@@ -78,3 +79,57 @@ def test_actual_absent_stdlib_does_not_force_legacy_distutils():
         import sysconfig
         expected=(Path(sysconfig.get_path('stdlib'))/'distutils'/'ccompiler.py').is_file()
         assert result is expected
+
+
+def test_real_pep517_build_hook_output_is_visible_to_native_reader(tmp_path, monkeypatch):
+    """A real, offline PEP 517 hook must reach the pip reader, not pip's hidden log."""
+    import contextlib
+    import io
+    import subprocess
+
+    project = tmp_path / 'hook-project'
+    project.mkdir()
+    (project / 'pyproject.toml').write_text(
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n')
+    marker = 'native-pep517-hook-emitted-output'
+    (project / 'backend.py').write_text(
+        'from pathlib import Path\n'
+        'def get_requires_for_build_wheel(config_settings=None):\n'
+        f'    print({marker!r}, flush=True)\n'
+        '    return []\n'
+        'def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):\n'
+        '    folder = Path(metadata_directory) / "native_probe-1.0.dist-info"\n'
+        '    folder.mkdir()\n'
+        '    (folder / "METADATA").write_text("Metadata-Version: 2.1\\nName: native-probe\\nVersion: 1.0\\n")\n'
+        '    (folder / "WHEEL").write_text("Wheel-Version: 1.0\\nGenerator: fixture\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n")\n'
+        '    return folder.name\n')
+    runtime = {'root': tmp_path, 'env': {
+        'HOME': str(tmp_path), 'PATH': os.environ['PATH'],
+        'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+        'PIP_NO_INPUT': '1', 'PYTHONDONTWRITEBYTECODE': '1'}}
+    command = [sys.executable, '-m', 'pip', 'install', '--use-pep517',
+               '--dry-run', '--ignore-installed', '--no-deps', '--no-index', str(project)]
+
+    # Verify the actual pip subprocess hides the hook output at normal verbosity.
+    hidden = subprocess.run([*command, '--no-clean'], cwd=tmp_path, env=runtime['env'],
+                            capture_output=True, timeout=45, check=True)
+    assert marker.encode() not in hidden.stdout + hidden.stderr
+
+    seen = []
+    original = pool._native_run
+
+    def inspect(argv, local, **kwargs):
+        value = original(argv, local, **kwargs)
+        if '--verbose' in argv:
+            seen.append(value)
+        return value
+
+    monkeypatch.setattr(pool, '_native_run', inspect)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            assert pool._native_metadata_command(command, runtime, tmp_path) == []
+        finally:
+            if '_pip_byte_progress' in runtime:
+                runtime['_pip_byte_progress'].close()
+    assert len(seen) == 1
+    assert marker.encode() in seen[0]

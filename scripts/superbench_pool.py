@@ -4441,7 +4441,8 @@ def _native_process_tree_snapshot(root_pid):
             pid = int(entry.name)
             row = {'pid': pid, 'ppid': int(fields[1]), 'state': fields[0],
                    'start_ticks': int(fields[19]),
-                   'cpu_ticks': int(fields[11]) + int(fields[12])}
+                   'cpu_ticks': int(fields[11]) + int(fields[12]),
+                   'reaped_cpu_ticks': int(fields[13]) + int(fields[14])}
         except (OSError, IndexError, ValueError):
             continue  # The process exited while procfs was being sampled.
         observed[pid] = row
@@ -4470,7 +4471,7 @@ def _native_process_tree_snapshot(root_pid):
             values = {}
             for line in (path / 'io').read_text().splitlines():
                 key, separator, value = line.partition(':')
-                if separator and key in ('read_bytes', 'write_bytes'):
+                if separator and key in ('rchar', 'wchar', 'read_bytes', 'write_bytes'):
                     values[key] = int(value.strip())
             row.update(values)
         except (OSError, ValueError) as exc:
@@ -4489,25 +4490,36 @@ def _native_process_activity(before, after, sample_seconds):
         if prior is None:
             continue
         item = {'pid': row['pid'], 'sample_seconds': sample_seconds,
-                'cpu_seconds': (row['cpu_ticks'] - prior['cpu_ticks']) / ticks_per_second}
-        for name in ('read_bytes', 'write_bytes'):
+                'cpu_seconds': (row['cpu_ticks'] - prior['cpu_ticks']) / ticks_per_second,
+                'reaped_cpu_seconds': (row['reaped_cpu_ticks'] - prior['reaped_cpu_ticks']) / ticks_per_second}
+        for name in ('rchar', 'wchar', 'read_bytes', 'write_bytes'):
             if name in row and name in prior:
                 item[name + '_delta'] = row[name] - prior[name]
         result.append(item)
     return result
 
 
+def _native_process_made_progress(activity):
+    """Require observed CPU time or actual process I/O, never mere PID survival."""
+    return any((sample['cpu_seconds'] > 0 or sample['reaped_cpu_seconds'] > 0
+                or any(sample.get(name + '_delta', 0) > 0
+                       for name in ('rchar', 'wchar', 'read_bytes', 'write_bytes')))
+               for sample in activity)
+
+
 def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
     """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
 
     A per-command total deadline prevents unbounded backtracking. An independent
-    no-observed-activity deadline prevents a worker from holding a slot through
-    silent network stalls. Both are configured, never inferred from task counts.
+    observed-activity deadline detects stalled workers without confusing a quiet
+    PEP 517 build with an idle subprocess: pip output/download bytes and sampled
+    process-tree CPU/I/O all count as actual work. Both deadlines are configured.
     Only a small diagnostic tail is retained for failures.
     """
     import signal
     total_limit, stall_limit = _native_pip_timeouts()
     total_limit = min(timeout, total_limit)
+    observation_interval = _conda_progress_interval()
     with _NATIVE_POOL_LOCK:
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
@@ -4528,6 +4540,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
+        process_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
 
         def consume():
             try:
@@ -4559,9 +4572,20 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             now = time.monotonic()
             with activity_lock:
                 idle = now - last_activity[0]
+            # The backend can spend minutes inside a silent Cython/native build.
+            # Observe its descendants instead of relying on pip's text stream.
+            if (now - process_sample[0] >= observation_interval or idle >= stall_limit):
+                snapshot = _native_process_tree_snapshot(process.pid)
+                changes = _native_process_activity(process_sample[1], snapshot,
+                                                   now - process_sample[0])
+                if _native_process_made_progress(changes):
+                    with activity_lock:
+                        last_activity[0] = max(last_activity[0], now)
+                        idle = now - last_activity[0]
+                process_sample = (now, snapshot)
             elapsed = now - started
             if (silent_sample is None and idle >= max(0, stall_limit -
-                    2 * _conda_progress_interval())):
+                    2 * observation_interval)):
                 silent_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
             if elapsed >= total_limit:
                 timed_out = ('total', total_limit)
@@ -4571,7 +4595,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
                 break
             # Poll at the same versioned cadence as the progress display.
             remaining = min(total_limit - elapsed, stall_limit - idle,
-                            _conda_progress_interval())
+                            observation_interval)
             try:
                 process.wait(timeout=max(0.001, remaining))
             except subprocess.TimeoutExpired:
@@ -4600,7 +4624,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             kind, limit = timed_out
             if kind == 'stall':
                 diagnostic = tail[-5000:].decode(errors='replace')
-                raise RuntimeError('native pip emitted no new output/download bytes for '
+                raise RuntimeError('native pip emitted no new output/download bytes and had no observable output/download/CPU/I/O activity for '
                                    + str(limit) + ' seconds; last output: ' + diagnostic)
             raise subprocess.TimeoutExpired(command, limit, output=bytes(tail))
         reader.join()
@@ -4744,7 +4768,9 @@ def _native_metadata_command(argv, runtime, directory):
         if use_stdlib:
             environment['SETUPTOOLS_USE_DISTUTILS'] = 'stdlib'
         local = {**runtime, 'env': environment}
-        _native_run([*argv, '--no-clean'], local, interpreter=argv[0])
+        # Pip normally hides backend subprocess output below INFO. The
+        # single verbose flag exposes PEP 517 work to our existing reader.
+        _native_run([*argv, '--verbose', '--no-clean'], local, interpreter=argv[0])
         return _native_build_requirements(temporary)
 
 
