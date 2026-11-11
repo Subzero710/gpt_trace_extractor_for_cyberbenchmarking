@@ -164,7 +164,7 @@ def test_seeded_wheel_is_selected_offline_with_original_pypi_provenance(tmp_path
     winner._pip_cache_context.cleanup()
 
 
-def test_native_pip_cpu_active_child_reaches_total_deadline_and_records_source(tmp_path, monkeypatch, capsys):
+def test_native_pip_cpu_active_child_still_times_out_when_silent(tmp_path, monkeypatch, capsys):
     import json
     runtime = _fake_pip(tmp_path,
         'import subprocess,sys\n'
@@ -176,18 +176,18 @@ def test_native_pip_cpu_active_child_reaches_total_deadline_and_records_source(t
     runtime['_native_source_context'] = source
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
-    with pytest.raises(subprocess.TimeoutExpired) as expired:
+    with pytest.raises(RuntimeError, match='no new output/download bytes') as expired:
         pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'], runtime, timeout=8)
     runtime['_pip_byte_progress'].close()
-    assert b'PEP 517 hook started' in expired.value.output
+    assert 'PEP 517 hook started' in str(expired.value)
     stderr = capsys.readouterr().err
     prefix = '[pool] native pip timeout diagnostic: '
     assert prefix in stderr
     line = next(line for line in stderr.splitlines() if line.startswith(prefix))
     observed = json.loads(line.removeprefix(prefix))
     assert observed['source'] == source
-    assert observed['timeout'] == 'total'
-    assert observed['silent_seconds'] < pool._native_pip_timeouts()[1]
+    assert observed['timeout'] == 'stall'
+    assert observed['silent_seconds'] >= pool._native_pip_timeouts()[1]
     assert len(observed['processes']) >= 2
     assert any(item['cpu_seconds'] > 0 for item in observed['process_activity'])
     assert 'PEP 517 hook started' not in stderr  # Tail stays in the raised exception.

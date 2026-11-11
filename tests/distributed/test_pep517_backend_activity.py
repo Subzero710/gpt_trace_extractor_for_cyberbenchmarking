@@ -23,23 +23,19 @@ def _fake_pip(root, body):
         'PYTHONDONTWRITEBYTECODE': '1'}}
 
 
-def test_native_pip_silent_active_child_is_not_killed(tmp_path, monkeypatch):
-    child = ('import time\n'
-             'finish = time.monotonic() + 2.8\n'
-             'while time.monotonic() < finish:\n'
-             '    pass\n')
-    runtime = _fake_pip(tmp_path, 'import subprocess, sys\n'
-                                'subprocess.run([sys.executable, "-c", ' + repr(child) + '], check=True)\n'
-                                'print("backend completed", flush=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 1))
+def test_native_pip_cpu_active_but_silent_child_times_out_as_stalled(tmp_path, monkeypatch):
+    runtime = _fake_pip(tmp_path,
+        'import subprocess, sys\n'
+        'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
-            output = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
-                                      runtime, timeout=7)
+            with pytest.raises(RuntimeError, match='no new output/download bytes'):
+                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
+                                 runtime, timeout=7)
         finally:
             runtime['_pip_byte_progress'].close()
-    assert b'backend completed' in output
 
 
 def test_native_pip_still_enforces_total_deadline_during_active_build(tmp_path, monkeypatch):
@@ -58,16 +54,20 @@ def test_native_pip_still_enforces_total_deadline_during_active_build(tmp_path, 
             runtime['_pip_byte_progress'].close()
 
 
-def test_native_process_progress_requires_cpu_or_io_delta():
-    idle = [{'pid': 1, 'cpu_seconds': 0.0, 'reaped_cpu_seconds': 0.0,
-             'rchar_delta': 0, 'wchar_delta': 0, 'read_bytes_delta': 0,
-             'write_bytes_delta': 0}]
-    assert not pool._native_process_made_progress(idle)
-    assert not pool._native_process_made_progress([])
-    for key in ('cpu_seconds', 'reaped_cpu_seconds', 'rchar_delta',
-                'wchar_delta', 'read_bytes_delta', 'write_bytes_delta'):
-        active = [dict(idle[0], **{key: 1})]
-        assert pool._native_process_made_progress(active)
+def test_pip_completion_never_scans_unrelated_procfs(tmp_path, monkeypatch):
+    runtime = _fake_pip(tmp_path, 'print("backend completed", flush=True)\n')
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    def not_needed(_pid):
+        raise AssertionError('procfs diagnostic scanned during successful resolution')
+    monkeypatch.setattr(pool, '_native_process_tree_snapshot', not_needed)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
+                                      runtime, timeout=7)
+        finally:
+            runtime['_pip_byte_progress'].close()
+    assert b'backend completed' in result
 
 
 def test_reaped_child_cpu_survives_process_tree_sampling():
@@ -75,4 +75,42 @@ def test_reaped_child_cpu_survives_process_tree_sampling():
     after = [{'pid': 1, 'start_ticks': 1, 'cpu_ticks': 0, 'reaped_cpu_ticks': 100}]
     activity = pool._native_process_activity(before, after, 1.0)
     assert activity[0]['reaped_cpu_seconds'] > 0
-    assert pool._native_process_made_progress(activity)
+
+
+def test_native_pip_active_hook_output_keeps_stall_budget(tmp_path, monkeypatch):
+    runtime = _fake_pip(tmp_path,
+        'import time\n'
+        'for index in range(7):\n'
+        '    print(f"build step {index}", flush=True)\n'
+        '    time.sleep(0.3)\n')
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (6, 1))
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
+                                      runtime, timeout=6)
+        finally:
+            runtime['_pip_byte_progress'].close()
+    assert b'build step 0' in result and b'build step 6' in result
+
+
+def test_parallel_silent_pip_workers_release_slots(tmp_path, monkeypatch):
+    import concurrent.futures
+    import time
+    runtime = _fake_pip(tmp_path,
+        'import subprocess, sys\n'
+        'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    start = time.monotonic()
+    def run():
+        with pytest.raises(RuntimeError, match='no new output/download bytes'):
+            pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
+                             runtime, timeout=8)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                tuple(executor.map(lambda _index: run(), range(3)))
+        finally:
+            runtime['_pip_byte_progress'].close()
+    assert time.monotonic() - start < 8

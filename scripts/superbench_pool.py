@@ -4499,22 +4499,13 @@ def _native_process_activity(before, after, sample_seconds):
     return result
 
 
-def _native_process_made_progress(activity):
-    """Require observed CPU time or actual process I/O, never mere PID survival."""
-    return any((sample['cpu_seconds'] > 0 or sample['reaped_cpu_seconds'] > 0
-                or any(sample.get(name + '_delta', 0) > 0
-                       for name in ('rchar', 'wchar', 'read_bytes', 'write_bytes')))
-               for sample in activity)
-
-
 def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
     """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
 
-    A per-command total deadline prevents unbounded backtracking. An independent
-    observed-activity deadline detects stalled workers without confusing a quiet
-    PEP 517 build with an idle subprocess: pip output/download bytes and sampled
-    process-tree CPU/I/O all count as actual work. Both deadlines are configured.
-    Only a small diagnostic tail is retained for failures.
+    A per-command total deadline bounds the subprocess. Only pip's actual output
+    and advancing download counters reset the inactivity deadline; CPU usage and
+    procfs I/O are diagnostic evidence, not proof that a build is progressing.
+    Verbose PEP 517 hooks expose their output to the same reader.
     """
     import signal
     total_limit, stall_limit = _native_pip_timeouts()
@@ -4540,7 +4531,6 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
-        process_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
 
         def consume():
             try:
@@ -4572,20 +4562,9 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             now = time.monotonic()
             with activity_lock:
                 idle = now - last_activity[0]
-            # The backend can spend minutes inside a silent Cython/native build.
-            # Observe its descendants instead of relying on pip's text stream.
-            if (now - process_sample[0] >= observation_interval or idle >= stall_limit):
-                snapshot = _native_process_tree_snapshot(process.pid)
-                changes = _native_process_activity(process_sample[1], snapshot,
-                                                   now - process_sample[0])
-                if _native_process_made_progress(changes):
-                    with activity_lock:
-                        last_activity[0] = max(last_activity[0], now)
-                        idle = now - last_activity[0]
-                process_sample = (now, snapshot)
             elapsed = now - started
-            if (silent_sample is None and idle >= max(0, stall_limit -
-                    2 * observation_interval)):
+            if (silent_sample is None and idle >= max(
+                    stall_limit / 2, stall_limit - 2 * observation_interval)):
                 silent_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
             if elapsed >= total_limit:
                 timed_out = ('total', total_limit)
@@ -4624,7 +4603,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             kind, limit = timed_out
             if kind == 'stall':
                 diagnostic = tail[-5000:].decode(errors='replace')
-                raise RuntimeError('native pip emitted no new output/download bytes and had no observable output/download/CPU/I/O activity for '
+                raise RuntimeError('native pip emitted no new output/download bytes for '
                                    + str(limit) + ' seconds; last output: ' + diagnostic)
             raise subprocess.TimeoutExpired(command, limit, output=bytes(tail))
         reader.join()
