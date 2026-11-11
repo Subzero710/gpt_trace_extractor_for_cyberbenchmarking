@@ -151,15 +151,18 @@ def test_submodule_mutations_remain_exclusive(tmp_path):
         assert len(reports) == 4
 
 
-def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path):
+def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, request):
     import hashlib
 
     root = tmp_path / 'native'
     root.mkdir()
     runtime = {'root': root, 'env': {}, 'prefixes': {},
                'conda_install_lock': threading.RLock(), 'bootstrapped': False}
-    objects = tmp_path / 'objects'
-    objects.mkdir()
+    # Exercise the real CAS API: native provisioning now links through
+    # Pool.link_verified_object rather than using raw os.link/digest.
+    candidate = pool.Pool(tmp_path)
+    request.addfinalizer(candidate._pip_cache_context.cleanup)
+    objects = candidate.objects
     artifacts = {}
     target_rows = []
     for name, version in [('alpha', '3.11.11'), ('beta', '3.12.12')]:
@@ -175,7 +178,7 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path):
     lock = {'artifacts': artifacts, 'environments': {
         sha: {'transactions': [{'key': sha, 'packages': [sha]}]}
         for sha, version in target_rows}}
-    candidate = SimpleNamespace(stage=tmp_path, objects=objects, conda_lock=lock)
+    candidate.conda_lock = lock
     downloader_barrier = threading.Barrier(len(target_rows), timeout=5)
     observed_downloads = []
     condas_running = 0
