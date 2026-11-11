@@ -2583,6 +2583,11 @@ class Pool:
         self._pip_cache_context = tempfile.TemporaryDirectory(prefix='swegym-pip-cache-')
         self.pip_cache = Path(self._pip_cache_context.name)
 
+    @staticmethod
+    def _object_signature(value):
+        return (value.st_dev, value.st_ino, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns)
+
     def verify_object(self, sha):
         """Reuse a digest only while the verified file identity remains unchanged."""
         if not isinstance(sha, str) or not SHA.fullmatch(sha):
@@ -2592,15 +2597,40 @@ class Pool:
             if target.parent.is_symlink():raise RuntimeError('unsafe CAS directory')
             info = target.lstat()
             if not stat.S_ISREG(info.st_mode):raise RuntimeError('unsafe CAS object')
-            def signature(value):
-                return (value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
-            current = signature(info)
+            current = self._object_signature(info)
             if self._verified_signatures.get(sha) != current:
                 if digest(target) != sha:raise RuntimeError('CAS bytes fail SHA-256 verification: '+sha)
-                if signature(target.lstat()) != current:raise RuntimeError('CAS changed during verification')
+                if self._object_signature(target.lstat()) != current:
+                    raise RuntimeError('CAS changed during verification')
                 self._verified_signatures[sha] = current
             self.verified_objects.add(sha)
             return info.st_size
+
+    def link_verified_object(self, sha, destination):
+        """Link a SHA-verified CAS object without racing another link's ctime.
+
+        Creating/removing a hardlink changes the source inode's ctime even when
+        its bytes and mtime are unchanged. Concurrent Conda/pip CAS links
+        therefore share the same lock as verify_object; only a verified inode
+        is linked.
+        The exact post-link signature is recorded so future users do not hash
+        large, unchanged archives again merely because their link count grew.
+        """
+        destination = Path(destination)
+        with self._state_lock:
+            self.verify_object(sha)
+            source = self.objects / sha[:2] / sha
+            if destination.is_symlink():
+                raise RuntimeError('unsafe CAS hardlink destination')
+            if destination.exists():
+                if not destination.is_file() or not destination.samefile(source):
+                    raise RuntimeError('CAS hardlink destination differs from verified object')
+            else:
+                os.link(source, destination)
+            if not destination.is_file() or not destination.samefile(source):
+                raise RuntimeError('CAS hardlink identity changed')
+            self._verified_signatures[sha] = self._object_signature(source.lstat())
+        return destination
 
     def reference(self, sha, category, identity, size):
         with self._state_lock:
@@ -2650,17 +2680,21 @@ class Pool:
         The broker alone performs final verification and publishes ready/.
         """
         path = Path(path)
-        target = self.objects / sha[:2] / sha
-        if path.samefile(target):
-            return
-        import secrets
-        temporary = path.parent / ('.pool-link-' + secrets.token_hex(16))
-        os.link(target, temporary)
-        try:
-            os.replace(temporary, path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        with self._state_lock:
+            self.verify_object(sha)
+            target = self.objects / sha[:2] / sha
+            if path.samefile(target):
+                return
+            import secrets
+            temporary = path.parent / ('.pool-link-' + secrets.token_hex(16))
+            os.link(target, temporary)
+            try:
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+                # os.link/os.unlink change inode ctime but not verified bytes.
+                self._verified_signatures[sha] = self._object_signature(target.lstat())
 
     def download(self, url, category, identity, *, sha=None, sri=None):
         """Serialize shared content identities, including aliases at different URLs."""
@@ -4253,18 +4287,12 @@ def _native_seed_wheelhouse(pool, runtime):
                             or origin.username or origin.password or origin.fragment
                             or urllib.parse.unquote(origin.path.rsplit('/', 1)[-1]) != filename):
                         raise RuntimeError('untrusted reusable native pip wheel URL')
-                    pool.verify_object(sha)
                     identity = (sha, url, bool(artifact.get('yanked', False)))
                     prior = indexed.get(filename)
                     if prior is not None and prior[:2] != identity[:2]:
                         raise RuntimeError('ambiguous same-name native pip wheel artifact: ' + filename)
                     indexed[filename] = (sha, url, bool(identity[2] or (prior[2] if prior else False)))
-                    destination = folder / filename
-                    source = pool.objects / sha[:2] / sha
-                    if not destination.exists():
-                        os.link(source, destination)
-                    elif destination.is_symlink() or not destination.samefile(source):
-                        raise RuntimeError('native pip wheelhouse file changed')
+                    pool.link_verified_object(sha, folder / filename)
             seen.add(checkpoint.name)
         return folder
 
@@ -4716,10 +4744,10 @@ def _native_locked_python(pool, target):
                 raise RuntimeError('invalid locked Conda artifact filename')
             archive = archive_root / package_sha / filename
             archive.parent.mkdir(parents=True, exist_ok=True)
-            if not archive.exists():
-                os.link(pool.objects / package_sha[:2] / package_sha, archive)
-            if digest(archive) != package_sha:
-                raise RuntimeError('locked interpreter dependency was modified')
+            # pool.download already checks the pinned digest. Linking the same
+            # inode is identity-preserving; a second digest of the hardlink can
+            # fail spuriously if another target simultaneously adds a link.
+            pool.link_verified_object(package_sha, archive)
             explicit.append(archive.as_uri())
         explicit_file = runtime['root'] / ('python-' + sha + '.explicit')
         explicit_file.write_text('@EXPLICIT\n' + '\n'.join(explicit) + '\n')
@@ -4931,7 +4959,6 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
     actual = pool.download(url, 'python-source', key, sha=sha)
     if actual != sha:
         raise RuntimeError('native source artifact identity differs')
-    pool.verify_object(sha)
     runtime = _native_pool_runtime(pool)
     python = _native_locked_python(pool, target)
     if python is None:
@@ -4939,12 +4966,7 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
     root = (runtime['root'] / 'source-metadata' /
             _target_fingerprint(target) / sha)
     root.mkdir(parents=True, exist_ok=True)
-    source = pool.objects / sha[:2] / sha
-    archive = root / filename
-    if not archive.exists():
-        os.link(source, archive)
-    if archive.is_symlink() or not archive.is_file() or not archive.samefile(source):
-        raise RuntimeError('native source archive was replaced')
+    archive = pool.link_verified_object(sha, root / filename)
     _check_legacy_setup_syntax(archive, python)
     report = root / 'pip-report.json'
     command = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
