@@ -4588,7 +4588,14 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
     total_limit, stall_limit = _native_pip_timeouts()
     total_limit = min(timeout, total_limit)
     observation_interval = _conda_progress_interval()
-    meter = runtime.get('_pip_byte_progress')
+    # Production shares the monitor owned by _native_pool_runtime. Minimal
+    # standalone runtimes receive exactly one monitor, attached to their own
+    # dictionary so callers retain explicit responsibility for closing it.
+    with _NATIVE_POOL_LOCK:
+        meter = runtime.get('_pip_byte_progress')
+        if meter is None:
+            meter = _NativePipByteProgress(_conda_progress_interval())
+            runtime['_pip_byte_progress'] = meter
     if not isinstance(meter, _NativePipByteProgress):
         raise RuntimeError('native Pip monitor is not owned by the shared runtime')
     identity = hashlib.sha256(

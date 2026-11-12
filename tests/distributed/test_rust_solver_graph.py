@@ -161,6 +161,7 @@ def test_compiled_rust_backtracks_after_proven_invalid_target_source():
     with tempfile.TemporaryDirectory() as temp, \
          patch.object(pool, '_candidate_versions', side_effect=domain), \
          patch.object(pool, '_native_source_candidate_metadata', side_effect=source), \
+         patch.object(pool, '_native_sdist_graph_metadata', return_value=None), \
          patch.object(pool, '_candidate_release_metadata', side_effect=wheel):
         plan = pool._resolve_registry_plan(
             pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],
@@ -187,6 +188,7 @@ def test_compiled_rust_does_not_reinterpret_metadata_infrastructure_failure():
     with tempfile.TemporaryDirectory() as temp, \
          patch.object(pool, '_candidate_versions', side_effect=domain), \
          patch.object(pool, '_native_source_candidate_metadata', side_effect=source), \
+         patch.object(pool, '_native_sdist_graph_metadata', return_value=None), \
          pytest.raises(RuntimeError, match='verified metadata network unavailable'):
         pool._resolve_registry_plan(
             pool.Pool(Path(temp)), fixture_target().as_dict(), {'example>=0.5'}, [],

@@ -168,10 +168,24 @@ class InterfaceAndShutdownTests(unittest.TestCase):
         cfg = {"deployment": {"role": "control"}}
         for adapter in ("gaia", "swe-gym-lite"):
             calls = []
-            with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "compose", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=lambda *a, **k: calls.append(("prepare", a))):
+            deferred = []
+
+            def prepare(*args, **kwargs):
+                calls.append(("prepare", args))
+                deferred.append(kwargs["fetch_source"])
+
+            with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "compose", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=prepare):
                 self.dispatch.control(cfg, "superbench-fetch", SimpleNamespace(adapter=adapter))
-            self.assertEqual(calls[1], ("fetch", ("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", adapter)))
-            self.assertEqual([x[0] for x in calls], ["project", "fetch"] + (["prepare"] if adapter == "swe-gym-lite" else []))
+                if adapter == "swe-gym-lite":
+                    self.assertEqual([row[0] for row in calls], ["project", "prepare"])
+                    self.assertEqual(len(deferred), 1)
+                    self.assertTrue(callable(deferred[0]))
+                    deferred[0]()
+                    self.assertEqual([row[0] for row in calls], ["project", "prepare", "fetch"])
+                else:
+                    self.assertEqual([row[0] for row in calls], ["project", "fetch"])
+                    self.assertFalse(deferred)
+                self.assertEqual(calls[-1], ("fetch", ("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", adapter)))
 
     def test_no_image_build_in_up_run_or_resume(self):
         parsed = ast.parse((ROOT / "scripts/distributed.py").read_bytes())
@@ -192,6 +206,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
         import hmac
         from types import SimpleNamespace
         from gpt_trace_transport.wire import CONTROLLER_ACTIONS
+        from workstation_broker.preparation_resources import ResourceObservationUnavailable
         path = ROOT / "apps/workstation-broker/src/workstation_broker/server.py"
         parsed = ast.parse(path.read_bytes())
         factory = copy.deepcopy(next(n for n in parsed.body if isinstance(n, ast.FunctionDef) and n.name == "create_app"))
@@ -206,6 +221,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
             names=[ast.alias(name="annotations")], level=0), *constants, identity, factory], type_ignores=[]))
         namespace = {"asyncio": asyncio, "hmac": hmac, "json": json, "re": re,
             "CONTROLLER_ACTIONS": CONTROLLER_ACTIONS,
+            "ResourceObservationUnavailable": ResourceObservationUnavailable,
             "JSONResponse": lambda body, status_code=200, **kwargs: SimpleNamespace(body=body, status_code=status_code)}
         exec(compile(program, str(path), "exec"), namespace)
 
