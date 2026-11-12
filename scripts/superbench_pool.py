@@ -577,6 +577,7 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host,
         connections={}
         _HTTPS_CONNECTIONS.connections=connections
     connection=connections.get(expected_host)
+    reused_socket = connection is not None and connection.sock is not None
     if connection is None:
         connection=http.client.HTTPSConnection(expected_host,timeout=timeout)
         connections[expected_host]=connection
@@ -608,6 +609,15 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host,
             raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,io.BytesIO(b''))
         else:
             raw=_read_metadata_response(response,limit)
+    except http.client.RemoteDisconnected:
+        _drop_expected_https_connection(expected_host)
+        if reused_socket:
+            # A pooled socket closed before response headers is stale. The
+            # request is a read-only GET; reconnect once, without a backoff.
+            return _read_expected_https_once(
+                url, timeout=timeout, limit=limit, user_agent=user_agent,
+                expected_host=expected_host, accept=accept)
+        raise
     except BaseException:
         _drop_expected_https_connection(expected_host)
         raise
@@ -3416,7 +3426,60 @@ def _memo_get_or_compute(cache,key,producer):
     return cache[key]
 
 
+class _BoundedCoreMetadataCache:
+    """Single-flight immutable metadata cache with a versioned byte budget."""
+    def __init__(self):
+        from collections import OrderedDict
+        self._lock = threading.Lock()
+        self._values = OrderedDict()
+        self._pending = {}
+        self._size = 0
+        self._limit = None
+
+    def get_or_compute(self, key, producer):
+        with self._lock:
+            if key in self._values:
+                self._values.move_to_end(key)
+                return self._values[key]
+            future = self._pending.get(key)
+            owner = future is None
+            if owner:
+                future = concurrent.futures.Future()
+                self._pending[key] = future
+        if not owner:
+            return future.result()
+        try:
+            value = producer()
+            if not isinstance(value, bytes):
+                raise RuntimeError('cached PyPI core metadata must be immutable bytes')
+            with self._lock:
+                if self._limit is None:
+                    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+                    if policy.is_symlink() or not policy.is_file():
+                        raise RuntimeError('missing versioned metadata cache policy')
+                    with policy.open('rb') as stream:
+                        limit = tomllib.load(stream)['acquisition']['pip_solver_cache_max_bytes']
+                    if type(limit) is not int or limit < 1:
+                        raise RuntimeError('invalid verified metadata cache budget')
+                    self._limit = limit
+                if len(value) <= self._limit:
+                    while self._values and self._size + len(value) > self._limit:
+                        _, old = self._values.popitem(last=False)
+                        self._size -= len(old)
+                    self._values[key] = value
+                    self._size += len(value)
+                self._pending.pop(key)
+                future.set_result(value)
+            return value
+        except BaseException as exc:
+            with self._lock:
+                self._pending.pop(key, None)
+                future.set_exception(exc)
+            raise
+
+
 _PYPI_JSON_CACHE=_SingleFlightCache()
+_PYPI_CORE_METADATA_CACHE=_BoundedCoreMetadataCache()
 
 
 def _pypi_json(url, *, limit=16*1024*1024):
@@ -4240,6 +4303,7 @@ def _native_pool_runtime(pool):
             'NPM_CONFIG_GLOBALCONFIG': str(npm_configs['global']),
         }
         native = {'context': temporary, 'root': root, 'env': environ,
+                  '_pip_byte_progress': _NativePipByteProgress(_conda_progress_interval()),
                   'prefixes': {}, 'bootstrapped': False,
                   'submodule_lock': threading.RLock(),
                   'conda_install_lock': threading.RLock()}
@@ -4524,11 +4588,9 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
     total_limit, stall_limit = _native_pip_timeouts()
     total_limit = min(timeout, total_limit)
     observation_interval = _conda_progress_interval()
-    with _NATIVE_POOL_LOCK:
-        meter = runtime.get('_pip_byte_progress')
-        if meter is None:
-            meter = _NativePipByteProgress(_conda_progress_interval())
-            runtime['_pip_byte_progress'] = meter
+    meter = runtime.get('_pip_byte_progress')
+    if not isinstance(meter, _NativePipByteProgress):
+        raise RuntimeError('native Pip monitor is not owned by the shared runtime')
     identity = hashlib.sha256(
         ('\0'.join(command) + '\0' + str(threading.get_ident())).encode()).hexdigest()[:12]
     meter.begin(identity)
@@ -5772,24 +5834,118 @@ def _wheel_core_metadata(path, *, expected_name=None, expected_version=None, tar
 
 
 def _pep658_candidate_metadata(candidate, target=None):
-    """Return hash-verified artifact-specific Core Metadata when PyPI publishes it."""
-    item=candidate['item'];descriptor=item.get('core-metadata')
-    if descriptor is False or descriptor is None:return None
-    if not isinstance(descriptor,dict) or not SHA.fullmatch(str(descriptor.get('sha256',''))):
-        raise RuntimeError('invalid PyPI core-metadata identity')
-    _artifact_sha,url=_candidate_artifact_identity(candidate)
-    raw=_read_https(url+'.metadata',timeout=90,limit=MAX_SOURCE,
-                    user_agent='gpt-trace-dependency-pool/4',expected_host='files.pythonhosted.org')
-    if hashlib.sha256(raw).hexdigest()!=descriptor['sha256']:
-        raise RuntimeError('PyPI core-metadata SHA-256 mismatch')
-    name,version,requirements,extras=_core_metadata_fields(raw,expected_name=candidate['name'],
-        expected_version=candidate['version'],target=target)
-    _,_,Version,InvalidVersion,_=_packaging_symbols()
-    try:same_version=Version(version)==Version(candidate['version'])
-    except InvalidVersion:same_version=False
-    if _normalized_package_name(name)!=_normalized_package_name(candidate['name']) or not same_version:
+    """Return SHA-verified PEP 658 bytes, parsed for the exact target."""
+    raw = _verified_pep658_bytes(candidate)
+    if raw is None:
+        return None
+    name, version, requirements, extras = _core_metadata_fields(
+        raw, expected_name=candidate['name'], expected_version=candidate['version'],
+        target=target)
+    _, _, Version, InvalidVersion, _ = _packaging_symbols()
+    try:
+        same_version = Version(version) == Version(candidate['version'])
+    except InvalidVersion:
+        same_version = False
+    if _normalized_package_name(name) != _normalized_package_name(candidate['name']) or not same_version:
         raise RuntimeError('PyPI core-metadata package identity differs')
-    return requirements,extras
+    return requirements, extras
+
+
+def _verified_pep658_bytes(candidate):
+    item = candidate['item']
+    descriptor = item.get('core-metadata')
+    if descriptor is None or descriptor is False:
+        return None
+    if (not isinstance(descriptor, dict)
+            or SHA.fullmatch(str(descriptor.get('sha256', ''))) is None):
+        raise RuntimeError('invalid PyPI core-metadata SHA-256')
+    _sha, url = _candidate_artifact_identity(candidate)
+    digest_sha = descriptor['sha256']
+
+    def load():
+        raw = _read_https(url + '.metadata', timeout=90, limit=MAX_SOURCE,
+                          user_agent='gpt-trace-dependency-pool/4',
+                          expected_host='files.pythonhosted.org')
+        if hashlib.sha256(raw).hexdigest() != digest_sha:
+            raise RuntimeError('PyPI core metadata SHA-256 mismatch')
+        return raw
+
+    # Metadata bytes are artifact-specific, but independent of target Python.
+    return _PYPI_CORE_METADATA_CACHE.get_or_compute((url, digest_sha), load)
+
+
+def _static_sdist_dependency_fields(raw, candidate, target):
+    """Only PEP 643 non-dynamic sdist dependency fields are graph-authoritative."""
+    import email.parser
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_SOURCE:
+        raise RuntimeError('invalid static source core metadata')
+    try:
+        parsed = email.parser.Parser().parsestr(bytes(raw).decode('utf-8'), headersonly=True)
+    except UnicodeError as exc:
+        raise RuntimeError('invalid static source core metadata encoding') from exc
+    if parsed.defects:
+        raise RuntimeError('malformed static source core metadata')
+    version = parsed.get('Metadata-Version')
+    if not isinstance(version, str) or re.fullmatch(r'2\.\d+', version) is None:
+        return None
+    if tuple(map(int, version.split('.'))) < (2, 2):
+        return None
+    dynamic = parsed.get_all('Dynamic', [])
+    if any(not isinstance(item, str) for item in dynamic):
+        raise RuntimeError('invalid Dynamic source metadata fields')
+    if {'requires-dist', 'provides-extra', 'requires-python'} & {
+            item.strip().lower() for item in dynamic}:
+        return None
+    _name, _version, requirements, extras = _core_metadata_fields(
+        raw, expected_name=candidate['name'], expected_version=candidate['version'], target=target)
+    return (sorted({normalize_legacy_source_requirement(row) for row in requirements}),
+            sorted(set(extras)))
+
+
+def _native_sdist_graph_metadata(pool, candidate, key, target):
+    """Prove immutable source graph fields without invoking an unchosen build backend.
+
+    PEP 658 sidecar bytes must match PyPI's published SHA-256. Otherwise the
+    complete source archive is SHA-256 checked before examining root PKG-INFO.
+    Old/dynamic source metadata is not proof and requires target PEP 517.
+    The winning source always undergoes target PEP 517 validation afterwards.
+    """
+    if candidate['kind'] != 'sdist':
+        raise RuntimeError('static source metadata requires sdist identity')
+    target = _coerce_target(target)
+    sha, url = _candidate_artifact_identity(candidate)
+    descriptor = candidate['item'].get('core-metadata')
+    if descriptor is not None and descriptor is not False:
+        raw = _verified_pep658_bytes(candidate)
+    else:
+        actual = pool.download(url, 'python-source', key, sha=sha)
+        if actual != sha:
+            raise RuntimeError('verified source archive identity differs')
+        members = _source_archive_files(pool.objects / sha[:2] / sha,
+                                        candidate['filename'])
+        raw = members.get('PKG-INFO')
+    if raw is None:
+        return None
+    fields = _static_sdist_dependency_fields(raw, candidate, target)
+    if fields is None:
+        return None
+    # Candidate-level target syntax rejection is part of the search protocol,
+    # not a materialization failure after Rust has committed to the solution.
+    if descriptor is not None and descriptor is not False:
+        actual = pool.download(url, 'python-source', key, sha=sha)
+        if actual != sha:
+            raise RuntimeError('verified source archive identity differs')
+    archive = pool.objects / sha[:2] / sha
+    interpreter = _native_locked_python(pool, target)
+    if interpreter is None:
+        raise RuntimeError('source metadata requires a locked target Python')
+    _check_legacy_setup_syntax(archive, interpreter)
+    requirements, extras = fields
+    return {'kind': 'sdist', 'name': candidate['name'],
+            'version': candidate['version'], 'filename': candidate['filename'],
+            'sha256': sha, 'url': url, 'requirements': requirements,
+            'provides_extra': extras, '_verified_static_sdist': True,
+            **_candidate_yank_provenance(candidate)}
 
 
 def _candidate_artifact_identity(candidate):
@@ -5890,9 +6046,14 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None,s
             pool.reference(actual['sha256'],'python-source',key,size)
         else:
             actual=_materialize_candidate_metadata(pool,candidate,key,target,artifact_cache)
+        if expected.get('_verified_static_sdist') is True and (
+                expected['kind'] != 'sdist' or source_probe is None
+                or not isinstance(actual.get('build_requirements'), list)):
+            raise RuntimeError('verified static source lacks mandatory final PEP 517 evidence')
         if (sorted(actual['requirements'])!=sorted(expected['requirements'])
                 or sorted(actual['provides_extra'])!=sorted(expected['provides_extra'])
                 or (expected['kind']=='sdist' and source_probe is not None
+                    and expected.get('_verified_static_sdist') is not True
                     and actual.get('build_requirements')!=expected.get('build_requirements'))
                 or _candidate_yank_provenance(candidate)!={
                     key:expected[key] for key in ('yanked','yanked_reason') if key in expected}):

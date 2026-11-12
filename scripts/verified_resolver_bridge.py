@@ -28,9 +28,11 @@ class _BoundedPrefetch:
     their slot until completion. Pending obsolete requests can be cancelled.
     Completed validated metadata stays in the ordinary resolver caches.
     """
-    def __init__(self, executor, probe, *, speculative_submit=None, promote=None):
+    def __init__(self, executor, probe, *, speculative_submit=None, promote=None,
+                 speculative_eligible=None):
         self.executor = executor
         self.probe = probe
+        self.speculative_eligible = speculative_eligible
         # Only the production shared metadata pool supplies an ordered
         # speculative queue; standalone protocol tests may use a bare executor.
         self.speculative_submit = (executor.submit if speculative_submit is None and executor is not None
@@ -70,7 +72,9 @@ class _BoundedPrefetch:
         for ref in references:
             if len(self.futures) >= width:
                 break
-            if ref not in self.futures and ref not in completed:
+            if (ref not in self.futures and ref not in completed
+                    and (self.speculative_eligible is None
+                         or self.speculative_eligible(ref))):
                 self.futures[ref] = self.speculative_submit(self.probe, ref)
 
     def take(self, ref):
@@ -361,9 +365,15 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             identity = ('native-source', host['_candidate_probe_identity'](candidate, target, no_deps))
             artifact_id = ('native-source-artifact',host['_target_fingerprint'](target),
                            host['_candidate_artifact_identity'](candidate)[0], candidate['filename'])
-            value = host['_memo_get_or_compute'](probe_cache, identity,
-                lambda: host['_memo_get_or_compute'](artifact_cache, artifact_id,
-                    lambda: source_probe(pool, candidate, key, target)))
+
+            def source_metadata():
+                static = host['_native_sdist_graph_metadata'](pool, candidate, key, target)
+                if static is not None:
+                    return static
+                return host['_memo_get_or_compute'](artifact_cache, artifact_id,
+                    lambda: source_probe(pool, candidate, key, target))
+
+            value = host['_memo_get_or_compute'](probe_cache, identity, source_metadata)
         else:
             value = host['_candidate_release_metadata'](
                 pool, candidate, key, target, probe_cache, artifact_cache, no_deps=no_deps)
@@ -382,7 +392,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
 
     prefetch = _BoundedPrefetch(executor, record,
                                speculative_submit=resolver_cache.get('metadata_speculative_submit'),
-                               promote=resolver_cache.get('metadata_promote'))
+                               promote=resolver_cache.get('metadata_promote'),
+                               speculative_eligible=lambda ref: candidate_by_id[ref]['kind'] == 'wheel')
 
     def active_dependencies(ref, extras):
         result = []
