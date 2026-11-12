@@ -56,6 +56,7 @@ def test_native_metadata_uses_real_interpreter_capability_only(available, expect
             assert ('SETUPTOOLS_USE_DISTUTILS' in environment) == available
             assert environment.get('SETUPTOOLS_USE_DISTUTILS') == expected_flag
             assert Path(environment['TMPDIR']).name.startswith('build-metadata-')
+            assert environment['PYTHONUNBUFFERED'] == '1'
             assert _argv[-1] == '--no-clean'
             assert '--verbose' in _argv
         assert runtime['env'] == original
@@ -133,3 +134,48 @@ def test_real_pep517_build_hook_output_is_visible_to_native_reader(tmp_path, mon
                 runtime['_pip_byte_progress'].close()
     assert len(seen) == 1
     assert marker.encode() in seen[0]
+
+
+def test_real_silent_buffered_pep517_hook_stays_observable(tmp_path, monkeypatch):
+    import contextlib
+    import io
+    import textwrap
+
+    project = tmp_path / 'hook-project'
+    project.mkdir()
+    (project / 'pyproject.toml').write_text(
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\nbackend-path = ["."]\n')
+    (project / 'backend.py').write_text(textwrap.dedent('''\
+        import time
+        from pathlib import Path
+
+        def get_requires_for_build_wheel(config_settings=None):
+            for step in range(8):
+                print(f"cython progress {step}")
+                time.sleep(0.55)
+            return []
+
+        def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+            folder = Path(metadata_directory) / "native_probe-1.0.dist-info"
+            folder.mkdir()
+            (folder / "METADATA").write_text(
+                "Metadata-Version: 2.1\\nName: native-probe\\nVersion: 1.0\\n")
+            (folder / "WHEEL").write_text(
+                "Wheel-Version: 1.0\\nGenerator: fixture\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n")
+            return folder.name
+        '''))
+    runtime = {'root': tmp_path, 'env': {
+        'HOME': str(tmp_path), 'PATH': os.environ['PATH'],
+        'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+        'PIP_NO_INPUT': '1', 'PYTHONDONTWRITEBYTECODE': '1'}}
+    command = [sys.executable, '-m', 'pip', 'install', '--use-pep517',
+               '--dry-run', '--ignore-installed', '--no-deps', '--no-index', str(project)]
+    runtime['_pip_byte_progress'] = pool._NativePipByteProgress(1)
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (15, 3))
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            assert pool._native_metadata_command(command, runtime, tmp_path) == []
+        finally:
+            runtime['_pip_byte_progress'].close()
+    assert 'PYTHONUNBUFFERED' not in runtime['env']

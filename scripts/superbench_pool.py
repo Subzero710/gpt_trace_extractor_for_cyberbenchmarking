@@ -4499,13 +4499,26 @@ def _native_process_activity(before, after, sample_seconds):
     return result
 
 
-def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
+def _native_backend_is_executing(activity):
+    """Distinguish a working build process from a sleeping one, not progress.
+
+    The full command deadline remains mandatory even for a CPU-bound loop.
+    """
+    return any(row.get('cpu_seconds', 0) > 0 or row.get('reaped_cpu_seconds', 0) > 0
+               or row.get('read_bytes_delta', 0) > 0
+               or row.get('write_bytes_delta', 0) > 0 for row in activity)
+
+
+def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *, metadata_build=False):
     """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
 
     A per-command total deadline bounds the subprocess. Only pip's actual output
     and advancing download counters reset the inactivity deadline; CPU usage and
     procfs I/O are diagnostic evidence, not proof that a build is progressing.
     Verbose PEP 517 hooks expose their output to the same reader.
+    Isolated metadata builds can perform silent CPU-intensive compilation: only
+    while the process tree is demonstrably executing do we defer the idle error,
+    and never beyond the already configured absolute command deadline.
     """
     import signal
     total_limit, stall_limit = _native_pip_timeouts()
@@ -4527,6 +4540,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
     last_progress = [None]
     process = None
     silent_sample = None
+    next_backend_probe = None
     try:
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -4563,18 +4577,37 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
             with activity_lock:
                 idle = now - last_activity[0]
             elapsed = now - started
-            if (silent_sample is None and idle >= max(
-                    stall_limit / 2, stall_limit - 2 * observation_interval)):
-                silent_sample = (time.monotonic(), _native_process_tree_snapshot(process.pid))
+            # Previous CPU samples must never stand in for a later output interval.
+            sampling_start = max(stall_limit / 2, stall_limit - 2 * observation_interval)
+            if idle < sampling_start:
+                silent_sample = None
+                next_backend_probe = None
+            elif silent_sample is None:
+                silent_sample = (now, _native_process_tree_snapshot(process.pid))
             if elapsed >= total_limit:
                 timed_out = ('total', total_limit)
                 break
             if idle >= stall_limit:
-                timed_out = ('stall', stall_limit)
-                break
+                if not metadata_build:
+                    timed_out = ('stall', stall_limit)
+                    break
+                if next_backend_probe is None or now >= next_backend_probe:
+                    snapshot = _native_process_tree_snapshot(process.pid)
+                    sample_time, before = silent_sample
+                    observed = _native_process_activity(before, snapshot, now - sample_time)
+                    if not _native_backend_is_executing(observed):
+                        timed_out = ('stall', stall_limit)
+                        break
+                    # CPU is NOT progress: keep the original idle age. Observe
+                    # compute liveness sparsely and respect the hard total cap.
+                    silent_sample = (now, snapshot)
+                    next_backend_probe = now + max(observation_interval, stall_limit / 2)
             # Poll at the same versioned cadence as the progress display.
-            remaining = min(total_limit - elapsed, stall_limit - idle,
-                            observation_interval)
+            remaining = min(total_limit - elapsed, observation_interval)
+            if idle < stall_limit:
+                remaining = min(remaining, stall_limit - idle)
+            elif next_backend_probe is not None:
+                remaining = min(remaining, next_backend_probe - now)
             try:
                 process.wait(timeout=max(0.001, remaining))
             except subprocess.TimeoutExpired:
@@ -4617,7 +4650,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout):
         meter.end(identity)
 
 
-def _native_run(argv, runtime, *, timeout=7200, interpreter=None):
+def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build=False):
     """Run an actual package tool with a complete, per-invocation interpreter PATH.
 
     Build backends and installed command entrypoints can invoke
@@ -4661,7 +4694,8 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None):
     for index in range(len(command) - 2):
         if command[index:index + 3] == ['-m', 'pip', 'install']:
             command.insert(index + 3, '--progress-bar=raw')
-            return _native_run_pip_with_byte_progress(command, runtime, environment, timeout)
+            return _native_run_pip_with_byte_progress(
+                command, runtime, environment, timeout, metadata_build=metadata_build)
     output = subprocess.run(command, cwd=runtime['root'], env=environment,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=timeout)
@@ -4743,13 +4777,14 @@ def _native_metadata_command(argv, runtime, directory):
     # other native commands. The build-isolation subprocess inherits the flag.
     use_stdlib = _native_interpreter_has_stdlib_distutils(runtime, argv[0])
     with tempfile.TemporaryDirectory(prefix='build-metadata-', dir=directory) as temporary:
-        environment = {**runtime['env'], 'TMPDIR': temporary}
+        environment = {**runtime['env'], 'TMPDIR': temporary, 'PYTHONUNBUFFERED': '1'}
         if use_stdlib:
             environment['SETUPTOOLS_USE_DISTUTILS'] = 'stdlib'
         local = {**runtime, 'env': environment}
         # Pip normally hides backend subprocess output below INFO. The
         # single verbose flag exposes PEP 517 work to our existing reader.
-        _native_run([*argv, '--verbose', '--no-clean'], local, interpreter=argv[0])
+        _native_run([*argv, '--verbose', '--no-clean'], local,
+                    interpreter=argv[0], metadata_build=True)
         return _native_build_requirements(temporary)
 
 
