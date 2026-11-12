@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "shared"))
-from gpt_trace_transport.wire import Endpoint, WireClient, token_value, TransportFailure, IdentityFailure, RemoteFailure
+from gpt_trace_transport.wire import Endpoint, WireClient, token_value, TransportFailure, IdentityFailure, RemoteFailure, READ_ACTIONS
 
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
@@ -332,12 +332,14 @@ def restore(cfg, directory):
 
 
 def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None, quiet=False):
-    """Read-only recovery with bounded latency and visible, actual outage time.
+    """Only idempotent protocol reads may retry unavailable server outcomes.
 
-    A lost read may be repeated. Mutations (e.g. prepare_templates) are never
-    replayed. An unreachable broker is not mistaken for a running worker or
-    a successful fetch, even when its Cloudflare tunnel container is healthy.
+    Authentication/identity failures and HTTP 4xx are never retried. HTTP
+    server failures and transport failures are bounded by versioned policy.
+    Mutating operations require explicit reconciliation, never replay.
     """
+    if action not in READ_ACTIONS:
+        raise ValueError('resilient broker calls require a declared read-only action')
     controls_path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     if controls_path.is_symlink() or not controls_path.is_file():
         raise RuntimeError('missing versioned broker monitoring policy')
@@ -371,8 +373,7 @@ def broker_read_resilient(cfg, action, payload=None, *, outage_seconds=None, qui
         except (TransportFailure, RemoteFailure) as exc:
             if isinstance(exc, IdentityFailure):
                 raise
-            if (isinstance(exc, RemoteFailure) and getattr(exc, 'status', None)
-                    not in {502, 503, 504, 520, 521, 522, 523, 524}):
+            if isinstance(exc, RemoteFailure) and not 500 <= exc.status <= 599:
                 raise
             last_error = ('HTTP ' + str(exc.status) if isinstance(exc, RemoteFailure)
                           else type(exc).__name__ + ': ' + str(exc))
@@ -640,7 +641,7 @@ def _record_fetch_failure(exc):
     except BaseException:
         raise
 
-def preparation_fetch(cfg):
+def preparation_fetch(cfg, *, fetch_source=None):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
     from gpt_trace_transport.local_templates import pool_contract, atomic_json
     view = _FetchBar()
@@ -681,6 +682,7 @@ def preparation_fetch(cfg):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     atomic_json(directory / ("preparation-" + operation_id + ".json"), identified, 0o600)
     started = False
+    source_fetched = False
     last_attempt = None
     try:
         while True:
@@ -725,6 +727,9 @@ def preparation_fetch(cfg):
                 if phase != "not_started" and not retryable_preflight_failure:
                     raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
                                        str(error) + "; administrative cleanup required")
+                if not source_fetched and fetch_source is not None:
+                    fetch_source()
+                    source_fetched = True
                 started = True
                 # Start exactly once. A lost response triggers read-only
                 # reconciliation instead of a duplicate start request.
@@ -1019,8 +1024,10 @@ def control(cfg, action, args):
     if action == "superbench-fetch":
         if not args.adapter: raise ValueError("ADAPTER is required")
         run([sys.executable, "scripts/project_state.py", "core"])
+        if args.adapter == "swe-gym-lite":
+            return preparation_fetch(cfg, fetch_source=lambda: compose(
+                "run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter))
         compose("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter)
-        if args.adapter == "swe-gym-lite": return preparation_fetch(cfg)
         return
     mapping = {"auth": "superbench-auth", "run": "superbench-run", "pause": "superbench-pause",
         "resume": "superbench-resume-active", "status": "superbench-active-status",

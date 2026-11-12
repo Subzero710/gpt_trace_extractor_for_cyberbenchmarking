@@ -5,6 +5,7 @@ attempt. No task/RPC supplies a filesystem path or executable. Direct libguestfs
 children inherit the cgroup, including children that create another session.
 """
 from __future__ import annotations
+import errno
 import json
 import os
 import re
@@ -17,6 +18,10 @@ UNIT = MOUNT / 'system.slice/gpt-trace-distributed-broker.service'
 PROJECT = 'gpt-trace-extractor'
 LABEL = 'io.gpttrace.'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
+
+
+class ResourceObservationUnavailable(RuntimeError):
+    pass
 
 
 def _jobs():
@@ -73,6 +78,41 @@ class JobScope:
         return UNIT / value['name']
 
     @classmethod
+    def leader_active(cls, state):
+        """Positive, bounded proof of the recorded leader; never proof of absence.
+
+        Full descendants/container inventories remain mandatory when the leader
+        is gone, before a retry, before publication and during shutdown.
+        """
+        stamp = state.get('worker')
+        if stamp is None or not _jobs().same_process(stamp):
+            return False
+        path = cls.path(state)
+        scope = state['scope']
+        if scope['boot_id'] != _jobs().boot_id() or scope['closed']:
+            raise RuntimeError('live preparation worker has an invalid recorded cgroup; preserved')
+        _directory(path)
+        expected = '0::/' + path.relative_to(MOUNT).as_posix()
+        try:
+            membership = (_jobs().PROC / str(stamp['pid']) / 'cgroup').read_text().splitlines()
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                raise
+            if _jobs().same_process(stamp):
+                raise ResourceObservationUnavailable('live worker cgroup observation raced with /proc') from exc
+            return False
+        # Recheck immutable process identity after reading its cgroup membership:
+        # a recycled PID or exiting leader cannot authorize a running report.
+        if not _jobs().same_process(stamp):
+            return False
+        if membership != [expected]:
+            raise RuntimeError('live preparation worker is outside its verified cgroup; preserved')
+        events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
+        if events.get('populated') != '1':
+            raise ResourceObservationUnavailable('live preparation worker has unconfirmed cgroup population')
+        return _jobs().same_process(stamp)
+
+    @classmethod
     def members(cls, state):
         path = cls.path(state)
         value = state['scope']
@@ -107,7 +147,7 @@ class JobScope:
         if events['populated'] == '1' and not members:
             # Allow an exited zombie only after a second, fresh empty event.
             again = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
-            if again.get('populated') != '0': raise RuntimeError('cgroup still populated; absence unconfirmed')
+            if again.get('populated') != '0': raise ResourceObservationUnavailable('cgroup still populated; absence unconfirmed')
         return list(members.values())
 
     @classmethod

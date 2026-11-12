@@ -443,6 +443,7 @@ class DurableJobProcessTests(unittest.TestCase):
 from pathlib import Path
 sys.path[:0] = INPUT_PATHS
 from workstation_broker import preparation as jobs
+from workstation_broker import preparation_resources as resources
 from workstation_broker.templates import TemplateRegistry
 jobs.BASE = BASE_PATH
 jobs.PROC = PROC_PATH
@@ -456,6 +457,9 @@ record.mkdir()
 fields = ['S','1',str(os.getpgrp()),str(os.getsid(0))] + ['0'] * 15 + [str(time.monotonic_ns() // 10000000)] + ['0'] * 10
 (record / 'stat').write_text(str(pid) + ' (python-fixture) ' + ' '.join(fields))
 (record / 'environ').write_bytes(b'\\0'.join((k+'='+v).encode() for k,v in os.environ.items()))
+state = json.loads(jobs.state_path(sys.argv[2]).read_text())
+scope_path = resources.JobScope.path(state)
+(record / 'cgroup').write_text('0::/' + scope_path.relative_to(resources.MOUNT).as_posix() + '\\n')
 mode = sys.argv[1]
 def physical_boundary(manager,state):
     count = COUNT_PATH
@@ -653,6 +657,23 @@ finally:
         self.assertEqual(self.manager.inventory(), [])
         self.assertEqual(self.files.registry_path.read_bytes(), before)
 
+    def test_status_live_leader_is_not_a_full_descendant_or_docker_inventory(self):
+        self.mode = 'long'
+        self.start()
+        self.wait_phase({'running'})
+        with patch.object(resources.JobScope, 'members', side_effect=AssertionError('full census on live status')), \
+             patch.object(self.manager, '_containers', side_effect=AssertionError('Docker poll on live status')):
+            status = self.manager.status({'operation_id': self.operation_id})
+        self.assertEqual(status['phase'], 'running')
+
+    def test_process_disappearance_during_proc_reads_is_not_a_conflict(self):
+        race = ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+        with patch.object(Path, 'read_text', side_effect=race):
+            self.assertIsNone(jobs.process_identity(os.getpid()))
+        with patch.object(Path, 'read_text', side_effect=PermissionError(errno.EACCES, 'denied')):
+            with self.assertRaises(PermissionError):
+                jobs.process_identity(os.getpid())
+
     def test_unknown_scope_and_missing_membership_proof_are_never_absence(self):
         extra = resources.UNIT / 'prep-unowned'
         extra.mkdir(mode=0o700)
@@ -767,6 +788,28 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 reply = await callback(Request(action))
                 self.assertEqual(reply.status_code, 403)
         asyncio.run(check())
+
+    def test_broker_read_recovers_server_failure_not_conflict(self):
+        from gpt_trace_transport.wire import RemoteFailure
+        calls = []
+        def request(_cfg, action, payload=None, **kwargs):
+            calls.append(action)
+            if len(calls) == 1:
+                raise RemoteFailure(action, 503, b'{"detail":"unavailable"}')
+            return {'phase': 'running'}
+        with patch.object(self.dispatch, 'broker', side_effect=request),              patch.object(self.dispatch.time, 'sleep'):
+            result = self.dispatch.broker_read_resilient(
+                {}, 'template_preparation_status', {}, quiet=True)
+        self.assertEqual(result['phase'], 'running')
+        self.assertEqual(len(calls), 2)
+        with patch.object(self.dispatch, 'broker', side_effect=RemoteFailure(
+                'template_preparation_status', 409, b'{"detail":"conflict"}')) as request:
+            with self.assertRaises(RemoteFailure):
+                self.dispatch.broker_read_resilient({}, 'template_preparation_status', {}, quiet=True)
+        request.assert_called_once()
+        with patch.object(self.dispatch, 'broker', side_effect=AssertionError('mutation sent')):
+            with self.assertRaises(ValueError):
+                self.dispatch.broker_read_resilient({}, 'prepare_templates', {}, quiet=True)
 
     def test_single_explicit_fetch_polls_and_never_repeats_a_lost_start(self):
         with tempfile.TemporaryDirectory() as temp:

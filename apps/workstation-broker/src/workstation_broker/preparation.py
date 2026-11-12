@@ -7,6 +7,7 @@ is rediscovered by ID; only an explicit later fetch may retry a proved-dead job.
 """
 from __future__ import annotations
 import contextlib
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -265,8 +266,10 @@ def boot_id():
 def process_identity(pid):
     try:
         raw = (PROC / str(pid) / "stat").read_text()
-    except FileNotFoundError:
-        return None
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return None
+        raise
     tail = raw[raw.rfind(")") + 2:].split()
     if len(tail) < 20: raise RuntimeError("invalid process identity record")
     return {"boot_id": boot_id(), "pid": int(pid), "start_ticks": int(tail[19]),
@@ -298,8 +301,10 @@ def group_members(stamp, operation_id):
         try:
             owner = path.stat().st_uid
             environment = (path / "environ").read_bytes().split(b"\0")
-        except FileNotFoundError:
-            continue
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            raise
         if owner != 0 or ("GPT_TRACE_PREPARATION_ID=" + operation_id).encode() not in environment:
             raise RuntimeError("foreign process in recorded preparation group; preserved")
         members.append(current)
@@ -581,6 +586,12 @@ class PreparationManager:
         with self.lock():
             state = self._read(operation_id)
             if state is None: return {"operation_id": operation_id, "phase": "not_started", "deployment": self.deployment}
+            # A running worker has a durable identity and a verified kernel
+            # cgroup. Polling does not need a process/container census; doing so
+            # for every read creates races with unrelated short-lived workers.
+            if (state['phase'] in {'starting', 'running', 'validating'}
+                    and JobScope.leader_active(state)):
+                return self._public(state)
             state = self._reconcile(state)
             if state["phase"] == "ready":
                 state = self._verify_ready(state)

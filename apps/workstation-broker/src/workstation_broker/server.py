@@ -29,6 +29,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from .computer import capture, input_events
 from .templates import TemplateRegistry, backing
+from .preparation_resources import ResourceObservationUnavailable
 from gpt_trace_transport.wire import CONTROLLER_ACTIONS
 
 PORT = 17171
@@ -1151,7 +1152,13 @@ def create_app(broker: Broker) -> Starlette:
                 elif action == "artifact_read": result = broker.artifact_chunk(ident, payload.get("args", {}))
                 else: return JSONResponse({"detail": "unknown broker operation"}, status_code=404)
                 return JSONResponse(result)
-        except (ValueError, RuntimeError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+        except (ResourceObservationUnavailable, OSError, TimeoutError) as exc:
+            # An internal kernel/I/O observation failure is not a domain
+            # conflict. An idempotent client read may retry HTTP 5xx; an
+            # unconfirmed mutation must still be rediscovered by identity.
+            logging.getLogger(__name__).exception('broker %s local observation failed', action)
+            return JSONResponse({"detail": "broker local observation unavailable"}, status_code=503)
+        except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             return JSONResponse({"detail": str(exc)[:1000]}, status_code=409)
 
     return Starlette(routes=[Route("/healthz", health), Route("/v1/{action}", dispatch, methods=["POST"])])
