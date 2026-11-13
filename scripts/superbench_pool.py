@@ -5735,15 +5735,101 @@ def _registry_exact_release_candidate(name,version_text,target,cache=None):
     return _memo_get_or_compute(cache,cache_key,load)
 
 
+class _PipVersionAdmissionCache:
+    """Bounded single-flight candidate masks shared by independent closure workers."""
+
+    def __init__(self, limit):
+        from collections import OrderedDict
+        if type(limit) is not int or limit < 1:
+            raise RuntimeError('invalid versioned Pip admission cache budget')
+        self.limit = limit
+        self.lock = threading.Lock()
+        self.values = OrderedDict()
+        self.pending = {}
+        self.bytes = 0
+
+    def mask(self, universe, specifier, prereleases):
+        # Strongly retain the immutable release universe until eviction so an
+        # object ID can never be reused while its mask is still indexed.
+        spelling = str(specifier)
+        key = (id(universe), spelling, bool(prereleases))
+        with self.lock:
+            existing = self.values.get(key)
+            if existing is not None:
+                if existing[0] is not universe:
+                    raise RuntimeError('Pip version admission identity collision')
+                self.values.move_to_end(key)
+                return existing[1]
+            pending = self.pending.get(key)
+            owner = pending is None
+            if owner:
+                pending = (universe, concurrent.futures.Future())
+                self.pending[key] = pending
+            elif pending[0] is not universe:
+                raise RuntimeError('Pip admission computation identity collision')
+        if not owner:
+            return pending[1].result()
+        try:
+            packed = bytearray((len(universe) + 7) // 8)
+            for index, (version, _artifact) in enumerate(universe):
+                if specifier.contains(version, prereleases=bool(prereleases)):
+                    packed[index >> 3] |= 1 << (index & 7)
+            mask = int.from_bytes(packed, 'little')
+            charge = (sys.getsizeof(mask) + sys.getsizeof(key) +
+                      sys.getsizeof(spelling) + sys.getsizeof(universe))
+        except BaseException as exc:
+            with self.lock:
+                self.pending.pop(key)
+            pending[1].set_exception(exc)
+            raise
+        with self.lock:
+            if charge <= self.limit:
+                while self.values and self.bytes + charge > self.limit:
+                    _discarded, (_universe, _mask, used) = self.values.popitem(last=False)
+                    self.bytes -= used
+                self.values[key] = (universe, mask, charge)
+                self.bytes += charge
+            self.pending.pop(key)
+        pending[1].set_result(mask)
+        return mask
+
+
+def _admitted_pip_versions(pool, universe, specifiers):
+    """Exact SpecifierSet.filter semantics without stacked generator pipelines.
+
+    For a nonempty SpecifierSet, packaging uses the set-wide prerelease policy
+    for every individual specifier, so admission is the intersection of their
+    predicates. An empty set retains packaging's special prerelease behavior.
+    """
+    if not specifiers:
+        allowed = set(specifiers.filter((row[0] for row in universe), prereleases=None))
+        return [row for row in universe if row[0] in allowed]
+    with pool._state_lock:
+        cache = getattr(pool, '_pip_version_admission_cache', None)
+        if cache is None:
+            policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+            if policy.is_symlink() or not policy.is_file():
+                raise RuntimeError('missing versioned Pip admission cache policy')
+            with policy.open('rb') as stream:
+                limit = tomllib.load(stream)['acquisition']['pip_solver_cache_max_bytes']
+            cache = _PipVersionAdmissionCache(limit)
+            pool._pip_version_admission_cache = cache
+    candidates = (1 << len(universe)) - 1
+    prereleases = bool(specifiers.prereleases)
+    for specifier in specifiers:
+        candidates &= cache.mask(universe, specifier, prereleases)
+        if not candidates:
+            return []
+    return [row for index, row in enumerate(universe) if candidates & (1 << index)]
+
+
 def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
     _,SpecifierSet,Version,InvalidVersion,_=_packaging_symbols()
     exact=_exact_registry_pin(requirements,constraints)
     universe=(_registry_exact_release_candidate(name,exact,target,release_cache) if exact is not None
               else _registry_release_candidates(name,target,release_cache))
     combined=SpecifierSet(','.join(str(req.specifier) for req in [*requirements,*constraints] if str(req.specifier)))
-    admitted=set(combined.filter([row[0] for row in universe],prereleases=None))
-    def allowed(row):return row[0] in admitted
-    candidates=[row for row in universe if allowed(row)]
+    candidates=_admitted_pip_versions(pool,universe,combined)
     if not candidates and exact is None:
         # PEP 592 permits a historical yanked release *only if* no compatible
         # active release satisfies these exact constraints and target tags.
@@ -5751,8 +5837,7 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
         # exception, an unverified replacement dependency or a silent omission.
         withdrawn=[row for row in _registry_release_candidates(name,target,release_cache,allow_yanked=True)
                    if row[1]['item'].get('yanked') is True]
-        admitted=set(combined.filter([row[0] for row in withdrawn],prereleases=None))
-        candidates=[row for row in withdrawn if allowed(row)]
+        candidates=_admitted_pip_versions(pool,withdrawn,combined)
         if candidates:
             print('[pool] WARNING: '+name+' has no compatible non-yanked PyPI release '
                   'for this target and active constraints; selecting a withdrawn '
