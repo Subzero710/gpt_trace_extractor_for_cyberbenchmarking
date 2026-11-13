@@ -34,6 +34,7 @@ import tomllib
 import urllib.parse
 import urllib.request
 import http.client
+import socket
 import ssl
 import tarfile
 import zipfile
@@ -469,12 +470,17 @@ def _retryable_network_error(exc):
         return exc.code in DOWNLOAD_RETRY_HTTP
     if isinstance(exc, ssl.SSLCertVerificationError):
         return False
+    # The direct HTTPS metadata transport raises socket.gaierror, not URLError.
+    # Only EAI_AGAIN is transient; an absent name must remain a hard failure.
+    if isinstance(exc, socket.gaierror):
+        return exc.errno == socket.EAI_AGAIN
     if isinstance(exc, (TimeoutError, ConnectionError, http.client.IncompleteRead,
                         http.client.BadStatusLine, ssl.SSLEOFError)):
         return True
     if isinstance(exc, urllib.error.URLError):
         reason=exc.reason
         if isinstance(reason, ssl.SSLCertVerificationError): return False
+        if isinstance(reason, socket.gaierror): return reason.errno == socket.EAI_AGAIN
         return isinstance(reason, (TimeoutError, ConnectionError, OSError))
     return False
 

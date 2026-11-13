@@ -1713,6 +1713,65 @@ class TestResolverConcurrency(unittest.TestCase):
         self.assertEqual(calls,['produce'])
 
 
+
+class TestTemporaryDnsFailureRetries(unittest.TestCase):
+    def test_direct_eai_again_is_retried_through_https_metadata_transport(self):
+        url = 'https://pypi.org/pypi/dns-retry-fixture/json'
+        transient = pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure')
+        with patch.object(pool, '_read_expected_https_once',
+                          side_effect=[transient, b'{"name":"dns-retry-fixture"}']) as reader, \
+             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool.time, 'sleep') as sleeper:
+            response = pool._read_https(url, timeout=90, limit=1024,
+                                        user_agent='test', expected_host='pypi.org')
+        self.assertEqual(response, b'{"name":"dns-retry-fixture"}')
+        self.assertEqual(reader.call_count, 2)
+        sleeper.assert_called_once_with(pool.DOWNLOAD_RETRY_BACKOFF[0])
+
+    def test_permanent_dns_error_fails_without_retry_direct_and_wrapped(self):
+        url = 'https://pypi.org/pypi/dns-noname-fixture/json'
+        for exception in (
+            pool.socket.gaierror(pool.socket.EAI_NONAME, 'name does not exist'),
+            pool.urllib.error.URLError(
+                pool.socket.gaierror(pool.socket.EAI_NONAME, 'name does not exist')),
+        ):
+            with self.subTest(exception=type(exception).__name__), \
+                 patch.object(pool, '_read_expected_https_once', side_effect=exception) as reader, \
+                 patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+                 patch.object(pool.time, 'sleep') as sleeper, \
+                 self.assertRaises(type(exception)):
+                pool._read_https(url, timeout=90, limit=1024,
+                                 user_agent='test', expected_host='pypi.org')
+            self.assertEqual(reader.call_count, 1)
+            sleeper.assert_not_called()
+
+    def test_wrapped_transient_dns_error_uses_same_retry_budget(self):
+        url = 'https://pypi.org/pypi/dns-wrapped-fixture/json'
+        failure = pool.urllib.error.URLError(
+            pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure'))
+        with patch.object(pool, '_read_expected_https_once',
+                          side_effect=[failure, b'{}']) as reader, \
+             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool.time, 'sleep') as sleeper:
+            self.assertEqual(pool._read_https(url, timeout=90, limit=1024,
+                             user_agent='test', expected_host='pypi.org'), b'{}')
+        self.assertEqual(reader.call_count, 2)
+        sleeper.assert_called_once_with(pool.DOWNLOAD_RETRY_BACKOFF[0])
+
+    def test_transient_dns_failure_stops_at_configured_retry_budget(self):
+        url = 'https://pypi.org/pypi/dns-budget-fixture/json'
+        failure = pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure')
+        with patch.object(pool, '_read_expected_https_once', side_effect=failure) as reader, \
+             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool.time, 'sleep') as sleeper, \
+             self.assertRaises(pool.socket.gaierror):
+            pool._read_https(url, timeout=90, limit=1024,
+                             user_agent='test', expected_host='pypi.org')
+        self.assertEqual(reader.call_count, pool.DOWNLOAD_ATTEMPTS)
+        self.assertEqual(sleeper.call_args_list,
+                         [((delay,), {}) for delay in pool.DOWNLOAD_RETRY_BACKOFF])
+
+
 class TestNetworkRetries(unittest.TestCase):
     class Response:
         def __init__(self, url, events, headers=None):
