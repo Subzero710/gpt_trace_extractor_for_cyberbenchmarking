@@ -944,4 +944,38 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(grading).hexdigest(), pins["upstream_files"]["grading.py"])
 
 
+class HybridCgroupMembershipTests(unittest.TestCase):
+    def test_monitor_accepts_v1_legacy_line_only_when_v2_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            mount = Path(temp) / "cgroup"
+            owned = mount / "system.slice" / "broker.service" / "prep-owned"
+            owned.mkdir(parents=True)
+            (owned / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+            proc = Path(temp) / "proc"
+            pid = os.getpid()
+            member = proc / str(pid)
+            member.mkdir(parents=True)
+            cgroup = member / "cgroup"
+            expected = "0::/" + owned.relative_to(mount).as_posix()
+            stamp = {"pid": pid}
+            state = {"worker": stamp, "scope": {"boot_id": "test-boot", "closed": False}}
+            fake_jobs = SimpleNamespace(PROC=proc, same_process=lambda value: value is stamp,
+                                        boot_id=lambda: "test-boot")
+            with patch.object(resources, "MOUNT", mount), \
+                 patch.object(resources, "_directory", side_effect=lambda path: path), \
+                 patch.object(resources, "_jobs", return_value=fake_jobs), \
+                 patch.object(resources.JobScope, "path", return_value=owned):
+                cgroup.write_text("1:net_cls:/\n" + expected + "\n")
+                self.assertTrue(resources.JobScope.leader_active(state))
+                cgroup.write_text("1:net_cls:/\n0::/other-scope\n")
+                with self.assertRaisesRegex(RuntimeError, "outside its verified cgroup"):
+                    resources.JobScope.leader_active(state)
+                cgroup.write_text(expected + "\n" + expected + "\n")
+                with self.assertRaisesRegex(RuntimeError, "outside its verified cgroup"):
+                    resources.JobScope.leader_active(state)
+                cgroup.write_text("1:net_cls:/\n")
+                with self.assertRaisesRegex(RuntimeError, "outside its verified cgroup"):
+                    resources.JobScope.leader_active(state)
+
+
 if __name__ == "__main__": unittest.main()

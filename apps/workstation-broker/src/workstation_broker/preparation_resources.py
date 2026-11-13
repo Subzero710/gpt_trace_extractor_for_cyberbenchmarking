@@ -105,7 +105,12 @@ class JobScope:
         # a recycled PID or exiting leader cannot authorize a running report.
         if not _jobs().same_process(stamp):
             return False
-        if membership != [expected]:
+        # /proc/PID/cgroup may also contain entries from legacy v1 hierarchies.
+        # Only hierarchy 0 describes cgroup v2 membership. Require precisely
+        # one v2 record matching the owned delegated scope; never accept an
+        # unrelated v2 scope or duplicate record.
+        unified = [entry for entry in membership if entry.startswith('0::')]
+        if unified != [expected]:
             raise RuntimeError('live preparation worker is outside its verified cgroup; preserved')
         events = dict(line.split() for line in (path / 'cgroup.events').read_text().splitlines())
         if events.get('populated') != '1':
