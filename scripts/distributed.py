@@ -512,7 +512,7 @@ class _FetchBar:
         received = network + pip
         # Once a stage has displayed download throughput, keep that metric
         # visible even when a burst finishes or pip_active returns to zero.
-        self.stage_has_transfer |= received > 0
+        self.stage_has_transfer |= received > 0 or progress['pip_active'] > 0
         # A byte-counter reset invalidates the old sampling window rather than
         # manufacturing positive throughput from a discontinuous counter.
         if self.byte_samples and received < self.byte_samples[-1][1]:
@@ -565,6 +565,7 @@ class _FetchBar:
 
         metric = ''
         suffix = ''
+        activity = ''
         if self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
             transferred = self.last['network_bytes'] + self.last['pip_bytes']
             bytes_per_second = max(0.0, self._rate(self.byte_samples))
@@ -575,8 +576,8 @@ class _FetchBar:
                 metric += f' | {bytes_per_second / 1048576:.2f} MiB/s'
             if completed is not None and unit:
                 metric += f' | {units_per_minute:.1f} {unit}/min'
-            if progress is not None and progress['pip_active']:
-                metric += f" | {progress['pip_active']} opérations Pip actives"
+            if self.last['pip_active']:
+                activity = f" | {self.last['pip_active']} pip actifs"
             if transferred:
                 suffix = f' | {transferred / 1048576:.1f} MiB reçus'
         if not metric and self.stage_started is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
@@ -590,7 +591,9 @@ class _FetchBar:
             columns = shutil.get_terminal_size((100, 24)).columns
             available = max(1, columns - 1)
             def bar_capacity():
-                return available - len(f'fetch | {stage} [] {label}{metric}{suffix}')
+                return available - len(f'fetch | {stage} [] {label}{metric}{suffix}{activity}')
+            if bar_capacity() < 2:
+                activity = ''
             if bar_capacity() < 2 and type(completed) is int and type(total) is int and total > 0 and unit:
                 # The work-rate metric already identifies the unit.
                 label = f'{completed}/{total} ({100 * min(1.0, completed / total):.1f}%)'
@@ -606,7 +609,7 @@ class _FetchBar:
             else:
                 filled = width if total == 0 and type(completed) is int else 0
         bar = '[' + '#' * filled + '-' * (width - filled) + ']'
-        text = f'fetch | {stage} {bar} {label}{metric}{suffix}'
+        text = f'fetch | {stage} {bar} {label}{metric}{suffix}{activity}'
         if self.tty:
             text = text[:max(1, columns - 1)]
             if text != self.previous:
