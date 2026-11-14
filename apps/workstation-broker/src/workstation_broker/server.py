@@ -997,6 +997,11 @@ def create_app(broker: Broker) -> Starlette:
                 if record["state"] == "failed":
                     response["detail"] = record["error"]
                 return JSONResponse(response)
+            if action == "template_preparation_status":
+                manager = getattr(broker, "preparations", None)
+                if manager is None:
+                    raise RuntimeError("native administrative preparation manager is unavailable")
+                return JSONResponse(await asyncio.to_thread(manager.status, payload))
             if action == "begin_async":
                 async with operation_lock:
                     if getattr(broker, "draining", False):
@@ -1067,7 +1072,7 @@ def create_app(broker: Broker) -> Starlette:
                 if action == "shutdown_status":
                     from workstation_broker.shutdown_observer import pending_status
                     return JSONResponse(pending_status(payload))
-                if action in {"template_preparation_probe", "prepare_templates", "template_preparation_status", "throw_template_storage"}:
+                if action in {"template_preparation_probe", "prepare_templates", "throw_template_storage"}:
                     manager = getattr(broker, "preparations", None)
                     if manager is None: raise RuntimeError("native administrative preparation manager is unavailable")
                     if action == "throw_template_storage":
@@ -1080,7 +1085,7 @@ def create_app(broker: Broker) -> Starlette:
                     if action == "prepare_templates":
                         await reject_runtime_for_template_preparation()
                     handler = {"template_preparation_probe": manager.probe,
-                        "prepare_templates": manager.start, "template_preparation_status": manager.status}[action]
+                        "prepare_templates": manager.start}[action]
                     return JSONResponse(await asyncio.to_thread(handler, payload))
                 if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
                 if action == "inventory": return JSONResponse(inventory(broker))

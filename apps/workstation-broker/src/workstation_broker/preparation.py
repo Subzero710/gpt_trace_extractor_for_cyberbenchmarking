@@ -7,6 +7,7 @@ is rediscovered by ID; only an explicit later fetch may retry a proved-dead job.
 """
 from __future__ import annotations
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -14,10 +15,12 @@ import importlib.util
 import json
 import logging
 import os
+import select
 import shutil
 import signal
 import subprocess
 import stat
+import struct
 import sys
 import time
 import tomllib
@@ -360,6 +363,109 @@ def generation_signature(root, base, generation):
     return result
 
 
+class _PreparationSnapshotEvents:
+    """Wait on named atomic publications without polling workers or holding locks."""
+
+    _MOVED_TO = 0x00000080
+    _CREATE = 0x00000100
+    _DELETE = 0x00000200
+    _ATTRIB = 0x00000004
+    _DELETE_SELF = 0x00000400
+    _MOVE_SELF = 0x00000800
+    _Q_OVERFLOW = 0x00004000
+    _IGNORED = 0x00008000
+    _WATCH_MASK = (_MOVED_TO | _CREATE | _DELETE | _ATTRIB |
+                   _DELETE_SELF | _MOVE_SELF)
+
+    def __init__(self, root, pool_root, operation_id, attempt):
+        stage_name = 'incoming-' + operation_id + '-' + str(attempt)
+        stage = pool_root / stage_name
+        self.paths = (
+            (root / operation_id, b'state.json'),
+            (pool_root, os.fsencode(stage_name)),
+            (stage, b'metadata'),
+            (stage / 'metadata', b'fetch-progress.json'),
+        )
+        self.api = ctypes.CDLL(None, use_errno=True)
+        self.api.inotify_init1.argtypes = [ctypes.c_int]
+        self.api.inotify_init1.restype = ctypes.c_int
+        self.api.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self.api.inotify_add_watch.restype = ctypes.c_int
+        self.fd = self.api.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+        if self.fd < 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+        self.watches = {}
+        self.poller = select.poll()
+        self.poller.register(self.fd, select.POLLIN)
+
+    def __enter__(self):
+        try:
+            self.refresh()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        os.close(self.fd)
+
+    def refresh(self):
+        for directory, name in self.paths:
+            if directory in self.watches:
+                continue
+            if directory.is_symlink():
+                raise RuntimeError('untrusted preparation progress watch directory')
+            if not directory.is_dir():
+                continue
+            watch_id = self.api.inotify_add_watch(
+                self.fd, os.fsencode(directory), self._WATCH_MASK)
+            if watch_id < 0:
+                code = ctypes.get_errno()
+                if code == errno.ENOENT:
+                    continue
+                raise OSError(code, os.strerror(code), str(directory))
+            self.watches[directory] = (watch_id, name)
+
+    def changed(self, seconds):
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            ready = self.poller.poll(max(1, int(remaining * 1000)))
+            if not ready:
+                return False
+            if any(mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL)
+                   for _descriptor, mask in ready):
+                raise RuntimeError('preparation inotify observation failed')
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                continue
+            offset = 0
+            watched_names = {number: name for number, name in self.watches.values()}
+            while offset < len(events):
+                if len(events) - offset < 16:
+                    raise RuntimeError('truncated preparation inotify event')
+                watch_id, mask, _cookie, length = struct.unpack_from('iIII', events, offset)
+                offset += 16
+                if offset + length > len(events):
+                    raise RuntimeError('invalid preparation inotify event size')
+                name = events[offset:offset + length].split(b'\0', 1)[0]
+                offset += length
+                if mask & self._IGNORED:
+                    for directory, (number, _wanted) in tuple(self.watches.items()):
+                        if number == watch_id:
+                            del self.watches[directory]
+                    return True
+                if mask & (self._Q_OVERFLOW | self._DELETE_SELF | self._MOVE_SELF):
+                    return True
+                if (watch_id in watched_names and name == watched_names[watch_id]
+                        and mask & (self._MOVED_TO | self._CREATE |
+                                    self._DELETE | self._ATTRIB)):
+                    return True
+
 class PreparationManager:
     def __init__(self, base, template_root, templates, *, source_root=ROOT, deployment=None):
         self.base, self.template_root, self.templates = Path(base), Path(template_root), templates
@@ -662,22 +768,62 @@ class PreparationManager:
         verify_published_inventory(folder, state, result)
         return state
 
-    def status(self, payload):
-        if set(payload) != {"operation_id"}: raise ValueError("invalid preparation status fields")
-        operation_id = identifier(payload["operation_id"])
+    def _status_now(self, operation_id):
         with self.lock():
             state = self._read(operation_id)
-            if state is None: return {"operation_id": operation_id, "phase": "not_started", "deployment": self.deployment}
-            # A running worker has a durable identity and a verified kernel
-            # cgroup. Polling does not need a process/container census; doing so
-            # for every read creates races with unrelated short-lived workers.
+            if state is None:
+                return {"operation_id": operation_id, "phase": "not_started",
+                        "deployment": self.deployment}
             if (state['phase'] in {'starting', 'running', 'validating'}
                     and JobScope.leader_active(state)):
                 return self._public(state)
             state = self._reconcile(state)
-            if state["phase"] == "ready":
+            if state['phase'] == 'ready':
                 state = self._verify_ready(state)
             return self._public(state)
+
+    @staticmethod
+    def _status_observation(status):
+        return {field: status.get(field) for field in ('phase', 'attempt', 'progress')}
+
+    def status(self, payload):
+        """Wait for a newly published progress or state event via inotify."""
+        if set(payload) not in ({'operation_id'}, {'operation_id', 'after'}):
+            raise ValueError('invalid preparation status fields')
+        operation_id = identifier(payload['operation_id'])
+        if 'after' not in payload:
+            return self._status_now(operation_id)
+        after = payload['after']
+        if (not isinstance(after, dict) or set(after) != {'phase', 'attempt', 'progress'}
+                or after['phase'] not in {'starting', 'running', 'validating'}
+                or type(after['attempt']) is not int or after['attempt'] < 1
+                or after['progress'] is not None and not isinstance(after['progress'], dict)
+                or len(canonical(after)) > 8192):
+            raise ValueError('invalid preparation progress observation')
+        policy = self.source_root / 'config/preparation.toml'
+        if policy.is_symlink() or not policy.is_file():
+            raise RuntimeError('missing versioned preparation observation policy')
+        with policy.open('rb') as stream:
+            acquisition = tomllib.load(stream)['acquisition']
+        interval = acquisition['progress_interval_seconds']
+        read_timeout = acquisition['broker_read_timeout_seconds']
+        if (type(interval) is not int or interval < 1
+                or type(read_timeout) is not int or read_timeout <= 1):
+            raise RuntimeError('invalid versioned preparation observation controls')
+        deadline = time.monotonic() + min(interval, read_timeout / 2)
+        with _PreparationSnapshotEvents(self.root, self.base.parent / 'dependency-pool',
+                                        operation_id, after['attempt']) as events:
+            while True:
+                latest = self._status_now(operation_id)
+                if (self._status_observation(latest) != after
+                        or latest['phase'] not in {'starting', 'running', 'validating'}):
+                    return latest
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return latest
+                if events.changed(remaining):
+                    events.refresh()
+
 
     def start(self, payload):
         if set(payload) != {"operation_id", "compatibility", "retry"} or type(payload["retry"]) is not bool:

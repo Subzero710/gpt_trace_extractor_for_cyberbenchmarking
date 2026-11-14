@@ -512,7 +512,7 @@ class _FetchBar:
         received = network + pip
         # Once a stage has displayed download throughput, keep that metric
         # visible even when a burst finishes or pip_active returns to zero.
-        self.stage_has_transfer |= received > 0 or progress['pip_active'] > 0
+        self.stage_has_transfer |= received > 0
         # A byte-counter reset invalidates the old sampling window rather than
         # manufacturing positive throughput from a discontinuous counter.
         if self.byte_samples and received < self.byte_samples[-1][1]:
@@ -575,6 +575,8 @@ class _FetchBar:
                 metric += f' | {bytes_per_second / 1048576:.2f} MiB/s'
             if completed is not None and unit:
                 metric += f' | {units_per_minute:.1f} {unit}/min'
+            if progress is not None and progress['pip_active']:
+                metric += f" | {progress['pip_active']} opérations Pip actives"
             if transferred:
                 suffix = f' | {transferred / 1048576:.1f} MiB reçus'
         if not metric and self.stage_started is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
@@ -684,9 +686,13 @@ def preparation_fetch(cfg, *, fetch_source=None):
     started = False
     source_fetched = False
     last_attempt = None
+    observed = None
     try:
         while True:
-            status = broker_read_resilient(cfg, "template_preparation_status", {"operation_id": operation_id}, quiet=True)
+            request = {'operation_id': operation_id}
+            if observed is not None:
+                request['after'] = observed
+            status = broker_read_resilient(cfg, 'template_preparation_status', request, quiet=True)
             if status.get("operation_id") != operation_id or status.get("deployment") != deployment:
                 raise RuntimeError("preparation status identity differs")
             phase = status.get("phase")
@@ -745,7 +751,8 @@ def preparation_fetch(cfg, *, fetch_source=None):
                         raise
             elif phase not in {"starting", "running", "validating"}:
                 raise RuntimeError("unknown preparation phase: " + str(phase))
-            time.sleep(2)
+            observed = {'phase': phase, 'attempt': attempt,
+                        'progress': status.get('progress')}
     except TransportFailure as exc:
         raise RuntimeError("preparation " + operation_id + " has an unconfirmed remote outcome: " + str(exc) +
             "; rerun make superbench-fetch ADAPTER=swe-gym-lite to rediscover it; no mutation was blindly retried") from exc

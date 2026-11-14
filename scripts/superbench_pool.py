@@ -155,6 +155,8 @@ class _PoolProgress:
         self.transfers = {}
         self.pip_bytes = 0
         self.pip_active = 0
+        self._pip_transfer_active = 0
+        self._pip_closure_active = 0
         self.pip_file = None
         self.last_time = time.monotonic()
         self.last_bytes = 0
@@ -320,8 +322,20 @@ class _PoolProgress:
     def pip_update(self, snapshot):
         with self.lock:
             self.pip_bytes = snapshot['bytes']
-            self.pip_active = snapshot['jobs']
+            self._pip_transfer_active = snapshot['jobs']
+            self.pip_active = self._pip_transfer_active + self._pip_closure_active
             self.pip_file = snapshot['file']
+            self._emit()
+
+    def closure_activity(self, delta):
+        if type(delta) is not int or delta not in (-1, 1):
+            raise RuntimeError('invalid native pip closure activity update')
+        with self.lock:
+            active = self._pip_closure_active + delta
+            if active < 0:
+                raise RuntimeError('native pip closure activity underflow')
+            self._pip_closure_active = active
+            self.pip_active = self._pip_transfer_active + active
             self._emit()
 
     def finish(self):
@@ -6518,9 +6532,18 @@ def acquire_pip_groups(pool, groups):
             cache['metadata_prefetch']=_metadata_prefetch_width(workers,metadata_workers)
             cache['prefetch_controller']=_ResolverActivity(metadata_workers)
         try:
+            def monitored_closure(key, group):
+                if _POOL_PROGRESS is None:
+                    return acquire_pip_group(pool, key, group)
+                _POOL_PROGRESS.closure_activity(1)
+                try:
+                    return acquire_pip_group(pool, key, group)
+                finally:
+                    _POOL_PROGRESS.closure_activity(-1)
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                     thread_name_prefix='verified-pip-closure') as executor:
-                futures={executor.submit(acquire_pip_group,pool,key,group):key
+                futures={executor.submit(monitored_closure,key,group):key
                          for key,group in ordered}
                 errors=[];done=0
                 for future in concurrent.futures.as_completed(futures):
