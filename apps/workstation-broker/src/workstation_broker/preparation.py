@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import signal
@@ -434,7 +435,7 @@ class PreparationManager:
         atomic_json(self._path(state["operation_id"]), {**state, "updated_at": time.time()}, 0o600)
 
     def _progress(self, state):
-        """Read a bounded atomic snapshot, never parse or relay worker stdout."""
+        """Read a verified atomic snapshot, retrying only a proven inode replacement."""
         attempt = state.get('attempt')
         operation_id = state.get('operation_id')
         if type(attempt) is not int or attempt < 1 or not isinstance(operation_id, str):
@@ -445,27 +446,106 @@ class PreparationManager:
                 or not metadata.is_dir() or metadata.is_symlink()):
             return None
         path = metadata/'fetch-progress.json'
-        if path.is_symlink():
-            raise RuntimeError('untrusted fetch progress symlink')
-        if not path.exists():
-            return None
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        owner = stage.stat().st_uid
+        logger = logging.getLogger(__name__)
+
+        def attributes(info):
+            return {'device': info.st_dev, 'inode': info.st_ino,
+                    'uid': info.st_uid, 'gid': info.st_gid,
+                    'mode': oct(stat.S_IMODE(info.st_mode)),
+                    'regular': stat.S_ISREG(info.st_mode),
+                    'links': info.st_nlink, 'size': info.st_size}
+
+        def reject(message, reason, **values):
+            logger.error('fetch progress snapshot rejected: operation_id=%s '
+                         'attempt=%s reason=%s rejected_values=%r',
+                         operation_id, attempt, reason, values)
+            raise RuntimeError(message)
+
         try:
-            info = os.fstat(descriptor)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or info.st_uid != stage.stat().st_uid
-                    or info.st_mode & 0o077 or info.st_size > 8192):
-                raise RuntimeError('untrusted fetch progress snapshot')
-            with os.fdopen(descriptor, 'rb', closefd=False) as stream:
-                value = stream.read(8193)
-        finally:
-            os.close(descriptor)
+            named = path.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(named.st_mode):
+            reject('untrusted fetch progress symlink', 'symlink',
+                   current=attributes(named), expected_uid=owner)
+
+        retry_deadline = None
+        while True:
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as exc:
+                reject('untrusted fetch progress snapshot', 'open_failed',
+                       errno=exc.errno, error=str(exc), expected_uid=owner)
+            try:
+                info = os.fstat(descriptor)
+                observed = attributes(info)
+                if (not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != owner
+                        or info.st_mode & 0o077
+                        or info.st_size > 8192
+                        or info.st_nlink not in (0, 1)):
+                    reject('untrusted fetch progress snapshot', 'file_attributes',
+                           opened=observed, expected_uid=owner,
+                           expected_mode='owner-only', expected_links=1,
+                           maximum_size=8192)
+
+                if info.st_nlink == 0:
+                    # os.replace() unlinks the previously named inode. The open
+                    # descriptor can legitimately observe zero links. Never accept
+                    # that descriptor: prove a different trusted inode is now
+                    # published, then reopen it and repeat every security check.
+                    try:
+                        current = path.lstat()
+                    except OSError as exc:
+                        reject('untrusted fetch progress snapshot',
+                               'detached_inode_without_replacement',
+                               opened=observed, errno=exc.errno, error=str(exc))
+                    replacement = attributes(current)
+                    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                            or current.st_uid != owner or current.st_mode & 0o077
+                            or current.st_size > 8192
+                            or (info.st_dev, info.st_ino) == (current.st_dev, current.st_ino)):
+                        reject('untrusted fetch progress snapshot',
+                               'invalid_replacement_inode', opened=observed,
+                               current=replacement, expected_uid=owner)
+                    if retry_deadline is None:
+                        policy = self.source_root / 'config/preparation.toml'
+                        if policy.is_symlink() or not policy.is_file():
+                            raise RuntimeError('missing versioned broker read controls')
+                        with policy.open('rb') as stream:
+                            read_seconds = tomllib.load(stream)['acquisition']['broker_read_timeout_seconds']
+                        if type(read_seconds) is not int or read_seconds < 1:
+                            raise RuntimeError('invalid versioned broker read timeout')
+                        retry_deadline = time.monotonic() + read_seconds
+                        logger.warning('fetch progress snapshot inode replaced during read: '
+                                       'operation_id=%s attempt=%s opened=%r current=%r',
+                                       operation_id, attempt, observed, replacement)
+                    if time.monotonic() >= retry_deadline:
+                        reject('untrusted fetch progress snapshot',
+                               'replacement_did_not_stabilize_before_broker_read_deadline',
+                               opened=observed, current=replacement)
+                    continue
+
+                with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+                    value = stream.read(8193)
+            finally:
+                os.close(descriptor)
+            break
+
         if not value or len(value) > 8192:
-            raise RuntimeError('invalid fetch progress snapshot size')
-        data = json.loads(value)
-        if (not isinstance(data, dict) or set(data) != {
-                'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
-                'network_bytes', 'pip_bytes', 'pip_active'}
+            reject('invalid fetch progress snapshot size', 'payload_size',
+                   read_bytes=len(value), opened=observed, payload=value)
+        try:
+            data = json.loads(value)
+        except (ValueError, UnicodeError) as exc:
+            reject('invalid verified fetch progress data', 'json_decode',
+                   error_type=type(exc).__name__, error=str(exc), payload=value)
+        required = {
+            'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
+            'network_bytes', 'pip_bytes', 'pip_active'
+        }
+        if (not isinstance(data, dict) or set(data) != required
                 or data['schema'] != 1 or data['operation_id'] != operation_id
                 or not isinstance(data['stage'], str) or not 0 < len(data['stage']) <= 160
                 or not isinstance(data['unit'], str) or len(data['unit']) > 64
@@ -476,7 +556,9 @@ class PreparationManager:
                        for key in ('completed', 'total'))
                 or (data['completed'] is not None and data['total'] is not None
                     and data['completed'] > data['total'])):
-            raise RuntimeError('invalid verified fetch progress data')
+            reject('invalid verified fetch progress data', 'payload_validation',
+                   rejected_payload=data, expected_keys=sorted(required),
+                   expected_operation_id=operation_id, opened=observed)
         return data
 
     def _public(self, state):
