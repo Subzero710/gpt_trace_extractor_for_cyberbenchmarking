@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import socket
+import time
 import struct
 import subprocess
 import tempfile
@@ -41,6 +42,17 @@ META_NS = "urn:gpt-trace:workstation:3"
 BLOCKED_EGRESS = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
                   "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
                   "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4")
+
+
+def _broker_command_timeout():
+    source = Path(__file__).resolve().parents[4] / 'config/preparation.toml'
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('missing versioned broker command timeout')
+    with source.open('rb') as stream:
+        seconds = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(seconds) is not int or seconds < 1:
+        raise RuntimeError('invalid versioned broker command timeout')
+    return seconds
 
 
 def run(*args: str, input: bytes | None = None, ok: tuple[int, ...] = (0,)) -> bytes:
@@ -245,7 +257,7 @@ add rule inet {table} input iifname "{bridge}" drop
         if not re.fullmatch(r"[0-9a-f]{20}", key):
             raise ValueError("invalid workstation resource key")
         table = "gt_" + key
-        if subprocess.run(("nft", "list", "table", "inet", table), capture_output=True).returncode == 0:
+        if subprocess.run(("nft", "list", "table", "inet", table), capture_output=True, timeout=_broker_command_timeout()).returncode == 0:
             run("nft", "delete", "table", "inet", table)
 
     @classmethod
@@ -293,7 +305,7 @@ add rule inet {table} input iifname "{bridge}" drop
         elif not run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines().__contains__(network):
             raise ValueError("attempt network missing")
         if network is not None and require_firewall and subprocess.run(("nft", "list", "table", "inet", "gt_" + suffix(ident)),
-                                               capture_output=True).returncode != 0:
+                                               capture_output=True, timeout=_broker_command_timeout()).returncode != 0:
             raise ValueError("attempt egress firewall missing")
         return data
 
@@ -599,7 +611,7 @@ add rule inet {table} input iifname "{bridge}" drop
         name, network, directory = self._paths(ident)
         key = suffix(ident)
         firewall_present = subprocess.run(("nft", "list", "table", "inet", "gt_" + key),
-                                          capture_output=True).returncode == 0
+                                          capture_output=True, timeout=_broker_command_timeout()).returncode == 0
         if (directory.exists() or (directory / "disk").is_mount() or firewall_present
                 or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
                 or network in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()):
@@ -849,7 +861,15 @@ add rule inet {table} input iifname "{bridge}" drop
 
 def recv_exact(connection: socket.socket, length: int) -> bytes:
     result = bytearray()
+    socket_timeout = connection.gettimeout()
+    if socket_timeout is None or socket_timeout <= 0:
+        raise RuntimeError('guest transport requires a finite socket deadline')
+    deadline = time.monotonic() + socket_timeout
     while len(result) < length:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('guest response exceeded its socket deadline')
+        connection.settimeout(remaining)
         chunk = connection.recv(length - len(result))
         if not chunk:
             raise OSError("guest transport closed")

@@ -513,14 +513,95 @@ def _native_closure_remaining():
     return remaining
 
 
+@functools.lru_cache(maxsize=1)
+def _operation_timeout():
+    # A limit on each operation, never on the complete acquisition job.
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned acquisition timeout policy')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned operation timeout')
+    return value
+
+
+
+def _bounded_wait_seconds():
+    remaining = _native_closure_remaining()
+    return _operation_timeout() if remaining is None else min(remaining, _operation_timeout())
+
+
+def _bounded_completed(futures):
+    pending = set(futures)
+    while pending:
+        completed, pending = concurrent.futures.wait(
+            pending, timeout=_operation_timeout(),
+            return_when=concurrent.futures.FIRST_COMPLETED)
+        if not completed:
+            raise TimeoutError('concurrent acquisition made no completed-task progress')
+        yield from completed
+
+
+def _bounded_future_result(future):
+    return future.result(timeout=_bounded_wait_seconds())
+
+
+@contextlib.contextmanager
+def _bounded_lock(lock):
+    if not lock.acquire(timeout=_bounded_wait_seconds()):
+        raise TimeoutError('versioned acquisition lock deadline reached')
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+_NETWORK_CALL_DEADLINE = contextvars.ContextVar('fetch_network_call_deadline', default=None)
+
+
+def _network_remaining():
+    deadline = _NETWORK_CALL_DEADLINE.get()
+    if deadline is None:
+        raise RuntimeError('network operation has no mandatory monotonic deadline')
+    remaining = deadline - time.monotonic()
+    closure = _native_closure_remaining()
+    if closure is not None:
+        remaining = min(remaining, closure)
+    if remaining <= 0:
+        raise TimeoutError('dependency network operation exceeded versioned deadline')
+    return remaining
+
+
+@contextlib.contextmanager
+def _network_deadline():
+    deadline = time.monotonic() + _operation_timeout()
+    inherited = _NETWORK_CALL_DEADLINE.get()
+    if inherited is not None:
+        deadline = min(deadline, inherited)
+    closure = _NATIVE_CLOSURE_DEADLINE.get()
+    if closure is not None:
+        deadline = min(deadline, closure)
+    token = _NETWORK_CALL_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _NETWORK_CALL_DEADLINE.reset(token)
+
+
 def _network_retry(label, operation, *, cleanup=None):
+    with _network_deadline():
+        return _bounded_network_retry(label, operation, cleanup=cleanup)
+
+
+def _bounded_network_retry(label, operation, *, cleanup=None):
     for attempt in range(1, DOWNLOAD_ATTEMPTS+1):
-        _native_closure_remaining()
+        _network_remaining()
         if cleanup is not None: cleanup()
         try:
             slots = _network_slots()
             remaining = _native_closure_remaining()
-            acquired = slots.acquire() if remaining is None else slots.acquire(timeout=remaining)
+            acquired = slots.acquire(timeout=_bounded_wait_seconds())
             if not acquired:
                 raise TimeoutError('native Pip closure exceeded network-slot deadline')
             try:
@@ -572,13 +653,27 @@ def _read_metadata_response(response, limit):
     if length.isdigit() and int(length)>limit:
         raise RuntimeError('HTTPS response exceeds limit')
     if encoding in ('','identity'):
-        raw=response.read(limit+1)
+        chunks=[];count=0
+        while count <= limit:
+            _network_remaining()
+            block=response.read(min(1048576,limit+1-count))
+            if not block:
+                break
+            chunks.append(block);count+=len(block)
+        raw=b''.join(chunks)
         if length.isdigit() and len(raw) != int(length):
             raise MetadataDecodeError('truncated HTTPS metadata response')
     elif encoding=='gzip':
         try:
+            chunks=[];count=0
             with gzip.GzipFile(fileobj=response,mode='rb') as stream:
-                raw=stream.read(limit+1)
+                while count <= limit:
+                    _network_remaining()
+                    block=stream.read(min(1048576,limit+1-count))
+                    if not block:
+                        break
+                    chunks.append(block);count+=len(block)
+            raw=b''.join(chunks)
         except (OSError,EOFError) as exc:
             raise MetadataDecodeError('invalid gzip HTTPS metadata response') from exc
     else:
@@ -615,11 +710,13 @@ def _open_https(request, *, timeout, expected_host=None):
     remaining = _native_closure_remaining()
     if remaining is not None:
         timeout = min(timeout, remaining)
-    return urllib.request.build_opener(_ValidatedHTTPSRedirect(expected_host)).open(request,timeout=timeout)
+    return urllib.request.build_opener(_ValidatedHTTPSRedirect(expected_host)).open(
+        request,timeout=min(timeout, _network_remaining()))
 
 
 def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
     parsed=_validate_https_endpoint(url,expected_host)
+    _network_remaining()
     remaining = _native_closure_remaining()
     if remaining is not None:
         timeout = min(timeout, remaining)
@@ -683,6 +780,7 @@ def _read_https(url, *, timeout, limit, user_agent, expected_host=None, accept=N
         raise RuntimeError('untrusted HTTPS endpoint: '+str(url))
     label=(parsed.hostname or '')+parsed.path
     def read_once():
+        _network_remaining()
         if expected_host is not None:
             return _read_expected_https_once(
                 url,timeout=timeout,limit=limit,user_agent=user_agent,expected_host=expected_host,
@@ -722,7 +820,11 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                 view.network_start(transfer_key, path.name, int(declared) if declared.isdigit() else 0)
             try:
                 with path.open('xb') as stream:
-                    for block in iter(lambda:response.read(1048576),b''):
+                    while True:
+                        _network_remaining()
+                        block = response.read(1048576)
+                        if not block:
+                            break
                         size+=len(block)
                         if size>limit: raise RuntimeError('download exceeds limit; partial retained')
                         stream.write(block); h.update(block)
@@ -790,7 +892,7 @@ class _StaticGitReadCache:
                 pending.set_exception(exc)
             else:
                 pending.set_result(oid)
-        return pending.result()
+        return _bounded_future_result(pending)
 
     def _blob(self, mirror, oid):
         key = (str(mirror), oid)
@@ -825,7 +927,7 @@ class _StaticGitReadCache:
                         self.blobs[key] = content
                         self.blob_bytes += size
                 pending.set_result(content)
-        return pending.result()
+        return _bounded_future_result(pending)
 
     def read(self, mirror, commit, path, *, required=False):
         path = path.removeprefix('./')
@@ -967,7 +1069,7 @@ def _git_has_commit(folder, commit):
         raise RuntimeError('invalid pinned Git commit')
     return subprocess.run(
         ['git','--git-dir',str(folder),'cat-file','-e',str(commit)+'^{commit}'],
-        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=_operation_timeout()).returncode==0
 
 
 def _git_tree_closure_issue(folder, commits):
@@ -1098,8 +1200,8 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
                                                thread_name_prefix=label+'-mirror') as executor:
         futures=[executor.submit(acquire,repo,commits) for repo,commits in ordered]
         try:
-            for future in concurrent.futures.as_completed(futures):
-                repo,mirror,version_refs=future.result()
+            for future in _bounded_completed(futures):
+                repo,mirror,version_refs=_bounded_future_result(future)
                 results[repo]=mirror;refs[repo]=version_refs
                 _pool_progress(phase,len(results),len(ordered),'repositories',f'{workers} workers')
         except BaseException:
@@ -2655,7 +2757,7 @@ class Pool:
         """Reuse a digest only while the verified file identity remains unchanged."""
         if not isinstance(sha, str) or not SHA.fullmatch(sha):
             raise RuntimeError('invalid CAS SHA-256 identity')
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             target = self.objects / sha[:2] / sha
             if target.parent.is_symlink():raise RuntimeError('unsafe CAS directory')
             info = target.lstat()
@@ -2680,7 +2782,7 @@ class Pool:
         large, unchanged archives again merely because their link count grew.
         """
         destination = Path(destination)
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             self.verify_object(sha)
             source = self.objects / sha[:2] / sha
             if destination.is_symlink():
@@ -2696,7 +2798,7 @@ class Pool:
         return destination
 
     def reference(self, sha, category, identity, size):
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             target = self.objects / sha[:2] / sha
             if self.verify_object(sha) != size:
                 raise RuntimeError('missing/invalid content-addressed dependency')
@@ -2720,7 +2822,7 @@ class Pool:
         if not SHA.fullmatch(sha):
             raise RuntimeError('invalid artifact SHA-256')
         size = path.stat().st_size
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             target = self.objects / sha[:2] / sha
             target.parent.mkdir(exist_ok=True)
             if not target.exists():
@@ -2743,7 +2845,7 @@ class Pool:
         The broker alone performs final verification and publishes ready/.
         """
         path = Path(path)
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             self.verify_object(sha)
             target = self.objects / sha[:2] / sha
             if path.samefile(target):
@@ -2767,7 +2869,7 @@ class Pool:
         if sha is not None:
             identities.add(('sha256', sha))
         identities.update((algorithm, value.hex()) for algorithm, value in (sri_parts(sri) or ()))
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             locks = [self._download_locks.setdefault(key, threading.Lock())
                      for key in sorted(identities)]
         with contextlib.ExitStack() as stack:
@@ -2785,7 +2887,7 @@ class Pool:
         if sha is not None and not SHA.fullmatch(str(sha)):
             raise RuntimeError('invalid expected artifact SHA-256')
         sri_value = tuple(sri_parts(sri) or ())
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             cached = None
             if sha is not None and (self.objects / sha[:2] / sha).is_file():
                 cached = sha
@@ -2806,7 +2908,7 @@ class Pool:
                 raise RuntimeError('conflicting expected checksum for existing download URL/SRI')
             target = self.objects / cached[:2] / cached
             matched_sri = verify_sri(target, sri) if sri_value else ()
-            with self._state_lock:
+            with _bounded_lock(self._state_lock):
                 self.verified_objects.add(cached)
                 if sri_value:
                     self.sri_verified.update((cached, part) for part in matched_sri)
@@ -2844,7 +2946,7 @@ class Pool:
         matched_sri = verify_sri(raw, sri) if sri_value else ()
         self.put(raw, category, identity, verified_sha=actual)
         self.coalesce_stage_file(raw, actual)
-        with self._state_lock:
+        with _bounded_lock(self._state_lock):
             self.by_url[url] = actual
             for algo, binary in [('sha256', bytes.fromhex(actual)), *known_hashes.items()]:
                 token = (algo, binary)
@@ -3239,7 +3341,7 @@ def acquire_locked_conda(pool,lock):
                     pending,timeout=progress.interval,return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in finished:
                     if future.cancelled():continue
-                    try:future.result()
+                    try:_bounded_future_result(future)
                     except BaseException as exc:
                         if first_error is None:first_error=exc
                 if first_error is not None:
@@ -3309,7 +3411,8 @@ def apt_closure(pool,packages):
         raise RuntimeError('Kali signing key fingerprint differs')
     ring=apt/'kali.gpg'
     with ring.open('xb') as output:
-        subprocess.run(['gpg','--dearmor'],input=key_path.read_bytes(),stdout=output,check=True)
+        subprocess.run(['gpg','--dearmor'],input=key_path.read_bytes(),stdout=output,check=True,
+                   timeout=_operation_timeout())
     sources=apt/'sources.list'
     write_new(sources,'deb [arch='+deb_arch+' signed-by='+str(ring)+'] https://http.kali.org/kali kali-last-snapshot main contrib non-free non-free-firmware\n')
     golden=Path(__file__).resolve().parents[1]/'golden-packages.txt'
@@ -3457,7 +3560,7 @@ class _SingleFlightCache:
             if owner:
                 future=concurrent.futures.Future()
                 self._pending[key]=future
-        if not owner:return future.result()
+        if not owner:return _bounded_future_result(future)
         try:
             value=producer()
         except BaseException as exc:
@@ -3500,7 +3603,7 @@ class _BoundedCoreMetadataCache:
                 future = concurrent.futures.Future()
                 self._pending[key] = future
         if not owner:
-            return future.result()
+            return _bounded_future_result(future)
         try:
             value = producer()
             if not isinstance(value, bytes):
@@ -4145,7 +4248,7 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
         self._threads = []
         try:
             for index in range(max_workers):
-                thread = threading.Thread(target=self._worker,
+                thread = threading.Thread(target=self._worker, daemon=True,
                                           name='verified-pypi-metadata-' + str(index))
                 thread.start()
                 self._threads.append(thread)
@@ -4187,7 +4290,7 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
         while True:
             with self._condition:
                 while not self._jobs and not self._shutdown:
-                    self._condition.wait()
+                    self._condition.wait(timeout=_native_pip_timeouts()[1])
                 if not self._jobs:
                     return
                 _priority, _order, generation, future = heapq.heappop(self._jobs)
@@ -4219,8 +4322,11 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
         for future in cancelled:
             future.cancel()
         if wait:
+            deadline = time.monotonic() + _native_pip_timeouts()[0]
             for thread in self._threads:
-                thread.join()
+                thread.join(timeout=max(0, deadline - time.monotonic()))
+                if thread.is_alive():
+                    raise TimeoutError('versioned metadata executor shutdown deadline exceeded')
 
 
 class _ResolverActivity:
@@ -4322,7 +4428,7 @@ _NATIVE_POOL_LOCK = threading.RLock()
 
 def _native_pool_runtime(pool):
     """Private, non-root host scratch for exact locked interpreters (no KVM)."""
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         runtime = getattr(pool, '_native_runtime', None)
         if runtime is not None:
             return runtime
@@ -4371,7 +4477,7 @@ def _native_seed_wheelhouse(pool, runtime):
     this is an exact local copy of a previously authenticated artifact, not
     a substituted version or an invented source URL.
     """
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         folder = runtime['root'] / 'wheelhouse'
         folder.mkdir(exist_ok=True)
         seen = runtime.setdefault('wheelhouse_indexed_plans', set())
@@ -4543,7 +4649,9 @@ class _NativePipByteProgress:
     def close(self):
         self.stop_event.set()
         if self.thread is not None:
-            self.thread.join()
+            self.thread.join(timeout=_conda_progress_interval())
+            if self.thread.is_alive():
+                raise TimeoutError('Pip progress monitor did not stop within its configured interval')
 
 
 def _native_process_tree_snapshot(root_pid):
@@ -4647,7 +4755,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
     # Production shares the monitor owned by _native_pool_runtime. Minimal
     # standalone runtimes receive exactly one monitor, attached to their own
     # dictionary so callers retain explicit responsibility for closing it.
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
             meter = _NativePipByteProgress(_conda_progress_interval())
@@ -4756,7 +4864,7 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait()
+            process.wait(timeout=observation_interval)
             reader.join(timeout=observation_interval)
             if reader.is_alive():
                 raise RuntimeError('native Pip output pipe remained open after timeout; refusing unbounded reader wait')
@@ -4880,7 +4988,7 @@ def _native_interpreter_has_stdlib_distutils(runtime, interpreter):
     without stdlib distutils retain their normal setuptools backend unchanged.
     """
     identity = str(interpreter)
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         cache = runtime.setdefault('native_stdlib_distutils', {})
         if identity in cache:
             return cache[identity]
@@ -4963,7 +5071,7 @@ def _native_locked_python(pool, target):
         return None  # golden system interpreter uses pip's explicit cross-target mode
     if not SHA.fullmatch(sha):
         raise RuntimeError('target Python does not have a locked package identity')
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         if pool.conda_lock['artifacts'][sha]['version'] != target.python_full_version:
             raise RuntimeError('locked native Python differs from target identity')
         cached = runtime['prefixes'].get(sha)
@@ -4985,7 +5093,7 @@ def _native_locked_python(pool, target):
             pending = concurrent.futures.Future()
             pending_by_sha[sha] = pending
     if not owner:
-        return pending.result()
+        return _bounded_future_result(pending)
     try:
         # Each target has its own hardlink directory and explicit transaction.
         # Overlapping immutable archives consume no duplicate CAS data blocks.
@@ -5030,7 +5138,7 @@ def _native_locked_python(pool, target):
         pending.set_exception(error)
         raise
     else:
-        with _NATIVE_POOL_LOCK:
+        with _bounded_lock(_NATIVE_POOL_LOCK):
             runtime['prefixes'][sha] = python
             pending_by_sha.pop(sha, None)
         pending.set_result(python)
@@ -5042,9 +5150,9 @@ def _native_acquired_archive(pool,runtime,url,sha,category,key):
     already=pool.objects/sha[:2]/sha
     if already.is_file():
         pool.verify_object(sha)
-        with pool._state_lock:pool.by_url[url]=sha
+        with _bounded_lock(pool._state_lock):pool.by_url[url]=sha
         return pool.reference(sha,category,key,already.stat().st_size)
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         index=runtime.setdefault('http_content_index',{})
         cache_root=Path(runtime['env']['PIP_CACHE_DIR'])
         if cache_root.is_symlink() or not cache_root.is_dir():
@@ -5065,7 +5173,7 @@ def _native_acquired_archive(pool,runtime,url,sha,category,key):
             if digest(target)!=sha:
                 raise RuntimeError('pip HTTP cache contents changed during archival')
             result=pool.put(target,category,key,verified_sha=sha,durable=True)
-            with pool._state_lock:pool.by_url[url]=sha
+            with _bounded_lock(pool._state_lock):pool.by_url[url]=sha
             return result
     # The backend may explicitly mark an archive as non-cacheable. Downloading
     # its pinned bytes is then necessary; no unverified local data is accepted.
@@ -5272,7 +5380,7 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
 
 def _native_solver_cache(pool):
     """Share single-flight PyPI metadata and verified source results across groups."""
-    with pool._state_lock:
+    with _bounded_lock(pool._state_lock):
         cache = getattr(pool, '_native_verified_solver_cache', None)
         if cache is None:
             cache = {'release_metadata': _SingleFlightCache(),
@@ -5412,7 +5520,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
     identity = hashlib.sha256(json.dumps({
         'mirror': str(mirror), 'commit': commit, 'target': target.as_dict(),
         'commands': commands, 'extras': sorted(extras)}, sort_keys=True).encode()).hexdigest()
-    with _NATIVE_POOL_LOCK:
+    with _bounded_lock(_NATIVE_POOL_LOCK):
         completed = runtime.setdefault('local_metadata', {})
         cached = completed.get(identity)
         if cached is not None:
@@ -5424,7 +5532,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
             pending = concurrent.futures.Future()
             inflight[identity] = pending
     if not owner:
-        dependencies, remote = pending.result()
+        dependencies, remote = _bounded_future_result(pending)
         return set(dependencies), set(remote)
     try:
         # The locked interpreter may be prepared by another task. Its Conda
@@ -5495,7 +5603,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
         pending.set_exception(error)
         raise
     else:
-        with _NATIVE_POOL_LOCK:
+        with _bounded_lock(_NATIVE_POOL_LOCK):
             completed[identity] = frozen
             inflight.pop(identity, None)
         pending.set_result(frozen)
@@ -5825,7 +5933,7 @@ class _PipVersionAdmissionCache:
             elif pending[0] is not universe:
                 raise RuntimeError('Pip admission computation identity collision')
         if not owner:
-            return pending[1].result()
+            return _bounded_future_result(pending[1])
         try:
             packed = bytearray((len(universe) + 7) // 8)
             for index, (version, _artifact) in enumerate(universe):
@@ -5861,7 +5969,7 @@ def _admitted_pip_versions(pool, universe, specifiers):
     if not specifiers:
         allowed = set(specifiers.filter((row[0] for row in universe), prereleases=None))
         return [row for row in universe if row[0] in allowed]
-    with pool._state_lock:
+    with _bounded_lock(pool._state_lock):
         cache = getattr(pool, '_pip_version_admission_cache', None)
         if cache is None:
             policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
@@ -6225,7 +6333,7 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None,s
         result = []
         for future in futures:
             remaining = _native_closure_remaining()
-            result.append(future.result() if remaining is None else future.result(timeout=remaining))
+            result.append(_bounded_future_result(future))
         return result
     except BaseException:
         for future in futures:future.cancel()
@@ -6462,7 +6570,7 @@ def _historical_pip_preferences(prior, requirements, constraints, target, *, upg
 
 def acquire_pip_group(pool,key,group,*,resolver_cache=None):
     """Deduplicate concurrent build/runtime closures by exact plan identity."""
-    with pool._state_lock:
+    with _bounded_lock(pool._state_lock):
         locks=getattr(pool,'_native_group_locks',None)
         if locks is None:
             locks={};pool._native_group_locks=locks
@@ -6484,13 +6592,16 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
                     seen.add(current)
                     pending.extend(pool._native_group_edges[current])
             pool._native_group_edges[parent].add(key)
+    inherited = _NATIVE_CLOSURE_DEADLINE.get()
+    deadline = time.monotonic() + _native_pip_timeouts()[0]
+    if inherited is not None:
+        deadline = min(deadline, inherited)
     try:
-        with lock:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not lock.acquire(timeout=remaining):
+            raise TimeoutError('native Pip closure deadline expired while awaiting its group lock')
+        try:
             pool._native_group_context.stack = (*stack, key)
-            inherited = _NATIVE_CLOSURE_DEADLINE.get()
-            deadline = time.monotonic() + _native_pip_timeouts()[0]
-            if inherited is not None:
-                deadline = min(deadline, inherited)
             token = _NATIVE_CLOSURE_DEADLINE.set(deadline)
             try:
                 _native_closure_remaining()
@@ -6498,9 +6609,11 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
             finally:
                 _NATIVE_CLOSURE_DEADLINE.reset(token)
                 pool._native_group_context.stack = stack
+        finally:
+            lock.release()
     finally:
         if stack:
-            with pool._state_lock:
+            with _bounded_lock(pool._state_lock):
                 pool._native_group_edges[stack[-1]].discard(key)
 
 
@@ -6590,7 +6703,7 @@ def acquire_pip_groups(pool, groups):
     _pool_progress('Pip closures',0,len(ordered),'closures',f'{workers} workers')
     cache=_native_solver_cache(pool)
     with _PriorityMetadataExecutor(metadata_workers) as io_executor:
-        with pool._state_lock:
+        with _bounded_lock(pool._state_lock):
             cache['metadata_executor']=io_executor
             cache['metadata_speculative_submit']=io_executor.submit_speculative
             cache['metadata_promote']=io_executor.promote
@@ -6611,9 +6724,9 @@ def acquire_pip_groups(pool, groups):
                 futures={executor.submit(monitored_closure,key,group):key
                          for key,group in ordered}
                 errors=[];done=0
-                for future in concurrent.futures.as_completed(futures):
+                for future in _bounded_completed(futures):
                     try:
-                        future.result()
+                        _bounded_future_result(future)
                         done+=1
                         _pool_progress('Pip closures',done,len(ordered),'closures',
                                        f'{workers} workers')
@@ -6625,7 +6738,7 @@ def acquire_pip_groups(pool, groups):
                     key,exc=min(errors,key=lambda row:row[0])
                     raise RuntimeError('verified pip closure '+key+' failed: '+str(exc)) from exc
         finally:
-            with pool._state_lock:
+            with _bounded_lock(pool._state_lock):
                 cache.pop('metadata_executor',None)
                 cache.pop('metadata_speculative_submit',None)
                 cache.pop('metadata_promote',None)
@@ -6809,8 +6922,8 @@ def _download_sri_closure(pool, urls, category, identity=None):
                                                thread_name_prefix=category) as executor:
         futures=[executor.submit(transfer,url,sri) for url,sri in ordered]
         try:
-            for future in concurrent.futures.as_completed(futures):
-                url,sha=future.result();results[url]=sha
+            for future in _bounded_completed(futures):
+                url,sha=_bounded_future_result(future);results[url]=sha
                 _pool_progress(phase,len(results),len(ordered),'archives',f'{workers} workers')
         except BaseException:
             for future in futures:future.cancel()

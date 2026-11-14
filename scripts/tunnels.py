@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value
+
+
+
 import json
 import os
 import subprocess
@@ -39,7 +53,7 @@ def compose_env() -> dict[str, str]:
         cwd=ROOT,
         check=True,
         text=True,
-    )
+     timeout=_versioned_host_subprocess_timeout())
     env = dict(os.environ)
     env.update(parse_env(ROOT / ".env"))
     return env
@@ -60,7 +74,7 @@ def run(
         text=True,
         check=check,
         capture_output=capture,
-    )
+     timeout=_versioned_host_subprocess_timeout())
 
 
 def active_runner_containers(env: dict[str, str]) -> list[str]:

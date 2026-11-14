@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value
+
+
+
 import json
 import os
 import re
@@ -35,7 +49,7 @@ def _run(
         input=input_text,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
-    )
+     timeout=_versioned_host_subprocess_timeout())
     if check and result.returncode != 0:
         if capture:
             if result.stdout:

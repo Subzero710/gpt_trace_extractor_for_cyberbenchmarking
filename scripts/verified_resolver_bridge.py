@@ -109,14 +109,31 @@ class _Wire:
         self.limit = frame_limit
         self.deadline = deadline
 
+    def _write(self, payload):
+        if isinstance(self.writer, io.BytesIO):
+            self.writer.write(payload)
+            return
+        descriptor = self.writer.fileno()
+        view = memoryview(payload)
+        while view:
+            if self.deadline is None:
+                raise RuntimeError('mandatory Rust IPC write deadline missing')
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('native Rust dependency solve exceeded configured deadline during IPC write')
+            _, writable, _ = select.select([], [descriptor], [], remaining)
+            if not writable:
+                raise TimeoutError('native Rust IPC write deadline exceeded')
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError('native Rust IPC write failed')
+            view = view[written:]
+
     def exact(self, count):
         if count < 0 or count > self.limit:
             raise RuntimeError('verified resolver exceeded IPC frame limit')
         if self.deadline is None:
-            value = self.reader.read(count)
-            if value is None or len(value) != count:
-                raise RuntimeError('verified resolver terminated during IPC')
-            return value
+            raise RuntimeError('mandatory verified resolver IPC read deadline missing')
         received = bytearray()
         descriptor = self.reader.fileno()
         while len(received) < count:
@@ -146,7 +163,7 @@ class _Wire:
         return [self.string() for _ in range(count)]
 
     def send_int(self, value, width=4):
-        self.writer.write(_uint(value, width))
+        self._write(_uint(value, width))
 
     def send_string(self, value):
         if type(value) is not str:
@@ -155,7 +172,7 @@ class _Wire:
         if len(raw) > self.limit:
             raise RuntimeError('verified resolver IPC text exceeds versioned limit')
         self.send_int(len(raw))
-        self.writer.write(raw)
+        self._write(raw)
 
     def send_strings(self, values):
         self.send_int(len(values))
@@ -172,21 +189,17 @@ class _Wire:
             result()
         finally:
             self.writer = destination
-        destination.write(b'\x01')
-        destination.write(output.getvalue())
-        destination.flush()
+        self._write(b'\x01' + output.getvalue())
 
     def error(self, exc):
-        self.writer.write(b'\x00')
+        self._write(b'\x00')
         self.send_string(type(exc).__name__ + ': ' + str(exc))
-        self.writer.flush()
 
     def rejected_source(self, exc):
         # Distinct protocol status: definitively invalid target-language source.
         # Other errors MUST still abort the solver.
-        self.writer.write(b'\x02')
+        self._write(b'\x02')
         self.send_string(str(exc))
-        self.writer.flush()
 
 
 
@@ -684,7 +697,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         except BaseException as exc:
             if child.poll() is None:
                 child.kill()
-            child.wait()
+            child.wait(timeout=policy['pip_total_timeout_seconds'])
             errors.seek(max(0, errors.tell() - 8192))
             text = errors.read().decode(errors='replace')
             if text:

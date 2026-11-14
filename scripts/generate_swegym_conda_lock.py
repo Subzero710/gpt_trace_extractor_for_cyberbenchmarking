@@ -10,6 +10,20 @@ host-only dependency fetcher without running a Conda solver.
 """
 from __future__ import annotations
 
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value
+
+
+
 import argparse
 import hashlib
 import json
@@ -143,13 +157,13 @@ def image_name(instance_id):
 def docker_command():
     if shutil.which("docker"):
         probe = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, timeout=_versioned_host_subprocess_timeout())
         if probe.returncode == 0:
             return ["docker"]
     if shutil.which("sudo") and shutil.which("docker"):
         # sudo may use /dev/tty for an interactive password prompt. Do not use a
         # shell or copy caller credentials into the container.
-        probe = subprocess.run(["sudo", "docker", "info"], stdout=subprocess.DEVNULL)
+        probe = subprocess.run(["sudo", "docker", "info"], stdout=subprocess.DEVNULL, timeout=_versioned_host_subprocess_timeout())
         if probe.returncode == 0:
             return ["sudo", "docker"]
     raise RuntimeError("Docker is required to compile conda-lock.json")

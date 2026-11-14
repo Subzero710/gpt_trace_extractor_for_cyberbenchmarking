@@ -226,7 +226,8 @@ def preflight():
     if "EnvironmentFile=/etc/gpt-trace-browser.env" not in unit or "CLOAKBROWSER_VERSION=" in unit:
         raise ValueError("browser version must be derived once from the installed wrapper")
     shell = firstboot_script()
-    subprocess.run(["bash", "-n"], input=shell, text=True, check=True)
+    subprocess.run(["bash", "-n"], input=shell, text=True, check=True,
+                   timeout=PROVISION_TIMEOUT_SECONDS)
     if "<<" in shell:
         raise ValueError("nested generated Python/heredocs are forbidden in firstboot")
     if not 0 < ROOT_MIN_GIB < VIRTUAL_DISK_GIB:
@@ -249,7 +250,8 @@ def _safe_parent():
         if path.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISDIR(info.st_mode):
             raise ValueError("unsafe golden storage root")
     def field(name):
-        return subprocess.check_output(["findmnt", "-n", "-o", name, "-T", str(DEST.parent)], text=True).strip()
+        return subprocess.check_output(["findmnt", "-n", "-o", name, "-T", str(DEST.parent)],
+                                       text=True, timeout=PROVISION_TIMEOUT_SECONDS).strip()
     if (Path(field("TARGET")) != DEST.parent or not field("SOURCE").startswith("/dev/")
             or field("FSTYPE") not in {"ext4", "xfs"} or "rw" not in field("OPTIONS").split(",")):
         raise ValueError("golden storage is not the configured dedicated writable ext4/xfs mount")
@@ -265,12 +267,14 @@ def require_host_build_runtime():
 
 
 def repo_commit():
-    value = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    value = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                                    text=True, timeout=PROVISION_TIMEOUT_SECONDS).strip()
     if re.fullmatch(r"[0-9a-f]{40}", value) is None:
         raise ValueError("repository commit identity is invalid")
     for path in (*input_files(), HERE / "build.py", HERE / "host_cache.py", HERE / "python-metadata.json",
                  HERE / "host-controller-input.json", ROOT / "config/preparation.toml"):
-        recorded = subprocess.check_output(["git", "show", value + ":" + path.relative_to(ROOT).as_posix()], cwd=ROOT)
+        recorded = subprocess.check_output(["git", "show", value + ":" + path.relative_to(ROOT).as_posix()],
+                                           cwd=ROOT, timeout=PROVISION_TIMEOUT_SECONDS)
         if recorded != path.read_bytes():
             raise ValueError("commit guest inputs before golden construction: " + str(path))
     return value
@@ -289,7 +293,8 @@ def cached_archive():
 
 def image_info(image):
     safe(image)
-    info = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(image)]))
+    info = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(image)],
+                                              timeout=PROVISION_TIMEOUT_SECONDS))
     data = info.get("format-specific", {}).get("data", {})
     if (info.get("format") != "qcow2" or info.get("backing-filename")
             or info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3

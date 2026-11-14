@@ -60,18 +60,6 @@ def contract_counts(source_root):
     return len(tasks), len(repos), len(environments)
 
 
-def acquisition_job_timeout_seconds(source_root):
-    path = Path(source_root) / "config/preparation.toml"
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError("missing versioned preparation controls")
-    with path.open("rb") as stream:
-        payload = tomllib.load(stream)
-    hours = (payload.get("acquisition") or {}).get("job_timeout_hours")
-    if type(hours) is not int or hours <= 0:
-        raise RuntimeError("invalid acquisition job timeout control")
-    return hours * 3600
-
-
 def trusted_fetch_python():
     """Return the root-owned system interpreter used after dropping privileges."""
     executable = shutil.which("python3", path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -1159,6 +1147,41 @@ def _integrate_published_pool(manager, state, ready, result):
     return integrated
 
 
+def _broker_cleanup_timeout(source_root):
+    source = Path(source_root) / 'config/preparation.toml'
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('missing versioned broker cleanup timeout')
+    with source.open('rb') as stream:
+        seconds = tomllib.load(stream)['acquisition']['broker_read_timeout_seconds']
+    if type(seconds) is not int or seconds < 1:
+        raise RuntimeError('invalid versioned broker cleanup timeout')
+    return seconds
+
+
+def _kill_verified_fetch_descendants(state, timeout, cadence):
+    # Rust and metadata subprocesses can start their own sessions. Killing only
+    # the downloader PGID does not prove that those scoped descendants exited.
+    deadline = time.monotonic() + timeout
+    while True:
+        members = [stamp for stamp in JobScope.members(state) if stamp['pid'] != os.getpid()]
+        if not members:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('verified preparation descendants survived cleanup deadline')
+        for stamp in members:
+            try:
+                descriptor = os.pidfd_open(stamp['pid'])
+            except ProcessLookupError:
+                continue
+            try:
+                if same_process(stamp):
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            finally:
+                os.close(descriptor)
+        time.sleep(min(remaining, cadence))
+
+
 def _prepare(manager, state):
     # Download on the execution host without guest VMs or persistent deletion capabilities.
     import pwd
@@ -1171,7 +1194,8 @@ def _prepare(manager, state):
         # Administrative one-time account provisioning happens in the broker,
         # not in the unprivileged dependency downloader.
         subprocess.run(["useradd", "--system", "--no-create-home",
-                        "--shell", "/usr/sbin/nologin", name], check=True)
+                        "--shell", "/usr/sbin/nologin", name], check=True,
+                       timeout=_broker_cleanup_timeout(manager.source_root))
         account = pwd.getpwnam(name)
     if account.pw_uid == 0:
         raise RuntimeError("refusing root pool download account")
@@ -1246,16 +1270,51 @@ def _prepare(manager, state):
                     *(["--reuse-from",str(reuse)] if reuse is not None else [])],
                    cwd=source_root, env=env, preexec_fn=drop_privileges,
                    stdin=subprocess.DEVNULL, start_new_session=True)
-    acquisition_timeout = acquisition_job_timeout_seconds(manager.source_root)
+    policy = manager.source_root / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned preparation watchdog policy')
+    with policy.open('rb') as stream:
+        acquisition = tomllib.load(stream)['acquisition']
+    cadence = acquisition['progress_interval_seconds']
+    stall_limit = acquisition['pip_stall_timeout_seconds']
+    if (type(cadence) is not int or cadence < 1
+            or type(stall_limit) is not int or stall_limit <= cadence):
+        raise RuntimeError('invalid versioned preparation watchdog controls')
+    last_observation = None
+    last_activity = time.monotonic()
     try:
-        exitcode = child.wait(timeout=acquisition_timeout)
-    except subprocess.TimeoutExpired as exc:
-        # Only the private process group created above may be terminated.
-        # Never kill a guessed PID or an unrelated service.
-        try: os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError: pass
-        child.wait()
-        raise RuntimeError("download worker exceeded configured acquisition deadline; zombie preserved") from exc
+        # Each wait is bounded. There is deliberately no whole-job deadline.
+        while True:
+            try:
+                exitcode = child.wait(timeout=cadence)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            progress = manager._progress(state)
+            if progress is not None:
+                observation = (progress['stage'], progress['completed'],
+                               progress['network_bytes'], progress['pip_bytes'])
+                if observation != last_observation:
+                    last_observation = observation
+                    last_activity = time.monotonic()
+            if time.monotonic() - last_activity >= stall_limit:
+                raise TimeoutError('acquisition made no verified progress for '
+                                   + str(stall_limit) + ' seconds')
+    except BaseException:
+        # A non-cooperative Python thread cannot be interrupted safely in-process.
+        # The independent privileged parent enforces the deadline on the private
+        # downloader process group, preserving the durable incomplete stage.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        cleanup_timeout = _broker_cleanup_timeout(manager.source_root)
+        try:
+            child.wait(timeout=cleanup_timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError('download worker remained unreaped after group SIGKILL; stage preserved') from exc
+        _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
+        raise
     if exitcode != 0:
         raise subprocess.CalledProcessError(exitcode, child.args)
     # Package build backends may spawn children. A successful downloader exit

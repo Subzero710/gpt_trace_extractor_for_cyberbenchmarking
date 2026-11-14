@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['build']['golden_provision_timeout_hours']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value * 3600
+
+
+
 import argparse
 import hashlib
 import json
@@ -92,9 +106,9 @@ def build_verified_resolver(root: Path) -> None:
            'CARGO_TARGET_DIR': str(project / 'target'),
            'RUSTFLAGS': '-C debuginfo=0'}
     subprocess.run([cargo, 'test', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
-                   cwd=root, check=True, env=env)
+                   cwd=root, check=True, env=env, timeout=_versioned_host_subprocess_timeout())
     subprocess.run([cargo, 'build', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
-                   cwd=root, check=True, env=env)
+                   cwd=root, check=True, env=env, timeout=_versioned_host_subprocess_timeout())
     seal_verified_resolver_build(root, expected_inputs=initial_inputs)
 
 
@@ -145,7 +159,7 @@ def build_host_broker(root: Path) -> None:
         'tests/distributed/test_rust_bridge_protocol.py',
         'tests/distributed/test_rust_source_contract.py',
         'tests/distributed/test_rust_solver_graph.py'],
-        cwd=root, env=test_env, check=True)
+        cwd=root, env=test_env, check=True, timeout=_versioned_host_subprocess_timeout())
 
 
 def compose_service_image(root: Path, service: str) -> str:
@@ -280,7 +294,7 @@ def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subpro
         check=check,
         text=True,
         capture_output=capture,
-    )
+     timeout=_versioned_host_subprocess_timeout())
 
 
 def ensure_builder(root: Path) -> None:

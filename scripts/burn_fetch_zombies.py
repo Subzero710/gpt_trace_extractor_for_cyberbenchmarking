@@ -6,6 +6,20 @@ containing potentially reusable bytes unless a completed, published pool proves
 that same operation no longer needs recovery. Keeps durable job journals.
 """
 from __future__ import annotations
+
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value
+
+
 import argparse
 import fcntl
 import hashlib
@@ -163,13 +177,13 @@ def main(argv=None):
     if any(item.is_symlink() for item in (parent,*parent.parents)):
         raise RuntimeError('symlink in configured storage root')
     mount=subprocess.run(['findmnt','-n','-o','TARGET','-T',str(parent)],
-                         text=True,capture_output=True,check=True).stdout.strip()
+                         text=True,capture_output=True,check=True, timeout=_versioned_host_subprocess_timeout()).stdout.strip()
     if Path(mount).resolve()!=parent.resolve():
         raise RuntimeError('storage disk is not mounted at its configured mount point')
     # All service states except a positive 'inactive'/'failed' are treated as unsafe.
     state=subprocess.run(['systemctl','show','--property=ActiveState','--value',
                           'gpt-trace-distributed-broker.service'],
-                         text=True,capture_output=True,check=True).stdout.strip()
+                         text=True,capture_output=True,check=True, timeout=_versioned_host_subprocess_timeout()).stdout.strip()
     if state not in {'inactive','failed'}:
         raise RuntimeError('stop execution broker before administrative cleanup')
     preparations=parent/'preparations'

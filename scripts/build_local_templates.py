@@ -3,6 +3,20 @@
 """Sequential local execution host builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
+def _versioned_host_subprocess_timeout():
+    import tomllib
+    from pathlib import Path
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned host subprocess deadline')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or value < 1:
+        raise RuntimeError('invalid versioned host subprocess deadline')
+    return value
+
+
+
 import argparse
 import fcntl
 import hashlib
@@ -404,7 +418,7 @@ def verify_sources(inputs, mirrors):
     missing = []
     for item in inputs["tasks"].values():
         mirror = mirrors / (item["repo"].replace("/", "_") + ".git")
-        status = subprocess.run(["git", "--git-dir", str(mirror), "cat-file", "-e", item["base_commit"] + "^{commit}"], capture_output=True)
+        status = subprocess.run(["git", "--git-dir", str(mirror), "cat-file", "-e", item["base_commit"] + "^{commit}"], capture_output=True, timeout=_versioned_host_subprocess_timeout())
         if status.returncode:
             missing.append(item["instance_id"])
     if missing:
@@ -417,7 +431,7 @@ def verify_sources(inputs, mirrors):
             raise RuntimeError("untrusted environment source URL")
         owner, name, commit, filename = parsed.path.lstrip("/").split("/", 3)
         mirror = mirrors / (owner + "_" + name + ".git")
-        result = subprocess.run(["git", "--git-dir", str(mirror), "show", commit + ":" + filename], capture_output=True)
+        result = subprocess.run(["git", "--git-dir", str(mirror), "show", commit + ":" + filename], capture_output=True, timeout=_versioned_host_subprocess_timeout())
         if snapshot["status_code"] == 404:
             if result.returncode == 0:
                 raise RuntimeError("pinned upstream path selection changed")
@@ -1613,7 +1627,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     cmd('git', '--git-dir', str(target), 'symbolic-ref', 'HEAD', 'refs/heads/frozen')
                     if revision and not re.fullmatch(r'[a-f0-9]{7,40}', revision):
                         result = subprocess.run(['git','check-ref-format','refs/heads/'+revision],
-                                                capture_output=True)
+                                                capture_output=True, timeout=_versioned_host_subprocess_timeout())
                         if result.returncode:
                             raise RuntimeError('unsafe frozen VCS branch name')
                         cmd('git', '--git-dir', str(target), 'update-ref',

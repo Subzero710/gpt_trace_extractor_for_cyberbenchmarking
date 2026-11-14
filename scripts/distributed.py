@@ -29,8 +29,22 @@ VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_source
 CORE = ("postgres", "storage", "teacher-browser", "teacher-browser-tunnel", "kali-workstation-controller", "workstation-gateway")
 
 
+def _distributed_operation_timeout():
+    policy = ROOT / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned distributed operation timeout')
+    with policy.open('rb') as stream:
+        settings = tomllib.load(stream)['acquisition']
+    seconds = settings['timeout_seconds']
+    if type(seconds) is not int or seconds <= 0:
+        raise RuntimeError('invalid versioned distributed operation timeout')
+    return seconds
+
+
 def run(arguments, *, capture=False, timeout=None):
     # Command arguments are never assembled from a shell string.
+    if timeout is None:
+        timeout = _distributed_operation_timeout()
     result = subprocess.run([str(x) for x in arguments], cwd=ROOT, check=True,
         text=True, capture_output=capture, timeout=timeout)
     return result.stdout.strip() if capture else ""
@@ -212,8 +226,21 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
     return result
 
 
+def _distributed_long_command_timeout():
+    # Docker builds/runner invocations are long workflows, not 180-second probes.
+    policy = ROOT / 'config/preparation.toml'
+    with policy.open('rb') as stream:
+        hours = tomllib.load(stream)['build']['timeout_hours']
+    if type(hours) is not int or hours < 1:
+        raise RuntimeError('invalid configured build/runner command timeout')
+    return hours * 3600
+
+
 def compose(*arguments, capture=False):
-    return run(["docker", "compose", "--profile", "runner", "--profile", "app-tunnels", "--profile", "benchmark-fetch", *arguments], capture=capture)
+    command = ["docker", "compose", "--profile", "runner", "--profile", "app-tunnels", "--profile", "benchmark-fetch", *arguments]
+    # Long-running Compose commands use the independently configured build limit.
+    limit = _distributed_long_command_timeout() if arguments and arguments[0] in ('build', 'run') else None
+    return run(command, capture=capture, timeout=limit)
 
 
 def verify_storage(cfg):

@@ -19,13 +19,12 @@ network = "10.0.2.0/24"
 service_address = "10.0.2.100"
 service_port = 3128
 timeout_seconds = 180
-job_timeout_hours = 24
 workers = 8
 # Reporting cadence for real Conda/Pip transfer counters (seconds).
 progress_interval_seconds = 5
 # Pip solver budget per closure, including metadata/build hooks.
 # A stalled worker must not monopolize acquisition for hours.
-pip_total_timeout_seconds = 900
+pip_total_timeout_seconds = 180
 pip_stall_timeout_seconds = 120
 # Native Rust graph search: CPU deadline applies to the whole closure.
 pip_solver_max_decisions = 1000000
