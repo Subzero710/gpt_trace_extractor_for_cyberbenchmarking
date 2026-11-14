@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import sys
 import tempfile
 import tomllib
@@ -1720,7 +1721,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
         transient = pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure')
         with patch.object(pool, '_read_expected_https_once',
                           side_effect=[transient, b'{"name":"dns-retry-fixture"}']) as reader, \
-             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool, '_network_slots', return_value=threading.BoundedSemaphore(pool._acquisition_workers())), \
              patch.object(pool.time, 'sleep') as sleeper:
             response = pool._read_https(url, timeout=90, limit=1024,
                                         user_agent='test', expected_host='pypi.org')
@@ -1737,7 +1738,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
         ):
             with self.subTest(exception=type(exception).__name__), \
                  patch.object(pool, '_read_expected_https_once', side_effect=exception) as reader, \
-                 patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+                 patch.object(pool, '_network_slots', return_value=threading.BoundedSemaphore(pool._acquisition_workers())), \
                  patch.object(pool.time, 'sleep') as sleeper, \
                  self.assertRaises(type(exception)):
                 pool._read_https(url, timeout=90, limit=1024,
@@ -1751,7 +1752,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
             pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure'))
         with patch.object(pool, '_read_expected_https_once',
                           side_effect=[failure, b'{}']) as reader, \
-             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool, '_network_slots', return_value=threading.BoundedSemaphore(pool._acquisition_workers())), \
              patch.object(pool.time, 'sleep') as sleeper:
             self.assertEqual(pool._read_https(url, timeout=90, limit=1024,
                              user_agent='test', expected_host='pypi.org'), b'{}')
@@ -1762,7 +1763,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
         url = 'https://pypi.org/pypi/dns-budget-fixture/json'
         failure = pool.socket.gaierror(pool.socket.EAI_AGAIN, 'temporary DNS failure')
         with patch.object(pool, '_read_expected_https_once', side_effect=failure) as reader, \
-             patch.object(pool, '_network_slots', return_value=contextlib.nullcontext()), \
+             patch.object(pool, '_network_slots', return_value=threading.BoundedSemaphore(pool._acquisition_workers())), \
              patch.object(pool.time, 'sleep') as sleeper, \
              self.assertRaises(pool.socket.gaierror):
             pool._read_https(url, timeout=90, limit=1024,
@@ -2341,12 +2342,13 @@ setup(version=dynamic_version(), **setup_args)
         self.assertNotIn('os.environ.copy()',physical)
         self.assertNotIn('dict(os.environ',physical)
         self.assertIn('PIP_CONFIG_FILE',physical)
-        self.assertIn('acquisition_timeout = acquisition_job_timeout_seconds(manager.source_root)',physical)
-        self.assertIn('child.wait(timeout=acquisition_timeout)',physical)
-        import tomllib
-        from workstation_broker.preparation import acquisition_job_timeout_seconds
+        self.assertIn('child.wait(timeout=cadence)',physical)
+        self.assertIn("acquisition['pip_stall_timeout_seconds']",physical)
+        self.assertNotIn('acquisition_job_timeout_seconds',physical)
         controls = tomllib.loads((ROOT/'config/preparation.toml').read_text())
-        self.assertEqual(acquisition_job_timeout_seconds(ROOT), controls['acquisition']['job_timeout_hours'] * 3600)
+        self.assertNotIn('job_timeout_hours', controls['acquisition'])
+        self.assertGreater(controls['acquisition']['timeout_seconds'],
+                           controls['acquisition']['pip_stall_timeout_seconds'])
         self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
 
     def test_conda_lock_downloads_each_sha_once_and_materializes_transactions(self):

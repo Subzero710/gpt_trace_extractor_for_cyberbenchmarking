@@ -589,6 +589,16 @@ def _network_deadline():
         _NETWORK_CALL_DEADLINE.reset(token)
 
 
+def _bounded_network_entrypoint(function):
+    @functools.wraps(function)
+    def execute(*args, **kwargs):
+        # The caller is not required to establish the deadline: every public
+        # low-level entrypoint owns one. Nested calls inherit the earlier limit.
+        with _network_deadline():
+            return function(*args, **kwargs)
+    return execute
+
+
 def _network_retry(label, operation, *, cleanup=None):
     with _network_deadline():
         return _bounded_network_retry(label, operation, cleanup=cleanup)
@@ -641,6 +651,7 @@ def _drop_expected_https_connection(host):
         except OSError:pass
 
 
+@_bounded_network_entrypoint
 def _read_metadata_response(response, limit):
     """Read identity/gzip metadata with a hard decompressed-size bound."""
     headers=getattr(response,'headers',None)
@@ -654,9 +665,11 @@ def _read_metadata_response(response, limit):
         raise RuntimeError('HTTPS response exceeds limit')
     if encoding in ('','identity'):
         chunks=[];count=0
-        while count <= limit:
+        expected = int(length) if length.isdigit() else limit + 1
+        target = min(expected, limit + 1)
+        while count < target:
             _network_remaining()
-            block=response.read(min(1048576,limit+1-count))
+            block=response.read(min(1048576,target-count))
             if not block:
                 break
             chunks.append(block);count+=len(block)
@@ -714,9 +727,10 @@ def _open_https(request, *, timeout, expected_host=None):
         request,timeout=min(timeout, _network_remaining()))
 
 
+@_bounded_network_entrypoint
 def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
     parsed=_validate_https_endpoint(url,expected_host)
-    _network_remaining()
+    timeout = min(timeout, _network_remaining())
     remaining = _native_closure_remaining()
     if remaining is not None:
         timeout = min(timeout, remaining)

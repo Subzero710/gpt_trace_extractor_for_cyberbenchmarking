@@ -118,6 +118,8 @@ def test_admin_cleanup_requires_confirmation_and_retains_journal(tmp_path,monkey
     module=load_script('scripts/burn_fetch_zombies.py')
     checkout=tmp_path/'checkout';(checkout/'scripts').mkdir(parents=True)
     (checkout/'config').mkdir()
+    (checkout/'config'/'preparation.toml').write_bytes(
+        (ROOT/'config/preparation.toml').read_bytes())
     storage=tmp_path/'storage';storage.mkdir()
     (checkout/'config'/'distributed.toml').write_text(
         '[paths]\nbase_image = '+json.dumps(str(storage/'base.qcow2'))+'\n')
@@ -156,6 +158,8 @@ def test_admin_cleanup_never_deletes_recoverable_without_published_proof(tmp_pat
     module=load_script('scripts/burn_fetch_zombies.py')
     checkout=tmp_path/'checkout';(checkout/'scripts').mkdir(parents=True)
     (checkout/'config').mkdir()
+    (checkout/'config'/'preparation.toml').write_bytes(
+        (ROOT/'config/preparation.toml').read_bytes())
     storage=tmp_path/'storage';storage.mkdir()
     (checkout/'config'/'distributed.toml').write_text(
         '[paths]\nbase_image = '+json.dumps(str(storage/'base.qcow2'))+'\n')
