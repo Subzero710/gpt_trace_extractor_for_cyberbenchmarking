@@ -1276,7 +1276,7 @@ def _prepare(manager, state):
     with policy.open('rb') as stream:
         acquisition = tomllib.load(stream)['acquisition']
     cadence = acquisition['progress_interval_seconds']
-    stall_limit = acquisition['pip_stall_timeout_seconds']
+    stall_limit = acquisition['progress_stall_timeout_seconds']
     if (type(cadence) is not int or cadence < 1
             or type(stall_limit) is not int or stall_limit <= cadence):
         raise RuntimeError('invalid versioned preparation watchdog controls')

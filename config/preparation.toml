@@ -26,6 +26,8 @@ progress_interval_seconds = 5
 # A stalled worker must not monopolize acquisition for hours.
 pip_total_timeout_seconds = 180
 pip_stall_timeout_seconds = 120
+# No verified stage/count/byte change in the entire fetch worker.
+progress_stall_timeout_seconds = 900
 # Native Rust graph search: CPU deadline applies to the whole closure.
 pip_solver_max_decisions = 1000000
 pip_solver_max_depth = 1024
