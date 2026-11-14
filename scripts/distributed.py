@@ -754,8 +754,12 @@ def preparation_fetch(cfg, *, fetch_source=None):
                         raise
             elif phase not in {"starting", "running", "validating"}:
                 raise RuntimeError("unknown preparation phase: " + str(phase))
-            observed = {'phase': phase, 'attempt': attempt,
-                        'progress': status.get('progress')}
+            # The broker accepts long-poll observations only for active jobs.
+            # A just-started (or explicitly retried) job must be rediscovered
+            # with a plain read; never replay its prior terminal observation.
+            observed = ({'phase': phase, 'attempt': attempt,
+                         'progress': status.get('progress')}
+                        if phase in {'starting', 'running', 'validating'} else None)
     except TransportFailure as exc:
         raise RuntimeError("preparation " + operation_id + " has an unconfirmed remote outcome: " + str(exc) +
             "; rerun make superbench-fetch ADAPTER=swe-gym-lite to rediscover it; no mutation was blindly retried") from exc
