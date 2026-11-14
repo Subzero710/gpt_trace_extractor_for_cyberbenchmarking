@@ -536,10 +536,7 @@ def _bounded_completed(futures):
     pending = set(futures)
     while pending:
         completed, pending = concurrent.futures.wait(
-            pending, timeout=_operation_timeout(),
-            return_when=concurrent.futures.FIRST_COMPLETED)
-        if not completed:
-            raise TimeoutError('concurrent acquisition made no completed-task progress')
+            pending, return_when=concurrent.futures.FIRST_COMPLETED)
         yield from completed
 
 
@@ -3574,7 +3571,7 @@ class _SingleFlightCache:
             if owner:
                 future=concurrent.futures.Future()
                 self._pending[key]=future
-        if not owner:return _bounded_future_result(future)
+        if not owner:return future.result()
         try:
             value=producer()
         except BaseException as exc:
@@ -3617,7 +3614,7 @@ class _BoundedCoreMetadataCache:
                 future = concurrent.futures.Future()
                 self._pending[key] = future
         if not owner:
-            return _bounded_future_result(future)
+            return future.result()
         try:
             value = producer()
             if not isinstance(value, bytes):
@@ -4913,6 +4910,7 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build
     command = [str(arg) for arg in argv]
     if not command:
         raise RuntimeError('empty native package command')
+    timeout = min(timeout, _operation_timeout())
     environment = dict(runtime['env'])
     base_bin = Path(runtime['root']) / 'conda' / 'bin'
     paths = [str(base_bin)]
@@ -5107,7 +5105,7 @@ def _native_locked_python(pool, target):
             pending = concurrent.futures.Future()
             pending_by_sha[sha] = pending
     if not owner:
-        return _bounded_future_result(pending)
+        return pending.result()
     try:
         # Each target has its own hardlink directory and explicit transaction.
         # Overlapping immutable archives consume no duplicate CAS data blocks.
@@ -5546,7 +5544,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
             pending = concurrent.futures.Future()
             inflight[identity] = pending
     if not owner:
-        dependencies, remote = _bounded_future_result(pending)
+        dependencies, remote = pending.result()
         return set(dependencies), set(remote)
     try:
         # The locked interpreter may be prepared by another task. Its Conda
