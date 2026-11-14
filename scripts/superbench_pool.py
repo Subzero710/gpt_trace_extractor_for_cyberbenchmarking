@@ -12,6 +12,7 @@ import ast
 import importlib.util
 import concurrent.futures
 import contextlib
+import contextvars
 import functools
 import heapq
 import base64
@@ -499,17 +500,41 @@ def _retryable_network_error(exc):
     return False
 
 
+_NATIVE_CLOSURE_DEADLINE = contextvars.ContextVar('native_pip_closure_deadline', default=None)
+
+
+def _native_closure_remaining():
+    deadline = _NATIVE_CLOSURE_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('native Pip closure exceeded its configured total deadline')
+    return remaining
+
+
 def _network_retry(label, operation, *, cleanup=None):
     for attempt in range(1, DOWNLOAD_ATTEMPTS+1):
+        _native_closure_remaining()
         if cleanup is not None: cleanup()
         try:
-            with _network_slots():
+            slots = _network_slots()
+            remaining = _native_closure_remaining()
+            acquired = slots.acquire() if remaining is None else slots.acquire(timeout=remaining)
+            if not acquired:
+                raise TimeoutError('native Pip closure exceeded network-slot deadline')
+            try:
                 return operation()
+            finally:
+                slots.release()
         except Exception as exc:
             if not _retryable_network_error(exc): raise
             if cleanup is not None: cleanup()
             if attempt >= DOWNLOAD_ATTEMPTS: raise
             delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
+            remaining = _native_closure_remaining()
+            if remaining is not None and delay >= remaining:
+                raise TimeoutError('native Pip closure deadline reached during network retry') from exc
             detail=('HTTP '+str(exc.code)) if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
             print(f'[pool] network retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s after {detail}: {label}',
                   file=sys.stderr, flush=True)
@@ -587,11 +612,17 @@ class _ValidatedHTTPSRedirect(urllib.request.HTTPRedirectHandler):
 
 def _open_https(request, *, timeout, expected_host=None):
     _validate_https_endpoint(request.full_url,expected_host)
+    remaining = _native_closure_remaining()
+    if remaining is not None:
+        timeout = min(timeout, remaining)
     return urllib.request.build_opener(_ValidatedHTTPSRedirect(expected_host)).open(request,timeout=timeout)
 
 
 def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
     parsed=_validate_https_endpoint(url,expected_host)
+    remaining = _native_closure_remaining()
+    if remaining is not None:
+        timeout = min(timeout, remaining)
     connections=getattr(_HTTPS_CONNECTIONS,'connections',None)
     if connections is None:
         connections={}
@@ -601,8 +632,10 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host,
     if connection is None:
         connection=http.client.HTTPSConnection(expected_host,timeout=timeout)
         connections[expected_host]=connection
-    elif connection.sock is not None:
-        connection.sock.settimeout(timeout)
+    else:
+        connection.timeout = timeout
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
     path=urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
     try:
         headers={'User-Agent':user_agent,'Accept-Encoding':'gzip'}
@@ -4607,6 +4640,9 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
     import signal
     total_limit, stall_limit = _native_pip_timeouts()
     total_limit = min(timeout, total_limit)
+    remaining = _native_closure_remaining()
+    if remaining is not None:
+        total_limit = min(total_limit, remaining)
     observation_interval = _conda_progress_interval()
     # Production shares the monitor owned by _native_pool_runtime. Minimal
     # standalone runtimes receive exactly one monitor, attached to their own
@@ -4721,14 +4757,18 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
             except ProcessLookupError:
                 pass
             process.wait()
-            reader.join()
+            reader.join(timeout=observation_interval)
+            if reader.is_alive():
+                raise RuntimeError('native Pip output pipe remained open after timeout; refusing unbounded reader wait')
             kind, limit = timed_out
             if kind == 'stall':
                 diagnostic = tail[-5000:].decode(errors='replace')
                 raise RuntimeError('native pip emitted no new output/download bytes for '
                                    + str(limit) + ' seconds; last output: ' + diagnostic)
             raise subprocess.TimeoutExpired(command, limit, output=bytes(tail))
-        reader.join()
+        reader.join(timeout=observation_interval)
+        if reader.is_alive():
+            raise RuntimeError('native Pip output pipe remained open after subprocess exit')
         if errors:
             raise RuntimeError('pip output-reader failed: ' + str(errors[0])) from errors[0]
         if process.returncode:
@@ -4785,6 +4825,9 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build
             command.insert(index + 3, '--progress-bar=raw')
             return _native_run_pip_with_byte_progress(
                 command, runtime, environment, timeout, metadata_build=metadata_build)
+    remaining = _native_closure_remaining()
+    if remaining is not None:
+        timeout = min(timeout, remaining)
     output = subprocess.run(command, cwd=runtime['root'], env=environment,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=timeout)
@@ -6173,10 +6216,17 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None,s
                                +expected['name']+'=='+expected['version'])
         return actual
     if executor is None or len(records)<2:
-        return [materialize(expected) for expected in records]
-    futures=[executor.submit(materialize,expected) for expected in records]
+        result = [materialize(expected) for expected in records]
+        _native_closure_remaining()
+        return result
+    context = contextvars.copy_context()
+    futures = [executor.submit(context.copy().run, materialize, expected) for expected in records]
     try:
-        return [future.result() for future in futures]
+        result = []
+        for future in futures:
+            remaining = _native_closure_remaining()
+            result.append(future.result() if remaining is None else future.result(timeout=remaining))
+        return result
     except BaseException:
         for future in futures:future.cancel()
         raise
@@ -6204,7 +6254,8 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     spec.loader.exec_module(module)
     return module.solve(globals(),pool,target,reqs,constraints,key,no_deps=no_deps,
                         resolver_cache=resolver_cache,materialize=materialize,
-                        preferred_versions=preferred_versions)
+                        preferred_versions=preferred_versions,
+                        deadline=_NATIVE_CLOSURE_DEADLINE.get())
 
 
 def _pip_plan_path(stage, key):
@@ -6436,9 +6487,16 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
     try:
         with lock:
             pool._native_group_context.stack = (*stack, key)
+            inherited = _NATIVE_CLOSURE_DEADLINE.get()
+            deadline = time.monotonic() + _native_pip_timeouts()[0]
+            if inherited is not None:
+                deadline = min(deadline, inherited)
+            token = _NATIVE_CLOSURE_DEADLINE.set(deadline)
             try:
+                _native_closure_remaining()
                 return _native_pip_group_locked(pool,key,group)
             finally:
+                _NATIVE_CLOSURE_DEADLINE.reset(token)
                 pool._native_group_context.stack = stack
     finally:
         if stack:
@@ -6469,11 +6527,17 @@ def _native_pip_group_locked(pool,key,group):
                       preferred_versions=group.get('preferred_versions')):
         return 'reused'
     try:
+        _native_closure_remaining()
         packages=_native_resolve_registry(pool,target,group['requirements'],
             group['constraints'],key,no_deps=group['no_deps'],
             preferred_versions=group.get('preferred_versions'))
+        _native_closure_remaining()
         build_plans = _native_acquire_build_dependencies(pool,target,packages)
+        _native_closure_remaining()
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        deadline = _NATIVE_CLOSURE_DEADLINE.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RuntimeError('native Pip closure exceeded configured total deadline: ' + key) from exc
         detail = str(exc)
         if isinstance(exc, subprocess.TimeoutExpired) and exc.output:
             detail += '; last pip output: ' + exc.output[-5000:].decode(errors='replace')
@@ -6502,6 +6566,7 @@ def _native_pip_group_locked(pool,key,group):
     # A checkpoint/publication failure is infrastructure failure, even for a
     # recipe that permits its installer to fail. Never overwrite a completed
     # record with an optional-failure marker.
+    _native_closure_remaining()
     _write_pip_plan(pool,target,group['requirements'],key,packages,
                     constraints=group['constraints'],no_deps=group['no_deps'],build_plans=build_plans,
                     preferred_versions=group.get('preferred_versions'))

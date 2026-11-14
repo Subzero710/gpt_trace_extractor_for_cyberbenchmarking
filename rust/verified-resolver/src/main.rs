@@ -176,7 +176,7 @@ struct Solver {
     wire: Wire,
     no_deps: bool,
     roots: BTreeSet<String>,
-    deadline: Option<Instant>,
+    deadline: Instant,
     max_decisions: u64,
     max_depth: usize,
     max_cache_bytes: usize,
@@ -205,9 +205,8 @@ struct Solver {
 }
 impl Solver {
     fn validate_time(&self) -> Result<(), String> {
-        // No wall-clock cap for a complete closure. Each host I/O / build
-        // operation is bounded by its own independently configured deadline.
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        // The configured deadline is mandatory, never optional.
+        if Instant::now() >= self.deadline {
             Err("native Rust dependency solve exceeded configured deadline".into())
         } else { Ok(()) }
     }
@@ -668,6 +667,14 @@ impl Solver {
     }
 }
 
+fn mandatory_deadline(seconds: u64) -> Result<Instant, String> {
+    if seconds == 0 {
+        return Err("native Rust resolver requires a nonzero closure deadline".into());
+    }
+    Instant::now().checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| "invalid native Rust resolver deadline".to_string())
+}
+
 fn process(wire: &mut Wire) -> Result<(),String> {
     let max_frame=wire.raw_u64()?;
     let limit=usize::try_from(max_frame).map_err(err)?;
@@ -696,10 +703,7 @@ fn process(wire: &mut Wire) -> Result<(),String> {
         roots.insert(name.clone());
         entries.push(Entry{name,requirement,extras,causes:BTreeSet::new()});
     }
-    let deadline=if deadline_seconds==0 { None } else {
-        Some(Instant::now().checked_add(Duration::from_secs(deadline_seconds))
-            .ok_or_else(||"invalid resolver deadline".to_string())?)
-    };
+    let deadline = mandatory_deadline(deadline_seconds)?;
     let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
         max_cache_bytes,prefetch_width,stats:Stats::default(),
         candidate_domains:HashMap::new(),registered_candidates:HashMap::new(),
@@ -728,6 +732,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mandatory_solver_deadline_rejects_zero() {
+        assert!(mandatory_deadline(0).is_err());
+        assert!(mandatory_deadline(1).is_ok());
+    }
 
     #[test]
     fn identical_requirements_combine_causal_provenance() {

@@ -42,6 +42,7 @@ def sendnum(x,n=4):o.write(x.to_bytes(n,'big'))
 def sendstr(x):
  raw=x.encode();sendnum(len(raw));o.write(raw)
 limit=num(8);max_decisions=num(8);depth=num(8);cache=num(8);deadline=num(8);prefetch=num(8);no_deps=num(1)
+assert 0 < deadline <= 20, 'unbounded Rust resolver deadline is forbidden'
 roots=[(string(),string(),strings()) for _ in range(num())]
 assert roots==[('demo','demo==1.0',[])]
 o.write(b'D');sendstr('demo');sendnum(1);sendstr('demo==1.0');o.flush()
@@ -83,6 +84,62 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
     }
     target=SimpleNamespace(python_artifact_sha256='a'*64)
     assert bridge.solve(host,None,target,{'demo==1.0'},set(),'group',materialize=False)==[result]
+
+
+def test_native_solver_deadline_contract_is_mandatory(tmp_path):
+    import importlib.util
+    import subprocess
+    import time
+    import pytest
+    import os
+
+    location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    rust = (Path(__file__).resolve().parents[2] /
+            'rust/verified-resolver/src/main.rs').read_text()
+    assert 'deadline: Instant' in rust
+    assert 'deadline: Option<Instant>' not in rust
+    assert 'mandatory_deadline(deadline_seconds)?' in rust
+    assert 'if seconds == 0' in rust
+    spec = importlib.util.spec_from_file_location('resolver_deadline_contract', location)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    (tmp_path / 'config').mkdir()
+    policy = tmp_path / 'config/preparation.toml'
+    policy.write_text('[acquisition]\npip_solver_max_decisions=1\n'
+                      'pip_solver_max_depth=1\npip_solver_cache_max_bytes=1\n'
+                      'pip_solver_max_frame_bytes=1024\npip_total_timeout_seconds=1\n')
+    assert bridge._policy(tmp_path)['pip_total_timeout_seconds'] == 1
+    policy.write_text(policy.read_text().replace('pip_total_timeout_seconds=1',
+                                                 'pip_total_timeout_seconds=0'))
+    with pytest.raises(RuntimeError, match='resource controls'):
+        bridge._policy(tmp_path)
+
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    wire = bridge._Wire(child, 1024, deadline=time.monotonic() + 0.05)
+    start = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match='deadline'):
+            wire.exact(1)
+        assert time.monotonic() - start < 2
+    finally:
+        child.kill()
+        child.wait(timeout=2)
+        child.stdin.close()
+        child.stdout.close()
+
+
+def test_compiled_rust_rejects_zero_global_deadline():
+    location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_compiled_deadline_test', location)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    program = bridge._binary(location.parents[1])
+    header = b''.join(number.to_bytes(8, 'big') for number in (1024, 1, 1, 1, 0, 1))
+    request = header + b'\x00' + (0).to_bytes(4, 'big')
+    finished = subprocess.run([str(program)], input=request, capture_output=True, timeout=10)
+    assert finished.returncode != 0
+    assert b'nonzero closure deadline' in finished.stdout
 
 
 def test_bridge_versions_use_pep440_not_string_spelling():
