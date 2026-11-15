@@ -4834,7 +4834,14 @@ def _conda_elementary_entry():
         package_cache_data.do_cache_action, 'conda:cache_package')
     emit('ready', 0, 'conda:instrumented')
     sys.argv = ['conda', *sys.argv[2:]]
-    runpy.run_module('conda', run_name='__main__', alter_sys=True)
+    try:
+        runpy.run_module('conda', run_name='__main__', alter_sys=True)
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            emit('complete', 0, 'conda:complete')
+        raise
+    else:
+        emit('complete', 0, 'conda:complete')
 
 
 
@@ -4856,6 +4863,8 @@ def _native_run_conda_elementary(command, runtime, environment):
         process = None
         active = {}
         paused = {}
+        ready = False
+        complete = False
         last_event = time.monotonic()
         buffered = bytearray()
         try:
@@ -4867,18 +4876,23 @@ def _native_run_conda_elementary(command, runtime, environment):
             write_fd = -1
             while True:
                 alive = process.poll() is None
-                readable, _, _ = select.select([read_fd], [], [], cadence if alive else 0)
+                readable, _, _ = select.select([read_fd], [], [], cadence)
                 if not alive and not readable:
                     if buffered:
                         raise RuntimeError('truncated Conda action event stream')
-                    break
+                    raise RuntimeError('Conda action event channel remained open after process exit')
                 if readable:
                     data = os.read(read_fd, 65536)
                     if not data:
                         if buffered:
                             raise RuntimeError('truncated Conda action event stream')
                         if process.poll() is None:
-                            raise RuntimeError('Conda action event channel closed prematurely')
+                            try:
+                                process.wait(timeout=limit)
+                            except subprocess.TimeoutExpired as exc:
+                                raise TimeoutError(
+                                    'Conda action event channel closed while the process '
+                                    'remained active after the configured operation deadline') from exc
                         break
                     if data:
                         buffered.extend(data)
@@ -4896,8 +4910,15 @@ def _native_run_conda_elementary(command, runtime, environment):
                                     or type(instant) is not float or not math.isfinite(instant)
                                     or instant > time.monotonic() + cadence):
                                 raise RuntimeError('invalid Conda action identity/timestamp')
-                            if kind == 'ready' and ident == 0:
+                            if kind == 'ready' and ident == 0 and not ready and not complete:
+                                ready = True
                                 last_event = instant
+                            elif (kind == 'complete' and ident == 0 and ready and not complete
+                                  and not active and not paused):
+                                complete = True
+                                last_event = instant
+                            elif not ready or complete:
+                                raise RuntimeError('unexpected Conda action transition')
                             elif kind == 'begin' and ident > 0 and ident not in active and ident not in paused:
                                 active[ident] = (instant, label)
                                 last_event = instant
@@ -4935,14 +4956,33 @@ def _native_run_conda_elementary(command, runtime, environment):
                 raise RuntimeError('instrumented Conda creation failed (exit '
                                    + str(process.returncode) + '): '
                                    + contents[-10000:].decode(errors='replace'))
+            if not ready or not complete or active or paused:
+                raise RuntimeError('Conda exited successfully without a complete, balanced action stream')
             return contents
-        except BaseException:
-            if process is not None and process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=cadence)
+        except BaseException as exc:
+            if process is not None:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=cadence)
+                    except subprocess.TimeoutExpired:
+                        exc.add_note('Conda process did not exit after its process group was killed')
+                output.seek(0, os.SEEK_END)
+                size = output.tell()
+                output.seek(max(0, size - 10000))
+                tail = output.read().decode(errors='replace')
+                diagnostic = {
+                    'exit_code': process.returncode,
+                    'ready': ready,
+                    'complete': complete,
+                    'active_actions': sorted(active.items()),
+                    'paused_actions': sorted(paused.items()),
+                }
+                exc.add_note('Conda supervisor state: ' + json.dumps(diagnostic, ensure_ascii=True)
+                             + ('\nConda stdout/stderr tail:\n' + tail if tail else ''))
             raise
         finally:
             os.close(read_fd)
@@ -7984,13 +8024,23 @@ def main(argv=None):
     _pool_progress('Dependency acquisition complete',force=True)
 
 
-if __name__=='__main__':
+def _pool_cli_entry():
     try:
         if sys.argv[1:2] == ['--conda-elementary-run']:
             _conda_elementary_entry()
         else:
             main()
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            raise
+        if _POOL_PROGRESS is not None: _POOL_PROGRESS.finish()
+        print('[pool] FAILED; data retained, no automatic cleanup:',str(exc),file=sys.stderr,flush=True)
+        raise
     except BaseException as exc:
         if _POOL_PROGRESS is not None: _POOL_PROGRESS.finish()
         print('[pool] FAILED; data retained, no automatic cleanup:',str(exc),file=sys.stderr,flush=True)
         raise
+
+
+if __name__=='__main__':
+    _pool_cli_entry()
