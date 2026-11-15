@@ -38,7 +38,8 @@ def test_silent_cpu_backend_completes_after_idle_limit(tmp_path, monkeypatch):
             ' check=True)\n'
             'print("metadata complete", flush=True)\n')
     runtime = _fixture(tmp_path, code)
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (2, 2))
+    monkeypatch.setattr(pool, '_operation_timeout', lambda: 8)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     assert b'metadata complete' in _execute(runtime, metadata_build=True)
 
@@ -47,28 +48,28 @@ def test_silent_sleeping_metadata_build_still_stalls(tmp_path, monkeypatch):
     runtime = _fixture(tmp_path, 'import time\nprint("start",flush=True)\ntime.sleep(20)\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
-    with pytest.raises(RuntimeError, match='no new output/download bytes'):
+    with pytest.raises(TimeoutError, match='no output and started no elementary'):
         _execute(runtime, metadata_build=True)
 
 
-def test_cpu_loop_in_metadata_cannot_extend_total_deadline(tmp_path, monkeypatch, capsys):
+def test_cpu_loop_in_metadata_is_bounded_by_elementary_idle(tmp_path, monkeypatch, capsys):
     runtime = _fixture(tmp_path, 'print("start",flush=True)\nwhile True: pass\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (4, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(TimeoutError, match='no output and started no elementary'):
         _execute(runtime, metadata_build=True)
     prefix = '[pool] native pip timeout diagnostic: '
     line = next(row for row in capsys.readouterr().err.splitlines() if row.startswith(prefix))
     observation = json.loads(line.removeprefix(prefix))
-    assert observation['timeout'] == 'total'
-    assert observation['silent_seconds'] >= 2
+    assert observation['timeout'] == 'stall'
+    assert observation['elapsed_seconds'] >= 2
 
 
 def test_silent_cpu_normal_pip_retains_stall_watchdog(tmp_path, monkeypatch):
     runtime = _fixture(tmp_path, 'print("start",flush=True)\nwhile True: pass\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
-    with pytest.raises(RuntimeError, match='no new output/download bytes'):
+    with pytest.raises(TimeoutError, match='no output and started no elementary'):
         _execute(runtime, metadata_build=False)
 
 

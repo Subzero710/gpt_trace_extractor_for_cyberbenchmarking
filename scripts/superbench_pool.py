@@ -4745,47 +4745,235 @@ def _native_backend_is_executing(activity):
                or row.get('write_bytes_delta', 0) > 0 for row in activity)
 
 
-def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *, metadata_build=False):
-    """Execute pip with bounded elapsed/stall budgets and byte-level feedback.
+# GPT_TRACE_ELEMENTARY_CONDA_PEP517_DEADLINES_V1
 
-    A per-command total deadline bounds the subprocess. Only pip's actual output
-    and advancing download counters reset the inactivity deadline; CPU usage and
-    procfs I/O are diagnostic evidence, not proof that a build is progressing.
-    Verbose PEP 517 hooks expose their output to the same reader.
-    Isolated metadata builds can perform silent CPU-intensive compilation: only
-    while the process tree is demonstrably executing do we defer the idle error,
-    and never beyond the already configured absolute command deadline.
-    """
+
+def _conda_elementary_entry():
+    import functools
+    import inspect
+    import itertools
+    import runpy
+    import threading
+    import time
+
+    fd_raw = os.environ.pop('GPT_TRACE_CONDA_EVENT_FD')
+    fd = int(fd_raw)
+    if fd < 3:
+        raise RuntimeError('untrusted Conda action event descriptor')
+    events = itertools.count(1)
+    writer_lock = threading.Lock()
+    thread_scope = threading.local()
+
+    def emit(event, ident, label):
+        payload = (json.dumps({'event': event, 'id': ident, 'label': label,
+                               'at': time.monotonic()},
+                              separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+        if len(payload) > 4096:
+            raise RuntimeError('Conda action event exceeds protocol bound')
+        with writer_lock:
+            if os.write(fd, payload) != len(payload):
+                raise RuntimeError('short Conda action event write')
+
+    from conda.core import link, package_cache_data, path_actions
+
+    def wrap(function, label):
+        @functools.wraps(function)
+        def observed(*args, **kwargs):
+            ident = next(events)
+            description = label
+            if args:
+                subject = args[0]
+                attributes = vars(subject) if hasattr(subject, '__dict__') else {}
+                detail = attributes.get('target_short_path')
+                if detail is None:
+                    detail = attributes.get('source_short_path')
+                if detail is not None:
+                    description += ':' + str(detail)[:200]
+            stack = getattr(thread_scope, 'stack', None)
+            if stack is None:
+                stack = []
+                thread_scope.stack = stack
+            if stack:
+                emit('pause', stack[-1][0], stack[-1][1])
+            emit('begin', ident, description)
+            stack.append((ident, description))
+            try:
+                return function(*args, **kwargs)
+            finally:
+                stack.pop()
+                emit('end', ident, description)
+                if stack:
+                    emit('resume', stack[-1][0], stack[-1][1])
+        return observed
+
+    def descendants(parent):
+        for subtype in parent.__subclasses__():
+            yield subtype
+            yield from descendants(subtype)
+
+    classes = list(dict.fromkeys((path_actions._Action, *descendants(path_actions._Action))))
+    instrumented = 0
+    for cls in classes:
+        for name in ('execute', 'verify'):
+            function = cls.__dict__.get(name)
+            if inspect.isfunction(function) and not getattr(function, '__isabstractmethod__', False):
+                setattr(cls, name, wrap(function, 'conda:' + cls.__name__ + '.' + name))
+                instrumented += 1
+    if instrumented < 2:
+        raise RuntimeError('Conda elementary action instrumentation is unavailable')
+
+    # Each explicit archive gets its own preparation budget. This is not the
+    # deadline for ProgressiveFetchExtract.execute, which handles many archives.
+    original_record = package_cache_data.ProgressiveFetchExtract.make_actions_for_record
+    package_cache_data.ProgressiveFetchExtract.make_actions_for_record = staticmethod(
+        wrap(original_record, 'conda:prepare_package'))
+    link.run_script = wrap(link.run_script, 'conda:package_script')
+    package_cache_data.do_extract_action = wrap(
+        package_cache_data.do_extract_action, 'conda:extract_package')
+    package_cache_data.do_cache_action = wrap(
+        package_cache_data.do_cache_action, 'conda:cache_package')
+    emit('ready', 0, 'conda:instrumented')
+    sys.argv = ['conda', *sys.argv[2:]]
+    runpy.run_module('conda', run_name='__main__', alter_sys=True)
+
+
+
+def _native_run_conda_elementary(command, runtime, environment):
+    import select
     import signal
-    total_limit, stall_limit = _native_pip_timeouts()
-    total_limit = min(timeout, total_limit)
-    remaining = _native_closure_remaining()
-    if remaining is not None:
-        total_limit = min(total_limit, remaining)
-    observation_interval = _conda_progress_interval()
-    # Production shares the monitor owned by _native_pool_runtime. Minimal
-    # standalone runtimes receive exactly one monitor, attached to their own
-    # dictionary so callers retain explicit responsibility for closing it.
+    import math
+
+    if (len(command) < 6 or command[1:4] != ['-m', 'conda', 'create']
+            or '--offline' not in command or '--file' not in command):
+        raise RuntimeError('only a pinned offline Conda creation can use the action supervisor')
+    limit = _operation_timeout()
+    cadence = _conda_progress_interval()
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    child_environment = {**environment, 'GPT_TRACE_CONDA_EVENT_FD': str(write_fd)}
+    wrapper = [command[0], '-I', '-B', str(Path(__file__).resolve()),
+               '--conda-elementary-run', *command[3:]]
+    with tempfile.TemporaryFile(mode='w+b') as output:
+        process = None
+        active = {}
+        paused = {}
+        last_event = time.monotonic()
+        buffered = bytearray()
+        try:
+            process = subprocess.Popen(wrapper, cwd=runtime['root'], env=child_environment,
+                                       stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True,
+                                       pass_fds=(write_fd,))
+            os.close(write_fd)
+            write_fd = -1
+            while True:
+                alive = process.poll() is None
+                readable, _, _ = select.select([read_fd], [], [], cadence if alive else 0)
+                if not alive and not readable:
+                    if buffered:
+                        raise RuntimeError('truncated Conda action event stream')
+                    break
+                if readable:
+                    data = os.read(read_fd, 65536)
+                    if not data:
+                        if buffered:
+                            raise RuntimeError('truncated Conda action event stream')
+                        if process.poll() is None:
+                            raise RuntimeError('Conda action event channel closed prematurely')
+                        break
+                    if data:
+                        buffered.extend(data)
+                        if len(buffered) > 65536:
+                            raise RuntimeError('Conda action event stream exceeded protocol bound')
+                        while b'\n' in buffered:
+                            line, _, rest = buffered.partition(b'\n')
+                            buffered = bytearray(rest)
+                            event = json.loads(line)
+                            if not isinstance(event, dict) or set(event) != {'event', 'id', 'label', 'at'}:
+                                raise RuntimeError('invalid Conda action event')
+                            ident, kind, label = event['id'], event['event'], event['label']
+                            instant = event['at']
+                            if (type(ident) is not int or not isinstance(label, str)
+                                    or type(instant) is not float or not math.isfinite(instant)
+                                    or instant > time.monotonic() + cadence):
+                                raise RuntimeError('invalid Conda action identity/timestamp')
+                            if kind == 'ready' and ident == 0:
+                                last_event = instant
+                            elif kind == 'begin' and ident > 0 and ident not in active and ident not in paused:
+                                active[ident] = (instant, label)
+                                last_event = instant
+                            elif kind == 'pause' and ident in active:
+                                started, original_label = active.pop(ident)
+                                if instant - started >= limit:
+                                    raise TimeoutError('Conda elementary action exceeded '
+                                                       + str(limit) + ' seconds: ' + original_label)
+                                paused[ident] = original_label
+                                last_event = instant
+                            elif kind == 'resume' and ident in paused:
+                                active[ident] = (instant, paused.pop(ident))
+                                last_event = instant
+                            elif kind == 'end' and ident in active:
+                                started, original_label = active.pop(ident)
+                                if instant - started >= limit:
+                                    raise TimeoutError('Conda elementary action exceeded '
+                                                       + str(limit) + ' seconds: ' + original_label)
+                                last_event = instant
+                            else:
+                                raise RuntimeError('unexpected Conda action transition')
+                now = time.monotonic()
+                if not alive:
+                    continue
+                for _ident, (started, label) in active.items():
+                    if now - started >= limit:
+                        raise TimeoutError('Conda elementary action exceeded '
+                                           + str(limit) + ' seconds: ' + label)
+                if not active and not paused and now - last_event >= limit:
+                    raise TimeoutError('Conda uninstrumented internal phase exceeded '
+                                       + str(limit) + ' seconds without an action event')
+            output.seek(0)
+            contents = output.read()
+            if process.returncode:
+                raise RuntimeError('instrumented Conda creation failed (exit '
+                                   + str(process.returncode) + '): '
+                                   + contents[-10000:].decode(errors='replace'))
+            return contents
+        except BaseException:
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=cadence)
+            raise
+        finally:
+            os.close(read_fd)
+            if write_fd >= 0:
+                os.close(write_fd)
+
+
+
+def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=False):
+    import signal
+
+    cadence = _conda_progress_interval()
+    limit = _operation_timeout()
+    _total, stall = _native_pip_timeouts()
     with _bounded_lock(_NATIVE_POOL_LOCK):
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
-            meter = _NativePipByteProgress(_conda_progress_interval())
+            meter = _NativePipByteProgress(cadence)
             runtime['_pip_byte_progress'] = meter
     if not isinstance(meter, _NativePipByteProgress):
-        raise RuntimeError('native Pip monitor is not owned by the shared runtime')
+        raise RuntimeError('native Pip progress monitor has invalid ownership')
     identity = hashlib.sha256(
-        ('\0'.join(command) + '\0' + str(threading.get_ident())).encode()).hexdigest()[:12]
+        ('\0'.join(command) + str(threading.get_ident())).encode()).hexdigest()[:12]
     meter.begin(identity)
     tail = bytearray()
-    errors = []
-    activity_lock = threading.Lock()
-    started = time.monotonic()
-    last_activity = [started]
-    last_progress = [None]
+    reader_errors = []
+    last_output = [time.monotonic()]
+    output_lock = threading.Lock()
     process = None
-    silent_sample = None
-    next_backend_probe = None
     try:
+        environment = {**environment, 'PIP_DEFAULT_TIMEOUT': str(limit)}
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
@@ -4793,112 +4981,103 @@ def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *
         def consume():
             try:
                 for line in iter(process.stdout.readline, b''):
-                    is_progress = meter.observe(identity, line)
-                    with activity_lock:
-                        if is_progress:
-                            # Repeated identical byte counters are not progress.
-                            if last_progress[0] != line:
-                                last_progress[0] = line
-                                last_activity[0] = time.monotonic()
-                        elif line.strip():
-                            last_activity[0] = time.monotonic()
-                    if is_progress:
-                        continue
-                    tail.extend(line)
-                    if len(tail) > 65536:
-                        del tail[:-65536]
-            except BaseException as exc:
-                errors.append(exc)
+                    byte_progress = meter.observe(identity, line)
+                    with output_lock:
+                        if line.strip():
+                            last_output[0] = time.monotonic()
+                    if not byte_progress:
+                        tail.extend(line)
+                        if len(tail) > 65536:
+                            del tail[:-65536]
+            except BaseException as error:
+                reader_errors.append(error)
             finally:
                 process.stdout.close()
 
-        reader = threading.Thread(target=consume, daemon=True,
-                                  name='native-pip-output-reader')
+        reader = threading.Thread(target=consume, name='native-pip-output-reader', daemon=True)
         reader.start()
-        timed_out = None
-        while process.poll() is None:
-            now = time.monotonic()
-            with activity_lock:
-                idle = now - last_activity[0]
-            elapsed = now - started
-            # Previous CPU samples must never stand in for a later output interval.
-            sampling_start = max(stall_limit / 2, stall_limit - 2 * observation_interval)
-            if idle < sampling_start:
-                silent_sample = None
-                next_backend_probe = None
-            elif silent_sample is None:
-                silent_sample = (now, _native_process_tree_snapshot(process.pid))
-            if elapsed >= total_limit:
-                timed_out = ('total', total_limit)
-                break
-            if idle >= stall_limit:
-                if not metadata_build:
-                    timed_out = ('stall', stall_limit)
-                    break
-                if next_backend_probe is None or now >= next_backend_probe:
-                    snapshot = _native_process_tree_snapshot(process.pid)
-                    sample_time, before = silent_sample
-                    observed = _native_process_activity(before, snapshot, now - sample_time)
-                    if not _native_backend_is_executing(observed):
-                        timed_out = ('stall', stall_limit)
-                        break
-                    # CPU is NOT progress: keep the original idle age. Observe
-                    # compute liveness sparsely and respect the hard total cap.
-                    silent_sample = (now, snapshot)
-                    next_backend_probe = now + max(observation_interval, stall_limit / 2)
-            # Poll at the same versioned cadence as the progress display.
-            remaining = min(total_limit - elapsed, observation_interval)
-            if idle < stall_limit:
-                remaining = min(remaining, stall_limit - idle)
-            elif next_backend_probe is not None:
-                remaining = min(remaining, next_backend_probe - now)
-            try:
-                process.wait(timeout=max(0.001, remaining))
-            except subprocess.TimeoutExpired:
-                pass
-        if timed_out is not None:
-            # Capture the live process state before destroying the only evidence.
-            observed_at = time.monotonic()
-            snapshot = _native_process_tree_snapshot(process.pid)
-            sample_time, sample = silent_sample if silent_sample is not None else (observed_at, [])
-            diagnostic = {'timeout': timed_out[0], 'limit_seconds': timed_out[1],
-                          'elapsed_seconds': observed_at - started,
-                          'silent_seconds': observed_at - last_activity[0],
-                          'command': command, 'source': runtime.get('_native_source_context'),
-                          'processes': snapshot,
-                          'process_activity': _native_process_activity(
-                              sample, snapshot, observed_at - sample_time)}
+        leaf_since = {}
+        previous_leaves = set()
+        started = time.monotonic()
+
+        def expired(kind, seconds, message, snapshot):
+            diagnostic = {
+                'timeout': kind, 'limit_seconds': seconds,
+                'elapsed_seconds': time.monotonic() - started,
+                'source': runtime.get('_native_source_context'),
+                'processes': [{key: row[key] for key in
+                               ('pid', 'ppid', 'state', 'start_ticks', 'cpu_ticks',
+                                'reaped_cpu_ticks', 'wait_channel') if key in row}
+                              for row in snapshot],
+                'command': command,
+            }
             print('[pool] native pip timeout diagnostic: '
                   + json.dumps(diagnostic, sort_keys=True), file=sys.stderr, flush=True)
-            # Kill the entire PEP 517 subprocess group, including nested hooks.
+            suffix = tail[-5000:].decode(errors='replace')
+            raise TimeoutError(message + ('; last output: ' + suffix if suffix else ''))
+
+        while process.poll() is None:
+            now = time.monotonic()
+            snapshot = _native_process_tree_snapshot(process.pid)
+            parents = {row['ppid'] for row in snapshot}
+            leaves = set()
+            for row in snapshot:
+                pid = row['pid']
+                if pid == process.pid or pid in parents or row['state'] == 'Z':
+                    continue
+                marker = (pid, row['start_ticks'])
+                leaves.add(marker)
+                born = leaf_since.setdefault(marker, now)
+                if now - born >= limit:
+                    expired('elementary', limit, 'Pip elementary subprocess exceeded '
+                            + str(limit) + ' seconds: '
+                            + str(row.get('command', pid))[:800], snapshot)
+            for marker in tuple(leaf_since):
+                if marker not in leaves:
+                    del leaf_since[marker]
+            if leaves != previous_leaves:
+                with output_lock:
+                    last_output[0] = now
+                previous_leaves = leaves
+            with output_lock:
+                idle = now - last_output[0]
+            # Without an active operation, Pip's own stall deadline catches a
+            # backend that is neither producing output nor spawning work.
+            if not leaves and idle >= stall:
+                expired('stall', stall, 'Pip emitted no output and started no elementary '
+                        + 'subprocess for ' + str(stall) + ' seconds', snapshot)
+            try:
+                process.wait(timeout=cadence)
+            except subprocess.TimeoutExpired:
+                pass
+        reader.join(timeout=cadence)
+        if reader.is_alive():
+            raise RuntimeError('Pip output reader remained alive after subprocess exit')
+        if reader_errors:
+            raise RuntimeError('Pip output reader failed') from reader_errors[0]
+        if process.returncode:
+            raise RuntimeError('native Pip invocation failed (exit '
+                               + str(process.returncode) + '): '
+                               + tail[-5000:].decode(errors='replace'))
+        return bytes(tail)
+    except BaseException:
+        if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            process.wait(timeout=observation_interval)
-            reader.join(timeout=observation_interval)
-            if reader.is_alive():
-                raise RuntimeError('native Pip output pipe remained open after timeout; refusing unbounded reader wait')
-            kind, limit = timed_out
-            if kind == 'stall':
-                diagnostic = tail[-5000:].decode(errors='replace')
-                raise RuntimeError('native pip emitted no new output/download bytes for '
-                                   + str(limit) + ' seconds; last output: ' + diagnostic)
-            raise subprocess.TimeoutExpired(command, limit, output=bytes(tail))
-        reader.join(timeout=observation_interval)
-        if reader.is_alive():
-            raise RuntimeError('native Pip output pipe remained open after subprocess exit')
-        if errors:
-            raise RuntimeError('pip output-reader failed: ' + str(errors[0])) from errors[0]
-        if process.returncode:
-            raise RuntimeError('native package command failed (exit '
-                + str(process.returncode) + '): ' + tail[-5000:].decode(errors='replace'))
-        return bytes(tail)
+            process.wait(timeout=cadence)
+        raise
     finally:
         meter.end(identity)
 
 
-def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build=False):
+def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *, metadata_build=False):
+    return _native_run_pip_elementary(command, runtime, environment,
+                                      metadata_build=metadata_build)
+
+
+def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build=False):
     """Run an actual package tool with a complete, per-invocation interpreter PATH.
 
     Build backends and installed command entrypoints can invoke
@@ -4910,7 +5089,10 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build
     command = [str(arg) for arg in argv]
     if not command:
         raise RuntimeError('empty native package command')
-    timeout = min(timeout, _operation_timeout())
+    if timeout is None:
+        timeout = _operation_timeout()
+    if type(timeout) is not int or timeout < 1:
+        raise RuntimeError('invalid native elementary command timeout')
     environment = dict(runtime['env'])
     base_bin = Path(runtime['root']) / 'conda' / 'bin'
     paths = [str(base_bin)]
@@ -4945,6 +5127,9 @@ def _native_run(argv, runtime, *, timeout=7200, interpreter=None, metadata_build
             command.insert(index + 3, '--progress-bar=raw')
             return _native_run_pip_with_byte_progress(
                 command, runtime, environment, timeout, metadata_build=metadata_build)
+    if (len(command) >= 4 and command[1:4] == ['-m', 'conda', 'create']
+            and '--offline' in command):
+        return _native_run_conda_elementary(command, runtime, environment)
     remaining = _native_closure_remaining()
     if remaining is not None:
         timeout = min(timeout, remaining)
@@ -5135,7 +5320,7 @@ def _native_locked_python(pool, target):
             conda = _native_bootstrap(pool, runtime)
             _native_run([conda.parent / 'python', '-m', 'conda',
                          'create', '--offline', '--yes', '--prefix', prefix,
-                         '--file', explicit_file], runtime, timeout=14400,
+                         '--file', explicit_file], runtime,
                          interpreter=conda.parent / 'python')
         python = prefix / 'bin' / 'python'
         version = _native_run([python, '-c',
@@ -7800,7 +7985,11 @@ def main(argv=None):
 
 
 if __name__=='__main__':
-    try:main()
+    try:
+        if sys.argv[1:2] == ['--conda-elementary-run']:
+            _conda_elementary_entry()
+        else:
+            main()
     except BaseException as exc:
         if _POOL_PROGRESS is not None: _POOL_PROGRESS.finish()
         print('[pool] FAILED; data retained, no automatic cleanup:',str(exc),file=sys.stderr,flush=True)

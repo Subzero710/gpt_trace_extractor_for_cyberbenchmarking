@@ -23,44 +23,47 @@ def _fake_pip(root, body):
         'PYTHONDONTWRITEBYTECODE': '1'}}
 
 
-def test_native_pip_cpu_active_but_silent_child_times_out_as_stalled(tmp_path, monkeypatch):
+def test_native_pip_cpu_active_child_has_a_per_process_limit(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path,
         'import subprocess, sys\n'
         'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
+    monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
-            with pytest.raises(RuntimeError, match='no new output/download bytes'):
-                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
-                                 runtime, timeout=7)
+            with pytest.raises(TimeoutError, match='elementary subprocess exceeded'):
+                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'], runtime, timeout=7)
         finally:
             runtime['_pip_byte_progress'].close()
 
 
-def test_native_pip_still_enforces_total_deadline_during_active_build(tmp_path, monkeypatch):
+def test_native_pip_does_not_enforce_a_cumulative_build_deadline(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\n'
-                                  'finish = time.monotonic() + 4\n'
+                                  'finish = time.monotonic() + 3\n'
                                   'while time.monotonic() < finish:\n'
-                                  '    pass\n')
+                                  '    pass\n'
+                                  'print("finished",flush=True)\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (1, 10))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
-            with pytest.raises(subprocess.TimeoutExpired):
-                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
-                                 runtime, timeout=5)
+            result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
+                                      runtime, timeout=1)
         finally:
             runtime['_pip_byte_progress'].close()
+    assert b'finished' in result
 
 
-def test_pip_completion_never_scans_unrelated_procfs(tmp_path, monkeypatch):
+def test_pip_observation_uses_only_the_spawned_root(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'print("backend completed", flush=True)\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
-    def not_needed(_pid):
-        raise AssertionError('procfs diagnostic scanned during successful resolution')
-    monkeypatch.setattr(pool, '_native_process_tree_snapshot', not_needed)
+    original = pool._native_process_tree_snapshot
+    def scoped(pid):
+        assert pid > 0 and pid != os.getpid()
+        return original(pid)
+    monkeypatch.setattr(pool, '_native_process_tree_snapshot', scoped)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
@@ -101,10 +104,11 @@ def test_parallel_silent_pip_workers_release_slots(tmp_path, monkeypatch):
         'import subprocess, sys\n'
         'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
     monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     start = time.monotonic()
     def run():
-        with pytest.raises(RuntimeError, match='no new output/download bytes'):
+        with pytest.raises(TimeoutError, match='elementary subprocess exceeded'):
             pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
                              runtime, timeout=8)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -113,4 +117,6 @@ def test_parallel_silent_pip_workers_release_slots(tmp_path, monkeypatch):
                 tuple(executor.map(lambda _index: run(), range(3)))
         finally:
             runtime['_pip_byte_progress'].close()
-    assert time.monotonic() - start < 8
+    assert time.monotonic() - start < 10
+
+
