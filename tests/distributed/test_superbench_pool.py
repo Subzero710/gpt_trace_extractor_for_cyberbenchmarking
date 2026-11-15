@@ -2343,12 +2343,12 @@ setup(version=dynamic_version(), **setup_args)
         self.assertNotIn('dict(os.environ',physical)
         self.assertIn('PIP_CONFIG_FILE',physical)
         self.assertIn('child.wait(timeout=cadence)',physical)
-        self.assertIn("acquisition['pip_stall_timeout_seconds']",physical)
+        self.assertIn("acquisition['progress_stall_timeout_seconds']",physical)
         self.assertNotIn('acquisition_job_timeout_seconds',physical)
         controls = tomllib.loads((ROOT/'config/preparation.toml').read_text())
         self.assertNotIn('job_timeout_hours', controls['acquisition'])
-        self.assertGreater(controls['acquisition']['timeout_seconds'],
-                           controls['acquisition']['pip_stall_timeout_seconds'])
+        self.assertGreater(controls['acquisition']['progress_stall_timeout_seconds'],
+                           controls['acquisition']['timeout_seconds'])
         self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
 
     def test_conda_lock_downloads_each_sha_once_and_materializes_transactions(self):

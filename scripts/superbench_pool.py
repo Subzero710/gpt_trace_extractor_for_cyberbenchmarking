@@ -3571,7 +3571,7 @@ class _SingleFlightCache:
             if owner:
                 future=concurrent.futures.Future()
                 self._pending[key]=future
-        if not owner:return future.result()
+        if not owner:return _bounded_future_result(future)
         try:
             value=producer()
         except BaseException as exc:
@@ -3614,7 +3614,7 @@ class _BoundedCoreMetadataCache:
                 future = concurrent.futures.Future()
                 self._pending[key] = future
         if not owner:
-            return future.result()
+            return _bounded_future_result(future)
         try:
             value = producer()
             if not isinstance(value, bytes):
@@ -5330,7 +5330,7 @@ def _native_locked_python(pool, target):
             pending = concurrent.futures.Future()
             pending_by_sha[sha] = pending
     if not owner:
-        return pending.result()
+        return _bounded_future_result(pending)
     try:
         # Each target has its own hardlink directory and explicit transaction.
         # Overlapping immutable archives consume no duplicate CAS data blocks.
@@ -5769,7 +5769,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
             pending = concurrent.futures.Future()
             inflight[identity] = pending
     if not owner:
-        dependencies, remote = pending.result()
+        dependencies, remote = _bounded_future_result(pending)
         return set(dependencies), set(remote)
     try:
         # The locked interpreter may be prepared by another task. Its Conda

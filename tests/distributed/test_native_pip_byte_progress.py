@@ -3,7 +3,7 @@ import contextlib
 import importlib.util
 import io
 import os
-import subprocess
+from unittest.mock import patch
 import sys
 import tempfile
 from pathlib import Path
@@ -88,10 +88,14 @@ def test_timeout_retains_partial_pip_output():
         runtime = {'root': root, 'env': {
             'PATH': os.environ['PATH'], 'PYTHONPATH': str(root),
             'PYTHONDONTWRITEBYTECODE': '1'}}
-        with contextlib.redirect_stdout(io.StringIO()):
-            with pytest.raises(subprocess.TimeoutExpired) as error:
-                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fake-package'],
-                                 runtime, timeout=1)
-            runtime['_pip_byte_progress'].close()
-        assert b'error context marker' in error.value.output
+        # Le superviseur Pip utilise un délai de stagnation par phase,
+        # et non un délai global d'invocation.
+        with patch.object(pool, '_native_pip_timeouts',
+                          return_value=(pool._operation_timeout(), 1)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with pytest.raises(TimeoutError, match='Pip emitted no output') as error:
+                    pool._native_run([sys.executable, '-m', 'pip', 'install', 'fake-package'],
+                                     runtime)
+                runtime['_pip_byte_progress'].close()
+        assert 'error context marker' in str(error.value)
         assert runtime['_pip_byte_progress'].snapshot()['bytes'] == 1048576
