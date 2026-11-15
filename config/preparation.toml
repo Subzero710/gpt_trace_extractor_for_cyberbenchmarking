@@ -39,6 +39,20 @@ broker_read_timeout_seconds = 15
 broker_outage_report_seconds = 30
 broker_outage_timeout_seconds = 180
 
+[[acquisition.pip_metadata_elementary_timeout_overrides]]
+repository = "pandas-dev/pandas"
+commit = "1186ee0080a43a08c3431a5bfa86898f6ec3b54d"
+task_id = "pandas-dev__pandas-53958"
+build_backend = "mesonpy"
+timeout_seconds = 900
+
+[[acquisition.pip_metadata_elementary_timeout_overrides]]
+repository = "pandas-dev/pandas"
+commit = "612823e824805b97a2dbe258ba808dc572083d49"
+task_id = "pandas-dev__pandas-56849"
+build_backend = "mesonpy"
+timeout_seconds = 900
+
 [bootstrap]
 miniconda_archive = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"
 miniconda_sha256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c"
