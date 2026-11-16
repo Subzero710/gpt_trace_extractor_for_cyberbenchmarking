@@ -15,11 +15,14 @@ import math
 import json
 import os
 import select
+import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -676,6 +679,14 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 try:
                     wire.response(action)
                 except BaseException as exc:
+                    if isinstance(exc, socket.gaierror) and exc.errno == socket.EAI_AGAIN:
+                        print('[pool] native Rust resolver DNS traceback: '
+                              + json.dumps({'closure': key,
+                                            'opcode': op.decode('ascii', errors='replace'),
+                                            'query': current_query},
+                                           sort_keys=True, ensure_ascii=False),
+                              file=sys.stderr, flush=True)
+                        traceback.print_exception(exc, file=sys.stderr)
                     remaining()
                     rejected = host.get('_IncompatibleSourceSyntax')
                     if (op == b'M' and len(references) == 1
