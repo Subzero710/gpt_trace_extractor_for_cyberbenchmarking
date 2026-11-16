@@ -4274,6 +4274,7 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
         self._condition = threading.Condition()
         self._jobs = []
         self._pending = {}
+        self._active = {}
         self._order = 0
         self._shutdown = False
         self._threads = []
@@ -4317,6 +4318,19 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
             heapq.heappush(self._jobs, (0, order, generation, future))
             self._condition.notify()
 
+    def snapshot(self):
+        """Bounded, read-only queue/worker counts for timeout diagnostics."""
+        with self._condition:
+            return {
+                'workers': len(self._threads),
+                'running': len(self._active),
+                'running_required': sum(priority == 0 for priority in self._active.values()),
+                'running_speculative': sum(priority == 1 for priority in self._active.values()),
+                'queued': len(self._pending),
+                'queued_required': sum(row[0] == 0 for row in self._pending.values()),
+                'queued_speculative': sum(row[0] == 1 for row in self._pending.values()),
+            }
+
     def _worker(self):
         while True:
             with self._condition:
@@ -4332,12 +4346,17 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
                 _priority, _order, _generation, fn, args, kwargs = item
             if not future.set_running_or_notify_cancel():
                 continue
+            with self._condition:
+                self._active[threading.get_ident()] = _priority
             try:
                 result = fn(*args, **kwargs)
             except BaseException as exc:
                 future.set_exception(exc)
             else:
                 future.set_result(result)
+            finally:
+                with self._condition:
+                    self._active.pop(threading.get_ident())
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         cancelled = ()
@@ -6977,6 +6996,19 @@ def _native_pip_group_locked(pool,key,group):
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         deadline = _NATIVE_CLOSURE_DEADLINE.get()
         if deadline is not None and time.monotonic() >= deadline:
+            evidence = {
+                'closure': key,
+                'requirements': sorted(set(group['requirements'])),
+                'constraints': sorted(set(group['constraints'])),
+                'preferred_versions': _canonical_pip_preferences(group.get('preferred_versions')),
+                'no_deps': group['no_deps'],
+                'tasks': sorted(set(group['tasks'])),
+                'target_python': target.python_full_version,
+                'target_fingerprint': _target_fingerprint(target),
+            }
+            print('[pool] timed-out pip closure input evidence: '
+                  + json.dumps(evidence, sort_keys=True, ensure_ascii=False),
+                  file=sys.stderr, flush=True)
             raise RuntimeError('native Pip closure exceeded configured total deadline: ' + key) from exc
         detail = str(exc)
         if isinstance(exc, subprocess.TimeoutExpired) and exc.output:

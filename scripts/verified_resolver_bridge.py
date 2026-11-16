@@ -458,6 +458,9 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             result.append(req)
         return result
 
+    current_opcode = None
+    current_query = None
+    pending_metadata = {}
     with tempfile.TemporaryFile(mode='w+b') as errors:
         child = subprocess.Popen([str(program)], cwd=target_root,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
@@ -486,8 +489,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             while True:
                 remaining()
                 op = wire.exact(1)
+                current_opcode = op.decode('ascii', errors='replace')
+                current_query = None
+                pending_metadata = {}
                 if op == b'D':
                     name, requirements = wire.string(), wire.strings()
+                    current_query = {'project': name, 'requirements': requirements}
                     def deliver_domain():
                         # Even a singleton propagation must use the shared I/O pool.
                         # The resolver loop must not perform PyPI work itself.
@@ -506,6 +513,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     if count > wire.limit:
                         raise RuntimeError('unbounded native domain batch')
                     requests = [(wire.string(), tuple(wire.strings())) for _ in range(count)]
+                    current_query = {'projects': [name for name, _requirements in requests]}
                     def deliver_domains():
                         if executor is None:
                             results = [domain(name, rows) for name, rows in requests]
@@ -602,6 +610,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     if count > wire.limit:
                         raise RuntimeError('unbounded native metadata request')
                     references = [wire.number() for _ in range(count)]
+                    pending_metadata = {ref: None for ref in references}
                     def deliver_metadata():
                         # Singleton propagation bypasses Rust's speculative prefetch.
                         # Submit every outstanding metadata probe to the I/O pool,
@@ -612,10 +621,13 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                 future = prefetch.take(ref)
                                 if future is not None:
                                     pending.append(future)
+                                    pending_metadata[ref] = future
                                 elif executor is None:
                                     record(ref)
                                 else:
-                                    pending.append(submit(record, ref))
+                                    future = submit(record, ref)
+                                    pending.append(future)
+                                    pending_metadata[ref] = future
                             for future in pending:
                                 future.result(timeout=remaining())
                         except BaseException:
@@ -695,6 +707,30 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             remaining()
             return selected
         except BaseException as exc:
+            if isinstance(exc, TimeoutError) or time.monotonic() >= expires:
+                candidates = []
+                for ref, future in sorted(pending_metadata.items()):
+                    candidate = candidate_by_id.get(ref)
+                    candidates.append({
+                        'ref': ref,
+                        'name': candidate.get('name') if candidate is not None else None,
+                        'version': candidate.get('version') if candidate is not None else None,
+                        'kind': candidate.get('kind') if candidate is not None else None,
+                        'running': future.running() if future is not None else None,
+                        'done': future.done() if future is not None else None,
+                        'cancelled': future.cancelled() if future is not None else None,
+                    })
+                evidence = {
+                    'closure': key,
+                    'opcode': current_opcode,
+                    'query': current_query,
+                    'metadata_candidates': candidates,
+                    'metadata_pool': (executor.snapshot() if executor is not None
+                                      and hasattr(executor, 'snapshot') else None),
+                }
+                print('[pool] native resolver timeout context: '
+                      + json.dumps(evidence, sort_keys=True, ensure_ascii=False),
+                      file=sys.stderr, flush=True)
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=policy['pip_total_timeout_seconds'])

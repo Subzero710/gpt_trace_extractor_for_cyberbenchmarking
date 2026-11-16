@@ -22,9 +22,10 @@ timeout_seconds = 180
 workers = 8
 # Reporting cadence for real Conda/Pip transfer counters (seconds).
 progress_interval_seconds = 5
-# Pip solver budget per closure, including metadata/build hooks.
-# A stalled worker must not monopolize acquisition for hours.
-pip_total_timeout_seconds = 180
+# Absolute verified Pip closure budget, including target PEP 517 metadata.
+# Never shorter than the largest permitted nested metadata build;
+# independent operation/stall limits continue to protect inactive work.
+pip_total_timeout_seconds = 900
 pip_stall_timeout_seconds = 120
 # No verified stage/count/byte change in the entire fetch worker.
 progress_stall_timeout_seconds = 900

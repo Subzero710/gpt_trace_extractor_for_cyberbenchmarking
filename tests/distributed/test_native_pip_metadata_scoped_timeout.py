@@ -42,7 +42,9 @@ def test_versioned_policy_is_project_scoped():
     with path.open('rb') as stream:
         acquisition = tomllib.load(stream)['acquisition']
     assert acquisition['timeout_seconds'] == 180
-    assert acquisition['pip_total_timeout_seconds'] == 180
+    assert acquisition['pip_total_timeout_seconds'] >= max(
+        rule['timeout_seconds'] for rule in
+        acquisition['pip_metadata_elementary_timeout_overrides'])
     assert acquisition['pip_stall_timeout_seconds'] == 120
     assert acquisition['progress_stall_timeout_seconds'] == 900
     assert acquisition['pip_metadata_elementary_timeout_overrides'] == [
