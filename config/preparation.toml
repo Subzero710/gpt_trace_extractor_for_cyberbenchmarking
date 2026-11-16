@@ -40,17 +40,13 @@ broker_outage_report_seconds = 30
 broker_outage_timeout_seconds = 180
 
 [[acquisition.pip_metadata_elementary_timeout_overrides]]
-repository = "pandas-dev/pandas"
-commit = "1186ee0080a43a08c3431a5bfa86898f6ec3b54d"
-task_id = "pandas-dev__pandas-53958"
-build_backend = "mesonpy"
+kind = "pinned-git-checkout"
+identity = "pandas-dev/pandas"
 timeout_seconds = 900
 
 [[acquisition.pip_metadata_elementary_timeout_overrides]]
-repository = "pandas-dev/pandas"
-commit = "612823e824805b97a2dbe258ba808dc572083d49"
-task_id = "pandas-dev__pandas-56849"
-build_backend = "mesonpy"
+kind = "pypi-sdist"
+identity = "pandas"
 timeout_seconds = 900
 
 [bootstrap]

@@ -4454,7 +4454,7 @@ def _native_pip_timeouts():
 
 @functools.lru_cache(maxsize=1)
 def _native_pip_metadata_timeout_overrides():
-    """Validate the exact pinned-source exceptions from the versioned policy."""
+    """Read verified-source metadata build limits from the versioned policy."""
     path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     if path.is_symlink() or not path.is_file():
         raise RuntimeError('missing staged native pip metadata timeout policy')
@@ -4463,54 +4463,58 @@ def _native_pip_metadata_timeout_overrides():
     if not isinstance(acquisition, dict):
         raise RuntimeError('invalid native pip acquisition policy')
     rows = acquisition.get('pip_metadata_elementary_timeout_overrides')
-    if not isinstance(rows, list):
-        raise RuntimeError('missing native pip metadata timeout exception declarations')
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError('missing native pip metadata timeout declarations')
     default = _operation_timeout()
     overrides = {}
-    fields = {'repository', 'commit', 'task_id', 'build_backend', 'timeout_seconds'}
     for row in rows:
-        if not isinstance(row, dict) or set(row) != fields:
-            raise RuntimeError('invalid native pip metadata timeout exception schema')
-        repository = row['repository']
-        commit = row['commit']
-        task_id = row['task_id']
-        backend = row['build_backend']
+        if not isinstance(row, dict) or set(row) != {'kind', 'identity', 'timeout_seconds'}:
+            raise RuntimeError('invalid native pip metadata timeout rule schema')
+        kind = row['kind']
+        identity = row['identity']
         seconds = row['timeout_seconds']
-        if (type(repository) is not str or REPO.fullmatch(repository) is None
-                or type(commit) is not str or COMMIT.fullmatch(commit) is None
-                or type(task_id) is not str or not task_id or len(task_id) > 256
-                or any(char.isspace() for char in task_id)
-                or type(backend) is not str or not backend or len(backend) > 128
-                or type(seconds) is not int or seconds <= default):
-            raise RuntimeError('invalid native pip metadata timeout exception')
-        key = (repository, commit, task_id, backend)
+        if (type(identity) is not str or type(seconds) is not int
+                or seconds <= default
+                or (kind == 'pinned-git-checkout' and REPO.fullmatch(identity) is None)
+                or (kind == 'pypi-sdist' and (not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', identity)
+                                               or _normalized_package_name(identity) != identity))
+                or kind not in {'pinned-git-checkout', 'pypi-sdist'}):
+            raise RuntimeError('invalid native pip metadata timeout rule')
+        key = (kind, identity)
         if key in overrides:
-            raise RuntimeError('duplicate native pip metadata timeout exception')
+            raise RuntimeError('duplicate native pip metadata timeout rule')
         overrides[key] = seconds
     return overrides
 
 
 def _native_pip_elementary_timeout(runtime, *, metadata_build=False):
-    """Raise only the elementary limit for a fully matching pinned build."""
+    """Raise only the elementary subprocess lifetime for matching source metadata."""
     default = _operation_timeout()
     if not metadata_build:
         return default
     overrides = _native_pip_metadata_timeout_overrides()
     context = runtime.get('_native_source_context')
-    if not isinstance(context, dict) or context.get('kind') != 'pinned-git-checkout':
+    if not isinstance(context, dict):
         return default
-    mirror = context.get('mirror')
-    if type(mirror) is not str:
-        return default
-    mirror_path = Path(mirror)
-    if not mirror_path.is_absolute() or mirror_path.parent.name != 'git':
-        return default
-    for (repository, commit, task_id, backend), seconds in overrides.items():
-        if (mirror_path.name == repository.replace('/', '_') + '.git'
-                and context.get('commit') == commit
-                and context.get('initiating_task') == task_id
-                and context.get('declared_backend') == backend):
-            return seconds
+    kind = context.get('kind')
+    if kind == 'pinned-git-checkout':
+        mirror = context.get('mirror')
+        commit = context.get('commit')
+        if type(mirror) is not str or type(commit) is not str or COMMIT.fullmatch(commit) is None:
+            return default
+        path = Path(mirror)
+        if not path.is_absolute() or path.parent.name != 'git':
+            return default
+        for (source_kind, repository), seconds in overrides.items():
+            if (source_kind == kind
+                    and path.name == repository.replace('/', '_') + '.git'):
+                return seconds
+    elif kind == 'pypi-sdist':
+        name = context.get('name')
+        sha = context.get('sha256')
+        if type(name) is not str or type(sha) is not str or SHA.fullmatch(sha) is None:
+            return default
+        return overrides.get((kind, _normalized_package_name(name)), default)
     return default
 
 
@@ -5080,9 +5084,9 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
     limit = _native_pip_elementary_timeout(runtime, metadata_build=metadata_build)
     _total, stall = _native_pip_timeouts()
     if limit != _operation_timeout():
-        source = runtime['_native_source_context']
-        print('[pool] scoped Pip metadata timeout: ' + source['initiating_task']
-              + '@' + source['commit'] + ' = ' + str(limit) + 's', flush=True)
+        print('[pool] scoped Pip metadata timeout: '
+              + json.dumps({'source': runtime.get('_native_source_context'),
+                            'limit_seconds': limit}, sort_keys=True), flush=True)
     with _bounded_lock(_NATIVE_POOL_LOCK):
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
