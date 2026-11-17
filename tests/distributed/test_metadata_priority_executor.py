@@ -217,19 +217,35 @@ def test_shared_closure_pool_installs_and_removes_priority_hooks(monkeypatch):
     cache = {}
     checked = []
 
-    def closure(_pool, key, _group):
+    def closure(_pool, key, _group, *, phase, selection=None, preferences_override=None):
         executor = cache['metadata_executor']
         assert cache['metadata_speculative_submit'] == executor.submit_speculative
         assert cache['metadata_promote'] == executor.promote
         assert executor.submit(lambda value: value, key).result(timeout=5) == key
-        checked.append(key)
+        assert preferences_override is None
+        if phase == 'plan':
+            assert selection is None
+            result = {'status': 'reused', 'packages': []}
+        elif phase == 'sources':
+            assert selection == {'status': 'reused', 'packages': []}
+            result = selection
+        elif phase == 'publish':
+            assert selection == {'status': 'reused', 'packages': []}
+            result = 'reused'
+        else:
+            raise AssertionError('unexpected global Pip planning phase: ' + str(phase))
+        checked.append((phase, key))
+        return result
 
     monkeypatch.setattr(module, '_native_solver_cache', lambda _pool: cache)
     monkeypatch.setattr(module, '_pip_worker_controls', lambda: (2, 3))
     monkeypatch.setattr(module, 'acquire_pip_group', closure)
     module.acquire_pip_groups(SimpleNamespace(_state_lock=threading.RLock()),
                               {'first': {}, 'second': {}})
-    assert set(checked) == {'first', 'second'}
+    assert set(checked) == {(phase, key)
+                            for phase in ('plan', 'sources', 'publish')
+                            for key in ('first', 'second')}
+    assert len(checked) == 6
     assert 'metadata_executor' not in cache
     assert 'metadata_speculative_submit' not in cache
     assert 'metadata_promote' not in cache

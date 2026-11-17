@@ -226,7 +226,7 @@ def test_only_inactive_requirements_admit_an_empty_plan():
 def test_build_requirement_cycles_fail_without_deadlock():
     target = current_target()
     with isolated_pool() as candidate:
-        def recursive(instance, key, group):
+        def recursive(instance, key, group, **_phase_options):
             return pool.acquire_pip_group(instance, key, group)
         with patch.object(pool, '_native_pip_group_locked', side_effect=recursive):
             with pytest.raises(RuntimeError, match='cyclic'):
@@ -237,7 +237,7 @@ def test_concurrent_build_graph_cycles_release_all_waiters():
     with isolated_pool() as candidate:
         barrier = threading.Barrier(2)
         errors = []
-        def resolve(instance, key, group):
+        def resolve(instance, key, group, **_phase_options):
             if len(instance._native_group_context.stack) == 1:
                 barrier.wait(timeout=5)
             return pool.acquire_pip_group(instance, 'right' if key == 'left' else 'left', group)
