@@ -4193,7 +4193,7 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
 
 
 PIP_PLAN_SCHEMA = 21
-PIP_RESOLVER_POLICY = 'mandatory-native-rust-solver-v1-soft-pins'
+PIP_RESOLVER_POLICY = 'mandatory-native-rust-solver-v2-global-shared-artifacts'
 
 
 def _pip_worker_controls():
@@ -5738,7 +5738,7 @@ def _native_solver_cache(pool):
         return cache
 
 
-def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False, preferred_versions=None):
+def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=False, preferred_versions=None, materialize=True):
     """Resolve the whole graph using verified PyPI metadata, not pip backtracking.
 
     The existing conflict-directed backjump solver chooses one globally valid
@@ -5758,7 +5758,7 @@ def _native_resolve_registry(pool, target, reqs, constraints, key, *, no_deps=Fa
     try:
         return _resolve_registry_plan(pool, target, reqs, constraints, key,
                                       no_deps=no_deps, resolver_cache=cache,
-                                      materialize=True, preferred_versions=preferred_versions)
+                                      materialize=materialize, preferred_versions=preferred_versions)
     finally:
         if activity is not None:
             activity.leave()
@@ -6336,10 +6336,13 @@ def _admitted_pip_versions(pool, universe, specifiers):
 
 def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
     _,SpecifierSet,Version,InvalidVersion,_=_packaging_symbols()
+    combined=SpecifierSet(','.join(str(req.specifier) for req in [*requirements,*constraints] if str(req.specifier)))
+    literal_pins=[spec.version for spec in combined if spec.operator=='==' and '*' not in spec.version]
+    if literal_pins and not all(combined.contains(Version(pin),prereleases=True) for pin in literal_pins):
+        return []
     exact=_exact_registry_pin(requirements,constraints)
     universe=(_registry_exact_release_candidate(name,exact,target,release_cache) if exact is not None
               else _registry_release_candidates(name,target,release_cache))
-    combined=SpecifierSet(','.join(str(req.specifier) for req in [*requirements,*constraints] if str(req.specifier)))
     candidates=_admitted_pip_versions(pool,universe,combined)
     if not candidates and exact is None:
         # PEP 592 permits a historical yanked release *only if* no compatible
@@ -6921,7 +6924,7 @@ def _historical_pip_preferences(prior, requirements, constraints, target, *, upg
     return inherited
 
 
-def acquire_pip_group(pool,key,group,*,resolver_cache=None):
+def acquire_pip_group(pool,key,group,*,resolver_cache=None,phase=None,selection=None,preferences_override=None):
     """Deduplicate concurrent build/runtime closures by exact plan identity."""
     with _bounded_lock(pool._state_lock):
         locks=getattr(pool,'_native_group_locks',None)
@@ -6958,7 +6961,8 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
             token = _NATIVE_CLOSURE_DEADLINE.set(deadline)
             try:
                 _native_closure_remaining()
-                return _native_pip_group_locked(pool,key,group)
+                return _native_pip_group_locked(pool,key,group,phase=phase,selection=selection,
+                                                preferences_override=preferences_override)
             finally:
                 _NATIVE_CLOSURE_DEADLINE.reset(token)
                 pool._native_group_context.stack = stack
@@ -6970,8 +6974,12 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None):
                 pool._native_group_edges[stack[-1]].discard(key)
 
 
-def _native_pip_group_locked(pool,key,group):
-    """Checkpoint a real pip solution, keeping optional groups explicit."""
+def _native_pip_group_locked(pool,key,group,*,phase=None,selection=None,preferences_override=None):
+    """Resolve metadata separately from publication; preserve single-group behavior."""
+    if phase not in (None, 'plan', 'sources', 'publish'):
+        raise ValueError('invalid native pip acquisition phase')
+    if phase in ('sources', 'publish') and not isinstance(selection, dict):
+        raise RuntimeError('native pip preparation requires a verified planned result')
     target=_coerce_target(group['target'])
     path = _pip_plan_path(pool.stage, key)
     if path.exists():
@@ -6987,17 +6995,47 @@ def _native_pip_group_locked(pool,key,group):
                 raise RuntimeError('optional pip outcome identity differs')
             if group['required']:
                 raise RuntimeError('required pip closure has only a recorded optional failure: '+key)
-            return 'optional-failed'
+            return ({'status':'optional-failed', 'error':previous['optional_failed']}
+                    if phase in ('plan', 'sources') else 'optional-failed')
     if reuse_pip_plan(pool,target,group['requirements'],key,
                       constraints=group['constraints'],no_deps=group['no_deps'],
                       preferred_versions=group.get('preferred_versions')):
+        if phase in ('plan', 'sources'):
+            return {'status':'reused', 'packages':json.loads(path.read_bytes())['packages']}
         return 'reused'
+    if phase == 'sources':
+        return _global_pip_finish_sources(pool, key, group, selection, _native_solver_cache(pool))
+    if phase == 'publish' and selection['status'] == 'optional-failed':
+        if group['required']:
+            raise RuntimeError('required native pip closure cannot publish optional failure')
+        write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
+            'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
+            'target':target.as_dict(),'python':target.python_full_version,
+            'requested':sorted(set(group['requirements'])),'constraints':sorted(set(group['constraints'])),
+            'preferred_versions':_canonical_pip_preferences(group.get('preferred_versions')),
+            'no_deps':group['no_deps'],'optional_failed':selection['error'],
+            'packages':[],'files':[],'source_archives':[]},sort_keys=True))
+        return 'optional-failed'
     try:
         _native_closure_remaining()
-        packages=_native_resolve_registry(pool,target,group['requirements'],
-            group['constraints'],key,no_deps=group['no_deps'],
-            preferred_versions=group.get('preferred_versions'))
+        if phase == 'publish':
+            if selection['status'] != 'planned':
+                raise RuntimeError('invalid native pip publication selection')
+            cache = _native_solver_cache(pool)
+            packages = _materialize_solution(
+                pool, selection['packages'], key, target,
+                cache['artifact_metadata'], executor=cache.get('metadata_executor'),
+                source_probe=cache['native_source_probe'])
+        else:
+            packages = _native_resolve_registry(
+                pool,target,group['requirements'],group['constraints'],key,
+                no_deps=group['no_deps'],
+                preferred_versions=(preferences_override if preferences_override is not None
+                                    else group.get('preferred_versions')),
+                materialize=(phase is None))
         _native_closure_remaining()
+        if phase == 'plan':
+            return {'status':'planned', 'packages':packages}
         build_plans = _native_acquire_build_dependencies(pool,target,packages)
         _native_closure_remaining()
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
@@ -7034,6 +7072,8 @@ def _native_pip_group_locked(pool,key,group):
                   +json.dumps(evidence,sort_keys=True,ensure_ascii=False),
                   file=sys.stderr,flush=True)
             raise RuntimeError('required native pip closure '+key+' failed: '+detail) from exc
+        if phase == 'plan':
+            return {'status':'optional-failed', 'error':str(exc)}
         write_new(pool.stage/'metadata'/('pip-plan-'+key+'.json'),json.dumps({
             'artifact_model':PIP_ARTIFACT_MODEL,'plan_schema':PIP_PLAN_SCHEMA,
             'target':target.as_dict(),'python':target.python_full_version,
@@ -7042,9 +7082,6 @@ def _native_pip_group_locked(pool,key,group):
             'no_deps':group['no_deps'],'optional_failed':str(exc),
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
-    # A checkpoint/publication failure is infrastructure failure, even for a
-    # recipe that permits its installer to fail. Never overwrite a completed
-    # record with an optional-failure marker.
     _native_closure_remaining()
     _write_pip_plan(pool,target,group['requirements'],key,packages,
                     constraints=group['constraints'],no_deps=group['no_deps'],build_plans=build_plans,
@@ -7052,64 +7089,340 @@ def _native_pip_group_locked(pool,key,group):
     return 'acquired'
 
 
+
+def _global_pip_policy():
+    """An explicit versioned ceiling on additional verified Rust graph solves."""
+    source = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('missing sealed global Pip planning policy')
+    with source.open('rb') as stream:
+        policy = tomllib.load(stream)['acquisition']
+    count = policy.get('pip_global_plan_variants')
+    if type(count) is not int or count < 1:
+        raise RuntimeError('invalid global Pip solution variant budget')
+    return count
+
+
+def _global_pip_artifacts(selection):
+    """A distinct PyPI SHA-256 is downloaded no more than once across closures."""
+    if selection['status'] == 'optional-failed':
+        return frozenset()
+    if selection['status'] not in ('planned', 'reused'):
+        raise RuntimeError('invalid global Pip selection')
+    return frozenset(row['sha256'] for row in selection['packages'])
+
+
+def _global_pip_hint(key, group, planned):
+    """Offer already verified versions as *soft* preferences, never as pins.
+
+    The Rust solver still verifies every requirement, marker, target tag and
+    dependency. No version or package is hardcoded into the optimization.
+    """
+    from collections import Counter
+    own = planned[key]
+    if own['status'] != 'planned':
+        return None
+    own_versions = {_normalized_package_name(row['name']): row['version']
+                    for row in own['packages']}
+    observed = defaultdict(Counter)
+    for other_key, other in sorted(planned.items()):
+        if other_key == key or other['status'] == 'optional-failed':
+            continue
+        # Count one vote per closure; no project-specific special cases.
+        for row in other['packages']:
+            name = _normalized_package_name(row['name'])
+            if name in own_versions:
+                observed[name][row['version']] += 1
+    if not any(any(version != own_versions[name] for version in versions)
+               for name, versions in observed.items()):
+        return None
+    preferences = _canonical_pip_preferences(group.get('preferred_versions'))
+    for name, versions in sorted(observed.items()):
+        ordered = sorted(versions, key=lambda ver: (-versions[ver], ver))
+        current = list(preferences.get(name, ()))
+        preferences[name] = list(dict.fromkeys([*ordered, *current]))
+    return preferences
+
+
+def _global_pip_choose(pool, candidates, locked=()):
+    """Minimize the union of not-yet-cached artifacts across verified plans.
+
+    Optimization is over *Rust-verified complete solutions*, not arbitrary
+    independently selected package versions. Uses bounded deterministic
+    coordinate descent, so no exponential enumeration of the Cartesian product.
+    """
+    keys = sorted(candidates)
+    known = set()
+    for alternatives in candidates.values():
+        for choice in alternatives:
+            known.update(_global_pip_artifacts(choice))
+    sizes = {}
+    for alternatives in candidates.values():
+        for choice in alternatives:
+            for row in choice.get('packages', ()): 
+                size = row.get('download_size')
+                if size is None:
+                    continue
+                if type(size) is not int or size < 0:
+                    raise RuntimeError('invalid verified artifact byte size')
+                sha = row['sha256']
+                if sha in sizes and sizes[sha] != size:
+                    raise RuntimeError('conflicting PyPI artifact byte sizes')
+                sizes[sha] = size
+    cached = set()
+    for sha in sorted(known):
+        path = pool.objects / sha[:2] / sha
+        if path.is_symlink():
+            raise RuntimeError('unsafe preexisting Pip artifact object')
+        if path.is_file():
+            actual_size = pool.verify_object(sha)
+            if sha in sizes and sizes[sha] != actual_size:
+                raise RuntimeError('verified local artifact size differs from PyPI')
+            cached.add(sha)
+    frozen = set(locked)
+    # Minimize actual additional download bytes when all possible new artifacts
+    # have a measured PyPI size. Unknown size is never treated as zero.
+    complete_sizes = (known - cached).issubset(sizes)
+    def score(indexes):
+        union = set()
+        for key, index in indexes.items():
+            union.update(_global_pip_artifacts(candidates[key][index]))
+        missing = union - cached
+        return ((sum(sizes[sha] for sha in missing), len(missing))
+                if complete_sizes else (len(missing),))
+    def improve(indexes):
+        while True:
+            changed = False
+            for key in keys:
+                if key in frozen or len(candidates[key]) < 2:
+                    continue
+                best = indexes[key]
+                best_score = score(indexes)
+                for index in range(len(candidates[key])):
+                    if index == indexes[key]:
+                        continue
+                    alternative = dict(indexes)
+                    alternative[key] = index
+                    cost = score(alternative)
+                    if cost < best_score:
+                        best_score, best = cost, index
+                if best != indexes[key]:
+                    indexes[key] = best
+                    changed = True
+            if not changed:
+                return indexes
+    seeds = [{key: 0 for key in keys},
+             {key: (len(candidates[key])-1 if key not in frozen else 0) for key in keys}]
+    results = [improve(seed) for seed in seeds]
+    winning = min(results, key=lambda indexes: (score(indexes), tuple(indexes[key] for key in keys)))
+    return {key:candidates[key][winning[key]] for key in keys}
+
+
+def _global_pip_finish_sources(pool, key, group, choice, cache):
+    """Get authoritative build requirements only for selected source archives.
+
+    PEP 517 metadata is inherently unavailable without executing the isolated
+    backend for some sdists. Those winning archives must be acquired in the
+    metadata phase, not guessed from PKG-INFO.
+    """
+    if choice['status'] != 'planned':
+        return choice
+    sources = [row for row in choice['packages'] if row['kind'] == 'sdist']
+    if not sources:
+        return choice
+    target = _coerce_target(group['target'])
+    observed = _materialize_solution(
+        pool, sources, key, target, cache['artifact_metadata'],
+        executor=cache.get('metadata_executor'), source_probe=cache['native_source_probe'])
+    by_identity = {(row['name'], row['version'], row['sha256']):row for row in observed}
+    rows = [by_identity[(row['name'], row['version'], row['sha256'])]
+            if row['kind'] == 'sdist' else row for row in choice['packages']]
+    return {'status':'planned', 'packages':rows}
+
+
+def _global_pip_child_groups(key, group, choice):
+    """Discover the recursively required PEP 517 build graphs before publish."""
+    if choice['status'] != 'planned':
+        return {}
+    target = _coerce_target(group['target'])
+    requirements = set()
+    for row in choice['packages']:
+        if row['kind'] != 'sdist':
+            continue
+        builds = row.get('build_requirements')
+        if not isinstance(builds, list):
+            raise RuntimeError('verified source has no observed PEP 517 build requirements')
+        for rows in builds:
+            if not isinstance(rows, list) or not all(isinstance(x, str) for x in rows):
+                raise RuntimeError('invalid verified PEP 517 build requirements')
+            if rows:
+                requirements.add(tuple(sorted(set(rows))))
+    result = {}
+    for rows in sorted(requirements):
+        child = pip_group_key(target, rows)
+        result[child] = {'target':target.as_dict(), 'requirements':list(rows),
+                         'constraints':[], 'preferred_versions':{},
+                         'no_deps':False, 'required':True, 'tasks':[],
+                         'steps':['observed PEP 517 build environment']}
+    return result
+
+
+def _global_pip_levels(groups, edges):
+    """Acyclic child-before-parent publication layers."""
+    depth = {}
+    active = set()
+    def visit(key):
+        if key in active:
+            raise RuntimeError('cyclic verified PEP 517 build requirements')
+        if key in depth:
+            return depth[key]
+        active.add(key)
+        children = edges.get(key, set())
+        if not children.issubset(groups):
+            raise RuntimeError('missing planned PEP 517 build closure')
+        value = 1 + max((visit(child) for child in children), default=-1)
+        active.remove(key)
+        depth[key] = value
+        return value
+    for key in sorted(groups):
+        visit(key)
+    layers = defaultdict(list)
+    for key in sorted(depth):
+        layers[depth[key]].append(key)
+    return [layers[level] for level in sorted(layers)]
+
+
 def acquire_pip_groups(pool, groups):
-    """Share bounded metadata I/O across concurrent verified closure solvers."""
-    ordered=sorted(groups.items())
+    """Plan all validated closure graphs, consolidate, then fetch winning CAS.
+
+    Separate stages ensure multiple candidate wheel archives are not downloaded
+    simply because different closures are solved independently. Dependencies of
+    chosen sdists are discovered recursively before final plan publication.
+    """
+    ordered = dict(sorted(groups.items()))
     if not ordered:
         return
     closure_workers, metadata_workers = _pip_worker_controls()
     if (type(closure_workers) is not int or closure_workers < 1
             or type(metadata_workers) is not int or metadata_workers < 1):
         raise RuntimeError('invalid configured pip solver concurrency')
-    workers=min(closure_workers,len(ordered))
+    workers = min(closure_workers, len(ordered))
+    variants = _global_pip_policy()
     if _POOL_PROGRESS is None:
-        print('[pool] verified Pip graph solver: '+str(len(ordered))+
-              ' closures, '+str(workers)+' closure workers, '+str(metadata_workers)+
-              ' shared metadata workers; host-only', flush=True)
-    _pool_progress('Pip closures',0,len(ordered),'closures',f'{workers} workers')
-    cache=_native_solver_cache(pool)
+        print('[pool] verified Pip global planner: '+str(len(ordered))+
+              ' initial closures, '+str(workers)+' Rust workers, '+str(metadata_workers)+
+              ' metadata workers; plan-before-download', flush=True)
+    cache = _native_solver_cache(pool)
     with _PriorityMetadataExecutor(metadata_workers) as io_executor:
         with _bounded_lock(pool._state_lock):
-            cache['metadata_executor']=io_executor
-            cache['metadata_speculative_submit']=io_executor.submit_speculative
-            cache['metadata_promote']=io_executor.promote
-            cache['metadata_prefetch']=_metadata_prefetch_width(workers,metadata_workers)
-            cache['prefetch_controller']=_ResolverActivity(metadata_workers)
+            cache['metadata_executor'] = io_executor
+            cache['metadata_speculative_submit'] = io_executor.submit_speculative
+            cache['metadata_promote'] = io_executor.promote
+            cache['metadata_prefetch'] = _metadata_prefetch_width(workers, metadata_workers)
+            cache['prefetch_controller'] = _ResolverActivity(metadata_workers)
         try:
-            def monitored_closure(key, group):
-                if _POOL_PROGRESS is None:
-                    return acquire_pip_group(pool, key, group)
-                _POOL_PROGRESS.closure_activity(1)
-                try:
-                    return acquire_pip_group(pool, key, group)
-                finally:
-                    _POOL_PROGRESS.closure_activity(-1)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
-                    thread_name_prefix='verified-pip-closure') as executor:
-                futures={executor.submit(monitored_closure,key,group):key
-                         for key,group in ordered}
-                errors=[];done=0
-                for future in _bounded_completed(futures):
+            planned = {}
+            edges = {}
+            frontier = ordered
+            all_groups = dict(ordered)
+            while frontier:
+                _pool_progress('Pip planning', len(planned), len(all_groups), 'closures',
+                               'verified Rust metadata')
+                def run(key, group, *, phase, choice=None, preference=None):
+                    if _POOL_PROGRESS is not None:
+                        _POOL_PROGRESS.closure_activity(1)
                     try:
-                        _bounded_future_result(future)
-                        done+=1
-                        _pool_progress('Pip closures',done,len(ordered),'closures',
-                                       f'{workers} workers')
-                    except BaseException as exc:
-                        errors.append((futures[future],exc))
-                        for other in futures:
-                            if not other.done():other.cancel()
-                if errors:
-                    key,exc=min(errors,key=lambda row:row[0])
-                    raise RuntimeError('verified pip closure '+key+' failed: '+str(exc)) from exc
+                        return acquire_pip_group(pool, key, group, phase=phase,
+                                                 selection=choice, preferences_override=preference)
+                    finally:
+                        if _POOL_PROGRESS is not None:
+                            _POOL_PROGRESS.closure_activity(-1)
+                def batch(inputs, *, phase, choices=None, preferences=None):
+                    completed = {}
+                    failures = []
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(workers, len(inputs)),
+                            thread_name_prefix='verified-pip-'+phase) as executor:
+                        futures = {executor.submit(run, key, all_groups[key], phase=phase,
+                                                   choice=(choices or {}).get(key),
+                                                   preference=(preferences or {}).get(key)):key
+                                   for key in sorted(inputs)}
+                        for future in _bounded_completed(futures):
+                            key = futures[future]
+                            try:
+                                completed[key] = _bounded_future_result(future)
+                                if phase == 'plan':
+                                    _pool_progress('Pip planning',len(planned)+len(completed),
+                                                   len(all_groups),'closures','verified Rust metadata')
+                            except BaseException as exc:
+                                failures.append((key,exc))
+                                for other in futures:
+                                    if not other.done():other.cancel()
+                    if failures:
+                        key, exc = min(failures, key=lambda row:row[0])
+                        raise RuntimeError('verified pip '+phase+' closure '+key+' failed: '+str(exc)) from exc
+                    return completed
+
+                baseline = batch(frontier, phase='plan')
+                choices = {key:[result] for key,result in baseline.items()}
+                all_visible = {**planned, **baseline}
+                if variants > 1:
+                    hints = {key:hint for key in sorted(frontier)
+                             if (hint := _global_pip_hint(key, all_groups[key], all_visible)) is not None}
+                    if hints:
+                        # Each additional solve is a complete, independent and
+                        # audited Rust solution. A preference is never a pin.
+                        for _ in range(1, variants):
+                            alternatives = batch(hints, phase='plan', preferences=hints)
+                            for key, result in alternatives.items():
+                                if (_global_pip_artifacts(result)
+                                        != _global_pip_artifacts(choices[key][-1])):
+                                    choices[key].append(result)
+                            # Repeating the same preference list yields the same
+                            # deterministic Rust choice: no redundant solves.
+                            break
+                options = {key:([planned[key]] if key in planned else choices[key])
+                           for key in sorted(all_visible)}
+                selected = _global_pip_choose(pool, options, locked=planned)
+                _pool_progress('Pip source evidence',0,len(frontier),'closures',
+                               'selected source archives and PEP 517 metadata')
+                completed_sources = batch(frontier, phase='sources', choices=selected)
+                for key in sorted(frontier):
+                    planned[key] = completed_sources[key]
+                next_frontier = {}
+                for key in sorted(frontier):
+                    children = _global_pip_child_groups(key, all_groups[key], planned[key])
+                    edges[key] = set(children)
+                    for child, info in children.items():
+                        if child == key:
+                            raise RuntimeError('self-referential PEP 517 build requirements')
+                        if child in all_groups:
+                            if (all_groups[child]['target'] != info['target'] or
+                                    all_groups[child]['requirements'] != info['requirements'] or
+                                    all_groups[child]['constraints'] != info['constraints'] or
+                                    all_groups[child]['no_deps'] != info['no_deps']):
+                                raise RuntimeError('Pip build closure identity collision')
+                            if not all_groups[child]['required']:
+                                raise RuntimeError('optional Pip closure is mandatory for a build')
+                        else:
+                            all_groups[child] = info
+                            next_frontier[child] = info
+                frontier = next_frontier
+            layers = _global_pip_levels(all_groups, edges)
+            done = 0
+            for layer in layers:
+                _pool_progress('Pip materialization',done,len(all_groups),'closures',
+                               'shared SHA-256 artifacts')
+                batch(layer, phase='publish', choices=planned)
+                done += len(layer)
+                _pool_progress('Pip materialization',done,len(all_groups),'closures',
+                               'shared SHA-256 artifacts')
         finally:
             with _bounded_lock(pool._state_lock):
-                cache.pop('metadata_executor',None)
-                cache.pop('metadata_speculative_submit',None)
-                cache.pop('metadata_promote',None)
-                cache.pop('metadata_prefetch',None)
-                cache.pop('prefetch_controller',None)
+                for key in ('metadata_executor','metadata_speculative_submit','metadata_promote',
+                            'metadata_prefetch','prefetch_controller'):
+                    cache.pop(key,None)
+
 
 def npm_lock_urls(lock, label, *, workspace_checker=None):
     """Extract trusted registry tarballs from npm lockfile v1/v2/v3."""

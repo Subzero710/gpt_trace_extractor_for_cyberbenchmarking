@@ -100,6 +100,8 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
         '_normalized_package_name':lambda name:name.lower(),
         '_candidate_versions':lambda *args,**kwargs:[artifact],
         '_candidate_artifact_identity':lambda v:(v['item']['digests']['sha256'],v['item']['url']),
+        '_target_fingerprint':lambda target:'offline',
+        '_candidate_probe_identity_from_fingerprint':lambda candidate,fingerprint,no_deps:(candidate['name'],candidate['version'],no_deps),
         '_target_fingerprint': fingerprint,
         '_candidate_probe_identity_from_fingerprint': probe_identity,
         '_candidate_release_metadata': metadata,

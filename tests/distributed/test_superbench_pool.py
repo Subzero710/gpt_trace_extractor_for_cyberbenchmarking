@@ -1399,19 +1399,20 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                             'constraints':[],'no_deps':False,'required':True,
                             'tasks':['task-'+str(index)],'steps':['install']}
                 for index in range(4)}
-        lock=__import__('threading').Lock();gate=__import__('threading').Barrier(2)
+        lock=threading.Lock();gate=threading.Barrier(2,timeout=5)
         active=0;maximum=0
-        def resolve(_pool,_target,_reqs,_constraints,key,**_kwargs):
+        def resolve(_pool,_target,_reqs,_constraints,key,**kwargs):
             nonlocal active,maximum
+            self.assertIs(kwargs['materialize'],False)
             with lock:
                 active+=1;maximum=max(maximum,active)
-            gate.wait(timeout=5)
+            gate.wait()
             with lock:active-=1
             return [{'kind':'wheel','name':'demo','version':'1.0','filename':key+'.whl',
                      'sha256':hashlib.sha256(key.encode()).hexdigest(),
                      'url':'https://files.pythonhosted.org/'+key+'.whl',
                      'requirements':[],'provides_extra':[]}]
-        def materialize(_pool,records,*_args,**_kwargs):
+        def materialize(_pool,records,key,*args,**kwargs):
             for row in records:
                 payload=row['url'].rsplit('/',1)[-1].removesuffix('.whl').encode()
                 self.assertEqual(hashlib.sha256(payload).hexdigest(),row['sha256'])
@@ -1421,10 +1422,14 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             return records
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'_native_resolve_registry',
-                     side_effect=lambda *args,**kwargs: materialize(args[0], resolve(*args,**kwargs))):
-                pool.acquire_pip_groups(candidate,groups)
+            try:
+                with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                     patch.object(pool,'_native_resolve_registry',side_effect=resolve), \
+                     patch.object(pool,'_materialize_solution',side_effect=materialize), \
+                     patch.object(pool,'_resolver_runtime_identity',return_value={'test':'sealed'}):
+                    pool.acquire_pip_groups(candidate,groups)
+            finally:
+                candidate._pip_cache_context.cleanup()
         self.assertEqual(maximum,2)
 
     def test_required_parallel_group_failure_remains_fatal(self):
@@ -1446,53 +1451,33 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                  self.assertRaisesRegex(RuntimeError,'required native pip closure a failed: boom'):
                 pool.acquire_pip_groups(candidate,groups)
 
-    def test_each_completed_closure_checkpoints_before_another_closure_fails(self):
+    def test_planning_failure_does_not_publish_unvalidated_sibling(self):
         target_env=fixture_target('3.10.14').as_dict()
         groups={name:{'target':target_env,'requirements':[name+'==1.0'],
                       'constraints':[],'no_deps':False,'required':True,
                       'tasks':['task-'+name],'steps':['install']}
                 for name in ('alpha','beta')}
-        threading=__import__('threading')
-        persisted=threading.Event()
-        original_write=pool._write_pip_plan
-
+        ready=threading.Event()
         def resolve(_pool,_target,_reqs,_constraints,key,**_kwargs):
             if key=='beta':
-                self.assertTrue(persisted.wait(timeout=5),
-                                'other closure must become durable before this failure')
+                self.assertTrue(ready.wait(timeout=5))
                 raise RuntimeError('planned sibling failure')
+            ready.set()
             return [{'kind':'wheel','name':'alpha','version':'1.0',
                      'filename':'alpha-1.0-py3-none-any.whl',
                      'sha256':hashlib.sha256(b'alpha').hexdigest(),
                      'url':'https://files.pythonhosted.org/alpha.whl',
                      'requirements':[],'provides_extra':[]}]
-
-        def materialize(_pool,records,*_args,**_kwargs):
-            for row in records:
-                payload=row['url'].rsplit('/',1)[-1].removesuffix('.whl').encode()
-                self.assertEqual(hashlib.sha256(payload).hexdigest(),row['sha256'])
-                path=_pool.objects/row['sha256'][:2]/row['sha256']
-                path.parent.mkdir(parents=True,exist_ok=True)
-                path.write_bytes(payload)
-            return records
-
-        def checkpoint(*args,**kwargs):
-            result=original_write(*args,**kwargs)
-            persisted.set()
-            return result
-
         with tempfile.TemporaryDirectory() as tmp:
             candidate=self.make_pool(Path(tmp))
-            with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
-                 patch.object(pool,'_native_resolve_registry',
-                     side_effect=lambda *args,**kwargs: materialize(args[0],resolve(*args,**kwargs))), \
-                 patch.object(pool,'_write_pip_plan',side_effect=checkpoint), \
-                 self.assertRaisesRegex(RuntimeError,'required native pip closure beta failed: planned sibling failure'):
-                pool.acquire_pip_groups(candidate,groups)
-            self.assertTrue(persisted.is_set())
-            plan=json.loads((Path(tmp)/'metadata/pip-plan-alpha.json').read_text())
-            self.assertEqual(plan['requested'],['alpha==1.0'])
-            self.assertEqual(plan['packages'][0]['name'],'alpha')
+            try:
+                with patch.object(pool,'_pip_worker_controls',return_value=(2,2)), \
+                     patch.object(pool,'_native_resolve_registry',side_effect=resolve), \
+                     self.assertRaisesRegex(RuntimeError,'planned sibling failure'):
+                    pool.acquire_pip_groups(candidate,groups)
+                self.assertFalse(list((Path(tmp)/'metadata').glob('pip-plan-*.json')))
+            finally:
+                candidate._pip_cache_context.cleanup()
 
     def test_cached_dependency_compatibility_prevents_pairwise_version_explosion(self):
         target=fixture_target('3.10.14')

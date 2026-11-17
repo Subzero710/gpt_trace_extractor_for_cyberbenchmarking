@@ -448,6 +448,11 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 not isinstance(value.get('requirements'), list) or
                 not all(isinstance(item, str) for item in value['requirements'])):
             raise RuntimeError('verified candidate metadata differs from chosen release')
+        # Registry-provided artifact size is an immutable optional cost hint,
+        # not dependency evidence. Never invent a size when PyPI omits it.
+        size = candidate.get('item', {}).get('size')
+        if type(size) is int and size >= 0:
+            value = {**value, 'download_size':size}
         with probe_lock:
             record_by_id[ref] = value
         with observed_lock:
