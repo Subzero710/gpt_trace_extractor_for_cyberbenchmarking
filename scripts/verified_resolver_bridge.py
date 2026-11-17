@@ -356,6 +356,11 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     if not roots:
         return []
 
+    # The target is immutable throughout a solve; its canonical hash must not
+    # be re-serialized for every K candidate or metadata request.
+    target_fingerprint = host['_target_fingerprint'](target)
+    probe_identity_by_id = {}
+
     candidate_by_id = {}
     # The Rust resolver keeps each immutable candidate identity once. Domain
     # responses after its first appearance transmit only the stable u32 ID.
@@ -400,6 +405,14 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         domain_cache[cache_key] = ids
         return ids
 
+    def probe_identity(ref):
+        identity = probe_identity_by_id.get(ref)
+        if identity is None:
+            identity = host['_candidate_probe_identity_from_fingerprint'](
+                candidate_by_id[ref], target_fingerprint, no_deps)
+            probe_identity_by_id[ref] = identity
+        return identity
+
     def record(ref):
         remaining()
         if ref not in candidate_by_id:
@@ -412,8 +425,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 return value
         candidate = candidate_by_id[ref]
         if candidate['kind'] == 'sdist' and source_probe is not None:
-            identity = ('native-source', host['_candidate_probe_identity'](candidate, target, no_deps))
-            artifact_id = ('native-source-artifact',host['_target_fingerprint'](target),
+            identity = ('native-source', probe_identity(ref))
+            artifact_id = ('native-source-artifact',target_fingerprint,
                            host['_candidate_artifact_identity'](candidate)[0], candidate['filename'])
 
             def source_metadata():
@@ -426,7 +439,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             value = host['_memo_get_or_compute'](probe_cache, identity, source_metadata)
         else:
             value = host['_candidate_release_metadata'](
-                pool, candidate, key, target, probe_cache, artifact_cache, no_deps=no_deps)
+                pool, candidate, key, target, probe_cache, artifact_cache,
+                no_deps=no_deps, target_fingerprint=target_fingerprint)
         if (not isinstance(value, dict) or
                 value.get('kind') != candidate['kind'] or
                 host['_normalized_package_name'](value.get('name', '')) != host['_normalized_package_name'](candidate['name']) or
@@ -554,9 +568,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                           for ref in candidate_ids_by_name.get(name, ())}
                         newly_verified = []
                         for ref in sorted(references - reported_metadata):
-                            candidate = candidate_by_id[ref]
-                            identity = host['_candidate_probe_identity'](
-                                candidate, target, no_deps)
+                            identity = probe_identity(ref)
                             entry = (probe_cache.peek(identity)
                                      if isinstance(probe_cache, host['_SingleFlightCache'])
                                      else probe_cache.get(identity))

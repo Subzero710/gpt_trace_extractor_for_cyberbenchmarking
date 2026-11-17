@@ -57,6 +57,14 @@ assert num()==candidate
 assert num(1)==0  # immutable candidate identity was already registered
 o.write(b'M');sendnum(1);sendnum(candidate);o.flush()
 assert read(1)==b'\\x01'
+o.write(b'K');sendnum(1);sendstr('demo');o.flush()
+assert read(1)==b'\\x01'
+assert num()==1
+assert num()==candidate
+# Already published verified identities must not be retransmitted.
+o.write(b'K');sendnum(1);sendstr('demo');o.flush()
+assert read(1)==b'\\x01'
+assert num()==0
 o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flush()
 ''')
     child.chmod(0o755)
@@ -65,18 +73,36 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
               'item':{'url':'https://files.pythonhosted.org/demo.whl','digests':{'sha256':'a'*64}}}
     result={**artifact,'sha256':'a'*64,'url':'https://files.pythonhosted.org/demo.whl',
             'requirements':[],'provides_extra':[]}
+    fingerprint_calls = []
+    def fingerprint(target):
+        fingerprint_calls.append(target)
+        return target.python_artifact_sha256
+    def probe_identity(candidate, digest, no_deps):
+        return (digest, candidate['kind'], candidate['name'], candidate['version'],
+                candidate['filename'], (candidate['item']['digests']['sha256'],
+                candidate['item']['url']), no_deps)
+    def metadata(_pool, candidate, _key, target, probe_cache, _artifact_cache, *,
+                 no_deps, target_fingerprint):
+        assert target_fingerprint == target.python_artifact_sha256
+        probe_cache[probe_identity(candidate, target_fingerprint, no_deps)] = result
+        return result
+    class ProbeCache(dict):
+        def peek(self, key):
+            return self.get(key)
     host={
         '__file__':str(root/'scripts/superbench_pool.py'),
         '_coerce_target':lambda v:v,
         '_packaging_symbols':lambda :(None, None, Version, InvalidVersion, None),
         '_constraint_map':lambda c,t:{},
-        '_SingleFlightCache':lambda :{},
+        '_SingleFlightCache':ProbeCache,
         '_parse_registry_requirement':Requirement,
         '_marker_active':lambda *args:True,
         '_normalized_package_name':lambda name:name.lower(),
         '_candidate_versions':lambda *args,**kwargs:[artifact],
         '_candidate_artifact_identity':lambda v:(v['item']['digests']['sha256'],v['item']['url']),
-        '_candidate_release_metadata':lambda *args,**kwargs:result,
+        '_target_fingerprint': fingerprint,
+        '_candidate_probe_identity_from_fingerprint': probe_identity,
+        '_candidate_release_metadata': metadata,
         '_candidate_satisfies':lambda candidate,reqs,constraints: all(
             not r.specifier or r.specifier.contains(candidate['version'],prereleases=True)
             for r in [*reqs,*constraints]),
@@ -84,6 +110,7 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
     }
     target=SimpleNamespace(python_artifact_sha256='a'*64)
     assert bridge.solve(host,None,target,{'demo==1.0'},set(),'group',materialize=False)==[result]
+    assert fingerprint_calls == [target]
 
 
 def test_native_solver_deadline_contract_is_mandatory(tmp_path):
@@ -304,7 +331,9 @@ pip_total_timeout_seconds = 900
         '_normalized_package_name': lambda name: name.lower(),
         '_candidate_versions': lambda _pool, name, *_args, **_kwargs: [candidates[name]],
         '_candidate_artifact_identity': lambda candidate: (candidate['item']['digests']['sha256'], candidate['item']['url']),
-        '_candidate_probe_identity': lambda candidate, target, no_deps: (candidate['name'], candidate['version'], no_deps),
+        '_target_fingerprint': lambda target: target.python_artifact_sha256,
+        '_candidate_probe_identity_from_fingerprint': (
+            lambda candidate, digest, no_deps: (candidate['name'], candidate['version'], no_deps)),
         '_candidate_release_metadata': lambda _pool, candidate, *_args, **_kwargs: {**candidate, 'requirements': []},
         '_candidate_satisfies': lambda candidate, requirements, constraints: all(
             not req.specifier or req.specifier.contains(candidate['version'], prereleases=True)

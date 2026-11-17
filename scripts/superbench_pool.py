@@ -6606,13 +6606,19 @@ def _materialize_candidate_metadata(pool,candidate,key,target,cache):
     return record
 
 
-def _candidate_probe_identity(candidate,target,no_deps):
-    """One identity for release metadata and read-only compatibility probes."""
-    return (_target_fingerprint(target),candidate['kind'],_normalized_package_name(candidate['name']),
+def _candidate_probe_identity_from_fingerprint(candidate,fingerprint,no_deps):
+    """Preserve the canonical metadata cache identity with a precomputed target hash."""
+    return (fingerprint,candidate['kind'],_normalized_package_name(candidate['name']),
             candidate['version'],candidate['filename'],_candidate_artifact_identity(candidate),bool(no_deps))
 
 
-def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,no_deps=False):
+def _candidate_probe_identity(candidate,target,no_deps):
+    """One identity for release metadata and read-only compatibility probes."""
+    return _candidate_probe_identity_from_fingerprint(candidate,_target_fingerprint(target),no_deps)
+
+
+def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_cache,*,
+                                no_deps=False,target_fingerprint=None):
     """Use only artifact-specific metadata as evidence for dependency decisions.
 
     Release JSON may describe another wheel from the same release. It cannot
@@ -6621,7 +6627,8 @@ def _candidate_release_metadata(pool,candidate,key,target,probe_cache,artifact_c
     --no-deps controls graph expansion, never metadata integrity verification.
     """
     target=_coerce_target(target)
-    identity=_candidate_probe_identity(candidate,target,no_deps)
+    fingerprint=(_target_fingerprint(target) if target_fingerprint is None else target_fingerprint)
+    identity=_candidate_probe_identity_from_fingerprint(candidate,fingerprint,no_deps)
     def probe():
         sha,url=_candidate_artifact_identity(candidate)
         core=_pep658_candidate_metadata(candidate,target)

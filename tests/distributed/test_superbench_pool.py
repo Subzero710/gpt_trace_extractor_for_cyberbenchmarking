@@ -47,6 +47,21 @@ def fixture_target(full_version="3.10.14", *, platform_tag="manylinux_2_17_x86_6
 
 
 class TestStaticDependencyResolution(unittest.TestCase):
+    def test_cached_probe_target_fingerprint_preserves_exact_cache_identity(self):
+        target = fixture_target()
+        digest = pool._target_fingerprint(target)
+        candidate = {
+            'kind': 'wheel', 'name': 'Example_Package', 'version': '1.2.3',
+            'filename': 'example_package-1.2.3-py3-none-any.whl',
+            'item': {'url': 'https://files.pythonhosted.org/example_package-1.2.3.whl',
+                     'digests': {'sha256': hashlib.sha256(b'exact artifact').hexdigest()}},
+        }
+        for no_deps in (False, True):
+            self.assertEqual(
+                pool._candidate_probe_identity(candidate, target, no_deps),
+                pool._candidate_probe_identity_from_fingerprint(candidate, digest, no_deps),
+            )
+
     def test_moto_named_install_requires(self):
         source = '''from setuptools import setup\ninstall_requires = ["requests>=2", "boto3>=1.9"]\nsetup(install_requires=install_requires)\n'''
         requirements, issues = pool.setup_static(source)
