@@ -100,7 +100,7 @@ out.write(b'S');sendnum(1);sendnum(new);sendstr('solver decisions=2');out.flush(
           '_normalized_package_name':lambda name:name.lower(),
           '_candidate_versions':lambda *args,**kwargs:[old,new],
           '_candidate_artifact_identity':lambda c:(c['item']['digests']['sha256'],c['item']['url']),
-          '_candidate_probe_identity':lambda c,target,no_deps:(c['version'],no_deps),
+          '_candidate_probe_identity_from_fingerprint':lambda c,digest,no_deps:(c['version'],no_deps),
           '_target_fingerprint':lambda target:'offline',
           '_native_sdist_graph_metadata':lambda *args,**kwargs:None,
           '_candidate_release_metadata':lambda *args,**kwargs:metadata,

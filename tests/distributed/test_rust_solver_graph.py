@@ -73,8 +73,10 @@ def _offline_graph(name_versions, dependencies, roots, target):
                     Version(candidate['version']),prereleases=True)
                     for req in [*requirements,*constraints])]
 
-    def metadata(_pool,candidate,key,_target,probe_cache,artifact_cache,*,no_deps=False):
-        identity=pool._candidate_probe_identity(candidate,_target,no_deps)
+    def metadata(_pool,candidate,key,_target,probe_cache,artifact_cache,*,
+                 no_deps=False,target_fingerprint):
+        identity=pool._candidate_probe_identity_from_fingerprint(
+            candidate,target_fingerprint,no_deps)
         def compute():
             return {**candidate, 'sha256':candidate['item']['digests']['sha256'],
                     'url':candidate['item']['url'],
