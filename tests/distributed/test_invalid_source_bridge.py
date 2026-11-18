@@ -67,11 +67,14 @@ no_deps=num(1)
 assert no_deps==1
 assert num()==1
 assert (string(),string(),strings())==('demo','demo>=0.5',[])
-out.write(b'D');sendstr('demo');sendnum(1);sendstr('demo>=0.5');out.flush()
+out.write(b'V');sendstr('demo');sendstr('demo>=0.5');out.flush()
 assert read(1)==b'\\x01'
 assert num()==2
-old=num();assert num(1)==1;assert string()=='sdist';assert string()=='0.5';assert string()=='demo-0.5.tar.gz'
-new=num();assert num(1)==1;assert string()=='wheel';assert string()=='1';assert string()=='demo-1-py3-none-any.whl'
+old=num();assert num(1)==1;assert string()=='sdist';assert string()=='0.5';assert string()=='demo-0.5.tar.gz';assert num()==1
+new=num();assert num(1)==1;assert string()=='wheel';assert string()=='1';assert string()=='demo-1-py3-none-any.whl';assert num()==2
+out.write(b'R');sendstr('demo');sendstr('demo>=0.5');out.flush()
+assert read(1)==b'\\x01'
+assert (num(),num(),num())==(1,1,3)
 out.write(b'M');sendnum(1);sendnum(old);out.flush()
 status=read(1)
 assert status==b'\\x02', (status, string())

@@ -6345,8 +6345,7 @@ def _candidate_versions(pool,name,requirements,constraints,target,release_cache=
         universe = _registry_release_candidates(
             name, target, release_cache, allow_yanked=True)
         compatible = [(version, artifact) for version, artifact in universe
-                      if _candidate_satisfies(artifact, [], constraints)
-                      and (not wheel_only or artifact['kind'] == 'wheel')]
+                      if _candidate_satisfies(artifact, [], constraints)]
         explicit = set()
         for raw in (preferred_versions or {}).get(_normalized_package_name(name), ()):
             try: explicit.add(Version(raw))

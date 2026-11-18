@@ -408,6 +408,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             pool, name, [parsed], constraints_by_name.get(name, []), target,
             release_cache=release_cache, preferred_versions=preferred,
             include_all=True)
+        if wheel_only:
+            items = [candidate for candidate in items if candidate['kind'] == 'wheel']
         _, _, Version, _, _ = host['_packaging_symbols']()
         ordered = [register(candidate) for candidate in items]
         sorted_items = sorted(items, key=lambda candidate:
@@ -450,6 +452,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         items = host['_candidate_versions'](
             pool, name, parsed, constraints_by_name.get(name, []), target,
             release_cache=release_cache, preferred_versions=preferred)
+        if wheel_only:
+            items = [candidate for candidate in items if candidate['kind'] == 'wheel']
         ids = [register(candidate) for candidate in items]
         domain_cache[cache_key] = ids
         return ids
@@ -576,6 +580,32 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                             _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
                             wire.send_int(rank)
                     action = deliver_universe
+                elif op == b'Q':
+                    count = wire.number()
+                    if count > wire.limit:
+                        raise RuntimeError('unbounded PubGrub universe batch')
+                    requests = [(wire.string(), wire.string()) for _ in range(count)]
+                    if len({name for name, _ in requests}) != len(requests):
+                        raise RuntimeError('duplicate PubGrub universe batch project')
+                    current_query = {'projects': [name for name, _ in requests]}
+                    def deliver_universes():
+                        if executor is None:
+                            answers = [universe(name, first) for name, first in requests]
+                        else:
+                            futures = [submit(universe, name, first) for name, first in requests]
+                            try:
+                                answers = [future.result(timeout=remaining()) for future in futures]
+                            except BaseException:
+                                for future in futures:
+                                    future.cancel()
+                                raise
+                        wire.send_int(len(answers))
+                        for refs in answers:
+                            wire.send_int(len(refs))
+                            for ref, rank in refs:
+                                _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
+                                wire.send_int(rank)
+                    action = deliver_universes
                 elif op == b'R':
                     name, requirement = wire.string(), wire.string()
                     current_query = {'project': name, 'requirement': requirement}

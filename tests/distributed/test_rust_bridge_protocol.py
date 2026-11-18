@@ -45,16 +45,18 @@ limit=num(8);max_decisions=num(8);depth=num(8);cache=num(8);deadline=num(8);pref
 assert 0 < deadline <= 20, 'unbounded Rust resolver deadline is forbidden'
 roots=[(string(),string(),strings()) for _ in range(num())]
 assert roots==[('demo','demo==1.0',[])]
-o.write(b'D');sendstr('demo');sendnum(1);sendstr('demo==1.0');o.flush()
+o.write(b'V');sendstr('demo');sendstr('demo==1.0');o.flush()
 assert read(1)==b'\\x01'
 assert num()==1
 candidate=num();assert num(1)==1
 assert string()=='wheel';assert string()=='1.0';assert string()=='demo-1.0.whl'
-o.write(b'D');sendstr('demo');sendnum(1);sendstr('demo>=1.0');o.flush()
-assert read(1)==b'\x01'
 assert num()==1
-assert num()==candidate
-assert num(1)==0  # immutable candidate identity was already registered
+o.write(b'R');sendstr('demo');sendstr('demo==1.0');o.flush()
+assert read(1)==b'\\x01'
+assert (num(),num(),num())==(1,1,2)
+o.write(b'R');sendstr('demo');sendstr('demo>=1.0');o.flush()
+assert read(1)==b'\\x01'
+assert (num(),num(),num())==(1,1,2)
 o.write(b'M');sendnum(1);sendnum(candidate);o.flush()
 assert read(1)==b'\\x01'
 o.write(b'K');sendnum(1);sendstr('demo');o.flush()
@@ -318,7 +320,7 @@ pip_total_timeout_seconds = 900
     original = bridge._Wire.exact
     def track(self, count):
         value = original(self, count)
-        if count == 1 and value in (b'C', b'K', b'B', b'M', b'P', b'V', b'R'):
+        if count == 1 and value in (b'C', b'K', b'B', b'M', b'P', b'V', b'Q', b'R'):
             inspected[value] += 1
         return value
     monkeypatch.setattr(bridge._Wire, 'exact', track)
@@ -348,7 +350,8 @@ pip_total_timeout_seconds = 900
     assert len(result) == len(names)
     # PubGrub obtains one admitted universe per project. Interval propagation
     # replaces full-domain re-querying, repeated compatibility and K polling.
-    assert inspected[b'V'] == len(names)
+    assert inspected[b'Q'] == 1
+    assert inspected[b'V'] == 0
     assert inspected[b'R'] >= len(names)
     assert inspected[b'C'] == inspected[b'K'] == inspected[b'B'] == 0
     assert inspected[b'M'] == len(names)
@@ -441,3 +444,122 @@ def test_solution_audit_reexpands_project_when_new_extra_arrives():
     with pytest.raises(RuntimeError, match='unreachable or undeclared'):
         bridge._verify_solution(host, None, [Requirement('a>=1')],
                                 {}, records, no_deps=False)
+
+
+def test_pubgrub_batches_independent_root_universes_on_shared_io_pool(monkeypatch, tmp_path):
+    import concurrent.futures
+    import threading
+
+    source = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('pubgrub_batched_universe_test', source)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config/preparation.toml').write_text('''[acquisition]
+pip_solver_max_decisions=100
+pip_solver_max_depth=100
+pip_solver_cache_max_bytes=100000
+pip_solver_max_frame_bytes=100000
+pip_total_timeout_seconds=30
+''')
+    (tmp_path / 'scripts/superbench_pool.py').write_text('# test source\n')
+    worker = tmp_path / 'pubgrub-batch-oracle'
+    worker.write_text('#!' + sys.executable + '''
+import sys
+stream=sys.stdin.buffer
+out=sys.stdout.buffer
+
+def read(length):
+    data=stream.read(length)
+    assert len(data)==length
+    return data
+
+def number():return int.from_bytes(read(4),'big')
+def string():return read(number()).decode()
+def put_number(value):out.write(value.to_bytes(4,'big'))
+def put_string(value):
+    raw=value.encode()
+    put_number(len(raw))
+    out.write(raw)
+
+for _ in range(6):read(8)
+assert read(1)==b'\\x01'
+assert number()==2
+assert [(string(),string(),number()) for _ in range(2)]==[
+    ('alpha','alpha==1',0),('beta','beta==1',0)]
+out.write(b'Q')
+put_number(2)
+for name in ('alpha','beta'):
+    put_string(name)
+    put_string(name+'==1')
+out.flush()
+assert read(1)==b'\\x01'
+assert number()==2
+ids=[]
+for name in ('alpha','beta'):
+    assert number()==1
+    ref=number()
+    assert read(1)==b'\\x01'
+    assert string()=='wheel'
+    assert string()=='1'
+    assert string()==name+'-1.whl'
+    assert number()==1
+    ids.append(ref)
+for name in ('alpha','beta'):
+    out.write(b'R')
+    put_string(name)
+    put_string(name+'==1')
+    out.flush()
+    assert read(1)==b'\\x01'
+    assert (number(),number(),number())==(1,1,2)
+out.write(b'S')
+put_number(len(ids))
+for ref in ids: put_number(ref)
+put_string('pubgrub decisions=3')
+out.flush()
+''')
+    worker.chmod(0o755)
+    monkeypatch.setattr(bridge, '_binary', lambda root: worker)
+    barrier = threading.Barrier(2, timeout=5)
+
+    def versions(_pool, name, _requirements, _constraints, _target, **_kwargs):
+        barrier.wait()
+        artifacts = []
+        for kind, extension in (('wheel', '.whl'), ('sdist', '.tar.gz')):
+            artifacts.append({'name': name, 'kind': kind, 'version': '1',
+                              'filename': name + '-1' + extension, 'item': {
+                                  'url': 'https://example.org/' + name + extension,
+                                  'digests': {'sha256': 'a' * 64}}})
+        return artifacts
+
+    def metadata(_pool, candidate, *_args, **_kwargs):
+        return {**candidate, 'requirements': []}
+
+    host = {
+        '__file__': str(tmp_path / 'scripts/superbench_pool.py'),
+        '_coerce_target': lambda value: value,
+        '_packaging_symbols': lambda: (Requirement, None, Version, InvalidVersion, None),
+        '_constraint_map': lambda _constraints, _target: {},
+        '_SingleFlightCache': dict,
+        '_parse_registry_requirement': Requirement,
+        '_marker_active': lambda *_args: True,
+        '_normalized_package_name': str.lower,
+        '_candidate_versions': versions,
+        '_candidate_artifact_identity': lambda value: (
+            value['item']['digests']['sha256'], value['item']['url']),
+        '_target_fingerprint': lambda target: target.python_artifact_sha256,
+        '_candidate_probe_identity_from_fingerprint': lambda candidate, *_args: candidate['name'],
+        '_candidate_release_metadata': metadata,
+        '_candidate_satisfies': lambda candidate, requirements, constraints: all(
+            req.specifier.contains(candidate['version'], prereleases=True)
+            for req in (*requirements, *constraints)),
+        '_POOL_PROGRESS': True,
+    }
+    target = SimpleNamespace(python_artifact_sha256=None)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        rows = bridge.solve(host, None, target, {'alpha==1', 'beta==1'}, [],
+                            'batch-io-test', no_deps=True, materialize=False,
+                            resolver_cache={'metadata_executor': executor,
+                                            'sources_require_locked_python': True})
+    assert [row['name'] for row in rows] == ['alpha', 'beta']

@@ -72,9 +72,10 @@ impl Wire {
         for id in ids.values() { self.put32(*id)?; }
         self.put_string(detail)?; self.flush()
     }
-    fn unsat(&mut self, detail: &str) -> Result<(),io::Error> {
+    fn unsat(&mut self, detail: &str, decisions: u64) -> Result<(),io::Error> {
         self.put8(b'U')?; self.put_string(detail)?;
-        self.put_string("pubgrub conflict derivation; no solution")?; self.flush()
+        self.put_string(&format!("pubgrub decisions={decisions}; conflict derivation; no solution"))?;
+        self.flush()
     }
     fn error(&mut self, detail: &str) -> Result<(),io::Error> {
         self.put8(b'F')?; self.put_string(detail)?; self.flush()
@@ -147,14 +148,10 @@ impl Oracle {
             _ => Err(failure("invalid candidate registration")),
         }
     }
-    fn ensure_universe(&mut self, name: &str, first: &str) -> Result<(),io::Error> {
-        if self.universes.contains_key(name) { return Ok(()); }
-        self.check_time()?;
-        self.wire.put8(b'V')?;
-        self.wire.put_string(name)?;
-        self.wire.put_string(first)?;
-        self.wire.flush()?;
-        self.wire.ack()?;
+    fn read_universe(&mut self, name: &str) -> Result<(),io::Error> {
+        if self.universes.contains_key(name) {
+            return Err(failure("duplicate PubGrub universe registration"));
+        }
         let count = self.wire.u32()? as usize;
         if count > self.wire.max_frame || count >= u32::MAX as usize {
             return Err(failure("unbounded PubGrub project universe"));
@@ -173,6 +170,55 @@ impl Oracle {
         }
         self.universes.insert(name.to_string(),Universe {preference:pref,by_rank:ranks});
         Ok(())
+    }
+    fn ensure_universe(&mut self, name: &str, first: &str) -> Result<(),io::Error> {
+        if self.universes.contains_key(name) { return Ok(()); }
+        self.check_time()?;
+        self.wire.put8(b'V')?;
+        self.wire.put_string(name)?;
+        self.wire.put_string(first)?;
+        self.wire.flush()?;
+        self.wire.ack()?;
+        self.read_universe(name)
+    }
+    fn prime_roots(&mut self, roots: &[Requirement]) -> Result<(),io::Error> {
+        let projects: BTreeMap<&str,&str> = roots.iter()
+            .map(|row| (row.name.as_str(),row.requirement.as_str())).collect();
+        if projects.len() < 2 { return Ok(()); }
+        self.check_time()?;
+        self.wire.put8(b'Q')?;
+        self.wire.put_len(projects.len())?;
+        for (name, first) in &projects {
+            self.wire.put_string(name)?;
+            self.wire.put_string(first)?;
+        }
+        self.wire.flush()?;
+        self.wire.ack()?;
+        if self.wire.u32()? as usize != projects.len() {
+            return Err(failure("PubGrub universe batch count differs"));
+        }
+        for (name, _) in projects {
+            self.read_universe(name)?;
+        }
+        Ok(())
+    }
+    fn prefetch_candidates(&mut self, name: &str, ranks: &[u32]) -> Result<(),io::Error> {
+        if ranks.len() < 2 { return Ok(()); }
+        self.check_time()?;
+        self.wire.put8(b'W')?;
+        self.wire.flush()?;
+        self.wire.ack()?;
+        let width = self.wire.u32()? as usize;
+        if width == 0 { return Err(failure("invalid adaptive metadata prefetch width")); }
+        let ids: Vec<u32> = ranks.iter().take(width)
+            .map(|rank| self.ref_for(name,*rank)).collect::<Result<_,_>>()?;
+        self.wire.put8(b'A')?;
+        // PubGrub's conflict-driven search has one flat candidate scope.
+        self.wire.put_len(0)?;
+        self.wire.put_len(ids.len())?;
+        for id in ids { self.wire.put32(id)?; }
+        self.wire.flush()?;
+        self.wire.ack()
     }
     fn range(&mut self, name: &str, requirement: &str) -> Result<Range,io::Error> {
         let key = (name.to_string(),requirement.to_string());
@@ -269,6 +315,7 @@ impl Oracle {
             Pkg::Root => {
                 if rank != 1 { return Err(failure("invalid PubGrub root version")); }
                 let root = std::mem::take(&mut self.roots);
+                self.prime_roots(&root)?;
                 for row in &root { self.add_requirement(&mut dependencies,row)?; }
                 self.roots=root;
             },
@@ -313,7 +360,7 @@ impl DependencyProvider for Provider {
         (Reverse(count),stats.conflict_count())
     }
     fn choose_version(&self, package:&Pkg, range:&Range)->Result<Option<u32>,io::Error> {
-        let oracle=self.oracle.borrow();
+        let mut oracle=self.oracle.borrow_mut();
         oracle.check_time()?;
         let decisions=oracle.decisions.get()+1;
         if decisions>oracle.max_decisions { return Err(failure("PubGrub decision budget exceeded")); }
@@ -323,7 +370,10 @@ impl DependencyProvider for Provider {
             Pkg::Base(name) | Pkg::Extra(name,_) => {
                 let universe=oracle.universes.get(name)
                     .ok_or_else(||failure("PubGrub selected a project before its verified range"))?;
-                Ok(universe.preference.iter().find(|&&rank|range.contains(&rank)).copied())
+                let allowed: Vec<u32> = universe.preference.iter().copied()
+                    .filter(|rank|range.contains(rank)).collect();
+                oracle.prefetch_candidates(name,&allowed)?;
+                Ok(allowed.first().copied())
             }
         }
     }
@@ -401,8 +451,8 @@ fn run(wire: &mut Wire) -> Result<(),io::Error> {
             if detail.len()>limit {
                 let mut end=limit;
                 while !detail.is_char_boundary(end) {end-=1;}
-                oracle.wire.unsat(&detail[..end])
-            } else { oracle.wire.unsat(&detail) }
+                oracle.wire.unsat(&detail[..end],oracle.decisions.get())
+            } else { oracle.wire.unsat(&detail,oracle.decisions.get()) }
         },
         Err(other)=>oracle.wire.error(&format!("{other:?}")),
     }
