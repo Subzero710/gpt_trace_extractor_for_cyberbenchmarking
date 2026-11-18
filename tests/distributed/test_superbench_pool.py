@@ -1686,6 +1686,43 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertIn('--no-auto-maintenance',command)
         self.assertIn('--no-tags',command)
 
+    def test_git_fetch_total_timeout_covers_all_retries(self):
+        controls = tomllib.loads((ROOT / 'config/preparation.toml').read_text())['acquisition']
+        maximum = controls['subprocess_timeout_seconds']
+        self.assertLessEqual(maximum, 900)
+        self.assertLessEqual(maximum, controls['progress_stall_timeout_seconds'])
+        elapsed = [0.0]
+        attempts = []
+
+        def failing_fetch(*args, timeout, **kwargs):
+            attempts.append(timeout)
+            elapsed[0] += timeout * 0.6
+            return subprocess.CompletedProcess(['git'], 128, stdout='', stderr='connection aborted')
+
+        def advance_backoff(delay):
+            elapsed[0] += delay
+
+        with patch.object(pool.subprocess, 'run', side_effect=failing_fetch), \
+             patch.object(pool.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(pool.time, 'sleep', side_effect=advance_backoff):
+            with self.assertRaisesRegex(RuntimeError, 'Git fetch failed'):
+                pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a' * 40])
+        self.assertGreater(len(attempts), 1)
+        self.assertLessEqual(elapsed[0], maximum)
+        self.assertTrue(all(0 < seconds <= maximum for seconds in attempts))
+        self.assertLess(attempts[-1], attempts[0])
+
+    def test_git_fetch_rejects_deadline_longer_than_versioned_budget(self):
+        controls = tomllib.loads((ROOT / 'config/preparation.toml').read_text())['acquisition']
+        with self.assertRaisesRegex(ValueError, 'deadline exceeds versioned subprocess budget'):
+            pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a' * 40],
+                            timeout=controls['subprocess_timeout_seconds'] + 1)
+
+    def test_one_hour_subprocess_deadlines_are_absent_from_runtime(self):
+        for relative in ('scripts/superbench_pool.py', 'scripts/build_local_templates.py'):
+            with self.subTest(path=relative):
+                self.assertNotRegex((ROOT / relative).read_text(), r'timeout\s*=\s*3600\b')
+
     def test_git_fetch_exhaustion_reports_bounded_stderr(self):
         failure=subprocess.CompletedProcess(['git'],128,stdout='',stderr='fatal: '+('x'*5000))
         with patch.object(pool.subprocess,'run',return_value=failure) as runner, \
@@ -2065,7 +2102,7 @@ class TestVerifiedPoolResume(unittest.TestCase):
             root=Path(tmp);repo='test/example';commit='a'*40
             folder=root/'git'/'test_example.git'
             folder.mkdir(parents=True)
-            def command(argv,*,cwd=None,capture=False,env=None,timeout=3600):
+            def command(argv,*,cwd=None,capture=False,env=None,timeout=None):
                 if 'rev-parse' in argv:return 'true'
                 if 'cat-file' in argv:return ''
                 if 'update-ref' in argv:return None

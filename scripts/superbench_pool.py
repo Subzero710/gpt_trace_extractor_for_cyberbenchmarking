@@ -349,8 +349,28 @@ def _pool_progress(stage, completed=None, total=None, unit='', details='', *, fo
         _POOL_PROGRESS.update(stage, completed, total, unit, details, force=force)
 
 
-def invoke(argv, *, cwd=None, capture=False, env=None, timeout=3600):
+
+@functools.lru_cache(maxsize=1)
+def _subprocess_timeout():
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned subprocess timeout policy')
+    with policy.open('rb') as stream:
+        controls = tomllib.load(stream)['acquisition']
+    value = controls['subprocess_timeout_seconds']
+    stall = controls['progress_stall_timeout_seconds']
+    if (type(value) is not int or value <= 0
+            or type(stall) is not int or stall < value):
+        raise RuntimeError('invalid versioned subprocess timeout budget')
+    return value
+
+
+def invoke(argv, *, cwd=None, capture=False, env=None, timeout=None):
     command = [str(v) for v in argv]
+    if timeout is None:
+        timeout = _subprocess_timeout()
+    if type(timeout) not in (int, float) or not 0 < timeout:
+        raise ValueError('invalid subprocess timeout')
     if _POOL_PROGRESS is None:
         print('[pool]', ' '.join(command), flush=True)
         try:
@@ -1052,13 +1072,19 @@ def git_files_named(mirror, commit, basename, *, limit=64):
             if len(rows)>limit:raise RuntimeError('Git basename search exceeds finite bound: '+basename)
     return sorted(set(rows))
 
-def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600, refetch=False):
+def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, refetch=False):
     """Fetch immutable GitHub refs quietly with bounded in-process retries.
 
     A failed network transfer is retried inside the same preparation so a transient
     GitHub/DNS/TLS failure cannot force an operator to restart the whole acquisition.
     The caller still verifies every requested commit/ref after the fetch.
     """
+    ceiling = _subprocess_timeout()
+    if timeout is None:
+        timeout = ceiling
+    if type(timeout) not in (int, float) or not 0 < timeout <= ceiling:
+        raise ValueError('Git fetch deadline exceeds versioned subprocess budget')
+    deadline = time.monotonic() + timeout
     if not REPO.fullmatch(repo):
         raise RuntimeError('untrusted Git repo')
     refs=tuple(str(value) for value in refspecs)
@@ -1075,10 +1101,16 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600, ref
     if not explicit_tags:command.append('--no-tags')
     command.extend(['https://github.com/'+repo+'.git',*refs])
     last_detail='unknown git fetch failure'
+    completed_attempts = 0
     for attempt in range(1,DOWNLOAD_ATTEMPTS+1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            last_detail = 'versioned Git fetch deadline exhausted'
+            break
+        completed_attempts = attempt
         try:
             result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                                  timeout=timeout)
+                                  timeout=remaining)
             if result.returncode==0:
                 return
             last_detail=(result.stderr or result.stdout or ('exit status '+str(result.returncode))).strip()
@@ -1089,10 +1121,13 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=3600, ref
         last_detail=last_detail[-500:]
         if attempt<DOWNLOAD_ATTEMPTS:
             delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
+            if delay >= deadline - time.monotonic():
+                last_detail = 'versioned Git fetch deadline exhausted: ' + last_detail
+                break
             print(f'[pool] git fetch retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s: {repo}: {last_detail}',
                   file=sys.stderr,flush=True)
             time.sleep(delay)
-    raise RuntimeError('Git fetch failed after '+str(DOWNLOAD_ATTEMPTS)+' attempts for '+repo+': '+last_detail)
+    raise RuntimeError('Git fetch failed after '+str(completed_attempts)+' attempts for '+repo+': '+last_detail)
 
 
 def _git_has_commit(folder, commit):
@@ -1118,7 +1153,7 @@ def _git_tree_closure_issue(folder, commits):
         result = subprocess.run(
             ['git', '--git-dir', str(folder), 'fsck', '--full', '--connectivity-only',
              '--no-reflogs', '--no-progress', '--no-dangling', *refs],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3600)
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=_subprocess_timeout())
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError('pinned Git tree-closure verification timed out') from exc
     if result.returncode == 0:

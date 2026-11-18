@@ -3,14 +3,17 @@
 """Sequential local execution host builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
-def _versioned_host_subprocess_timeout():
+def _versioned_host_subprocess_timeout(field='timeout_seconds'):
     import tomllib
     from pathlib import Path
     policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned host subprocess deadline')
+    if field not in ('timeout_seconds', 'subprocess_timeout_seconds'):
+        raise RuntimeError('unsupported host subprocess deadline field')
     with policy.open('rb') as stream:
-        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+        controls = tomllib.load(stream)['acquisition']
+    value = controls[field]
     if type(value) is not int or value < 1:
         raise RuntimeError('invalid versioned host subprocess deadline')
     return value
@@ -348,7 +351,9 @@ def free_space(path, margin):
         raise RuntimeError(f"host free-space safety margin reached: {free} < {margin} bytes")
 
 
-def command(*args, cwd=None, timeout=3600, log=None, margin=0, monitor=None, tail_file=None, **kwargs):
+def command(*args, cwd=None, timeout=None, log=None, margin=0, monitor=None, tail_file=None, **kwargs):
+    if timeout is None:
+        timeout = _versioned_host_subprocess_timeout('subprocess_timeout_seconds')
     print("+", " ".join(str(arg) for arg in args), flush=True)
     if monitor:
         free_space(monitor, margin)
@@ -405,7 +410,7 @@ def tempfile_output():
 
 
 def capture(*args):
-    return subprocess.check_output(args, timeout=3600)
+    return subprocess.check_output(args, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
 
 
 def verify_sources(inputs, mirrors):
@@ -1408,7 +1413,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     common.chmod(original_mode)
 
             if common_ready:
-                subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=3600)
+                subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
                 print("reused verified complete immutable common QCOW2", flush=True)
             else:
                 # A generic base-image marker is never accepted as common proof.
@@ -1459,7 +1464,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     os.rename(legacy, current_scratch)
                     relative = os.path.relpath(common, current_scratch.parent)
                     cmd("qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2",
-                        "-b", relative, str(current_scratch), timeout=3600)
+                        "-b", relative, str(current_scratch), timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
                     print("migrated persistent task scratch volume: " + scratch_name, flush=True)
 
             def scratch_uses_common(image):
@@ -1827,7 +1832,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     ready = completion_matches(image, REPO_COMPLETION, repo_completion) or legacy_repo_complete
                 if ready:
                     refresh_overlay_runtime(image)
-                    subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=3600)
+                    subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
                     print("reused verified repository image " + repo, flush=True)
                 else:
                     if not image.exists():
@@ -1945,7 +1950,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 value = json.loads(capture("qemu-img", "info", "--output=json", str(path)))
                 signature = file_signature(path)
                 if checked_images.get(path) != signature:
-                    command("qemu-img", "check", str(path), timeout=3600)
+                    command("qemu-img", "check", str(path), timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
                     checked_images[path] = signature
                 return value
 
