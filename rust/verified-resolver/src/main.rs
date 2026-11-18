@@ -334,7 +334,30 @@ impl Oracle {
                 };
                 if !self.no_deps {
                     for row in self.dependencies(id,&extras)? {
-                        self.add_requirement(&mut dependencies,&row)?;
+                        if row.name == *name {
+                            // A distribution is already fixed to `rank` here. A
+                            // self-requirement cannot introduce another choice of
+                            // its version, so reject a contradiction directly.
+                            // PubGrub must not be asked to solve a dependency
+                            // edge from a package back to that same package.
+                            if !self.range(name,&row.requirement)?.contains(&rank) {
+                                return Ok(Dependencies::Unavailable(format!(
+                                    "selected {name} version contradicts {}",row.requirement)));
+                            }
+                            // Self-requirements can still activate other extras.
+                            // Keep those as separate virtual packages at the
+                            // already-selected distribution version.
+                            for extra in row.extras {
+                                let virtual_package=Pkg::Extra(name.clone(),extra);
+                                if &virtual_package == package { continue; }
+                                let exact=Range::singleton(rank);
+                                dependencies.entry(virtual_package)
+                                    .and_modify(|existing| *existing=existing.intersection(&exact))
+                                    .or_insert(exact);
+                            }
+                        } else {
+                            self.add_requirement(&mut dependencies,&row)?;
+                        }
                     }
                 }
             }
