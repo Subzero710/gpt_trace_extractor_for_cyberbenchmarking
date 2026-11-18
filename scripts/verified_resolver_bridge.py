@@ -835,6 +835,11 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         pool, result, key, target, artifact_cache, executor=executor,
                         source_probe=source_probe) if materialize else result)
             remaining()
+            withdrawn = sorted(row['name'] + '==' + row['version']
+                               for row in selected if row.get('yanked') is True)
+            if withdrawn:
+                print('[pool] WARNING: selected withdrawn PyPI artifacts: ' +
+                      ', '.join(withdrawn), flush=True)
             return selected
         except BaseException as exc:
             if isinstance(exc, TimeoutError) or time.monotonic() >= expires:

@@ -1204,7 +1204,9 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 pool._resolve_registry_plan(candidate_pool,target,{'conflict>=1'},(),'bounded-log',materialize=False)
         summary = re.search(r'\bdecisions=(\d+)\b', str(failure.exception))
         self.assertIsNotNone(summary, str(failure.exception))
-        self.assertLessEqual(int(summary.group(1)), domain_size + 1, str(failure.exception))
+        # One root decision and one empty-domain decision are counted in
+        # addition to the candidate versions PubGrub rejects.
+        self.assertLessEqual(int(summary.group(1)), domain_size + 2, str(failure.exception))
         self.assertEqual(output.getvalue().count('decision '), 0)
 
     def test_conflict_directed_backjump_skips_irrelevant_version_combinations(self):
@@ -1213,7 +1215,8 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         calls=[]
         def candidate(name,version):
             return verified_registry_fixture(name, version)
-        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None):
+        def versions(_pool,name,_requirements,_constraints,_target,release_cache=None,preferred_versions=None,*,include_all=False):
+            self.assertTrue(include_all)
             if name=='conflict':return [candidate(name,index) for index in range(1,4)]
             if name=='missing':return []
             if name in noise:return [candidate(name,1),candidate(name,2)]
@@ -1266,8 +1269,11 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             with patch.object(pool,'_pypi_simple_project',return_value=('1.0',)),                  patch.object(pool,'_pypi_json',side_effect=project),                  patch.object(pool,'fetch',side_effect=fetch),                  patch.object(pool,'_wheel_core_metadata',side_effect=read_metadata):
                 pool.pip_closure(candidate_pool,target,{'root-a==1.0'},'first',resolver_cache=cache)
                 pool.pip_closure(candidate_pool,target,{'root-b==1.0'},'second',resolver_cache=cache)
-        self.assertEqual(project_calls.count('shared'),0)
-        self.assertEqual(release_calls.count(('shared','1.0')),1)
+        # The stable PubGrub universe requires the project index, even when
+        # the first incoming edge happens to be an exact version pin.
+        # Across both closures the project and wheel metadata are each read once.
+        self.assertEqual(project_calls.count('shared'),1)
+        self.assertEqual(release_calls.count(('shared','1.0')),0)
         self.assertEqual(len(metadata_reads),3)
 
     def test_pep658_core_metadata_avoids_release_json_and_rejected_artifact_downloads(self):
@@ -1323,9 +1329,16 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                     'url':'https://files.pythonhosted.org/'+name+'.whl',
                     'digests':{'sha256':hashlib.sha256(payloads[name]).hexdigest()}}
         def api(url,**_kwargs):
-            name=url.split('/pypi/')[1].split('/')[0]
-            return {'info':{'name':name,'version':'1.0','requires_dist':[],
-                            'provides_extra':[]},'urls':[artifact(name)]}
+            parts=url.split('/pypi/',1)[1].removesuffix('/json').split('/')
+            name=parts[0]
+            if len(parts)==1:
+                return {'releases':{'1.0':[artifact(name)]}}
+            if parts==[name,'1.0']:
+                # Release metadata deliberately contradicts the wheel's
+                # verified Requires-Dist field; the wheel remains authoritative.
+                return {'info':{'name':name,'version':'1.0','requires_dist':[],
+                                'provides_extra':[]},'urls':[artifact(name)]}
+            raise AssertionError('unexpected PyPI endpoint '+url)
         def fetch(url,path,**_kwargs):
             data=payloads[Path(url).stem];Path(path).write_bytes(data)
             return hashlib.sha256(data).hexdigest()
@@ -1495,7 +1508,9 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         def release(name,_target,_cache=None,**_kwargs):return universes[name]
         def exact(name,version,_target,_cache=None):
             return tuple(row for row in universes[name] if row[0]==Version(version))
+        metadata_probes=[]
         def metadata(_pool,item,_key,_target,_probe,_artifact,**_kwargs):
+            metadata_probes.append((item['name'], item['version']))
             def compute():
                 deps=(['botocore=='+item['version']] if item['name']=='awscli'
                       else ['botocore==1'] if item['name']=='boto3' else [])
@@ -1517,10 +1532,10 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             self.assertIn(chosen['boto3'],{str(v) for v in versions})
             summary=output.getvalue()
             import re
+            self.assertIn('pubgrub decisions=', summary)
             decisions=int(re.search(r'decisions=(\d+)',summary).group(1))
-            pruning=int(re.search(r'forward_prunes=(\d+)',summary).group(1))
-            self.assertLess(decisions,len(versions)*3,summary)
-            self.assertGreater(pruning,0,summary)
+            self.assertLess(decisions,len(versions)*len(universes),summary)
+            self.assertLessEqual(len(metadata_probes),decisions,summary)
 
     def test_adaptive_prefetch_expands_as_resolvers_finish(self):
         activity=pool._ResolverActivity(8)

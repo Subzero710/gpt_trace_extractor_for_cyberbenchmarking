@@ -362,10 +362,12 @@ class AuditRegressions(unittest.TestCase):
                 return True
             expected = any(valid(dict(zip(names, values))) for values in itertools.product(('1', '2'), repeat=len(names)))
             def candidates(instance, name, requirements, constraints, target, **kwargs):
+                # PubGrub retracts incoming requirements during backjumping;
+                # the admitted universe must not be narrowed by its first edge.
+                self.assertIs(kwargs.get('include_all'), True)
                 return [self.candidate((name+version).encode(), name=name, version=version,
                             filename=name+'-'+version+'-py3-none-any.whl')
-                        for version in ('2','1') if all(not req.specifier or req.specifier.contains(version)
-                                                       for req in requirements)]
+                        for version in ('2','1')]
             def metadata(instance, candidate, *args, **kwargs):
                 return {**candidate, 'requirements': graph[candidate['name'],candidate['version']], 'provides_extra': []}
             with self.subTest(seed=seed), tempfile.TemporaryDirectory() as raw:
