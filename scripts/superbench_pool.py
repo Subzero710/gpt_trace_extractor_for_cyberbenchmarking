@@ -6334,9 +6334,33 @@ def _admitted_pip_versions(pool, universe, specifiers):
     return [row for index, row in enumerate(universe) if candidates & (1 << index)]
 
 
-def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None):
+def _candidate_versions(pool,name,requirements,constraints,target,release_cache=None,preferred_versions=None,*,include_all=False):
     _,SpecifierSet,Version,InvalidVersion,_=_packaging_symbols()
     combined=SpecifierSet(','.join(str(req.specifier) for req in [*requirements,*constraints] if str(req.specifier)))
+    if include_all:
+        # PubGrub owns global range propagation. Read the project once, on the
+        # first incoming constraint, and admit every target-compatible release
+        # that might participate in any subsequently narrowed interval. Never
+        # silently discard withdrawn releases: PubGrub tries active ones first.
+        universe = _registry_release_candidates(
+            name, target, release_cache, allow_yanked=True)
+        compatible = [(version, artifact) for version, artifact in universe
+                      if _candidate_satisfies(artifact, [], constraints)
+                      and (not wheel_only or artifact['kind'] == 'wheel')]
+        explicit = set()
+        for raw in (preferred_versions or {}).get(_normalized_package_name(name), ()):
+            try: explicit.add(Version(raw))
+            except InvalidVersion as exc:
+                raise RuntimeError('invalid preferred version identity') from exc
+        cached = set()
+        for raw in _cached_python_versions(pool,name):
+            try: cached.add(Version(raw))
+            except InvalidVersion: continue
+        compatible.sort(key=lambda pair:
+                        (not bool(pair[1]['item'].get('yanked')),
+                         pair[0] in explicit, pair[0] in cached,
+                         not pair[0].is_prerelease, pair[0]), reverse=True)
+        return [artifact for _version,artifact in compatible]
     literal_pins=[spec.version for spec in combined if spec.operator=='==' and '*' not in spec.version]
     if literal_pins and not all(combined.contains(Version(pin),prereleases=True) for pin in literal_pins):
         return []

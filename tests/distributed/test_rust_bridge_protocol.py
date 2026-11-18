@@ -318,7 +318,7 @@ pip_total_timeout_seconds = 900
     original = bridge._Wire.exact
     def track(self, count):
         value = original(self, count)
-        if count == 1 and value in (b'C', b'K', b'B', b'M', b'P'):
+        if count == 1 and value in (b'C', b'K', b'B', b'M', b'P', b'V', b'R'):
             inspected[value] += 1
         return value
     monkeypatch.setattr(bridge._Wire, 'exact', track)
@@ -346,10 +346,11 @@ pip_total_timeout_seconds = 900
     result = bridge.solve(host, None, target, {name + '==1.0' for name in names}, [],
                           'ipc-budget-test', materialize=False)
     assert len(result) == len(names)
-    # Originally: 6,480 C and 3,240 K round trips for 80 roots.
-    assert inspected[b'C'] == len(names)
-    assert inspected[b'K'] == len(names)
-    assert inspected[b'B'] == 1
+    # PubGrub obtains one admitted universe per project. Interval propagation
+    # replaces full-domain re-querying, repeated compatibility and K polling.
+    assert inspected[b'V'] == len(names)
+    assert inspected[b'R'] >= len(names)
+    assert inspected[b'C'] == inspected[b'K'] == inspected[b'B'] == 0
     assert inspected[b'M'] == len(names)
     assert inspected[b'P'] == len(names)
 

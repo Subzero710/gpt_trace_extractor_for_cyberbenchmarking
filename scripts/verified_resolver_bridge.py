@@ -375,6 +375,71 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     candidate_lock = threading.Lock()
     observed_lock = threading.Lock()
     observed_metadata = set()
+    def register(candidate):
+        identity = (candidate['name'], candidate['kind'], candidate['version'],
+                    candidate['filename'], host['_candidate_artifact_identity'](candidate))
+        with candidate_lock:
+            ref = id_by_identity.get(identity)
+            if ref is None:
+                ref = len(candidate_by_id) + 1
+                if ref >= 2 ** 32:
+                    raise RuntimeError('native Rust candidate reference overflow')
+                id_by_identity[identity] = ref
+                candidate_by_id[ref] = candidate
+                canonical = host['_normalized_package_name'](candidate['name'])
+                candidate_ids_by_name.setdefault(canonical, set()).add(ref)
+        return ref
+
+    # One immutable PEP 440-ranked universe per package, obtained at its first
+    # incoming requirement. The universe is NOT narrowed by that requirement:
+    # PubGrub may retract it during conflict-driven backjumping.
+    # No Cartesian product or eager transitive metadata scan is constructed.
+    pubgrub_universes = {}
+
+    def universe(name, first_requirement):
+        remaining()
+        existing = pubgrub_universes.get(name)
+        if existing is not None:
+            raise RuntimeError('duplicate PubGrub universe registration')
+        parsed = host['_parse_registry_requirement'](first_requirement)
+        if host['_normalized_package_name'](parsed.name) != name:
+            raise RuntimeError('PubGrub universe requirement changes package identity')
+        items = host['_candidate_versions'](
+            pool, name, [parsed], constraints_by_name.get(name, []), target,
+            release_cache=release_cache, preferred_versions=preferred,
+            include_all=True)
+        _, _, Version, _, _ = host['_packaging_symbols']()
+        ordered = [register(candidate) for candidate in items]
+        sorted_items = sorted(items, key=lambda candidate:
+                              (Version(candidate['version']), candidate['filename']))
+        if len(sorted_items) >= 2 ** 32:
+            raise RuntimeError('PubGrub project universe exceeds rank capacity')
+        ranks = {register(item): index + 1 for index, item in enumerate(sorted_items)}
+        if len(ranks) != len(sorted_items):
+            raise RuntimeError('duplicate PubGrub artifact identity in project universe')
+        versions = {ref: Version(candidate_by_id[ref]['version']) for ref in ordered}
+        pubgrub_universes[name] = (tuple(ordered), ranks, versions)
+        return tuple((ref, ranks[ref]) for ref in ordered)
+
+    def intervals(name, requirement):
+        remaining()
+        if name not in pubgrub_universes:
+            raise RuntimeError('PubGrub requested a range before its universe')
+        parsed = host['_parse_registry_requirement'](requirement)
+        if host['_normalized_package_name'](parsed.name) != name:
+            raise RuntimeError('PubGrub range requirement changes package identity')
+        _order, ranks, versions = pubgrub_universes[name]
+        permitted = sorted(rank for ref, rank in ranks.items()
+                           if not parsed.specifier or
+                           parsed.specifier.contains(versions[ref], prereleases=True))
+        result = []
+        for rank in permitted:
+            if result and rank == result[-1][1]:
+                result[-1] = (result[-1][0], rank + 1)
+            else:
+                result.append((rank, rank + 1))
+        return result
+
     def domain(name, requirements):
         remaining()
         raw = tuple(requirements)
@@ -385,23 +450,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         items = host['_candidate_versions'](
             pool, name, parsed, constraints_by_name.get(name, []), target,
             release_cache=release_cache, preferred_versions=preferred)
-        if wheel_only:
-            items = [candidate for candidate in items if candidate['kind'] == 'wheel']
-        ids = []
-        for candidate in items:
-            identity = (candidate['name'], candidate['kind'], candidate['version'],
-                        candidate['filename'], host['_candidate_artifact_identity'](candidate))
-            with candidate_lock:
-                ref = id_by_identity.get(identity)
-                if ref is None:
-                    ref = len(candidate_by_id) + 1
-                    if ref >= 2 ** 32:
-                        raise RuntimeError('native Rust candidate reference overflow')
-                    id_by_identity[identity] = ref
-                    candidate_by_id[ref] = candidate
-                    canonical_name = host['_normalized_package_name'](candidate['name'])
-                    candidate_ids_by_name.setdefault(canonical_name, set()).add(ref)
-            ids.append(ref)
+        ids = [register(candidate) for candidate in items]
         domain_cache[cache_key] = ids
         return ids
 
@@ -514,7 +563,30 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 current_opcode = op.decode('ascii', errors='replace')
                 current_query = None
                 pending_metadata = {}
-                if op == b'D':
+                if op == b'V':
+                    name, first = wire.string(), wire.string()
+                    current_query = {'project': name, 'first_requirement': first}
+                    def deliver_universe():
+                        if executor is None:
+                            refs = universe(name, first)
+                        else:
+                            refs = submit(universe, name, first).result(timeout=remaining())
+                        wire.send_int(len(refs))
+                        for ref, rank in refs:
+                            _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
+                            wire.send_int(rank)
+                    action = deliver_universe
+                elif op == b'R':
+                    name, requirement = wire.string(), wire.string()
+                    current_query = {'project': name, 'requirement': requirement}
+                    def deliver_range():
+                        segments = intervals(name, requirement)
+                        wire.send_int(len(segments))
+                        for lower, upper in segments:
+                            wire.send_int(lower)
+                            wire.send_int(upper)
+                    action = deliver_range
+                elif op == b'D':
                     name, requirements = wire.string(), wire.strings()
                     current_query = {'project': name, 'requirements': requirements}
                     def deliver_domain():

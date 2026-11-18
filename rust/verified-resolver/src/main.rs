@@ -1,15 +1,22 @@
-//! Production dependency-graph decision engine.
-//! All Python packaging / wheel / PEP 517 semantics stay with the verified host
-//! callback. This executable exclusively owns search, state propagation, conflict
-//! learning, and CPU work. Zero third-party Rust dependencies; offline build.
-//! Protocol is typed length-prefixed binary, versioned by source/policy identity.
-
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+//! Exact PubGrub interval propagation, conflict learning and backjumping.
+//! Python remains the authoritative PEP 440/508/517 and artifact oracle.
+//! The finite candidate universe of a project is discovered only when an
+//! incoming requirement first reaches that project, not before.
+use pubgrub::{resolve, Dependencies, DependencyConstraints, DependencyProvider,
+    DefaultStringReporter, PackageResolutionStatistics, PubGrubError, Ranges,
+    Reporter};
+use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::time::{Duration, Instant};
-use std::sync::Arc;
 
-fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
+type Range = Ranges<u32>;
+
+fn failure(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, message.into())
+}
 
 struct Wire {
     input: BufReader<io::Stdin>,
@@ -19,712 +26,391 @@ struct Wire {
 impl Wire {
     fn new() -> Self {
         Self { input: BufReader::new(io::stdin()), output: BufWriter::new(io::stdout()),
-               max_frame: u32::MAX as usize }
+            max_frame: u32::MAX as usize }
     }
-    fn raw_u8(&mut self) -> Result<u8, String> {
-        let mut b = [0u8; 1]; self.input.read_exact(&mut b).map_err(err)?; Ok(b[0])
+    fn u8(&mut self) -> Result<u8, io::Error> {
+        let mut bytes = [0u8; 1]; self.input.read_exact(&mut bytes)?; Ok(bytes[0])
     }
-    fn raw_u32(&mut self) -> Result<u32, String> {
-        let mut b = [0u8; 4]; self.input.read_exact(&mut b).map_err(err)?; Ok(u32::from_be_bytes(b))
+    fn u32(&mut self) -> Result<u32, io::Error> {
+        let mut bytes = [0u8; 4]; self.input.read_exact(&mut bytes)?;
+        Ok(u32::from_be_bytes(bytes))
     }
-    fn raw_u64(&mut self) -> Result<u64, String> {
-        let mut b = [0u8; 8]; self.input.read_exact(&mut b).map_err(err)?; Ok(u64::from_be_bytes(b))
+    fn u64(&mut self) -> Result<u64, io::Error> {
+        let mut bytes = [0u8; 8]; self.input.read_exact(&mut bytes)?;
+        Ok(u64::from_be_bytes(bytes))
     }
-    fn raw_string(&mut self) -> Result<String, String> {
-        let size = self.raw_u32()? as usize;
-        if size > self.max_frame { return Err("resolver IPC string exceeds versioned limit".into()); }
-        let mut data = vec![0u8; size]; self.input.read_exact(&mut data).map_err(err)?;
-        String::from_utf8(data).map_err(err)
+    fn string(&mut self) -> Result<String, io::Error> {
+        let size = self.u32()? as usize;
+        if size > self.max_frame { return Err(failure("IPC string exceeds frame limit")); }
+        let mut bytes = vec![0; size]; self.input.read_exact(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|e| failure(e.to_string()))
     }
-    fn send_u8(&mut self, v: u8) -> Result<(), String> { self.output.write_all(&[v]).map_err(err) }
-    fn send_u32(&mut self, v: u32) -> Result<(), String> { self.output.write_all(&v.to_be_bytes()).map_err(err) }
-    fn send_len(&mut self, v: usize) -> Result<(), String> {
-        self.send_u32(u32::try_from(v).map_err(err)?)
+    fn put8(&mut self, value: u8) -> Result<(), io::Error> {
+        self.output.write_all(&[value])
     }
-    fn send_string(&mut self, v: &str) -> Result<(), String> {
-        if v.len() > self.max_frame { return Err("resolver IPC outbound string exceeds limit".into()); }
-        self.send_len(v.len())?; self.output.write_all(v.as_bytes()).map_err(err)
+    fn put32(&mut self, value: u32) -> Result<(), io::Error> {
+        self.output.write_all(&value.to_be_bytes())
     }
-    fn flush(&mut self) -> Result<(), String> { self.output.flush().map_err(err) }
-    fn ack(&mut self) -> Result<(), String> {
-        match self.raw_u8()? {
+    fn put_len(&mut self, value: usize) -> Result<(), io::Error> {
+        self.put32(u32::try_from(value).map_err(|e| failure(e.to_string()))?)
+    }
+    fn put_string(&mut self, value: &str) -> Result<(), io::Error> {
+        if value.len() > self.max_frame { return Err(failure("IPC outbound string exceeds frame limit")); }
+        self.put_len(value.len())?;
+        self.output.write_all(value.as_bytes())
+    }
+    fn flush(&mut self) -> Result<(), io::Error> { self.output.flush() }
+    fn ack(&mut self) -> Result<(), io::Error> {
+        match self.u8()? {
             1 => Ok(()),
-            0 => Err(self.raw_string()?),
-            _ => Err("invalid resolver IPC response status".into()),
+            0 => Err(failure(self.string()?)),
+            other => Err(failure(format!("invalid IPC response {other}"))),
         }
     }
-    fn strings(&mut self, values: &[String]) -> Result<(), String> {
-        self.send_len(values.len())?;
-        for s in values { self.send_string(s)?; }
-        Ok(())
+    fn success(&mut self, ids: &BTreeMap<String,u32>, detail: &str) -> Result<(),io::Error> {
+        self.put8(b'S')?; self.put_len(ids.len())?;
+        for id in ids.values() { self.put32(*id)?; }
+        self.put_string(detail)?; self.flush()
     }
-    fn finish_success(&mut self, selected: &BTreeMap<String, Arc<Candidate>>, stats: &Stats) -> Result<(), String> {
-        self.send_u8(b'S')?; self.send_len(selected.len())?;
-        for candidate in selected.values() { self.send_u32(candidate.id)?; }
-        self.send_string(&stats.render())?; self.flush()
+    fn unsat(&mut self, detail: &str) -> Result<(),io::Error> {
+        self.put8(b'U')?; self.put_string(detail)?;
+        self.put_string("pubgrub conflict derivation; no solution")?; self.flush()
     }
-    fn finish_unsat(&mut self, detail: &str, stats: &Stats) -> Result<(), String> {
-        self.send_u8(b'U')?; self.send_string(detail)?; self.send_string(&stats.render())?; self.flush()
-    }
-    fn finish_error(&mut self, detail: &str) -> Result<(), String> {
-        self.send_u8(b'F')?; self.send_string(detail)?; self.flush()
+    fn error(&mut self, detail: &str) -> Result<(),io::Error> {
+        self.put8(b'F')?; self.put_string(detail)?; self.flush()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Entry {
-    name: String,
-    requirement: String,
-    extras: BTreeSet<String>,
-    causes: BTreeSet<String>,
+#[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+enum Pkg {
+    Root,
+    Base(String),
+    Extra(String,String),
 }
+impl fmt::Display for Pkg {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => write!(fmt, "<verified-root>"),
+            Self::Base(name) => fmt.write_str(name),
+            Self::Extra(name, extra) => write!(fmt, "{name}[{extra}]"),
+        }
+    }
+}
+impl Pkg {
+    fn name(&self) -> Option<&str> {
+        match self { Self::Root => None, Self::Base(name) | Self::Extra(name,_) => Some(name) }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct Candidate {
-    id: u32,
-    kind: String,
-    version: String,
-    filename: String,
+struct Candidate { id: u32, kind: String, version: String, filename: String }
+struct Universe {
+    // Rank follows exact PEP 440 ordering supplied by Python. The preference
+    // vector follows cache/release policy independently of that ordering.
+    preference: Vec<u32>,
+    by_rank: HashMap<u32,u32>,
 }
-#[derive(Default, Clone)]
-struct Stats {
-    decisions: u64,
-    propagations: u64,
-    backjumps: u64,
-    memo_hits: u64,
-    learned_skips: u64,
-    forward_prunes: u64,
-    decisions_by_name: BTreeMap<String, u64>,
-}
-impl Stats {
-    fn render(&self) -> String {
-        let hot = self.decisions_by_name.iter().max_by_key(|(name, n)| (*n, *name));
-        let (name, count) = hot.map(|(name, n)| (name.as_str(), *n)).unwrap_or(("-", 0));
-        format!("solver decisions={} propagations={} backjumps={} memo_hits={} learned_skips={} forward_prunes={} hottest={}:{}", 
-            self.decisions, self.propagations, self.backjumps, self.memo_hits, self.learned_skips,
-            self.forward_prunes, name, count)
-    }
-}
-#[derive(Clone)]
-struct State {
-    entries: Arc<Vec<Entry>>,
-    selected: BTreeMap<String, Arc<Candidate>>,
-    expanded: BTreeMap<String, BTreeSet<String>>,
-}
-struct Grouped {
-    rows: BTreeMap<String, Vec<Entry>>,
-    extras: BTreeMap<String, BTreeSet<String>>,
-}
-fn grouped(entries: &[Entry]) -> Grouped {
-    let mut by_key: BTreeMap<(String,String), Entry> = BTreeMap::new();
-    let mut extras: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for row in entries {
-        extras.entry(row.name.clone()).or_default().extend(row.extras.iter().cloned());
-        let key = (row.name.clone(), row.requirement.clone());
-        if let Some(old) = by_key.get_mut(&key) { old.causes.extend(row.causes.iter().cloned()); }
-        else { by_key.insert(key, row.clone()); }
-    }
-    let mut rows: BTreeMap<String,Vec<Entry>> = BTreeMap::new();
-    for ((_name, _requirement), row) in by_key {
-        rows.entry(row.name.clone()).or_default().push(row);
-    }
-    Grouped { rows, extras }
-}
-fn causes(rows: &[Entry]) -> BTreeSet<String> {
-    rows.iter().flat_map(|r| r.causes.iter().cloned()).collect()
-}
-type StateKey = (Vec<(String, Vec<String>)>,
-                 Vec<(String, String, String, String)>,
-                 Vec<(String, Vec<String>)>);
-type NogoodKey = (String, String, String, String, Vec<String>, Vec<String>);
-type Clause = Vec<(String, (String, String, String))>;
-
-// Learned exclusions are conditional on selected ancestors. Their provenance
-// must contribute to conflict-directed backjumping when an option is skipped.
-fn matched_nogood_causes(clauses: &[Clause], selected: &BTreeMap<String, Arc<Candidate>>)
-    -> Option<BTreeSet<String>> {
-    clauses.iter().find_map(|clause| {
-        if clause.iter().all(|(name, identity)| selected.get(name).map(|candidate|
-            (&candidate.kind, &candidate.version, &candidate.filename)
-                == (&identity.0, &identity.1, &identity.2)
-        ).unwrap_or(false)) {
-            Some(clause.iter().map(|(name, _)| name.clone()).collect())
-        } else { None }
-    })
-}
-
-fn current_state_key(state: &State, group: &Grouped) -> StateKey {
-    // Literal port of Python state_key: the requirement strings, the selected
-    // artifact (kind/version/filename), and expanded extras form the key.
-    // Causal provenance is intentionally NOT part of Python's memo identity.
-    let requirements = group.rows.iter().map(|(name, rows)|
-        (name.clone(), rows.iter().map(|row| row.requirement.clone()).collect())
-    ).collect();
-    let assignments = state.selected.iter().map(|(name, candidate)|
-        (name.clone(), candidate.kind.clone(), candidate.version.clone(),
-         candidate.filename.clone())
-    ).collect();
-    let extras = state.expanded.iter().map(|(name, values)|
-        (name.clone(), values.iter().cloned().collect())
-    ).collect();
-    (requirements, assignments, extras)
-}
-#[derive(Clone)]
-struct Failure { conflict: BTreeSet<String>, detail: String }
-enum Outcome { Solved(BTreeMap<String, Arc<Candidate>>), Failed(Failure) }
-
-struct Solver {
+struct Requirement { name: String, requirement: String, extras: Vec<String> }
+struct Oracle {
     wire: Wire,
-    no_deps: bool,
-    roots: BTreeSet<String>,
     deadline: Instant,
+    no_deps: bool,
+    roots: Vec<Requirement>,
+    candidates: HashMap<u32,Candidate>,
+    universes: HashMap<String,Universe>,
+    ranges: HashMap<(String,String),Range>,
+    rejected: HashMap<u32,String>,
+    checked: HashSet<u32>,
+    decisions: Cell<u64>,
     max_decisions: u64,
-    max_depth: usize,
-    max_cache_bytes: usize,
-    prefetch_width: usize,
-    stats: Stats,
-    // The host assigns stable IDs. Keep immutable candidate metadata once,
-    // and cache domains as compact ID vectors shared between search states.
-    // No domain/state contains duplicate strings for the same PyPI release.
-    candidate_domains: HashMap<(String,Vec<String>),Arc<Vec<u32>>>,
-    registered_candidates: HashMap<u32,Arc<Candidate>>,
-    // Only positive cache observations are monotonic; unobserved metadata may
-    // arrive asynchronously through Python's speculative PEP 517/HTTP probes.
-    metadata_known: HashSet<u32>,
-    // Python remains the PEP 440 authority. Memoize its immutable answers in
-    // the native search rather than re-entering Python on every propagation.
-    compatibility: HashMap<(u32,Vec<String>),bool>,
-    compatibility_bytes: usize,
-    metadata_seen: HashSet<u32>,
-    rejected_source: HashMap<u32,String>,
-    expanded_cache: HashMap<(u32,Vec<String>),Vec<Entry>>,
-    failed_states: HashSet<StateKey>,
-    failed_fifo: VecDeque<StateKey>,
-    failed_bytes: usize,
-    nogoods: HashMap<NogoodKey,Vec<Clause>>,
-    nogood_bytes: usize,
 }
-impl Solver {
-    fn validate_time(&self) -> Result<(), String> {
-        // The configured deadline is mandatory, never optional.
+impl Oracle {
+    fn check_time(&self) -> Result<(),io::Error> {
         if Instant::now() >= self.deadline {
-            Err("native Rust dependency solve exceeded configured deadline".into())
+            Err(failure("PubGrub solve exceeded configured deadline"))
         } else { Ok(()) }
     }
-    fn read_candidate(&mut self) -> Result<u32,String> {
-        let id = self.wire.raw_u32()?;
-        // A reference introduced by Python must be accompanied by its immutable
-        // identity exactly once. Reused references carry just the numeric ID.
-        match self.wire.raw_u8()? {
-            0 if self.registered_candidates.contains_key(&id) => Ok(id),
-            0 => Err("unknown previously registered candidate ID".into()),
-            1 => {
-                if self.registered_candidates.contains_key(&id) {
-                    return Err("duplicate candidate identity registration".into());
-                }
-                let kind = self.wire.raw_string()?;
-                let version = self.wire.raw_string()?;
-                let filename = self.wire.raw_string()?;
+    fn read_candidate(&mut self) -> Result<u32,io::Error> {
+        let id = self.wire.u32()?;
+        match self.wire.u8()? {
+            0 if self.candidates.contains_key(&id) => Ok(id),
+            1 if !self.candidates.contains_key(&id) => {
+                let kind = self.wire.string()?;
+                let version = self.wire.string()?;
+                let filename = self.wire.string()?;
                 if kind != "wheel" && kind != "sdist" {
-                    return Err("unrecognized candidate kind".into());
+                    return Err(failure("invalid candidate artifact kind"));
                 }
-                self.registered_candidates.insert(id,Arc::new(Candidate{id,kind,version,filename}));
+                self.candidates.insert(id,Candidate{id,kind,version,filename});
                 Ok(id)
             },
-            _ => Err("invalid candidate registration status".into()),
+            _ => Err(failure("invalid candidate registration")),
         }
     }
-    fn domain(&mut self, name: &str, rows: &[Entry]) -> Result<Arc<Vec<u32>>,String> {
-        self.validate_time()?;
-        let requirements: Vec<String> = rows.iter().map(|e| e.requirement.clone()).collect();
-        let key = (name.to_string(), requirements.clone());
-        if let Some(cached) = self.candidate_domains.get(&key) { return Ok(cached.clone()); }
-        self.wire.send_u8(b'D')?; self.wire.send_string(name)?;
-        self.wire.strings(&requirements)?; self.wire.flush()?;
-        self.wire.ack()?;
-        let count = self.wire.raw_u32()? as usize;
-        if count > self.wire.max_frame { return Err("candidate count exceeds IPC safety limit".into()); }
-        let mut candidates = Vec::with_capacity(count);
-        for _ in 0..count { candidates.push(self.read_candidate()?); }
-        let shared = Arc::new(candidates);
-        self.candidate_domains.insert(key, Arc::clone(&shared));
-        Ok(shared)
-    }
-    fn domains(&mut self, unresolved: &[String], group: &Grouped)
-        -> Result<BTreeMap<String, Arc<Vec<u32>>>, String> {
-        let mut missing = Vec::new();
-        let mut answers = BTreeMap::new();
-        for name in unresolved {
-            let rows = &group.rows[name];
-            let requirements: Vec<String> = rows.iter().map(|r| r.requirement.clone()).collect();
-            let key = (name.clone(), requirements.clone());
-            if let Some(cached) = self.candidate_domains.get(&key) {
-                answers.insert(name.clone(), cached.clone());
-            } else {
-                missing.push((name.clone(), requirements));
-            }
-        }
-        if !missing.is_empty() {
-            self.validate_time()?;
-            self.wire.send_u8(b'B')?;
-            self.wire.send_len(missing.len())?;
-            for (name, requirements) in &missing {
-                self.wire.send_string(name)?;
-                self.wire.strings(requirements)?;
-            }
-            self.wire.flush()?;
-            self.wire.ack()?;
-            let count = self.wire.raw_u32()? as usize;
-            if count != missing.len() { return Err("batch domain count differs".into()); }
-            for (name, requirements) in missing {
-                let size = self.wire.raw_u32()? as usize;
-                if size > self.wire.max_frame { return Err("domain candidate count exceeds IPC limit".into()); }
-                let mut candidates = Vec::with_capacity(size);
-                for _ in 0..size { candidates.push(self.read_candidate()?); }
-                let shared = Arc::new(candidates);
-                self.candidate_domains.insert((name.clone(), requirements), Arc::clone(&shared));
-                answers.insert(name, shared);
-            }
-        }
-        Ok(answers)
-    }
-    fn known_metadata(&mut self, domains: &BTreeMap<String, Arc<Vec<u32>>>)
-        -> Result<(), String> {
-        if self.no_deps { return Ok(()); }
-        // Python owns artifact evidence. Its observed-name filter avoids
-        // inspecting candidates for projects whose metadata has never been
-        // probed. Ask for names rather than retransmitting every candidate ID
-        // on every search iteration; newly verified candidates are returned
-        // by ID, and only positive observations remain cached in Rust.
-        let observed_projects: Vec<&String> = domains.iter()
-            .filter(|(_, candidates)| candidates.iter()
-                .any(|id| !self.metadata_known.contains(id)))
-            .map(|(name, _)| name).collect();
-        if observed_projects.is_empty() { return Ok(()); }
-        self.wire.send_u8(b'K')?;
-        self.wire.send_len(observed_projects.len())?;
-        for name in observed_projects { self.wire.send_string(name)?; }
+    fn ensure_universe(&mut self, name: &str, first: &str) -> Result<(),io::Error> {
+        if self.universes.contains_key(name) { return Ok(()); }
+        self.check_time()?;
+        self.wire.put8(b'V')?;
+        self.wire.put_string(name)?;
+        self.wire.put_string(first)?;
         self.wire.flush()?;
         self.wire.ack()?;
-        let count = self.wire.raw_u32()? as usize;
-        if count > self.wire.max_frame || count > self.registered_candidates.len() {
-            return Err("metadata-known count exceeds IPC safety limit".into());
+        let count = self.wire.u32()? as usize;
+        if count > self.wire.max_frame || count >= u32::MAX as usize {
+            return Err(failure("unbounded PubGrub project universe"));
         }
+        let mut pref = Vec::with_capacity(count);
+        let mut ranks = HashMap::with_capacity(count);
+        let mut seen = HashSet::with_capacity(count);
         for _ in 0..count {
-            let id = self.wire.raw_u32()?;
-            if !self.registered_candidates.contains_key(&id) || !self.metadata_known.insert(id) {
-                return Err("unrecognized or duplicate verified metadata candidate".into());
+            let id = self.read_candidate()?;
+            let rank = self.wire.u32()?;
+            if rank == 0 || rank > count as u32 || !seen.insert(rank)
+                || ranks.insert(rank,id).is_some() {
+                return Err(failure("invalid or duplicate PEP 440 version rank"));
+            }
+            pref.push(rank);
+        }
+        self.universes.insert(name.to_string(),Universe {preference:pref,by_rank:ranks});
+        Ok(())
+    }
+    fn range(&mut self, name: &str, requirement: &str) -> Result<Range,io::Error> {
+        let key = (name.to_string(),requirement.to_string());
+        if let Some(cached) = self.ranges.get(&key) { return Ok(cached.clone()); }
+        self.ensure_universe(name,requirement)?;
+        self.wire.put8(b'R')?;
+        self.wire.put_string(name)?;
+        self.wire.put_string(requirement)?;
+        self.wire.flush()?;
+        self.wire.ack()?;
+        let segments = self.wire.u32()? as usize;
+        let max = self.universes[name].preference.len();
+        if segments > max { return Err(failure("invalid PubGrub interval count")); }
+        let mut range = Range::empty();
+        let mut previous = 0;
+        for _ in 0..segments {
+            let lo = self.wire.u32()?;
+            let hi = self.wire.u32()?;
+            if lo == 0 || hi <= lo || hi > (max as u32 + 1) || lo <= previous {
+                return Err(failure("noncanonical verified interval range"));
+            }
+            range = range.union(&Range::between(lo,hi));
+            previous = hi-1;
+        }
+        self.ranges.insert(key,range.clone());
+        Ok(range)
+    }
+    fn add_requirement(&mut self, deps: &mut BTreeMap<Pkg,Range>, row: &Requirement)
+        -> Result<(),io::Error> {
+        let range = self.range(&row.name,&row.requirement)?;
+        let base = Pkg::Base(row.name.clone());
+        let intersect = |key:Pkg, value:Range, target:&mut BTreeMap<Pkg,Range>| {
+            target.entry(key).and_modify(|existing| {
+                *existing = existing.intersection(&value);
+            }).or_insert(value);
+        };
+        intersect(base,range.clone(),deps);
+        if !self.no_deps {
+            for extra in &row.extras {
+                intersect(Pkg::Extra(row.name.clone(),extra.clone()),range.clone(),deps);
             }
         }
         Ok(())
     }
-    fn prefetch(&mut self, candidate_ids: &[u32], index: usize, depth: usize) -> Result<(), String> {
-        // Python's schedule_metadata submits futures without awaiting them.
-        // The Python host recomputes its live fairness-adjusted width.
-        self.wire.send_u8(b'W')?;
+    fn ref_for(&self, name: &str, rank: u32) -> Result<u32,io::Error> {
+        self.universes.get(name).and_then(|universe| universe.by_rank.get(&rank))
+            .copied().ok_or_else(||failure("selected PubGrub version absent from proven universe"))
+    }
+    fn metadata(&mut self, id: u32) -> Result<Option<String>,io::Error> {
+        if let Some(reason) = self.rejected.get(&id) { return Ok(Some(reason.clone())); }
+        if self.checked.contains(&id) { return Ok(None); }
+        self.check_time()?;
+        self.wire.put8(b'M')?; self.wire.put_len(1)?; self.wire.put32(id)?;
+        self.wire.flush()?;
+        match self.wire.u8()? {
+            1 => {self.checked.insert(id);Ok(None)},
+            2 => {
+                let reason = self.wire.string()?;
+                if reason.is_empty() { return Err(failure("missing verified source rejection reason")); }
+                self.rejected.insert(id,reason.clone()); Ok(Some(reason))
+            },
+            0 => Err(failure(self.wire.string()?)),
+            _ => Err(failure("invalid metadata verification acknowledgement")),
+        }
+    }
+    fn dependencies(&mut self, id: u32, extras: &[String])
+        -> Result<Vec<Requirement>,io::Error> {
+        self.check_time()?;
+        self.wire.put8(b'P')?;
+        self.wire.put32(id)?;
+        self.wire.put_len(extras.len())?;
+        for extra in extras { self.wire.put_string(extra)?; }
         self.wire.flush()?;
         self.wire.ack()?;
-        let width = self.wire.raw_u32()? as usize;
-        if width == 0 { return Err("invalid live Rust prefetch width".into()); }
-        let stop = std::cmp::min(candidate_ids.len(), index.saturating_add(width));
-        self.wire.send_u8(b'A')?;
-        self.wire.send_len(depth)?;
-        self.wire.send_len(stop - index)?;
-        for &id in &candidate_ids[index..stop] { self.wire.send_u32(id)?; }
-        self.wire.flush()?;
-        self.wire.ack()
-    }
-    fn check(&mut self, candidate: &Candidate, rows: &[Entry]) -> Result<bool,String> {
-        self.validate_time()?;
-        let requirements: Vec<String> = rows.iter().map(|e| e.requirement.clone()).collect();
-        let key = (candidate.id, requirements);
-        if let Some(&value) = self.compatibility.get(&key) { return Ok(value); }
-        self.wire.send_u8(b'C')?; self.wire.send_u32(candidate.id)?;
-        self.wire.strings(&key.1)?;
-        self.wire.flush()?; self.wire.ack()?;
-        let value = match self.wire.raw_u8()? {
-            0 => false, 1 => true,
-            _ => return Err("invalid candidate compatibility response".into()),
-        };
-        // Bound the additional native memo by the existing versioned cache
-        // budget. Eviction does not change the authoritative Python result.
-        let size = std::mem::size_of::<(u32,Vec<String>,bool)>()
-            .saturating_add(key.1.iter().fold(0usize, |total, row|
-                total.saturating_add(std::mem::size_of::<String>()).saturating_add(row.len())));
-        if size <= self.max_cache_bytes {
-            if self.compatibility_bytes.saturating_add(size) > self.max_cache_bytes {
-                self.compatibility.clear();
-                self.compatibility_bytes = 0;
-            }
-            self.compatibility.insert(key, value);
-            self.compatibility_bytes += size;
-        }
-        Ok(value)
-    }
-    fn metadata_batch(&mut self, ids: &[u32]) -> Result<Option<String>,String> {
-        self.validate_time()?;
-        for id in ids {
-            if let Some(reason) = self.rejected_source.get(id) {
-                return Ok(Some(reason.clone()));
-            }
-        }
-        let missing: Vec<u32> = ids.iter().copied().filter(|id| !self.metadata_seen.contains(id)).collect();
-        if missing.is_empty() { return Ok(None); }
-        // Each candidate requires a separate authoritative source check, so
-        // only one can be rejected in a response without ambiguity.
-        if missing.len() != 1 { return Err("source metadata request must identify one candidate".into()); }
-        self.wire.send_u8(b'M')?; self.wire.send_len(missing.len())?;
-        for id in &missing { self.wire.send_u32(*id)?; }
-        self.wire.flush()?;
-        match self.wire.raw_u8()? {
-            1 => {
-                self.metadata_seen.insert(missing[0]);
-                Ok(None)
-            },
-            2 => {
-                let reason = self.wire.raw_string()?;
-                if reason.is_empty() { return Err("empty rejected-source evidence".into()); }
-                self.rejected_source.insert(missing[0], reason.clone());
-                Ok(Some(reason))
-            },
-            0 => Err(self.wire.raw_string()?),
-            _ => Err("invalid source metadata IPC acknowledgement".into()),
-        }
-    }
-    fn expand(&mut self, candidate: &Candidate, extras: &BTreeSet<String>) -> Result<Vec<Entry>,String> {
-        if self.no_deps { return Ok(Vec::new()); }
-        if self.metadata_batch(&[candidate.id])?.is_some() {
-            return Err("rejected source was selected before metadata verification".into());
-        }
-        let extras_key: Vec<String> = extras.iter().cloned().collect();
-        let key = (candidate.id, extras_key.clone());
-        if let Some(rows) = self.expanded_cache.get(&key) { return Ok(rows.clone()); }
-        self.wire.send_u8(b'P')?; self.wire.send_u32(candidate.id)?;
-        self.wire.strings(&extras_key)?; self.wire.flush()?; self.wire.ack()?;
-        let count = self.wire.raw_u32()? as usize;
-        if count > self.wire.max_frame { return Err("dependency count exceeds IPC safety limit".into()); }
-        let mut entries = Vec::with_capacity(count);
+        let count = self.wire.u32()? as usize;
+        if count > self.wire.max_frame { return Err(failure("unbounded dependency metadata")); }
+        let mut result=Vec::with_capacity(count);
         for _ in 0..count {
-            let name = self.wire.raw_string()?;
-            let requirement = self.wire.raw_string()?;
-            let extra_count = self.wire.raw_u32()? as usize;
-            if extra_count > self.wire.max_frame { return Err("extra count exceeds IPC safety limit".into()); }
-            let mut extras = BTreeSet::new();
-            for _ in 0..extra_count { extras.insert(self.wire.raw_string()?); }
-            entries.push(Entry {name,requirement,extras,causes:BTreeSet::new()});
+            let name=self.wire.string()?;
+            let requirement=self.wire.string()?;
+            let n=self.wire.u32()? as usize;
+            if n > self.wire.max_frame { return Err(failure("invalid extras count")); }
+            let mut extras=Vec::with_capacity(n);
+            for _ in 0..n { extras.push(self.wire.string()?); }
+            result.push(Requirement{name,requirement,extras});
         }
-        self.expanded_cache.insert(key,entries.clone());
-        Ok(entries)
+        Ok(result)
     }
-    fn lookahead(&mut self, name: &str, candidate: &Candidate, rows: &[Entry],
-                 group: &Grouped, selected: &BTreeMap<String,Arc<Candidate>>)
-       -> Result<Option<(BTreeSet<String>,String)>,String> {
-        if self.no_deps { return Ok(None); }
-        let extras = group.extras.get(name).cloned().unwrap_or_default();
-        let dependencies = self.expand(candidate, &extras)?;
-        for dep in dependencies {
-            let dep_name = dep.name.as_str();
-            let conflict = if dep_name == name {
-                !self.check(candidate, &[dep.clone()])?
-            } else if let Some(prior) = selected.get(dep_name) {
-                !self.check(prior, &[dep.clone()])?
-            } else if let Some(prior_rows) = group.rows.get(dep_name) {
-                let mut combined = prior_rows.clone(); combined.push(dep.clone());
-                self.domain(dep_name, &combined)?.is_empty()
-            } else { false };
-            if conflict {
-                let mut provenance = causes(rows);
-                provenance.insert(name.to_string());
-                if dep_name != name {
-                    if selected.contains_key(dep_name) { provenance.insert(dep.name.clone()); }
-                    if let Some(existing) = group.rows.get(dep_name) { provenance.extend(causes(existing)); }
+    fn get_deps(&mut self, package: &Pkg, rank: u32)
+        -> Result<Dependencies<Pkg,Range,String>,io::Error> {
+        self.check_time()?;
+        let mut dependencies=BTreeMap::<Pkg,Range>::new();
+        match package {
+            Pkg::Root => {
+                if rank != 1 { return Err(failure("invalid PubGrub root version")); }
+                let root = std::mem::take(&mut self.roots);
+                for row in &root { self.add_requirement(&mut dependencies,row)?; }
+                self.roots=root;
+            },
+            Pkg::Base(name) | Pkg::Extra(name,_) => {
+                let id=self.ref_for(name,rank)?;
+                if let Some(reason)=self.metadata(id)? {
+                    return Ok(Dependencies::Unavailable(reason));
                 }
-                return Ok(Some((provenance,dep.name)));
-            }
-        }
-        Ok(None)
-    }
-    fn failed(&mut self, key: StateKey) {
-        let size = format!("{:?}", key).len();
-        if size > self.max_cache_bytes { return; }
-        while self.failed_bytes.saturating_add(size) > self.max_cache_bytes {
-            if let Some(old) = self.failed_fifo.pop_front() {
-                self.failed_bytes = self.failed_bytes.saturating_sub(format!("{:?}", old).len());
-                self.failed_states.remove(&old);
-            } else { break; }
-        }
-        if self.failed_states.insert(key.clone()) {
-            self.failed_bytes = self.failed_bytes.saturating_add(size);
-            self.failed_fifo.push_back(key);
-        }
-    }
-    fn nogood_key(name: &str,c: &Candidate,rows: &[Entry],extras: &BTreeSet<String>) -> NogoodKey {
-        (name.to_string(),c.kind.clone(),c.version.clone(),c.filename.clone(),
-         rows.iter().map(|r| r.requirement.clone()).collect(),
-         extras.iter().cloned().collect())
-    }
-    fn nogood_conflict(&self, key: &NogoodKey, selected: &BTreeMap<String,Arc<Candidate>>)
-        -> Option<BTreeSet<String>> {
-        self.nogoods.get(key).and_then(|clauses| matched_nogood_causes(clauses, selected))
-    }
-    fn learn_nogood(&mut self,key: NogoodKey, conflict: &BTreeSet<String>, name: &str,
-                    selected: &BTreeMap<String,Arc<Candidate>>) {
-        let clause: Clause = conflict.iter()
-            .filter(|n| n.as_str()!=name)
-            .filter_map(|n| selected.get(n).map(|c|
-                (n.clone(),(c.kind.clone(),c.version.clone(),c.filename.clone()))))
-            .collect();
-        let size = format!("{:?}{:?}", key, clause).len();
-        if size > self.max_cache_bytes { return; }
-        if self.nogood_bytes.saturating_add(size) > self.max_cache_bytes {
-            self.nogoods.clear(); self.nogood_bytes=0;
-        }
-        let entries = self.nogoods.entry(key).or_default();
-        if !entries.contains(&clause) { entries.push(clause); self.nogood_bytes+=size; }
-    }
-    fn search(&mut self,mut state: State,depth: usize) -> Result<Outcome,String> {
-        if depth > self.max_depth { return Err("native Rust solver exceeded configured recursion depth".into()); }
-        loop {
-            self.validate_time()?;
-            let group = grouped(&state.entries);
-            // A successful path does not memoize or revisit failed states.
-            // Avoid allocating and sorting a full graph signature on each
-            // propagation/decision until at least one failure exists.
-            let key = if self.failed_states.is_empty() { None } else {
-                let candidate_key = current_state_key(&state,&group);
-                if self.failed_states.contains(&candidate_key) {
-                    self.stats.memo_hits+=1;
-                    let conflict = state.selected.keys().cloned().collect();
-                    return Ok(Outcome::Failed(Failure {conflict,
-                        detail:"memoized unsatisfiable resolver state".into()}));
+                if let Pkg::Extra(_,_) = package {
+                    // A requested extra is a virtual package whose version is
+                    // *identically* the selected distribution version.
+                    dependencies.insert(Pkg::Base(name.clone()),Range::singleton(rank));
                 }
-                Some(candidate_key)
-            };
-            for (name,c) in &state.selected {
-                let rows = group.rows.get(name).map(|x|x.as_slice()).unwrap_or(&[]);
-                if !self.check(c,rows)? {
-                    let mut conflict=causes(rows); conflict.insert(name.clone());
-                    let detail=format!("selected {}=={} violates required constraints",name,c.version);
-                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-                    return Ok(Outcome::Failed(Failure{conflict,detail}));
-                }
-            }
-            let mut next_expanded=state.expanded.clone();
-            let mut additions=Vec::new();
-            for (name,c) in &state.selected {
-                let extras=group.extras.get(name).cloned().unwrap_or_default();
-                if state.expanded.get(name)==Some(&extras) { continue; }
-                let mut origin=causes(group.rows.get(name).map(|x|x.as_slice()).unwrap_or(&[]));
-                origin.insert(name.clone());
-                for mut dep in self.expand(c,&extras)? {
-                    dep.causes=origin.clone(); additions.push(dep);
-                }
-                next_expanded.insert(name.clone(),extras);
-            }
-            if !additions.is_empty() || next_expanded!=state.expanded {
-                self.stats.propagations+=additions.len() as u64;
-                Arc::make_mut(&mut state.entries).extend(additions);
-                state.expanded=next_expanded;
-                continue;
-            }
-            let unresolved: Vec<String> = group.rows.keys().filter(|name|!state.selected.contains_key(*name)).cloned().collect();
-            if unresolved.is_empty() { return Ok(Outcome::Solved(state.selected)); }
-            // Retain the ancestor provenance of every forward-pruned option.
-            // Otherwise a later exhaustion can incorrectly backjump past a
-            // relevant ancestor and report a satisfiable graph as UNSAT.
-            // Complete domains contain immutable candidate IDs, not clones of
-            // wheel filenames/kinds/versions. An unfiltered choice needs no
-            // survivor array at all: it simply refers to the whole domain.
-            let mut choices: Vec<(usize,bool,String,Arc<Vec<u32>>,Option<Vec<usize>>,BTreeSet<String>)> = Vec::new();
-            let domains = self.domains(&unresolved, &group)?;
-            self.known_metadata(&domains)?;
-            for name in unresolved {
-                let rows=&group.rows[&name];
-                let candidates=Arc::clone(&domains[&name]);
-                if candidates.is_empty() {
-                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-                    return Ok(Outcome::Failed(Failure {conflict: causes(rows),
-                        detail:format!("no compatible release for {} under requirements {:?}",name,
-                                       rows.iter().map(|r|r.requirement.as_str()).collect::<Vec<_>>())}));
-                }
-                let mut survivors: Option<Vec<usize>>=None;
-                let mut known_conflict=BTreeSet::new();
-                let mut first_detail=None;
-                for (position,&id) in candidates.iter().enumerate() {
-                    if self.metadata_known.contains(&id) {
-                        let candidate=Arc::clone(self.registered_candidates.get(&id)
-                            .ok_or_else(||"missing registered metadata candidate".to_string())?);
-                        if let Some((involved,dep_name))=self.lookahead(&name,&candidate,rows,&group,&state.selected)? {
-                            if survivors.is_none() { survivors=Some((0..position).collect()); }
-                            known_conflict.extend(involved);
-                            if first_detail.is_none() { first_detail=Some(dep_name); }
-                            self.stats.forward_prunes+=1;
-                            continue;
-                        }
-                    }
-                    if let Some(indices)=survivors.as_mut() { indices.push(position); }
-                }
-                let count=survivors.as_ref().map_or(candidates.len(),|indices|indices.len());
-                if count==0 {
-                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-                    // The unresolved project itself is not an ancestor decision.
-                    let conflict=known_conflict.into_iter().filter(|cause| cause!=&name).collect();
-                    return Ok(Outcome::Failed(Failure{conflict,
-                        detail:format!("all cached compatible releases of {} conflict with {}",name,
-                            first_detail.unwrap_or_default())}));
-                }
-                choices.push((count,!self.roots.contains(&name),name,candidates,survivors,known_conflict));
-            }
-            choices.sort_by(|a,b| (a.0,a.1,&a.2).cmp(&(b.0,b.1,&b.2)));
-            let (count,_is_transitive,name,candidates,filtered,pruned_conflicts)=choices.remove(0);
-            let positions=filtered.unwrap_or_else(|| (0..count).collect());
-            // A singleton obtained by *conditional* forward pruning is not an
-            // unconditional unit: it must enter the branch path so rejections
-            // of other candidates remain attached to their ancestor decisions.
-            if count == 1 && pruned_conflicts.is_empty() {
-                let singleton=Arc::clone(self.registered_candidates.get(&candidates[positions[0]])
-                    .ok_or_else(||"missing registered singleton candidate".to_string())?);
-                if let Some(reason) = self.metadata_batch(&[singleton.id])? {
-                    self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-                    return Ok(Outcome::Failed(Failure {
-                        conflict: causes(&group.rows[&name]),
-                        detail: format!("source candidate {}=={} invalid for target: {}",
-                                        name, singleton.version, reason),
-                    }));
-                }
-                state.selected.insert(name,singleton);
-                self.stats.propagations+=1;
-                continue;
-            }
-            let rows=&group.rows[&name];
-            let branch_causes=causes(rows);
-            let extras=group.extras.get(&name).cloned().unwrap_or_default();
-            let mut combined_conflict: BTreeSet<String> = pruned_conflicts.into_iter()
-                .filter(|cause| cause!=&name).collect();
-            let mut last_detail=String::new();
-            let candidate_ids: Vec<u32> = positions.iter().map(|&i| candidates[i]).collect();
-            for (idx,&id) in candidate_ids.iter().enumerate() {
-                self.validate_time()?;
-                let candidate=Arc::clone(self.registered_candidates.get(&id)
-                    .ok_or_else(||"missing registered branch candidate".to_string())?);
-                let nogood=Self::nogood_key(&name,&candidate,rows,&extras);
-                if let Some(involved)=self.nogood_conflict(&nogood,&state.selected) {
-                    self.stats.learned_skips+=1;
-                    // The exclusion is valid only while these ancestors have
-                    // the recorded assignments; never lose that dependency.
-                    combined_conflict.extend(involved);
-                    continue;
-                }
-                self.stats.decisions+=1;
-                if self.stats.decisions>self.max_decisions {
-                    return Err("native Rust solver exceeded configured decision budget".into());
-                }
-                *self.stats.decisions_by_name.entry(name.clone()).or_default()+=1;
-                // Submit, do not wait for the entire metadata prefetch window.
-                // Only the current candidate must finish before lookahead.
-                self.prefetch(&candidate_ids, idx, depth)?;
-                let rejection = self.metadata_batch(&[candidate.id])?;
-                let conflict = if rejection.is_none() {
-                    self.lookahead(&name,&candidate,rows,&group,&state.selected)?
-                } else { None };
-                let result=if let Some(reason)=rejection {
-                    // The artifact itself is unusable, independently of any
-                    // ancestor selection. Try the next allowed candidate.
-                    Outcome::Failed(Failure {conflict: BTreeSet::from([name.clone()]),
-                        detail:format!("source candidate {}=={} invalid for target: {}",
-                                       name,candidate.version,reason)})
-                } else if let Some((involved,dep_name))=conflict {
-                    self.stats.forward_prunes+=1;
-                    Outcome::Failed(Failure {conflict:involved,
-                        detail:format!("candidate {}=={} leaves incompatible requirements for {}",
-                                       name,candidate.version,dep_name)})
-                } else {
-                    let mut next=state.clone();
-                    next.selected.insert(name.clone(),Arc::clone(&candidate));
-                    // Preserve useful sibling probes while the child explores its
-                    // graph. The host keeps only a live, bounded prefetch set.
-                    self.search(next,depth+1)?
+                let extras=match package {
+                    Pkg::Extra(_,extra)=>vec![extra.clone()], _=>Vec::new(),
                 };
-                match result {
-                    Outcome::Solved(sol) => return Ok(Outcome::Solved(sol)),
-                    Outcome::Failed(failure) => {
-                        last_detail=failure.detail.clone();
-                        if failure.conflict.contains(&name) {
-                            self.learn_nogood(nogood,&failure.conflict,&name,&state.selected);
-                        } else {
-                            self.stats.backjumps+=1;
-                            self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-                            return Ok(Outcome::Failed(failure));
-                        }
-                        combined_conflict.extend(failure.conflict.into_iter().filter(|n|n!=&name));
+                if !self.no_deps {
+                    for row in self.dependencies(id,&extras)? {
+                        self.add_requirement(&mut dependencies,&row)?;
                     }
                 }
             }
-            combined_conflict.extend(branch_causes);
-            self.failed(key.clone().unwrap_or_else(||current_state_key(&state,&group)));
-            if last_detail.is_empty() { last_detail=format!("all compatible candidates exhausted for {}",name); }
-            return Ok(Outcome::Failed(Failure{conflict:combined_conflict,detail:last_detail}));
+        }
+        Ok(Dependencies::Available(DependencyConstraints::from_iter(dependencies)))
+    }
+}
+
+struct Provider { oracle: RefCell<Oracle> }
+impl DependencyProvider for Provider {
+    type P = Pkg;
+    type V = u32;
+    type VS = Range;
+    type Priority = (Reverse<usize>,u32);
+    type M = String;
+    type Err = io::Error;
+    fn prioritize(&self, package:&Pkg, range:&Range, stats:&PackageResolutionStatistics)
+        -> Self::Priority {
+        let oracle=self.oracle.borrow();
+        let count=package.name().and_then(|name|oracle.universes.get(name))
+            .map(|universe|universe.preference.iter().filter(|&&rank|range.contains(&rank)).count())
+            .unwrap_or(1);
+        (Reverse(count),stats.conflict_count())
+    }
+    fn choose_version(&self, package:&Pkg, range:&Range)->Result<Option<u32>,io::Error> {
+        let oracle=self.oracle.borrow();
+        oracle.check_time()?;
+        let decisions=oracle.decisions.get()+1;
+        if decisions>oracle.max_decisions { return Err(failure("PubGrub decision budget exceeded")); }
+        oracle.decisions.set(decisions);
+        match package {
+            Pkg::Root => Ok(range.contains(&1).then_some(1)),
+            Pkg::Base(name) | Pkg::Extra(name,_) => {
+                let universe=oracle.universes.get(name)
+                    .ok_or_else(||failure("PubGrub selected a project before its verified range"))?;
+                Ok(universe.preference.iter().find(|&&rank|range.contains(&rank)).copied())
+            }
         }
     }
+    fn get_dependencies(&self, package:&Pkg, version:&u32)
+        ->Result<Dependencies<Pkg,Range,String>,io::Error> {
+        self.oracle.borrow_mut().get_deps(package,*version)
+    }
+    fn should_cancel(&self)->Result<(),io::Error> {
+        self.oracle.borrow().check_time()
+    }
 }
 
-fn mandatory_deadline(seconds: u64) -> Result<Instant, String> {
-    if seconds == 0 {
-        return Err("native Rust resolver requires a nonzero closure deadline".into());
-    }
+fn mandatory_deadline(seconds:u64)->Result<Instant,io::Error> {
+    if seconds == 0 { return Err(failure("native Rust resolver requires a nonzero closure deadline")); }
     Instant::now().checked_add(Duration::from_secs(seconds))
-        .ok_or_else(|| "invalid native Rust resolver deadline".to_string())
+        .ok_or_else(||failure("invalid mandatory deadline"))
 }
 
-fn process(wire: &mut Wire) -> Result<(),String> {
-    let max_frame=wire.raw_u64()?;
-    let limit=usize::try_from(max_frame).map_err(err)?;
-    if limit==0 || limit>u32::MAX as usize { return Err("invalid configured IPC frame limit".into()); }
-    wire.max_frame=limit;
-    let max_decisions=wire.raw_u64()?;
-    let max_depth=usize::try_from(wire.raw_u64()?).map_err(err)?;
-    let max_cache_bytes=usize::try_from(wire.raw_u64()?).map_err(err)?;
-    let deadline_seconds=wire.raw_u64()?;
-    let prefetch_width=usize::try_from(wire.raw_u64()?).map_err(err)?;
-    let no_deps=wire.raw_u8()? != 0;
+fn run(wire: &mut Wire) -> Result<(),io::Error> {
+    let frame=wire.u64()?;
+    if frame==0 || frame>u32::MAX as u64 { return Err(failure("invalid IPC frame capacity")); }
+    wire.max_frame=frame as usize;
+    let max_decisions=wire.u64()?;
+    let max_depth=wire.u64()?;
+    let max_cache_bytes=wire.u64()?;
+    let deadline_seconds=wire.u64()?;
+    let prefetch_width=wire.u64()?;
+    let no_deps=wire.u8()? != 0;
     if max_decisions==0 || max_depth==0 || max_cache_bytes==0 || prefetch_width==0 {
-        return Err("invalid versioned solver resource policy".into());
+        return Err(failure("invalid mandatory PubGrub resource policy"));
     }
-    let count=wire.raw_u32()? as usize;
-    if count>limit { return Err("root requirement count exceeds IPC safety limit".into()); }
-    let mut roots=BTreeSet::new();
-    let mut entries=Vec::with_capacity(count);
+    let count=wire.u32()? as usize;
+    if count>wire.max_frame { return Err(failure("unbounded PubGrub roots")); }
+    let mut roots=Vec::with_capacity(count);
     for _ in 0..count {
-        let name=wire.raw_string()?;
-        let requirement=wire.raw_string()?;
-        let extras_count=wire.raw_u32()? as usize;
-        if extras_count>limit { return Err("root extras count exceeds IPC limit".into()); }
-        let mut extras=BTreeSet::new();
-        for _ in 0..extras_count { extras.insert(wire.raw_string()?); }
-        roots.insert(name.clone());
-        entries.push(Entry{name,requirement,extras,causes:BTreeSet::new()});
+        let name=wire.string()?;
+        let requirement=wire.string()?;
+        let extra_count=wire.u32()? as usize;
+        if extra_count>wire.max_frame { return Err(failure("unbounded root extras")); }
+        let mut extras=Vec::with_capacity(extra_count);
+        for _ in 0..extra_count { extras.push(wire.string()?); }
+        roots.push(Requirement{name,requirement,extras});
     }
-    let deadline = mandatory_deadline(deadline_seconds)?;
-    let mut solver=Solver {wire:Wire::new(),no_deps,roots,deadline,max_decisions,max_depth,
-        max_cache_bytes,prefetch_width,stats:Stats::default(),
-        candidate_domains:HashMap::new(),registered_candidates:HashMap::new(),
-        metadata_known:HashSet::new(),
-        compatibility:HashMap::new(),compatibility_bytes:0,
-        metadata_seen:HashSet::new(),rejected_source:HashMap::new(),
-        expanded_cache:HashMap::new(),failed_states:HashSet::new(),failed_fifo:VecDeque::new(),
-        failed_bytes:0,nogoods:HashMap::new(),nogood_bytes:0};
-    solver.wire.max_frame=limit;
-    let state=State{entries:Arc::new(entries),selected:BTreeMap::new(),expanded:BTreeMap::new()};
-    let result=solver.search(state,0);
-    match result {
-        Ok(Outcome::Solved(selected))=>solver.wire.finish_success(&selected,&solver.stats),
-        Ok(Outcome::Failed(failure))=>solver.wire.finish_unsat(&failure.detail,&solver.stats),
-        Err(detail)=>solver.wire.finish_error(&detail),
+    let deadline=mandatory_deadline(deadline_seconds)?;
+    let oracle=Oracle {wire:Wire::new(),deadline,no_deps,roots,
+        candidates:HashMap::new(),universes:HashMap::new(),ranges:HashMap::new(),
+        rejected:HashMap::new(),checked:HashSet::new(),decisions:Cell::new(0),max_decisions};
+    let provider=Provider {oracle:RefCell::new(oracle)};
+    let outcome=resolve(&provider,Pkg::Root,1u32);
+    let mut oracle=provider.oracle.into_inner();
+    match outcome {
+        Ok(solution)=>{
+            let mut refs=BTreeMap::<String,u32>::new();
+            let mut selected=BTreeMap::<String,u32>::new();
+            for (pkg,rank) in solution.iter() {
+                if let Pkg::Base(name)=pkg {
+                    selected.insert(name.clone(),*rank);
+                    refs.insert(name.clone(),oracle.ref_for(name,*rank)?);
+                }
+            }
+            for (pkg,rank) in solution.iter() {
+                if let Pkg::Extra(name,_)=pkg {
+                    if selected.get(name)!=Some(rank) {
+                        return Err(failure("PubGrub extra version differs from its distribution"));
+                    }
+                }
+            }
+            let details=format!("pubgrub decisions={} packages={}",oracle.decisions.get(),refs.len());
+            oracle.wire.success(&refs,&details)
+        },
+        Err(PubGrubError::NoSolution(mut tree))=>{
+            tree.collapse_no_versions();
+            let detail=DefaultStringReporter::report(&tree);
+            let limit=oracle.wire.max_frame;
+            if detail.len()>limit {
+                let mut end=limit;
+                while !detail.is_char_boundary(end) {end-=1;}
+                oracle.wire.unsat(&detail[..end])
+            } else { oracle.wire.unsat(&detail) }
+        },
+        Err(other)=>oracle.wire.error(&format!("{other:?}")),
     }
 }
 fn main() {
     let mut wire=Wire::new();
-    if let Err(error)=process(&mut wire) {
-        let _=wire.finish_error(&error);
+    if let Err(error)=run(&mut wire) {
+        let _=wire.error(&error.to_string());
         std::process::exit(1);
     }
 }
@@ -732,88 +418,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn mandatory_solver_deadline_rejects_zero() {
+    fn deadline_is_mandatory() {
         assert!(mandatory_deadline(0).is_err());
         assert!(mandatory_deadline(1).is_ok());
     }
-
     #[test]
-    fn identical_requirements_combine_causal_provenance() {
-        let a=Entry{name:"dependency".into(), requirement:"dependency<2".into(),
-            extras:BTreeSet::new(),causes:BTreeSet::from(["left".into()])};
-        let b=Entry{causes:BTreeSet::from(["right".into()]),..a.clone()};
-        let merged=grouped(&[a,b]);
-        assert_eq!(merged.rows["dependency"].len(),1);
-        assert_eq!(merged.rows["dependency"][0].causes,
-                   BTreeSet::from(["left".into(),"right".into()]));
+    fn interval_ranges_eliminate_incompatible_candidates() {
+        let allowed=Range::between(10u32,20u32).intersection(&Range::between(15u32,25u32));
+        assert!(allowed.contains(&15));
+        assert!(!allowed.contains(&14));
+        assert!(!allowed.contains(&20));
     }
-
     #[test]
-    fn state_identity_matches_python_requirement_and_assignment_semantics() {
-        let a=Entry{name:"dependency".into(),requirement:"dependency<2".into(),
-            extras:BTreeSet::new(),causes:BTreeSet::from(["left".into()])};
-        let b=Entry{causes:BTreeSet::from(["right".into()]),..a.clone()};
-        let left=State{entries:Arc::new(vec![a]),selected:BTreeMap::new(),expanded:BTreeMap::new()};
-        let right=State{entries:Arc::new(vec![b]),selected:BTreeMap::new(),expanded:BTreeMap::new()};
-        // Python's state_key intentionally excludes causal provenance.
-        assert_eq!(current_state_key(&left,&grouped(&left.entries)),
-                   current_state_key(&right,&grouped(&right.entries)));
+    fn disjoint_intervals_prove_impossibility() {
+        let left=Range::between(1u32,5u32);
+        let right=Range::between(7u32,12u32);
+        assert_eq!(left.intersection(&right),Range::empty());
     }
-
     #[test]
-    fn learned_clause_match_preserves_ancestor_provenance() {
-        let selected = BTreeMap::from([("ancestor".to_string(), Arc::new(Candidate {
-            id: 9, kind: "wheel".into(), version: "1".into(), filename: "ancestor.whl".into(),
-        }))]);
-        let clause = vec![("ancestor".to_string(),
-            ("wheel".to_string(), "1".to_string(), "ancestor.whl".to_string()))];
-        assert_eq!(matched_nogood_causes(&[clause.clone()], &selected),
-            Some(BTreeSet::from(["ancestor".to_string()])));
-        assert_eq!(matched_nogood_causes(&[clause], &BTreeMap::new()), None);
-        assert_eq!(matched_nogood_causes(&[Vec::new()], &selected),
-            Some(BTreeSet::new()));
+    fn real_pubgrub_backtracks_without_enumerating_combinations() {
+        let mut provider=pubgrub::OfflineDependencyProvider::<&str,Range>::new();
+        provider.add_dependencies("root",1u32,[
+            ("a",Range::between(1u32,4u32)),("b",Range::singleton(1u32))]);
+        provider.add_dependencies("a",3u32,[("b",Range::singleton(2u32))]);
+        provider.add_dependencies("a",2u32,[("b",Range::singleton(1u32))]);
+        provider.add_dependencies("b",1u32,[]);
+        provider.add_dependencies("b",2u32,[]);
+        let result=resolve(&provider,"root",1u32).unwrap();
+        assert_eq!(result.get(&"a"),Some(&2));
+        assert_eq!(result.get(&"b"),Some(&1));
     }
-
     #[test]
-    fn recursive_search_state_shares_candidate_metadata_and_immutable_roots() {
-        let candidate=Arc::new(Candidate{id:17,kind:"wheel".into(),
-            version:"1.0".into(),filename:"package-1.0.whl".into()});
-        let state=State {
-            entries:Arc::new(vec![Entry{name:"package".into(),
-                requirement:"package>=1".into(),extras:BTreeSet::new(),
-                causes:BTreeSet::new()}]),
-            selected:BTreeMap::from([("package".into(),candidate)]),
-            expanded:BTreeMap::new(),
-        };
-        let child=state.clone();
-        assert!(Arc::ptr_eq(&state.entries,&child.entries));
-        assert!(Arc::ptr_eq(&state.selected["package"],&child.selected["package"]));
-    }
-
-    #[test]
-    fn forward_pruned_ancestors_remain_after_exhausting_survivors() {
-        // "chosen" was the candidate being explored; the eliminated
-        // alternative required a specific "ancestor" selection.
-        let name="chosen".to_string();
-        let pruned=BTreeSet::from([name.clone(), "ancestor".to_string()]);
-        let mut combined: BTreeSet<String> = pruned.into_iter()
-            .filter(|cause| cause!=&name).collect();
-        combined.extend(BTreeSet::from(["other-ancestor".to_string()]));
-        assert_eq!(combined, BTreeSet::from([
-            "ancestor".to_string(), "other-ancestor".to_string()]));
-    }
-
-    #[test]
-    fn ordered_grouping_is_independent_of_input_order() {
-        let mut entries=Vec::new();
-        for name in ["z", "a", "b"] {
-            entries.push(Entry{name:name.into(),requirement:format!("{}>=1",name),
-                extras:BTreeSet::new(),causes:BTreeSet::new()});
-        }
-        let mut reversed=entries.clone();reversed.reverse();
-        assert_eq!(format!("{:?}",grouped(&entries).rows),
-                   format!("{:?}",grouped(&reversed).rows));
+    fn real_pubgrub_proves_disjoint_transitive_intervals_unsat() {
+        let mut provider=pubgrub::OfflineDependencyProvider::<&str,Range>::new();
+        provider.add_dependencies("root",1u32,[
+            ("a",Range::singleton(1u32)),("b",Range::singleton(1u32))]);
+        provider.add_dependencies("a",1u32,[("c",Range::singleton(1u32))]);
+        provider.add_dependencies("b",1u32,[("c",Range::singleton(2u32))]);
+        provider.add_dependencies("c",1u32,[]);
+        provider.add_dependencies("c",2u32,[]);
+        assert!(matches!(resolve(&provider,"root",1u32),Err(PubGrubError::NoSolution(_))));
     }
 }
