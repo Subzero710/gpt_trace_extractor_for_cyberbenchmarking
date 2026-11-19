@@ -1082,7 +1082,7 @@ def _git_acquisition_controls():
     with policy.open('rb') as stream:
         acquisition = tomllib.load(stream)['acquisition']
     keys = ('git_fetch_workers', 'git_fetch_batch_size', 'git_fetch_attempts',
-            'git_fetch_attempt_timeout_seconds', 'git_fetch_total_timeout_seconds')
+            'git_fetch_attempt_timeout_seconds')
     values = {key: acquisition.get(key) for key in keys}
     if any(type(value) is not int or value < 1 for value in values.values()):
         raise RuntimeError('invalid versioned Git acquisition controls')
@@ -1095,10 +1095,6 @@ def _git_acquisition_controls():
             or len(backoff) != values['git_fetch_attempts'] - 1
             or any(type(value) is not int or value < 0 for value in backoff)):
         raise RuntimeError('invalid versioned Git retry backoff schedule')
-    if values['git_fetch_total_timeout_seconds'] < (
-            values['git_fetch_attempts'] * values['git_fetch_attempt_timeout_seconds']
-            + sum(backoff)):
-        raise RuntimeError('Git total deadline cannot accommodate the configured attempts')
     return {**values, 'git_fetch_retry_backoff_seconds': tuple(backoff)}
 
 
@@ -1258,19 +1254,11 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, ref
         command.append('--no-tags')
     command.extend(['https://github.com/' + repo + '.git', *refs])
     with _git_mirror_lock(folder):
-        deadline = time.monotonic() + controls['git_fetch_total_timeout_seconds']
         last_detail = 'Git fetch did not complete'
-        completed_attempts = 0
         attempts = controls['git_fetch_attempts']
         for attempt in range(1, attempts + 1):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                last_detail = 'versioned Git fetch total deadline exhausted: ' + last_detail
-                break
-            completed_attempts = attempt
-            limit = min(attempt_limit, remaining)
             try:
-                result = _git_run_fetch(command, timeout=limit, repo=repo)
+                result = _git_run_fetch(command, timeout=attempt_limit, repo=repo)
                 if result.returncode == 0:
                     return
                 last_detail = (result.stderr or result.stdout
@@ -1279,7 +1267,7 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, ref
                 detail = exc.stderr or ''
                 if isinstance(detail, bytes):
                     detail = detail.decode(errors='replace')
-                last_detail = 'Git fetch attempt timed out after ' + str(round(limit, 2)) + 's'
+                last_detail = 'Git fetch attempt timed out after ' + str(round(attempt_limit, 2)) + 's'
                 if detail:
                     last_detail += ': ' + detail[-500:]
             # Popen has observed EOF or terminated its private process group.
@@ -1288,13 +1276,10 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, ref
             last_detail = last_detail[-500:]
             if attempt < attempts:
                 delay = controls['git_fetch_retry_backoff_seconds'][attempt - 1]
-                if delay >= deadline - time.monotonic():
-                    last_detail = 'versioned Git fetch total deadline exhausted: ' + last_detail
-                    break
                 print(f'[pool] git fetch retry {attempt + 1}/{attempts} in {delay}s: {repo}: {last_detail}',
                       file=sys.stderr, flush=True)
                 time.sleep(delay)
-        raise RuntimeError('Git fetch failed after ' + str(completed_attempts)
+        raise RuntimeError('Git fetch failed after ' + str(attempts)
                            + ' attempts for ' + repo + ': ' + last_detail)
 
 

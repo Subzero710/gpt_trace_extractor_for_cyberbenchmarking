@@ -1690,10 +1690,10 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertIn('--no-tags', command)
         self.assertEqual(runner.call_args_list[0].kwargs['repo'], 'modin-project/modin')
 
-    def test_git_fetch_total_timeout_allows_full_budgets_for_every_retry(self):
+    def test_git_fetch_independent_attempt_deadlines_allow_all_retries(self):
         controls = tomllib.loads((ROOT / 'config/preparation.toml').read_text())['acquisition']
+        self.assertNotIn('git_fetch_total_timeout_seconds', controls)
         attempt_budget = controls['git_fetch_attempt_timeout_seconds']
-        total_budget = controls['git_fetch_total_timeout_seconds']
         attempts = controls['git_fetch_attempts']
         elapsed = [0.0]
         requested = []
@@ -1714,8 +1714,6 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a'*40])
         self.assertEqual(len(requested), attempts)
         self.assertTrue(all(value == attempt_budget for value in requested))
-        self.assertGreater(elapsed[0], attempt_budget)
-        self.assertLessEqual(elapsed[0], total_budget)
         self.assertEqual(elapsed[0], attempts * attempt_budget
                          + sum(controls['git_fetch_retry_backoff_seconds']))
 
