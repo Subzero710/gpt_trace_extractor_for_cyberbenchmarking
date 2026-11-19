@@ -1673,50 +1673,57 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertEqual(len(calls),2)
 
     def test_git_fetch_retries_quietly_inside_same_preparation(self):
-        failure=subprocess.CompletedProcess(['git'],128,stdout='',stderr='RPC failed; curl 92 HTTP/2 stream closed')
-        success=subprocess.CompletedProcess(['git'],0,stdout='',stderr='')
-        with patch.object(pool.subprocess,'run',side_effect=[failure,success]) as runner, \
-             patch.object(pool.time,'sleep') as sleeper:
-            pool._git_fetch(Path('/tmp/mirror.git'),'modin-project/modin',['a'*40])
-        self.assertEqual(runner.call_count,2)
+        failure = subprocess.CompletedProcess(['git'], 128, stdout='',
+            stderr='RPC failed; curl 92 HTTP/2 stream closed')
+        success = subprocess.CompletedProcess(['git'], 0, stdout='', stderr='')
+        with patch.object(pool, '_git_run_fetch', side_effect=[failure, success]) as runner, \
+             patch.object(pool, '_git_clear_failed_fetch_locks'), \
+             patch.object(pool.time, 'sleep') as sleeper:
+            pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a'*40])
+        self.assertEqual(runner.call_count, 2)
         sleeper.assert_called_once_with(1)
-        command=runner.call_args_list[0].args[0]
-        self.assertIn('--quiet',command)
-        self.assertIn('--no-recurse-submodules',command)
-        self.assertIn('--no-auto-maintenance',command)
-        self.assertIn('--no-tags',command)
+        command = runner.call_args_list[0].args[0]
+        self.assertNotIn('--quiet', command)
+        self.assertIn('--progress', command)
+        self.assertIn('--no-recurse-submodules', command)
+        self.assertIn('--no-auto-maintenance', command)
+        self.assertIn('--no-tags', command)
+        self.assertEqual(runner.call_args_list[0].kwargs['repo'], 'modin-project/modin')
 
-    def test_git_fetch_total_timeout_covers_all_retries(self):
+    def test_git_fetch_total_timeout_allows_full_budgets_for_every_retry(self):
         controls = tomllib.loads((ROOT / 'config/preparation.toml').read_text())['acquisition']
-        maximum = controls['subprocess_timeout_seconds']
-        self.assertLessEqual(maximum, 900)
-        self.assertLessEqual(maximum, controls['progress_stall_timeout_seconds'])
+        attempt_budget = controls['git_fetch_attempt_timeout_seconds']
+        total_budget = controls['git_fetch_total_timeout_seconds']
+        attempts = controls['git_fetch_attempts']
         elapsed = [0.0]
-        attempts = []
+        requested = []
 
         def failing_fetch(*args, timeout, **kwargs):
-            attempts.append(timeout)
-            elapsed[0] += timeout * 0.6
-            return subprocess.CompletedProcess(['git'], 128, stdout='', stderr='connection aborted')
+            requested.append(timeout)
+            elapsed[0] += timeout
+            raise subprocess.TimeoutExpired(args[0], timeout)
 
         def advance_backoff(delay):
             elapsed[0] += delay
 
-        with patch.object(pool.subprocess, 'run', side_effect=failing_fetch), \
+        with patch.object(pool, '_git_run_fetch', side_effect=failing_fetch), \
+             patch.object(pool, '_git_clear_failed_fetch_locks'), \
              patch.object(pool.time, 'monotonic', side_effect=lambda: elapsed[0]), \
              patch.object(pool.time, 'sleep', side_effect=advance_backoff):
-            with self.assertRaisesRegex(RuntimeError, 'Git fetch failed'):
-                pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a' * 40])
-        self.assertGreater(len(attempts), 1)
-        self.assertLessEqual(elapsed[0], maximum)
-        self.assertTrue(all(0 < seconds <= maximum for seconds in attempts))
-        self.assertLess(attempts[-1], attempts[0])
+            with self.assertRaisesRegex(RuntimeError, 'Git fetch failed after ' + str(attempts)):
+                pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a'*40])
+        self.assertEqual(len(requested), attempts)
+        self.assertTrue(all(value == attempt_budget for value in requested))
+        self.assertGreater(elapsed[0], attempt_budget)
+        self.assertLessEqual(elapsed[0], total_budget)
+        self.assertEqual(elapsed[0], attempts * attempt_budget
+                         + sum(controls['git_fetch_retry_backoff_seconds']))
 
-    def test_git_fetch_rejects_deadline_longer_than_versioned_budget(self):
+    def test_git_fetch_rejects_attempt_deadline_longer_than_versioned_budget(self):
         controls = tomllib.loads((ROOT / 'config/preparation.toml').read_text())['acquisition']
         with self.assertRaisesRegex(ValueError, 'deadline exceeds versioned subprocess budget'):
-            pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a' * 40],
-                            timeout=controls['subprocess_timeout_seconds'] + 1)
+            pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a'*40],
+                            timeout=controls['git_fetch_attempt_timeout_seconds'] + 1)
 
     def test_one_hour_subprocess_deadlines_are_absent_from_runtime(self):
         for relative in ('scripts/superbench_pool.py', 'scripts/build_local_templates.py'):
@@ -1724,13 +1731,16 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
                 self.assertNotRegex((ROOT / relative).read_text(), r'timeout\s*=\s*3600\b')
 
     def test_git_fetch_exhaustion_reports_bounded_stderr(self):
-        failure=subprocess.CompletedProcess(['git'],128,stdout='',stderr='fatal: '+('x'*5000))
-        with patch.object(pool.subprocess,'run',return_value=failure) as runner, \
-             patch.object(pool.time,'sleep'):
-            with self.assertRaisesRegex(RuntimeError,'Git fetch failed after 5 attempts for modin-project/modin') as raised:
-                pool._git_fetch(Path('/tmp/mirror.git'),'modin-project/modin',['a'*40])
-        self.assertEqual(runner.call_count,pool.DOWNLOAD_ATTEMPTS)
-        self.assertLess(len(str(raised.exception)),800)
+        attempts = pool._git_acquisition_controls()['git_fetch_attempts']
+        failure = subprocess.CompletedProcess(['git'], 128, stdout='', stderr='fatal: ' + ('x'*5000))
+        with patch.object(pool, '_git_run_fetch', return_value=failure) as runner, \
+             patch.object(pool, '_git_clear_failed_fetch_locks'), \
+             patch.object(pool.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError,
+                    'Git fetch failed after ' + str(attempts) + ' attempts for modin-project/modin') as raised:
+                pool._git_fetch(Path('/tmp/mirror.git'), 'modin-project/modin', ['a'*40])
+        self.assertEqual(runner.call_count, attempts)
+        self.assertLess(len(str(raised.exception)), 800)
 
     def test_same_filename_different_bytes_are_separate_cas_objects(self):
         with tempfile.TemporaryDirectory() as tmp:

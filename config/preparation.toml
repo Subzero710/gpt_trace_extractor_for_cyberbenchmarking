@@ -21,6 +21,14 @@ service_port = 3128
 timeout_seconds = 180
 subprocess_timeout_seconds = 900
 workers = 8
+# GitHub upload-pack streams can reset with an incomplete response. Each
+# transaction retains its exact commit and object-closure verification.
+git_fetch_workers = 2
+git_fetch_batch_size = 4
+git_fetch_attempts = 5
+git_fetch_attempt_timeout_seconds = 900
+git_fetch_total_timeout_seconds = 1800
+git_fetch_retry_backoff_seconds = [1, 2, 4, 8]
 # Reporting cadence for real Conda/Pip transfer counters (seconds).
 progress_interval_seconds = 5
 # Absolute verified Pip closure budget, including target PEP 517 metadata.

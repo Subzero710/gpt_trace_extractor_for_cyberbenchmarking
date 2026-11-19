@@ -23,7 +23,9 @@ import io
 import json
 import os
 import re
+import select
 import shlex
+import signal
 import shutil
 import stat
 import tempfile
@@ -1072,62 +1074,228 @@ def git_files_named(mirror, commit, basename, *, limit=64):
             if len(rows)>limit:raise RuntimeError('Git basename search exceeds finite bound: '+basename)
     return sorted(set(rows))
 
-def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, refetch=False):
-    """Fetch immutable GitHub refs quietly with bounded in-process retries.
+@functools.lru_cache(maxsize=1)
+def _git_acquisition_controls():
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned Git acquisition controls')
+    with policy.open('rb') as stream:
+        acquisition = tomllib.load(stream)['acquisition']
+    keys = ('git_fetch_workers', 'git_fetch_batch_size', 'git_fetch_attempts',
+            'git_fetch_attempt_timeout_seconds', 'git_fetch_total_timeout_seconds')
+    values = {key: acquisition.get(key) for key in keys}
+    if any(type(value) is not int or value < 1 for value in values.values()):
+        raise RuntimeError('invalid versioned Git acquisition controls')
+    if values['git_fetch_workers'] > _acquisition_workers():
+        raise RuntimeError('Git worker budget exceeds acquisition worker budget')
+    if values['git_fetch_attempt_timeout_seconds'] > _subprocess_timeout():
+        raise RuntimeError('Git attempt deadline exceeds versioned subprocess budget')
+    backoff = acquisition.get('git_fetch_retry_backoff_seconds')
+    if (not isinstance(backoff, list)
+            or len(backoff) != values['git_fetch_attempts'] - 1
+            or any(type(value) is not int or value < 0 for value in backoff)):
+        raise RuntimeError('invalid versioned Git retry backoff schedule')
+    if values['git_fetch_total_timeout_seconds'] < (
+            values['git_fetch_attempts'] * values['git_fetch_attempt_timeout_seconds']
+            + sum(backoff)):
+        raise RuntimeError('Git total deadline cannot accommodate the configured attempts')
+    return {**values, 'git_fetch_retry_backoff_seconds': tuple(backoff)}
 
-    A failed network transfer is retried inside the same preparation so a transient
-    GitHub/DNS/TLS failure cannot force an operator to restart the whole acquisition.
-    The caller still verifies every requested commit/ref after the fetch.
+
+_GIT_MIRROR_LOCK_GUARD = threading.Lock()
+_GIT_MIRROR_LOCKS = {}
+
+
+def _git_mirror_lock(folder):
+    key = str(Path(folder).absolute())
+    with _GIT_MIRROR_LOCK_GUARD:
+        if key not in _GIT_MIRROR_LOCKS:
+            _GIT_MIRROR_LOCKS[key] = threading.Lock()
+        return _GIT_MIRROR_LOCKS[key]
+
+
+def _git_clear_failed_fetch_locks(folder):
+    """Discard only Git transaction locks after the supervised process exits.
+
+    The caller owns the exclusive per-mirror acquisition lock. Interrupted
+    shallow fetches otherwise turn every subsequent retry into 'shallow.lock
+    exists', even though the remote stream error was transient.
     """
-    ceiling = _subprocess_timeout()
-    if timeout is None:
-        timeout = ceiling
-    if type(timeout) not in (int, float) or not 0 < timeout <= ceiling:
-        raise ValueError('Git fetch deadline exceeds versioned subprocess budget')
+    folder = Path(folder)
+    if folder.is_symlink() or not folder.is_dir():
+        raise RuntimeError('unsafe interrupted Git mirror')
+    owner = folder.stat().st_uid
+    for base, directories, names in os.walk(folder, followlinks=False):
+        for name in directories:
+            if (Path(base) / name).is_symlink():
+                raise RuntimeError('unsafe symlink in interrupted Git mirror')
+        for name in names:
+            if not name.endswith('.lock'):
+                continue
+            path = Path(base) / name
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != owner:
+                raise RuntimeError('unsafe interrupted Git lock: ' + str(path))
+            path.unlink()
+
+
+_GIT_RECEIVED = re.compile(
+    rb'Receiving objects:\s*\d+%\s*\(\d+/\d+\),\s*'
+    rb'(\d+(?:\.\d+)?)\s*(bytes|KiB|MiB|GiB)\b')
+_GIT_BYTE_UNITS = {'bytes': 1, 'KiB': 1024, 'MiB': 1048576, 'GiB': 1073741824}
+
+
+class _GitVerifiedTransfer:
+    """Publish only byte totals reported by Git's actual pack receiver."""
+    def __init__(self, repo):
+        self.view = _POOL_PROGRESS
+        self.identity = object()
+        self.pending = b''
+        self.reported = 0
+        if self.view is not None:
+            self.view.network_start(self.identity, 'Git ' + repo, 0)
+
+    def feed(self, payload):
+        if self.view is None:
+            return
+        segments = (self.pending + payload).replace(b'\r', b'\n').split(b'\n')
+        self.pending = segments.pop()[-8192:]
+        for segment in segments:
+            self._observe(segment)
+
+    def _observe(self, line):
+        match = _GIT_RECEIVED.match(line)
+        if match is None:
+            return
+        # Use only Git's own observed pack-byte counters; never elapsed-time
+        # heartbeats or remotely supplied progress messages.
+        amount = match.group(1).decode('ascii')
+        whole, dot, fraction = amount.partition('.')
+        factor = _GIT_BYTE_UNITS[match.group(2).decode('ascii')]
+        measured = int(whole) * factor
+        if dot:
+            measured += int(fraction) * factor // (10 ** len(fraction))
+        if measured > self.reported:
+            self.view.network_advance(self.identity, measured - self.reported)
+            self.reported = measured
+
+    def close(self):
+        if self.view is not None:
+            if self.pending:
+                self._observe(self.pending)
+            self.view.network_end(self.identity)
+
+
+def _git_run_fetch(command, *, timeout, repo):
+    """Supervise the complete Git process group and read live transfer proof."""
+    progress = _GitVerifiedTransfer(repo)
+    process = None
+    tail = bytearray()
     deadline = time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        assert process.stderr is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout,
+                                                stderr=bytes(tail).decode(errors='replace'))
+            readable, _, _ = select.select(
+                [process.stderr], [], [], min(remaining, _conda_progress_interval()))
+            if not readable:
+                continue
+            data = os.read(process.stderr.fileno(), 65536)
+            if not data:
+                result = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                return subprocess.CompletedProcess(
+                    command, result, stdout='', stderr=bytes(tail).decode(errors='replace'))
+            tail.extend(data)
+            if len(tail) > 16384:
+                del tail[:-16384]
+            progress.feed(data)
+    except BaseException:
+        if process is not None:
+            # Git launches upload-pack helpers and index-pack descendants. A
+            # timeout must terminate the private group, not just the Git leader.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=_subprocess_timeout())
+        raise
+    finally:
+        if process is not None and process.stderr is not None:
+            process.stderr.close()
+        progress.close()
+
+
+def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, refetch=False):
+    """Retry the exact immutable ref request with independently bounded attempts.
+
+    Only GitHub is admitted; no alternate remote or revision is substituted.
+    Every requested tree/blob is checked by the caller before publication.
+    """
+    controls = _git_acquisition_controls()
+    attempt_limit = controls['git_fetch_attempt_timeout_seconds']
+    if timeout is not None:
+        if type(timeout) not in (int, float) or not 0 < timeout <= attempt_limit:
+            raise ValueError('Git attempt deadline exceeds versioned subprocess budget')
+        attempt_limit = timeout
     if not REPO.fullmatch(repo):
         raise RuntimeError('untrusted Git repo')
-    refs=tuple(str(value) for value in refspecs)
-    if not refs or any(not value or '\x00' in value or '\n' in value or '\r' in value for value in refs):
+    refs = tuple(str(value) for value in refspecs)
+    if (not refs or (explicit_tags and refs != ('+refs/tags/*:refs/tags/*',))
+            or (not explicit_tags and any(COMMIT.fullmatch(ref) is None for ref in refs))):
         raise RuntimeError('invalid Git fetch refspec')
-    command=['git','-c','protocol.file.allow=never','--git-dir',str(folder),'fetch',
-             '--quiet','--no-recurse-submodules','--no-auto-maintenance','--no-write-fetch-head',
-             '--depth=1']
+    command = ['git', '-c', 'protocol.file.allow=never', '--git-dir', str(folder),
+               'fetch', '--progress', '--no-recurse-submodules',
+               '--no-auto-maintenance', '--no-write-fetch-head', '--depth=1']
     if refetch:
-        # Git may otherwise decline to transfer an already-present commit even
-        # when a reachable tree/blob object is absent from a retained mirror.
-        # --refetch obtains the pinned object's entire closure again.
         command.append('--refetch')
-    if not explicit_tags:command.append('--no-tags')
-    command.extend(['https://github.com/'+repo+'.git',*refs])
-    last_detail='unknown git fetch failure'
-    completed_attempts = 0
-    for attempt in range(1,DOWNLOAD_ATTEMPTS+1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            last_detail = 'versioned Git fetch deadline exhausted'
-            break
-        completed_attempts = attempt
-        try:
-            result=subprocess.run(command,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                                  timeout=remaining)
-            if result.returncode==0:
-                return
-            last_detail=(result.stderr or result.stdout or ('exit status '+str(result.returncode))).strip()
-        except subprocess.TimeoutExpired as exc:
-            last_detail='timeout after '+str(timeout)+'s'
-            if exc.stderr:
-                last_detail+=': '+str(exc.stderr)[-500:]
-        last_detail=last_detail[-500:]
-        if attempt<DOWNLOAD_ATTEMPTS:
-            delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
-            if delay >= deadline - time.monotonic():
-                last_detail = 'versioned Git fetch deadline exhausted: ' + last_detail
+    if not explicit_tags:
+        command.append('--no-tags')
+    command.extend(['https://github.com/' + repo + '.git', *refs])
+    with _git_mirror_lock(folder):
+        deadline = time.monotonic() + controls['git_fetch_total_timeout_seconds']
+        last_detail = 'Git fetch did not complete'
+        completed_attempts = 0
+        attempts = controls['git_fetch_attempts']
+        for attempt in range(1, attempts + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_detail = 'versioned Git fetch total deadline exhausted: ' + last_detail
                 break
-            print(f'[pool] git fetch retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s: {repo}: {last_detail}',
-                  file=sys.stderr,flush=True)
-            time.sleep(delay)
-    raise RuntimeError('Git fetch failed after '+str(completed_attempts)+' attempts for '+repo+': '+last_detail)
+            completed_attempts = attempt
+            limit = min(attempt_limit, remaining)
+            try:
+                result = _git_run_fetch(command, timeout=limit, repo=repo)
+                if result.returncode == 0:
+                    return
+                last_detail = (result.stderr or result.stdout
+                               or ('exit status ' + str(result.returncode))).strip()
+            except subprocess.TimeoutExpired as exc:
+                detail = exc.stderr or ''
+                if isinstance(detail, bytes):
+                    detail = detail.decode(errors='replace')
+                last_detail = 'Git fetch attempt timed out after ' + str(round(limit, 2)) + 's'
+                if detail:
+                    last_detail += ': ' + detail[-500:]
+            # Popen has observed EOF or terminated its private process group.
+            # No Git writer from this transaction remains while locks are cleared.
+            _git_clear_failed_fetch_locks(folder)
+            last_detail = last_detail[-500:]
+            if attempt < attempts:
+                delay = controls['git_fetch_retry_backoff_seconds'][attempt - 1]
+                if delay >= deadline - time.monotonic():
+                    last_detail = 'versioned Git fetch total deadline exhausted: ' + last_detail
+                    break
+                print(f'[pool] git fetch retry {attempt + 1}/{attempts} in {delay}s: {repo}: {last_detail}',
+                      file=sys.stderr, flush=True)
+                time.sleep(delay)
+        raise RuntimeError('Git fetch failed after ' + str(completed_attempts)
+                           + ' attempts for ' + repo + ': ' + last_detail)
 
 
 def _git_has_commit(folder, commit):
@@ -1172,15 +1340,17 @@ def _git_ensure_complete(folder, repo, commits):
     if not REPO.fullmatch(repo) or not refs or any(COMMIT.fullmatch(ref) is None for ref in refs):
         raise RuntimeError('invalid pinned Git mirror requirements')
     missing = [ref for ref in refs if not _git_has_commit(folder, ref)]
-    if missing:
-        _git_fetch(folder, repo, missing)
+    batch_size = _git_acquisition_controls()['git_fetch_batch_size']
+    for start in range(0, len(missing), batch_size):
+        _git_fetch(folder, repo, missing[start:start + batch_size])
     issue = _git_tree_closure_issue(folder, refs)
     if issue is not None:
         # Repeating a normal fetch is insufficient: Git can decide the commit
         # already exists although a nested tree or blob was lost on recovery.
         print('[pool] incomplete pinned Git object graph; refetching exact commits: '
               + repo, flush=True)
-        _git_fetch(folder, repo, refs, refetch=True)
+        for start in range(0, len(refs), batch_size):
+            _git_fetch(folder, repo, refs[start:start + batch_size], refetch=True)
         issue = _git_tree_closure_issue(folder, refs)
         if issue is not None:
             raise RuntimeError('pinned Git tree/blob closure remains incomplete for '
@@ -1251,7 +1421,8 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
         raise RuntimeError('CPU affinity is empty for Git acquisition')
     # Git fetch performs pack inflation/indexing and filesystem writes, unlike the
     # metadata-only HTTP resolver. Bound Git concurrency by actual CPU capacity.
-    workers=min(_acquisition_workers(),cpu_capacity,len(ordered))
+    workers=min(_acquisition_workers(), _git_acquisition_controls()['git_fetch_workers'],
+                cpu_capacity, len(ordered))
     phase = 'Git mirrors: ' + label
     if _POOL_PROGRESS is not None:
         _pool_progress(phase,0,len(ordered),'repositories',f'{workers} workers')
