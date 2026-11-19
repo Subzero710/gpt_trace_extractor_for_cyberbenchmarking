@@ -2072,6 +2072,53 @@ class TestVerifiedPoolResume(unittest.TestCase):
             with patch.object(pool,'fetch',side_effect=AssertionError('network forbidden')):
                 self.assertEqual(candidate.download('https://example.test/pkg','conda','env',sha=sha),sha)
 
+    def test_interrupted_git_mirrors_drop_stale_locks_but_keep_verified_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);old=root/'old';new=root/'new';work=root/'work'
+            old.mkdir();new.mkdir()
+            (old/'STAGING').write_text('interrupted')
+
+            def git(*argv):
+                return subprocess.run(['git',*map(str,argv)],check=True,
+                                      capture_output=True,text=True).stdout.strip()
+
+            git('init','--quiet',work)
+            (work/'source.txt').write_text('verified source tree\n')
+            git('-C',work,'add','source.txt')
+            git('-C',work,'-c','user.name=Fixture',
+                '-c','user.email=fixture@example.invalid',
+                'commit','--quiet','-m','pinned source')
+            commit=git('-C',work,'rev-parse','HEAD')
+            self.assertRegex(commit,r'^[0-9a-f]{40}$')
+            locks=('shallow.lock','packed-refs.lock',
+                   'refs/heads/gpttrace-pinned-'+commit+'.lock',
+                   'objects/pack/multi-pack-index.lock')
+            for kind in ('git','git-extra'):
+                mirror=old/kind/'fixture_example.git'
+                mirror.parent.mkdir()
+                git('clone','--quiet','--bare',work,mirror)
+                for name in locks:
+                    path=mirror/name
+                    path.parent.mkdir(parents=True,exist_ok=True)
+                    path.write_bytes(b'interrupted Git transaction')
+
+            self.assertEqual(pool.salvage_verified_stage(old,new),set())
+            for kind in ('git','git-extra'):
+                source=old/kind/'fixture_example.git'
+                recovered=new/kind/'fixture_example.git'
+                for name in locks:
+                    self.assertTrue((source/name).is_file())
+                    self.assertFalse((recovered/name).exists())
+                self.assertTrue((recovered/'config').is_file())
+                with patch.object(pool,'_git_fetch',side_effect=AssertionError(
+                        'verified commit must not need another network transfer')):
+                    self.assertEqual(
+                        pool.mirror_commits(new,'fixture/example',{commit},label=kind),
+                        recovered)
+                self.assertIsNone(pool._git_tree_closure_issue(recovered,{commit}))
+                self.assertEqual(git('--git-dir',recovered,'rev-parse',
+                                     'refs/heads/gpttrace-pinned-'+commit),commit)
+
     def test_corrupt_old_object_is_not_reused(self):
         with tempfile.TemporaryDirectory() as tmp:
             old=Path(tmp)/'old';new=Path(tmp)/'new'

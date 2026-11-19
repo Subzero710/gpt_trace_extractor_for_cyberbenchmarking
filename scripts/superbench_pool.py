@@ -3122,11 +3122,26 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
                 raise RuntimeError('native pip cache changed during verified recovery')
         print('[pool] restored native pip HTTP response cache', flush=True)
     # Git refs/packed objects can be mutated by a later fetch: COPY them, never
-    # hardlink mutable Git objects to the failed stage.
+    # hardlink mutable Git objects to the failed stage. Interrupted transactions
+    # leave *.lock files that must not become locks in the recovered candidate.
+    # Retain every Git object and ref; mirror_commits verifies the pinned closure.
+    def ignore_transient_git_locks(directory, names):
+        ignored=set()
+        for name in names:
+            if not name.endswith('.lock'):
+                continue
+            path=Path(directory)/name
+            mode=path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise RuntimeError('unsafe retained Git lock entry: '+str(path))
+            if stat.S_ISREG(mode):
+                ignored.add(name)
+        return ignored
     for kind in ('git','git-extra'):
         source=old/kind
         if source.is_dir():
-            shutil.copytree(source,new/kind,dirs_exist_ok=True,copy_function=shutil.copy2)
+            shutil.copytree(source,new/kind,dirs_exist_ok=True,
+                            copy_function=shutil.copy2,ignore=ignore_transient_git_locks)
     # Retain only files already hardlinked to a SHA-verified old CAS object.
     # Partial HTTP transfers, unconstrained downloads and pip scratch files
     # are deliberately excluded.
