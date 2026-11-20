@@ -10,8 +10,9 @@ golden_vcpus = 4
 swap_gib = 16
 free_space_gib = 64
 root_min_gib = 480
-timeout_hours = 96
-golden_provision_timeout_hours = 2
+golden_qcow2_copy_mib = 1024
+template_payload_batch_mib = 1024
+template_payload_batch_members = 512
 
 [acquisition]
 # QEMU's restricted user network forwards only this explicit proxy endpoint.
@@ -19,25 +20,26 @@ network = "10.0.2.0/24"
 service_address = "10.0.2.100"
 service_port = 3128
 timeout_seconds = 180
-subprocess_timeout_seconds = 900
+network_attempts = 5
+network_retry_backoff_seconds = [1, 2, 4, 8]
+golden_download_attempts = 6
+golden_download_retry_backoff_seconds = [1, 2, 4, 8, 16]
 workers = 8
 # GitHub upload-pack streams can reset with an incomplete response. Each
 # transaction retains its exact commit and object-closure verification.
 git_fetch_workers = 2
 git_fetch_batch_size = 4
 git_fetch_attempts = 5
-git_fetch_attempt_timeout_seconds = 900
+git_fetch_attempt_timeout_seconds = 180
 git_fetch_retry_backoff_seconds = [1, 2, 4, 8]
 # Reporting cadence for real Conda/Pip transfer counters (seconds).
 progress_interval_seconds = 5
-# Absolute verified Pip closure budget, including target PEP 517 metadata.
-# Never shorter than the largest permitted nested metadata build;
-# independent operation/stall limits continue to protect inactive work.
-pip_total_timeout_seconds = 900
+# Inactivity limit for a Pip process without an active child.
 pip_stall_timeout_seconds = 120
-# No verified stage/count/byte change in the entire fetch worker.
-progress_stall_timeout_seconds = 900
-# Native Rust graph search: CPU deadline applies to the whole closure.
+# Observes work outside registered elementary operations.
+unregistered_work_timeout_seconds = 180
+# Native Rust graph search: process CPU time for one PubGrub attempt.
+pip_solver_compute_timeout_seconds = 180
 pip_solver_max_decisions = 1000000
 pip_solver_max_depth = 1024
 pip_solver_cache_max_bytes = 67108864
@@ -50,16 +52,10 @@ broker_read_timeout_seconds = 15
 broker_outage_report_seconds = 30
 broker_outage_timeout_seconds = 180
 
-[[acquisition.pip_metadata_elementary_timeout_overrides]]
-kind = "pinned-git-checkout"
-identity = "pandas-dev/pandas"
-timeout_seconds = 900
-
-[[acquisition.pip_metadata_elementary_timeout_overrides]]
-kind = "pypi-sdist"
-identity = "pandas"
-timeout_seconds = 900
-
 [bootstrap]
 miniconda_archive = "Miniconda3-py311_24.7.1-0-Linux-x86_64.sh"
 miniconda_sha256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d120c"
+
+[compose]
+status_timeout_seconds = 15
+status_interval_seconds = 2

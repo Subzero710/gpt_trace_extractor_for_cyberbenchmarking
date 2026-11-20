@@ -3,18 +3,16 @@
 """Sequential local execution host builder; invoked only by the authenticated preparation job."""
 from __future__ import annotations
 
-def _versioned_host_subprocess_timeout(field='timeout_seconds'):
+def _versioned_host_subprocess_timeout():
     import tomllib
     from pathlib import Path
     policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned host subprocess deadline')
-    if field not in ('timeout_seconds', 'subprocess_timeout_seconds'):
-        raise RuntimeError('unsupported host subprocess deadline field')
     with policy.open('rb') as stream:
         controls = tomllib.load(stream)['acquisition']
-    value = controls[field]
-    if type(value) is not int or value < 1:
+    value = controls['timeout_seconds']
+    if type(value) is not int or not 1 <= value <= 180:
         raise RuntimeError('invalid versioned host subprocess deadline')
     return value
 
@@ -28,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -66,7 +65,7 @@ def _preparation_controls():
     with path.open("rb") as stream:
         payload = tomllib.load(stream)
     build = payload.get("build")
-    required = {"virtual_disk_gib", "memory_reserve_mb", "memory_min_mb", "memory_cap_mb", "vcpu_cap", "golden_memory_mb", "golden_vcpus", "swap_gib", "free_space_gib", "root_min_gib", "timeout_hours", "golden_provision_timeout_hours"}
+    required = {"virtual_disk_gib", "memory_reserve_mb", "memory_min_mb", "memory_cap_mb", "vcpu_cap", "golden_memory_mb", "golden_vcpus", "swap_gib", "free_space_gib", "root_min_gib", "golden_qcow2_copy_mib", "template_payload_batch_mib", "template_payload_batch_members"}
     if not isinstance(build, dict) or set(build) != required:
         raise RuntimeError("preparation controls have missing or unknown fields")
     if any(type(build[name]) is not int or build[name] <= 0 for name in required):
@@ -90,7 +89,6 @@ VCPU_CAP = int(_CONTROLS["vcpu_cap"])
 SWAP_GIB = int(_CONTROLS["swap_gib"])
 FREE_SPACE_GIB = int(_CONTROLS["free_space_gib"])
 ROOT_MIN_GIB = int(_CONTROLS["root_min_gib"])
-BUILD_TIMEOUT_HOURS = int(_CONTROLS["timeout_hours"])
 
 
 def qemu_system_binary():
@@ -351,55 +349,102 @@ def free_space(path, margin):
         raise RuntimeError(f"host free-space safety margin reached: {free} < {margin} bytes")
 
 
-def command(*args, cwd=None, timeout=None, log=None, margin=0, monitor=None, tail_file=None, **kwargs):
+def _payload_batches(payload):
+    byte_limit = _CONTROLS["template_payload_batch_mib"] * 1024**2
+    member_limit = _CONTROLS["template_payload_batch_members"]
+    if payload.is_symlink() or not payload.is_dir():
+        raise ValueError("invalid template payload directory")
+    entries, size = [], 0
+    for path in (payload, *sorted(payload.rglob("*"))):
+        info = path.lstat()
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError("unsupported file in template payload: " + str(path))
+        weight = info.st_size if stat.S_ISREG(info.st_mode) else 0
+        if entries and (len(entries) >= member_limit or size + weight > byte_limit):
+            yield entries
+            entries, size = [], 0
+        entries.append(path.relative_to(payload.parent))
+        size += weight
+    if entries:
+        yield entries
+
+
+def _inject_payload(image, payload, work, run):
+    with tempfile.TemporaryDirectory(prefix=".guest-payload-", dir=work) as temporary:
+        staging = Path(temporary)
+        names, archive = staging / "names", staging / "payload.tar"
+        for batch in _payload_batches(payload):
+            names.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in batch))
+            run("tar", "-C", str(payload.parent), "--no-recursion", "--null",
+                "--verbatim-files-from", "--files-from=" + str(names), "-cf", str(archive))
+            run("virt-tar-in", "-a", str(image), str(archive), "/opt")
+
+
+
+def command(*args, cwd=None, timeout=None, log=None, margin=0, monitor=None, tail_file=None, watch=None, **kwargs):
+    if watch is not None and (tail_file is None or timeout is not None):
+        raise ValueError("guest supervision requires a serial log and its own deadlines")
     if timeout is None:
-        timeout = _versioned_host_subprocess_timeout('subprocess_timeout_seconds')
+        timeout = _versioned_host_subprocess_timeout()
     print("+", " ".join(str(arg) for arg in args), flush=True)
     if monitor:
         free_space(monitor, margin)
     # A log file prevents unbounded QEMU/build output from filling host RAM.
     output = Path(log).open("a+b") if log else tempfile_output()
     try:
-        with subprocess.Popen(args, cwd=cwd, stdout=output, stderr=subprocess.STDOUT, **kwargs) as process:
-            deadline = time.monotonic() + timeout
-            serial_cursor = 0
-            serial_pending = b""
-            def stream_serial_phases():
-                nonlocal serial_cursor, serial_pending
-                if tail_file is None or not Path(tail_file).is_file():
-                    return
-                with Path(tail_file).open("rb") as serial:
-                    serial.seek(serial_cursor)
-                    while chunk := serial.read(65536):
-                        serial_cursor += len(chunk)
-                        serial_pending += chunk
-                        while b"\n" in serial_pending:
-                            line, serial_pending = serial_pending.split(b"\n", 1)
-                            if b"GPTTRACE_PHASE " in line:
-                                print("[guest] " + line.decode("utf-8", errors="replace")[-2000:], flush=True)
-                        if len(serial_pending) > 65536:
-                            serial_pending = serial_pending[-65536:]
-            try:
-                while process.poll() is None:
-                    stream_serial_phases()
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("host build command timed out")
-                    if monitor:
-                        free_space(monitor, margin)
-                    time.sleep(1)
-                stream_serial_phases()
-            except BaseException:
-                stream_serial_phases()
-                process.terminate()
-                try: process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=15)
-                raise
-            if process.returncode:
-                output.seek(0, os.SEEK_END)
-                output.seek(max(0, output.tell()-4000))
-                raise RuntimeError(f"host build command failed ({process.returncode}): {output.read().decode(errors='replace')}")
+        deadline = time.monotonic() + timeout
+        process = subprocess.Popen(args, cwd=cwd, stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True, **kwargs)
+        serial_cursor = 0
+        serial_pending = b""
+
+        def stream_serial_phases():
+            nonlocal serial_cursor, serial_pending
+            if tail_file is None or not Path(tail_file).is_file():
+                return
+            with Path(tail_file).open("rb") as serial:
+                serial.seek(serial_cursor)
+                if chunk := serial.read(65536):
+                    serial_cursor += len(chunk)
+                    if watch is not None:
+                        watch.feed(chunk)
+                    serial_pending += chunk
+                    while b"\n" in serial_pending:
+                        line, serial_pending = serial_pending.split(b"\n", 1)
+                        if b"GPTTRACE_PHASE " in line:
+                            print("[guest] " + line.decode("utf-8", errors="replace")[-2000:], flush=True)
+                    if len(serial_pending) > 65536:
+                        serial_pending = serial_pending[-65536:]
+                    return True
+            return False
+
+        try:
+            while True:
+                remaining = watch.check() if watch is not None else deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("host build command timed out")
+                status = process.poll()
+                pending_serial = stream_serial_phases()
+                if status is not None and not pending_serial:
+                    break
+                if monitor:
+                    free_space(monitor, margin)
+                if not pending_serial:
+                    time.sleep(min(1, remaining))
+            if status == 0 and watch is not None:
+                watch.require_complete()
+        except BaseException:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=_versioned_host_subprocess_timeout())
+            raise
+        if process.returncode:
+            output.seek(0, os.SEEK_END)
+            output.seek(max(0, output.tell()-4000))
+            raise RuntimeError(f"host build command failed ({process.returncode}): {output.read().decode(errors='replace')}")
     finally:
         output.close()
 
@@ -410,7 +455,7 @@ def tempfile_output():
 
 
 def capture(*args):
-    return subprocess.check_output(args, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
+    return subprocess.check_output(args, timeout=_versioned_host_subprocess_timeout())
 
 
 def verify_sources(inputs, mirrors):
@@ -450,7 +495,7 @@ def firstboot(body, *, trim=True, shared_warm_cache=False):
     # Task scratch overlays are truncated/recreated between tasks, so fstrim on
     # every warm/replay only burns HDD time; permanent common/repo images still trim.
     trim_step = r'''
-        elif ! fstrim -av; then
+        elif ! template_step filesystem-trim fstrim -av; then
             echo 'failed to reclaim temporary guest swap blocks'
             rc=1
 ''' if trim else ""
@@ -458,13 +503,13 @@ def firstboot(body, *, trim=True, shared_warm_cache=False):
 test -b /dev/vdb
 cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
 if test -z "$cache_type"; then
-    mkfs.ext4 -F -L GPTTRACE_WARM_CACHE /dev/vdb
+    template_step cache-format mkfs.ext4 -F -L GPTTRACE_WARM_CACHE /dev/vdb
 elif test "$cache_type" != ext4; then
     echo "unexpected shared warm-cache filesystem: $cache_type" >&2
     exit 1
 fi
 mkdir -p /mnt/gpt-trace-warm-cache
-mount -o noatime,nosuid,nodev /dev/vdb /mnt/gpt-trace-warm-cache
+template_step cache-mount mount -o noatime,nosuid,nodev /dev/vdb /mnt/gpt-trace-warm-cache
 WARM_CACHE_MOUNT=/mnt/gpt-trace-warm-cache
 marker="$WARM_CACHE_MOUNT/.gpt-trace-warm-cache-v1"
 if test ! -e "$marker"; then
@@ -479,15 +524,33 @@ export GPT_TRACE_SHARED_WARM_CACHE="$WARM_CACHE_MOUNT"
     script = """#!/bin/bash
 set -eo pipefail
 exec >> /var/log/swe-gym-lite-builder.log 2>&1
-rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
-systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
+export GPTTRACE_TEMPLATE_TRACE=1
+export GPTTRACE_TEMPLATE_TIMEOUT=__TEMPLATE_SECONDS__
+template_event() {
+    printf 'GPTTRACE_TEMPLATE %s %s\\n' "$1" "$2" > /dev/ttyS0
+}
+template_step() {
+    local phase=$1 rc=0
+    shift
+    template_event begin "$phase"
+    "$@" || rc=$?
+    template_event end "$phase"
+    return "$rc"
+}
+template_copy_files() {
+    local src=$1 dest=$2 item
+    find "$src" -mindepth 1 -maxdepth 1 -print0 |
+    while IFS= read -r -d '' item; do
+        template_step copy-build-input cp -a "$item" "$dest/" || return "$?"
+    done
+}
 SWAP_FILE=/root/.gpt-trace-swe-gym-build.swap
 WARM_CACHE_MOUNT=
 finish() {
     rc=$?
     trap - EXIT
     if [ "$rc" -eq 0 ]; then
-        if ! swapoff "$SWAP_FILE"; then
+        if ! template_step swap-disable swapoff "$SWAP_FILE"; then
             echo 'failed to disable temporary guest swap'
             rc=1
         elif ! rm -f "$SWAP_FILE"; then
@@ -496,35 +559,46 @@ finish() {
 """ + trim_step + """        fi
     fi
     if test -n "$WARM_CACHE_MOUNT" && mountpoint -q "$WARM_CACHE_MOUNT"; then
-        sync
-        if ! umount "$WARM_CACHE_MOUNT"; then
+        if ! template_step warm-cache-sync sync -f "$WARM_CACHE_MOUNT"; then
+            rc=1
+        fi
+        if ! template_step warm-cache-unmount umount "$WARM_CACHE_MOUNT"; then
             echo 'failed to unmount shared warm cache'
             rc=1
         fi
     fi
-    if [ "$rc" -eq 0 ]; then
-        echo ok > /etc/gpt-trace-image-build-complete
+    if [ "$rc" -eq 0 ] &&
+        echo ok > /etc/gpt-trace-image-build-complete &&
+        template_step completion-proof sync; then
+        template_event shutdown complete
     else
+        rm -f /etc/gpt-trace-image-build-complete
+        if [ "$rc" -eq 0 ]; then rc=1; fi
         echo "$rc" > /etc/gpt-trace-image-build-failed
+        template_step failure-sync sync || true
+        template_event shutdown failed
     fi
-    sync
     systemctl poweroff --no-block
 }
 trap finish EXIT
+template_step reset-completion rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
+template_step stop-desktop systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
 test ! -L "$SWAP_FILE"
 if test -e "$SWAP_FILE"; then
     test -f "$SWAP_FILE"
     test "$(stat -c %u:%a "$SWAP_FILE")" = "0:600"
     test "$(stat -c %s "$SWAP_FILE")" = "__SWAP_BYTES__"
 else
-    fallocate -l __SWAP_GIB__G "$SWAP_FILE"
+    template_step swap-reserve fallocate -l __SWAP_GIB__G "$SWAP_FILE"
     chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE"
+    template_step swap-format mkswap "$SWAP_FILE"
 fi
-swapon "$SWAP_FILE"
+template_step swap-enable swapon "$SWAP_FILE"
 echo 'temporary guest build swap enabled: __SWAP_GIB__ GiB'
 """ + cache_setup + body + "\n"
-    return script.replace("__SWAP_BYTES__", str(SWAP_GIB * 1024**3)).replace("__SWAP_GIB__", str(SWAP_GIB))
+    return (script.replace("__SWAP_BYTES__", str(SWAP_GIB * 1024**3))
+            .replace("__SWAP_GIB__", str(SWAP_GIB))
+            .replace("__TEMPLATE_SECONDS__", str(_versioned_host_subprocess_timeout())))
 
 def root_growth():
     # cloud-guest-utils comes from the verified, locally staged .deb closure.
@@ -534,7 +608,7 @@ test "$(findmnt -n -o FSTYPE /)" = ext4
 parent=$(lsblk -n -o PKNAME "$root_device")
 partition=$(lsblk -n -o PARTN "$root_device")
 test -n "$parent" && test -n "$partition"
-if growth_output=$(growpart "/dev/$parent" "$partition" 2>&1); then
+if growth_output=$(template_step partition-grow growpart "/dev/$parent" "$partition" 2>&1); then
     printf '%s\n' "$growth_output"
 else
     growth_rc=$?
@@ -546,7 +620,7 @@ else
         exit "$growth_rc"
     fi
 fi
-resize2fs "$root_device"
+template_step filesystem-grow resize2fs "$root_device"
 '''
 
 
@@ -651,9 +725,9 @@ def build(args):
     if pool_record.get("complete") is not True:
         raise RuntimeError("dependency pool is not complete")
     from workstation_broker.preparation_resources import source_container_arguments
-    if (args.virtual_gib, args.free_space_gib, args.build_timeout_hours) != (VIRTUAL_GIB, FREE_SPACE_GIB, BUILD_TIMEOUT_HOURS):
+    if (args.virtual_gib, args.free_space_gib) != (VIRTUAL_GIB, FREE_SPACE_GIB):
         raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
-    for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", qemu_system_binary(), "dpkg-deb"):
+    for executable in ("docker", "git", "qemu-img", "virt-customize", "virt-cat", "virt-copy-out", "virt-tar-in", qemu_system_binary(), "dpkg-deb"):
         if shutil.which(executable) is None:
             raise RuntimeError("missing host build executable: " + executable)
     golden = load_module("swe_gym_kali_builder", ROOT / "infra/workstation/image/build.py")
@@ -815,10 +889,10 @@ def build(args):
             boot_file.write_text(firstboot(boot, trim=trim, shared_warm_cache=cache_disk is not None))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
             if payload is not None:
-                argv += ["--copy-in", str(payload) + ":/opt"]
+                _inject_payload(image, payload, scratch_root, cmd)
             if refresh_runtime:
                 argv += runtime_upload_arguments()
-            cmd(*argv, "--firstboot", str(boot_file), timeout=14400)
+            cmd(*argv, "--firstboot", str(boot_file))
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
             argv = [qemu_system_binary(), "-machine", "accel=kvm", "-cpu", "host",
@@ -828,15 +902,17 @@ def build(args):
                 argv += ["-drive", f"file={cache_disk},format=qcow2,if=virtio,cache=writeback,discard=unmap"]
             argv += ["-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0"] if network else ["-nic", "none"]
             if serial_log is None:
-                serial = ["-serial", "none"]
-            else:
-                serial_log.parent.mkdir(parents=True, exist_ok=True)
-                serial_log.unlink(missing_ok=True)
-                print("live task phase log: " + str(serial_log), flush=True)
-                serial = ["-serial", "file:" + str(serial_log)]
-            cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", *serial,
-                "-monitor", "none", "-no-reboot", timeout=args.build_timeout_hours * 3600,
-                tail_file=serial_log)
+                serial_log = image.with_name(image.name + ".serial.log")
+            serial_log.parent.mkdir(parents=True, exist_ok=True)
+            serial_log.unlink(missing_ok=True)
+            print("live guest phase log: " + str(serial_log), flush=True)
+            watch = golden._GuestProvisionWatch(_versioned_host_subprocess_timeout(),
+                prefix=b"GPTTRACE_TEMPLATE ", description="template guest", allow_pause=True)
+            try:
+                cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "file:" + str(serial_log),
+                    "-monitor", "none", "-no-reboot", tail_file=serial_log, watch=watch)
+            except (RuntimeError, TimeoutError, ValueError) as exc:
+                raise RuntimeError(str(exc) + "\nfirstboot diagnostics:\n" + guest_failure_diagnostics(image)) from exc
             if not generic_guest_complete(image):
                 raise RuntimeError("guest build completion proof is missing; "
                                    "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
@@ -850,7 +926,7 @@ def build(args):
             image.chmod(0o600)
             try:
                 cmd("virt-customize", "--no-network", "-a", str(image),
-                    *runtime_upload_arguments(), timeout=14400)
+                    *runtime_upload_arguments())
             finally:
                 image.chmod(original_mode)
 
@@ -886,8 +962,18 @@ def build(args):
                 shutil.copytree(source, path, symlinks=False)
             else:
                 # Pull only from the immutable local pool, never from origin.
-                cmd('git', '--git-dir', str(path), 'fetch', '--no-tags', str(source),
-                    '+refs/*:refs/remotes/pool/*', timeout=14400)
+                refs = capture("git", "--git-dir", str(source), "for-each-ref", "--format=%(refname)").decode().splitlines()
+                if not refs or any(not ref.startswith("refs/") for ref in refs):
+                    raise RuntimeError("immutable Git mirror has invalid local refs")
+                policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
+                batch = policy["git_fetch_batch_size"]
+                if type(batch) is not int or batch < 1:
+                    raise RuntimeError("invalid Git ref import batch size")
+                for offset in range(0, len(refs), batch):
+                    mappings = ["+" + ref + ":refs/remotes/pool/" + ref.removeprefix("refs/")
+                                for ref in refs[offset:offset + batch]]
+                    cmd("git", "--git-dir", str(path), "fetch", "--atomic", "--no-tags",
+                        "--no-write-fetch-head", str(source), *mappings)
             return path
 
         def submodule_mirror(url, commit):
@@ -979,8 +1065,14 @@ def build(args):
             # Build only a source-fetch image and bind its private build cache.
             image = "gpt-trace-lite-local-source:" + digest(PINS)[:32]
             if not (inputs_root / "inputs.json").is_file():
-                cmd("docker", "build", "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
-                    "-f", "apps/runner/Dockerfile", ".", cwd=ROOT, timeout=14400)
+                build_steps = load_module("swegym_host_build_steps", ROOT / "scripts/distributed.py")
+                build_config = load_module("swegym_host_build_config", ROOT / "scripts/build.py")
+                build_config.ensure_builder(ROOT)
+                build_steps._run_buildkit(
+                    ["docker", "buildx", "build", "--builder", build_config.BUILDER_NAME, "--progress", "rawjson", "--load",
+                     "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
+                     "-f", "apps/runner/Dockerfile", "."],
+                    monitor=lambda: free_space(staged, margin))
                 source_cache = cache_root / "dataset"
                 source_cache.mkdir(mode=0o700, exist_ok=True)
                 cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", "bridge", "--cap-drop", "ALL",
@@ -1188,8 +1280,7 @@ def build(args):
                     # resolve() is intentionally not idempotent.  Keep the QCOW2
                     # volume itself and clear only its incomplete guest scratch.
                     cmd("virt-customize", "--no-network", "-a", str(resolver),
-                        "--run-command", "rm -rf /opt/swe-gym-os /opt/swe-gym-os-helper " + RESOLVER_COMPLETION,
-                        timeout=14400)
+                        "--run-command", "rm -rf /opt/swe-gym-os /opt/swe-gym-os-helper " + RESOLVER_COMPLETION)
                     os_payload = staged / "swe-gym-os-helper"
                     if os_payload.exists():
                         shutil.rmtree(os_payload)
@@ -1334,10 +1425,10 @@ cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym
 cp /opt/swe-gym-build/environments.json /opt/swe-gym-lite/build-environments.json
 cp /opt/swe-gym-build/conda-lock.json /opt/swe-gym-lite/conda-lock.json
 mkdir -p /opt/swe-gym-lock
-cp -a /opt/swe-gym-build/conda-artifacts/. /opt/swe-gym-lock/
+template_copy_files /opt/swe-gym-build/conda-artifacts /opt/swe-gym-lock
 mkdir -p /opt/swe-gym-lite/caches/pip-index /opt/swe-gym-lite/npm-artifacts
-cp -a /opt/swe-gym-build/pip-artifacts/. /opt/swe-gym-lite/caches/pip-index/
-cp -a /opt/swe-gym-build/npm-artifacts/. /opt/swe-gym-lite/npm-artifacts/
+template_copy_files /opt/swe-gym-build/pip-artifacts /opt/swe-gym-lite/caches/pip-index
+template_copy_files /opt/swe-gym-build/npm-artifacts /opt/swe-gym-lite/npm-artifacts
 cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 cp /opt/swe-gym-build/os-artifacts/manifest.json /opt/swe-gym-lite/os-manifest.json
 /usr/bin/python3 - <<'PY_GUEST'
@@ -1347,12 +1438,12 @@ module['install']('/opt/swe-gym-build/os-artifacts',json.load(open('/opt/swe-gym
 PY_GUEST
 ''' + root_growth() + r'''
 test ! -e /opt/miniconda3
-bash /opt/swe-gym-build/miniconda.sh -b -p /opt/miniconda3
+template_step miniconda-bootstrap bash /opt/swe-gym-build/miniconda.sh -b -p /opt/miniconda3
 /usr/bin/python3 - <<'PY_NPM'
 import runpy
 runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
 PY_NPM
-rm -rf /opt/swe-gym-build
+template_step remove-build-payload rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
@@ -1362,14 +1453,14 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
 '''
             boot_resume = r'''
 mkdir -p /opt/swe-gym-lite/caches/pip-index /opt/swe-gym-lite/npm-artifacts
-cp -a /opt/swe-gym-build/pip-artifacts/. /opt/swe-gym-lite/caches/pip-index/
-cp -a /opt/swe-gym-build/npm-artifacts/. /opt/swe-gym-lite/npm-artifacts/
+template_copy_files /opt/swe-gym-build/pip-artifacts /opt/swe-gym-lite/caches/pip-index
+template_copy_files /opt/swe-gym-build/npm-artifacts /opt/swe-gym-lite/npm-artifacts
 cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 /usr/bin/python3 - <<'PY_NPM'
 import runpy
 runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
 PY_NPM
-rm -rf /opt/swe-gym-build
+template_step remove-build-payload rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
@@ -1401,7 +1492,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 try:
                     cmd("virt-customize", "--no-network", "-a", str(common),
                         "--run-command", "mkdir -p /opt/swe-gym-lite",
-                        *runtime_upload_arguments(), timeout=14400)
+                        *runtime_upload_arguments())
                     for source, guest_path in (
                             (GUEST, "/opt/swe-gym-lite/runtime.py"),
                             (GUEST.with_name("task_sources.py"), "/opt/swe-gym-lite/task_sources.py"),
@@ -1413,7 +1504,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     common.chmod(original_mode)
 
             if common_ready:
-                subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
+                subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout())
                 print("reused verified complete immutable common QCOW2", flush=True)
             else:
                 # A generic base-image marker is never accepted as common proof.
@@ -1427,8 +1518,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 else:
                     if not initial_common:
                         cmd("virt-customize", "--no-network", "-a", str(common),
-                            "--run-command", "rm -rf /opt/miniconda3 /opt/swe-gym-lite /opt/swe-gym-build",
-                            timeout=14400)
+                            "--run-command", "rm -rf /opt/miniconda3 /opt/swe-gym-lite /opt/swe-gym-build")
                     print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
                 try:
                     provision(common, boot_resume if has_conda else boot,
@@ -1464,7 +1554,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     os.rename(legacy, current_scratch)
                     relative = os.path.relpath(common, current_scratch.parent)
                     cmd("qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2",
-                        "-b", relative, str(current_scratch), timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
+                        "-b", relative, str(current_scratch), timeout=_versioned_host_subprocess_timeout())
                     print("migrated persistent task scratch volume: " + scratch_name, flush=True)
 
             def scratch_uses_common(image):
@@ -1832,7 +1922,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     ready = completion_matches(image, REPO_COMPLETION, repo_completion) or legacy_repo_complete
                 if ready:
                     refresh_overlay_runtime(image)
-                    subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
+                    subprocess.run(["qemu-img", "check", str(image)], check=True, timeout=_versioned_host_subprocess_timeout())
                     print("reused verified repository image " + repo, flush=True)
                 else:
                     if not image.exists():
@@ -1950,7 +2040,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 value = json.loads(capture("qemu-img", "info", "--output=json", str(path)))
                 signature = file_signature(path)
                 if checked_images.get(path) != signature:
-                    command("qemu-img", "check", str(path), timeout=_versioned_host_subprocess_timeout('subprocess_timeout_seconds'))
+                    command("qemu-img", "check", str(path), timeout=_versioned_host_subprocess_timeout())
                     checked_images[path] = signature
                 return value
 

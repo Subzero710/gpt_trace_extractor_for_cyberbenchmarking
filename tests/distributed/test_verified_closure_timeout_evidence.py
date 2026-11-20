@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,16 +12,13 @@ import pytest
 import superbench_pool as pool
 
 
-def test_nested_metadata_build_budget_is_covered_by_closure_deadline():
+def test_pip_inactivity_limit_is_independent_of_compute_budget():
     root = Path(pool.__file__).resolve().parents[1]
     with (root / 'config/preparation.toml').open('rb') as stream:
         acquisition = tomllib.load(stream)['acquisition']
-    assert acquisition['pip_total_timeout_seconds'] >= max(
-        row['timeout_seconds'] for row in
-        acquisition['pip_metadata_elementary_timeout_overrides'])
-    assert pool._native_pip_timeouts()[0] == acquisition['pip_total_timeout_seconds']
-    assert pool._operation_timeout() < acquisition['pip_total_timeout_seconds']
-    assert pool._native_pip_timeouts()[1] < pool._native_pip_timeouts()[0]
+    assert 'pip_total_timeout_seconds' not in acquisition
+    assert pool._native_pip_stall_timeout() == acquisition['pip_stall_timeout_seconds']
+    assert acquisition['pip_solver_compute_timeout_seconds'] <= 180
 
 
 def test_metadata_pool_snapshot_counts_real_work():
@@ -53,8 +49,8 @@ def test_metadata_pool_snapshot_counts_real_work():
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def test_expired_required_closure_names_its_own_exact_inputs(monkeypatch, tmp_path, capsys):
-    target = SimpleNamespace(python_full_version='3.8.19')
+def test_elementary_timeout_reports_affected_required_inputs(monkeypatch, tmp_path, capsys):
+    target = SimpleNamespace(as_dict=lambda: {'python_full_version': '3.8.19'})
     group = {
         'target': {}, 'requirements': ['heavy>=1', 'torch'],
         'constraints': ['torch<3'], 'no_deps': False,
@@ -62,21 +58,15 @@ def test_expired_required_closure_names_its_own_exact_inputs(monkeypatch, tmp_pa
         'tasks': ['sample-task'],
     }
     monkeypatch.setattr(pool, '_coerce_target', lambda value: target)
-    monkeypatch.setattr(pool, '_target_fingerprint', lambda value: 'verified-target')
     monkeypatch.setattr(pool, 'reuse_pip_plan', lambda *args, **kwargs: False)
     monkeypatch.setattr(pool, '_native_resolve_registry',
                         lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError('metadata wait')))
-    token = pool._NATIVE_CLOSURE_DEADLINE.set(time.monotonic() - 1)
-    try:
-        with pytest.raises(RuntimeError, match='closure exceeded configured total deadline'):
-            pool._native_pip_group_locked(SimpleNamespace(stage=tmp_path), 'actual-closure', group)
-    finally:
-        pool._NATIVE_CLOSURE_DEADLINE.reset(token)
-    marker = '[pool] timed-out pip closure input evidence: '
+    with pytest.raises(RuntimeError, match='actual-closure failed: metadata wait'):
+        pool._native_pip_group_locked(SimpleNamespace(stage=tmp_path), 'actual-closure', group)
+    marker = '[pool] required pip closure input evidence: '
     evidence = next(json.loads(line.split(marker, 1)[1])
                     for line in capsys.readouterr().err.splitlines() if marker in line)
     assert evidence['closure'] == 'actual-closure'
     assert evidence['tasks'] == ['sample-task']
     assert evidence['requirements'] == ['heavy>=1', 'torch']
-    assert evidence['target_python'] == '3.8.19'
-    assert evidence['target_fingerprint'] == 'verified-target'
+    assert evidence['target'] == {'python_full_version': '3.8.19'}

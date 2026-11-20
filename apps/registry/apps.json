@@ -8,7 +8,7 @@
       "id": "kali-workstation",
       "kind": "local_mcp",
       "manifest_path_default": "../kali-workstation/tool-manifest.json",
-      "manifest_sha256": "ba3f7190476722270d544a404422af286a64c80a029b4b058ee75a292cd2fc6d",
+      "manifest_sha256": "2757f2a36834b4e0e4f71153cb5b7be9c428ffd7dfead1f30011aa10cd01c7d0",
       "mcp_endpoint_default": "http://workstation-gateway:8000/mcp",
       "version": "3.0.0"
     },

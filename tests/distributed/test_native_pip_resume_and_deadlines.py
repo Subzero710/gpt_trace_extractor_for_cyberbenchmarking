@@ -64,7 +64,7 @@ def test_cached_http_body_is_reused_and_not_published(tmp_path):
 
 def test_native_pip_detects_stall_and_keeps_tail(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\nprint("fixture started",flush=True)\ntime.sleep(15)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 3))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 3)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         with pytest.raises(TimeoutError, match='no output and started no elementary') as result:
@@ -77,7 +77,7 @@ def test_native_pip_active_bytes_reset_stall_budget(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'import time\nfor i in range(1,8):\n'
                                  ' print(f"Progress {i} of 7", flush=True)\n'
                                  ' time.sleep(0.35)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (6, 3))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 3)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'],
@@ -92,7 +92,7 @@ def test_native_pip_sequential_children_have_no_aggregate_deadline(tmp_path, mon
         'for index in range(4):\n'
         ' subprocess.run([sys.executable,"-c","import time;time.sleep(0.7)"],check=True)\n'
         ' print(index,flush=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (1, 3))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 3)
     monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -105,8 +105,7 @@ def test_native_pip_sequential_children_have_no_aggregate_deadline(tmp_path, mon
 
 
 def test_versioned_controls_are_restrictive_and_readable():
-    total, stalled = pool._native_pip_timeouts()
-    assert 0 < stalled < total < 7200
+    assert 0 < pool._native_pip_stall_timeout() <= pool._operation_timeout()
 
 
 def test_salvage_ignores_abandoned_native_scratch_but_not_other_symlinks(tmp_path):
@@ -177,7 +176,7 @@ def test_native_pip_cpu_active_child_has_its_own_timeout(tmp_path, monkeypatch, 
         'child.wait()\n')
     source = {'kind': 'pinned-git-checkout', 'initiating_task': 'fixture'}
     runtime['_native_source_context'] = source
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with pytest.raises(TimeoutError, match='elementary subprocess exceeded') as expired:

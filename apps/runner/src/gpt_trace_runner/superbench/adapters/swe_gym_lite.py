@@ -35,14 +35,22 @@ async def materialize(runtime, item, kind):
     return record
 
 
-async def execute(runtime, program, *, timeout=1800):
+async def execute(runtime, program):
     result = await runtime.call("exec_command", {
         "command": "sudo -n /usr/bin/python3 -c 'import sys; exec(compile(sys.stdin.read(), \"trusted-swe-gym\", \"exec\"))'",
-        "cwd": "/tmp", "stdin": program, "timeout_seconds": timeout,
+        "cwd": "/tmp", "stdin": program,
     })
     if result.get("timed_out") or result.get("exit_code") != 0 or result.get("stdout_truncated") or result.get("stderr_truncated"):
         raise AppInfrastructureError("SWE-Gym trusted guest operation failed: " + str(result.get("stderr", ""))[-3000:])
     return result
+
+
+async def install_runtime_cache(runtime, item, cache):
+    await execute(runtime, guest_program(f"""
+item = json.loads({json.dumps(json.dumps(item))})
+cache = json.loads({json.dumps(json.dumps(cache))})
+install_setup_cache(item, cache)
+"""))
 
 
 def native_grade(row, output):
@@ -114,12 +122,11 @@ class SWEGymLiteAdapter(BenchmarkAdapter):
             raise AppInfrastructureError("Lite task/template mapping mismatch")
         artifact = await materialize(runtime, item, "task_source")
         cache = await materialize(runtime, item, "setup_cache")
+        await install_runtime_cache(runtime, item, cache)
         body = f"""
 item = json.loads({json.dumps(json.dumps(item))})
 ROOT.joinpath('attempt').mkdir(exist_ok=True)
 artifact = json.loads({json.dumps(json.dumps(artifact))})
-cache = json.loads({json.dumps(json.dumps(cache))})
-install_setup_cache(item, cache)
 prepare(item, artifact=artifact, log=ROOT / 'attempt/setup.log')
 workspace = Path('/home/kali/workspace')
 if workspace.is_symlink():
@@ -207,29 +214,34 @@ print(json.dumps(proof))
             hidden = commands[:3] + specs.get("eval_commands", []) + commands[-4:-2]
             # No gold patch or oracle lists enter either VM. Only hidden tests
             # enter this runner-only evaluator, after clean setup and candidate.
-            prepare_body = f"""
+            await install_runtime_cache(evaluator, item, cache)
+            setup_input = f"""
 item = json.loads({json.dumps(json.dumps(item))})
 artifact = json.loads({json.dumps(json.dumps(artifact))})
-cache = json.loads({json.dumps(json.dumps(cache))})
-install_setup_cache(item, cache)
-proof = prepare_evaluator(item, artifact, json.loads({json.dumps(json.dumps(setup))}), '/tmp/swe-gym-evaluator')
-print(json.dumps(proof))
+folder = '/tmp/swe-gym-evaluator'
 """
-            ready = await execute(evaluator, guest_program(prepare_body))
+            await execute(evaluator, guest_program(setup_input + "prepare_evaluator_repository(item, artifact, folder)"))
+            ready = await execute(evaluator, guest_program(setup_input + f"""
+proof = finish_evaluator_setup(item, artifact, json.loads({json.dumps(json.dumps(setup))}), folder)
+print(json.dumps(proof))
+"""))
             if json.loads(ready["stdout"]) != {"base_commit":item["base_commit"], "env_hash":item["env_hash"], "source_sha256":artifact["sha256"]}:
                 raise AppInfrastructureError("clean evaluator setup proof mismatch")
             # Even the candidate FILE enters only after all clean setup succeeds.
             await evaluator.import_bytes(patch, "/tmp/swe-gym-candidate/exact-candidate.patch")
-            body = f"""
+            await execute(evaluator, guest_program(f"""
 item = json.loads({json.dumps(json.dumps(item))})
-proof = grade_prepared(item, '/tmp/swe-gym-candidate/exact-candidate.patch',
+apply_grading_inputs(item, '/tmp/swe-gym-candidate/exact-candidate.patch',
     candidate_sha256={candidate['sha256']!r}, candidate_size={candidate['size']!r},
-    hidden=json.loads({json.dumps(json.dumps(hidden))}), test_command={test_command!r},
+    hidden=json.loads({json.dumps(json.dumps(hidden))}), folder='/tmp/swe-gym-evaluator')
+"""))
+            result = await execute(evaluator, guest_program(f"""
+item = json.loads({json.dumps(json.dumps(item))})
+proof = run_native_tests(item, {test_command!r},
     test_prelude=json.loads({json.dumps(json.dumps(commands[:3] + specs.get('eval_commands', [])))}),
     folder='/tmp/swe-gym-evaluator')
 print(json.dumps(proof))
-"""
-            result = await execute(evaluator, guest_program(body))
+"""))
             proof = json.loads(result["stdout"])
             log = await evaluator.export("/tmp/swe-gym-evaluator/tests.log", "tests.log")
             await evaluator.export("/tmp/swe-gym-evaluator/setup.log", "setup.log")

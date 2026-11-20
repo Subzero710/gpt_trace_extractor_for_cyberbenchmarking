@@ -10,19 +10,22 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = ROOT / "infra/workstation/image"
-sys.path.insert(0, str(HERE))
+sys.path[:0] = [str(HERE), str(ROOT / "shared")]
+from gpt_trace_transport.operation_watch import OperationWatch
 from golden_assets import (CACHE_TAG, CACHE_MOUNT, atomic_bytes, atomic_json,
-                           digest, download, mkdir, read_json, safe, sync)
+                           digest, download, download_policy, mkdir, operation_timeout, read_json, safe, sync)
 import golden_lock
 import guest_build
 import host_cache
@@ -75,7 +78,8 @@ def versioned_digest(path):
 def _preparation_build_controls():
     path = versioned_file(ROOT / "config/preparation.toml")
     controls = tomllib.loads(path.read_text())["build"]
-    required = {"virtual_disk_gib", "root_min_gib", "golden_provision_timeout_hours", "golden_memory_mb", "golden_vcpus"}
+    required = {"virtual_disk_gib", "root_min_gib", "golden_memory_mb", "golden_vcpus",
+                "golden_qcow2_copy_mib"}
     if not required <= set(controls) or any(type(controls[k]) is not int or controls[k] <= 0 for k in required):
         raise ValueError("golden preparation controls must be positive integers")
     if controls["root_min_gib"] >= controls["virtual_disk_gib"]:
@@ -94,25 +98,52 @@ def configured_base_image():
 _BUILD_CONTROLS = _preparation_build_controls()
 VIRTUAL_DISK_GIB = _BUILD_CONTROLS["virtual_disk_gib"]
 ROOT_MIN_GIB = _BUILD_CONTROLS["root_min_gib"]
-PROVISION_TIMEOUT_SECONDS = _BUILD_CONTROLS["golden_provision_timeout_hours"] * 3600
 DEST = configured_base_image()
 CACHE_DIR = DEST.parent / "cache"
 CACHE_ARCHIVE = CACHE_DIR / ARCHIVE
 
 
-def run(*cmd, timeout=7200, **kwargs):
+def run(*cmd, timeout=None, **kwargs):
     print("+ " + " ".join(str(x) for x in cmd), flush=True)
+    if timeout is None:
+        timeout = operation_timeout(_acquisition_controls())
     if BUILD_LOG is not None:
         kwargs.setdefault("stdout", BUILD_LOG)
         kwargs.setdefault("stderr", subprocess.STDOUT)
-    # Surviving QEMU/guestfs children keep the exclusive lock after parent death.
-    if BUILD_LOCK is not None:
-        kwargs["pass_fds"] = (BUILD_LOCK,)
-    return subprocess.run([str(x) for x in cmd], check=True, timeout=timeout, **kwargs)
+    result = _image_tool(cmd, timeout, **kwargs)
+    result.check_returncode()
+    return result
 
 
 def capture(*cmd):
-    return subprocess.run([str(x) for x in cmd], check=False, capture_output=True, text=True, timeout=180)
+    return _image_tool(cmd, operation_timeout(_acquisition_controls()),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _image_tool(cmd, timeout, **kwargs):
+    args = [str(x) for x in cmd]
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(args, start_new_session=True,
+                               pass_fds=() if BUILD_LOCK is None else (BUILD_LOCK,), **kwargs)
+    try:
+        output, errors = process.communicate(timeout=max(0, deadline - time.monotonic()))
+        return subprocess.CompletedProcess(args, process.returncode, output, errors)
+    except BaseException:
+        cleanup = _acquisition_controls()["broker_read_timeout_seconds"]
+        _stop_image_process(process, cleanup)
+        raise
+    finally:
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _stop_image_process(process, cleanup):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=cleanup)
 
 
 def _hash_component(hasher, label, raw):
@@ -139,7 +170,7 @@ def guest_source_bytes(path, raw=None):
 def input_files():
     files = [ROOT / "apps/kali-workstation/pyproject.toml", HERE / "requirements.lock",
              HERE / "python-lock.json", HERE / "golden_lock.py", HERE / "golden_assets.py",
-             HERE / "guest_build.py", HERE / "firstboot.sh.in",
+             HERE / "guest_build.py", HERE / "apt_downloads.py", HERE / "conda_trace.py", HERE / "firstboot.sh.in",
              ROOT / "infra/workstation/systemd/gpt-trace-workstation-agent.service",
              ROOT / "infra/workstation/systemd/gpt-trace-golden-build.service"]
     source = ROOT / "apps/kali-workstation/src/kali_workstation"
@@ -157,15 +188,31 @@ def input_files():
 
 
 def guest_contract():
+    operations = _acquisition_controls()
     return {"schema": 2, "source": SOURCE + ARCHIVE, "source_sha256": ARCHIVE_SHA256,
             "source_architecture": SOURCE_ARCHITECTURE,
             "virtual_disk_gib": VIRTUAL_DISK_GIB, "root_min_gib": ROOT_MIN_GIB,
-            "apt_suite": APT_SUITE, "packages": list(GUEST_PACKAGES)}
+            "apt_suite": APT_SUITE, "packages": list(GUEST_PACKAGES),
+            "download": _golden_download_policy(),
+            "apt_network_retries": operations["network_attempts"],
+            "progress_interval_seconds": operations["progress_interval_seconds"],
+            "cleanup_timeout_seconds": operations["broker_read_timeout_seconds"]}
+
+
+def _acquisition_controls():
+    source = versioned_file(ROOT / "config/preparation.toml")
+    return tomllib.loads(source.read_text())["acquisition"]
+
+
+def _golden_download_policy():
+    return download_policy(_acquisition_controls())
 
 
 def firstboot_script(template=None):
     text = (HERE / "firstboot.sh.in").read_text() if template is None else template
-    for token, value in {"@CACHE_MOUNT@": str(CACHE_MOUNT), "@CACHE_TAG@": CACHE_TAG}.items():
+    values = {"@CACHE_MOUNT@": str(CACHE_MOUNT), "@CACHE_TAG@": CACHE_TAG,
+              "@OPERATION_TIMEOUT@": str(operation_timeout(_acquisition_controls()))}
+    for token, value in values.items():
         if token not in text or not re.fullmatch(r"[A-Za-z0-9_./-]+", value):
             raise ValueError("invalid firstboot template token/value")
         text = text.replace(token, value)
@@ -205,7 +252,7 @@ def preflight():
     value = golden_lock.check(ROOT)
     pins = {row["name"] for row in value["packages"]}
     imports = set()
-    for name in ("guest_build.py", "golden_assets.py", "golden_lock.py"):
+    for name in ("guest_build.py", "golden_assets.py", "golden_lock.py", "apt_downloads.py"):
         path = HERE / name
         tree = ast.parse(path.read_bytes(), str(path))
         compile(tree, str(path), "exec")
@@ -227,7 +274,7 @@ def preflight():
         raise ValueError("browser version must be derived once from the installed wrapper")
     shell = firstboot_script()
     subprocess.run(["bash", "-n"], input=shell, text=True, check=True,
-                   timeout=PROVISION_TIMEOUT_SECONDS)
+                   timeout=operation_timeout(_acquisition_controls()))
     if "<<" in shell:
         raise ValueError("nested generated Python/heredocs are forbidden in firstboot")
     if not 0 < ROOT_MIN_GIB < VIRTUAL_DISK_GIB:
@@ -251,7 +298,7 @@ def _safe_parent():
             raise ValueError("unsafe golden storage root")
     def field(name):
         return subprocess.check_output(["findmnt", "-n", "-o", name, "-T", str(DEST.parent)],
-                                       text=True, timeout=PROVISION_TIMEOUT_SECONDS).strip()
+                                       text=True, timeout=operation_timeout(_acquisition_controls())).strip()
     if (Path(field("TARGET")) != DEST.parent or not field("SOURCE").startswith("/dev/")
             or field("FSTYPE") not in {"ext4", "xfs"} or "rw" not in field("OPTIONS").split(",")):
         raise ValueError("golden storage is not the configured dedicated writable ext4/xfs mount")
@@ -267,14 +314,15 @@ def require_host_build_runtime():
 
 
 def repo_commit():
+    timeout = operation_timeout(_acquisition_controls())
     value = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT,
-                                    text=True, timeout=PROVISION_TIMEOUT_SECONDS).strip()
+                                    text=True, timeout=timeout).strip()
     if re.fullmatch(r"[0-9a-f]{40}", value) is None:
         raise ValueError("repository commit identity is invalid")
     for path in (*input_files(), HERE / "build.py", HERE / "host_cache.py", HERE / "python-metadata.json",
                  HERE / "host-controller-input.json", ROOT / "config/preparation.toml"):
         recorded = subprocess.check_output(["git", "show", value + ":" + path.relative_to(ROOT).as_posix()],
-                                           cwd=ROOT, timeout=PROVISION_TIMEOUT_SECONDS)
+                                           cwd=ROOT, timeout=timeout)
         if recorded != path.read_bytes():
             raise ValueError("commit guest inputs before golden construction: " + str(path))
     return value
@@ -287,14 +335,14 @@ def cached_archive():
         CACHE_DIR.chmod(0o700)
     else:
         mkdir(CACHE_DIR)
-    return download(SOURCE + ARCHIVE, CACHE_ARCHIVE, ARCHIVE_SHA256,
+    return download(SOURCE + ARCHIVE, CACHE_ARCHIVE, ARCHIVE_SHA256, policy=_golden_download_policy(),
                     pass_fds=() if BUILD_LOCK is None else (BUILD_LOCK,))
 
 
 def image_info(image):
     safe(image)
     info = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(image)],
-                                              timeout=PROVISION_TIMEOUT_SECONDS))
+                                              timeout=operation_timeout(_acquisition_controls())))
     data = info.get("format-specific", {}).get("data", {})
     if (info.get("format") != "qcow2" or info.get("backing-filename")
             or info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3
@@ -461,12 +509,15 @@ def prepare_offline(image, temp, state=None):
         # Inject only these private, fingerprint-verified snapshots. Subsequent
         # edits to a development checkout cannot change the bytes being built.
         unit_dir = work
-        run("virt-customize", "--no-network", "-a", image,
-            "--mkdir", "/opt/gpt-trace", "--copy-in", str(bundle) + ":/opt/gpt-trace",
-            "--copy-in", str(script) + ":/usr/local/sbin", "--copy-in", str(identity) + ":/etc",
-            "--copy-in", str(unit_dir / "gpt-trace-workstation-agent.service") + ":/etc/systemd/system",
-            "--copy-in", str(unit_dir / "gpt-trace-golden-build.service") + ":/etc/systemd/system",
-            "--run-command", "systemctl enable gpt-trace-golden-build.service")
+        customize = ("virt-customize", "--no-network", "-a", image)
+        limit = operation_timeout(_acquisition_controls())
+        run(*customize, "--mkdir", "/opt/gpt-trace", timeout=limit)
+        for source, destination in ((bundle, "/opt/gpt-trace"), (script, "/usr/local/sbin"),
+                                    (identity, "/etc"),
+                                    (unit_dir / "gpt-trace-workstation-agent.service", "/etc/systemd/system"),
+                                    (unit_dir / "gpt-trace-golden-build.service", "/etc/systemd/system")):
+            run(*customize, "--copy-in", str(source) + ":" + destination, timeout=limit)
+        run(*customize, "--run-command", "systemctl enable gpt-trace-golden-build.service", timeout=limit)
         for path in sorted(bundle.rglob("*")):
             if path.is_file() and guest_read(image, "/opt/gpt-trace/bundle/" + path.relative_to(bundle).as_posix()) != path.read_bytes():
                 raise ValueError("offline bundle injection byte verification failed")
@@ -481,13 +532,83 @@ def provision_in_real_guest(image):
     safe(CACHE_DIR, directory=True)
     if any(ch in str(path) for path in (image, CACHE_DIR) for ch in (",", "\n", "\0")):
         raise ValueError("ambiguous QEMU storage path")
-    run("qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
-        "-m", str(_BUILD_CONTROLS["golden_memory_mb"]), "-smp", str(_BUILD_CONTROLS["golden_vcpus"]),
-        "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap",
-        "-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0",
-        "-device", "virtio-rng-pci", "-fsdev", f"local,id=goldencache,path={CACHE_DIR},security_model=none",
-        "-device", f"virtio-9p-pci,fsdev=goldencache,mount_tag={CACHE_TAG}",
-        "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot", timeout=PROVISION_TIMEOUT_SECONDS)
+    descriptor, serial_path = tempfile.mkstemp(prefix="guest-serial-", suffix=".log", dir=image.parent)
+    with os.fdopen(descriptor, "rb") as serial:
+        command = (
+            "qemu-system-x86_64", "-machine", "accel=kvm", "-cpu", "host",
+            "-m", str(_BUILD_CONTROLS["golden_memory_mb"]), "-smp", str(_BUILD_CONTROLS["golden_vcpus"]),
+            "-drive", f"file={image},format=qcow2,if=virtio,cache=writeback,discard=unmap",
+            "-netdev", "user,id=net0,ipv6=off", "-device", "virtio-net-pci,netdev=net0",
+            "-device", "virtio-rng-pci", "-fsdev", f"local,id=goldencache,path={CACHE_DIR},security_model=none",
+            "-device", f"virtio-9p-pci,fsdev=goldencache,mount_tag={CACHE_TAG}",
+            "-display", "none", "-serial", "file:" + serial_path, "-monitor", "none", "-no-reboot")
+        print("+ " + " ".join(command), flush=True)
+        controls = _acquisition_controls()
+        limit = operation_timeout(controls)
+        interval = controls["progress_interval_seconds"]
+        cleanup = controls["broker_read_timeout_seconds"]
+        if (type(interval) is not int or not 1 <= interval < limit
+                or type(cleanup) is not int or not 1 <= cleanup <= limit):
+            raise ValueError("invalid golden supervisor policy")
+        watch = _GuestProvisionWatch(limit)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=BUILD_LOG,
+                                   stderr=subprocess.STDOUT, start_new_session=True,
+                                   pass_fds=() if BUILD_LOCK is None else (BUILD_LOCK,))
+        try:
+            _wait_guest_provision(process, serial, watch, interval)
+        except BaseException:
+            if process.poll() is None:
+                _stop_image_process(process, cleanup)
+            raise
+
+
+class _GuestProvisionWatch(OperationWatch):
+    def __init__(self, limit, *, prefix=b"GPTTRACE_GOLDEN ", description="golden guest", allow_pause=False):
+        super().__init__(limit, prefix=prefix, description=description, allow_pause=allow_pause)
+
+
+
+def _wait_guest_provision(process, serial, watch, interval):
+    while True:
+        remaining = watch.check()
+        status = process.poll()
+        data = serial.read(65536)
+        if data:
+            watch.feed(data)
+            continue
+        if status is not None:
+            if status != 0:
+                raise subprocess.CalledProcessError(status, process.args)
+            watch.require_complete()
+            return
+        time.sleep(min(interval, remaining))
+
+
+
+def _copy_qcow2(source, target):
+    result = capture("qemu-img", "info", "--output=json", "-f", "qcow2", source)
+    result.check_returncode()
+    info = json.loads(result.stdout)
+    size = info.get("virtual-size")
+    features = info.get("format-specific", {}).get("data", {})
+    if (info.get("format") != "qcow2" or info.get("backing-filename")
+            or features.get("data-file") or features.get("corrupt") or features.get("dirty-flag")
+            or type(size) is not int or not 0 < size <= VIRTUAL_DISK_GIB * 1024**3 or size % 512):
+        raise ValueError("official archive has an unsupported QCOW2 layout")
+    block = _BUILD_CONTROLS["golden_qcow2_copy_mib"] * 1024**2
+    run("qemu-img", "create", "-f", "qcow2", target, str(size))
+
+    def raw_slice(path, offset, length):
+        return "json:" + json.dumps({
+            "driver": "raw", "offset": offset, "size": length,
+            "file": {"driver": "qcow2", "file": {"driver": "file", "filename": str(path.absolute())}},
+        }, separators=(",", ":"))
+
+    for offset in range(0, size, block):
+        length = min(block, size - offset)
+        source_slice, target_slice = (raw_slice(path, offset, length) for path in (source, target))
+        run("qemu-img", "convert", "-n", "--target-is-zero", source_slice, target_slice)
+        run("qemu-img", "compare", source_slice, target_slice)
 
 
 def _convert(archive, stage, state):
@@ -525,7 +646,7 @@ def _convert(archive, stage, state):
             raise ValueError("conversion partial has unexpected hardlinks")
     # Only this explicitly disposable partial can be overwritten after a crash
     # without a conversion receipt. No checkpointed/permanent image is removed.
-    run("qemu-img", "convert", "-O", "qcow2", images[0], part)
+    _copy_qcow2(images[0], part)
     run("qemu-img", "resize", "-f", "qcow2", part, str(VIRTUAL_DISK_GIB) + "G")
     image_info(part)
     with part.open("rb") as stream:

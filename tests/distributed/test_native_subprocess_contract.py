@@ -9,6 +9,7 @@ import concurrent.futures
 import hashlib
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
@@ -111,3 +112,23 @@ def test_native_build_closure_reads_metadata_not_unrelated_entrypoint_symlinks()
         metadata.symlink_to(executable)
         with pytest.raises(RuntimeError):
             pool._native_build_requirements(root)
+
+
+def test_native_elementary_timeout_leaves_no_live_process_in_its_group(tmp_path, monkeypatch):
+    runtime, _, _ = _fixture(tmp_path)
+    monkeypatch.setattr(pool, '_operation_timeout', lambda: 1)
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 0.01)
+    marker = tmp_path / 'child-pid'
+    child = (
+        'import os, signal, time\n'
+        'from pathlib import Path\n'
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        f'Path({str(marker)!r}).write_text(str(os.getpid()))\n'
+        'time.sleep(30)\n'
+    )
+    parent = f'import subprocess, sys\nsubprocess.call([sys.executable, "-c", {child!r}])'
+    with pytest.raises(subprocess.TimeoutExpired):
+        pool._native_run([sys.executable, '-c', parent], runtime)
+    stat = Path('/proc') / marker.read_text() / 'stat'
+    if stat.exists():
+        assert stat.read_text().rsplit(') ', 1)[1].split()[0] == 'Z'

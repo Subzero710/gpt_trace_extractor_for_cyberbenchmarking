@@ -5,6 +5,7 @@ attached to task/evaluator guests. A stage never owns or removes this cache.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -141,8 +143,31 @@ def inventory(folder):
     return result
 
 
-def download(url, destination, expected=None, *, pass_fds=()):
+def operation_timeout(controls):
+    seconds = controls["timeout_seconds"]
+    if type(seconds) is not int or not 1 <= seconds <= 180:
+        raise ValueError("invalid golden operation timeout")
+    return seconds
+
+
+def download_policy(controls):
+    seconds = operation_timeout(controls)
+    attempts = controls["golden_download_attempts"]
+    backoff = controls["golden_download_retry_backoff_seconds"]
+    if (type(attempts) is not int or attempts < 1
+            or not isinstance(backoff, list) or len(backoff) != attempts - 1
+            or any(type(delay) is not int or delay < 0 for delay in backoff)):
+        raise ValueError("invalid golden download attempt policy")
+    return {"timeout_seconds": seconds, "golden_download_attempts": attempts,
+            "golden_download_retry_backoff_seconds": backoff}
+
+
+def download(url, destination, expected=None, *, policy, pass_fds=(), observe=contextlib.nullcontext):
     """One explicit origin; resumable .part and atomic verified promotion."""
+    controls = download_policy(policy)
+    seconds = controls["timeout_seconds"]
+    attempts = controls["golden_download_attempts"]
+    backoff = controls["golden_download_retry_backoff_seconds"]
     destination = Path(destination)
     if destination.exists() or destination.is_symlink():
         safe(destination)
@@ -169,9 +194,18 @@ def download(url, destination, expected=None, *, pass_fds=()):
         os.replace(part, destination)
         sync(destination.parent)
         return destination
-    subprocess.run(["curl", "--fail", "--location", "--retry", "5", "--retry-all-errors",
-                    "--continue-at", "-", "--output", str(part), url], check=True, timeout=7200,
-                   pass_fds=pass_fds)
+    command = ["curl", "--fail", "--location", "--no-buffer", "--retry", "0", "--max-time", str(seconds),
+               "--continue-at", "-", "--output", str(part), url]
+    for attempt in range(attempts):
+        try:
+            with observe():
+                subprocess.run(command, check=True, timeout=seconds, pass_fds=pass_fds)
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoff[attempt])
+        else:
+            break
     if expected is not None and digest(part) != expected:
         raise ValueError("download hash mismatch; partial preserved: " + str(part))
     with safe(part).open("rb") as stream:
@@ -199,7 +233,7 @@ def browser_identity():
             "version": PLATFORM_CHROMIUM_VERSIONS[tag]}
 
 
-def browser_archive(cache, identity, *, fetch=download):
+def browser_archive(cache, identity, *, policy, fetch=download):
     from cloakbrowser import config, download as upstream
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     namespace = mkdir(mkdir(cache / "browser") / key)
@@ -211,8 +245,8 @@ def browser_archive(cache, identity, *, fetch=download):
         atomic_json(identity_path, identity, 0o444)
     url = config.get_download_url(identity["version"])
     origin = url.rsplit("/", 1)[0]
-    manifest = fetch(origin + "/SHA256SUMS", namespace / "SHA256SUMS")
-    signature = fetch(origin + "/SHA256SUMS.sig", namespace / "SHA256SUMS.sig")
+    manifest = fetch(origin + "/SHA256SUMS", namespace / "SHA256SUMS", policy=policy)
+    signature = fetch(origin + "/SHA256SUMS.sig", namespace / "SHA256SUMS.sig", policy=policy)
     raw = safe(manifest).read_bytes()
     try:
         upstream._verify_signature(raw, safe(signature).read_bytes())
@@ -227,7 +261,7 @@ def browser_archive(cache, identity, *, fetch=download):
     if len(matches) != 1 or SHA.fullmatch(matches[0][0]) is None:
         raise ValueError("signed browser manifest has no unique archive hash")
     sha = matches[0][0]
-    archive = fetch(url, namespace / (sha + ".tar.gz"), sha)
+    archive = fetch(url, namespace / (sha + ".tar.gz"), sha, policy=policy)
     # Even an already-cached file is verified under the signed upstream hash.
     upstream._verify_checksum(safe(archive), sha)
     return archive, {**identity, "archive_sha256": sha,

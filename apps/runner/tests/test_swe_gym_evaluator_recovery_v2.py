@@ -55,6 +55,15 @@ def grading(tmp_path):
             return {"identity":{**self._identity(task,environments,fingerprint,attempt),"purpose":"evaluator","evaluator_retry":retry},
                 "domain":"evaluator-"+retry,"overlay":"/isolated/"+retry,"template_id":item["template_id"],
                 "template_generation":"b"*64,"backing_sha256":"c"*64,"backing_path":"/immutable/repo.qcow2","network":None}
+        async def _guest_call(self, ident, method, args, prefix):
+            assert prefix == "evaluator_" and method == "exec_command"
+            return await self._request("evaluator_rpc", {**ident, "method": method, "args": args})
+        async def _runtime(self, ident, operation, args, prefix=""):
+            if operation == "materialize_template_artifact":
+                assert prefix == "evaluator_"
+                return await self._request("evaluator_materialize_template_artifact", {**ident, **args})
+            assert operation in {"destroy_evaluator", "abandon_evaluators", "abandon_attempt"} and not args
+            return await self._request(operation, ident)
         async def _request(self, action, payload):
             self.actions.append(action)
             if action == "destroy_evaluator":
@@ -75,14 +84,20 @@ def grading(tmp_path):
             compile(program,"isolated-recovery-test","exec")
             assert "GOLD_NEVER_DELIVERED" not in program
             self.programs.append((payload["evaluator_retry"],program))
-            if "proof = prepare_evaluator" in program:
+            if "proof = finish_evaluator_setup" in program:
                 assert "HIDDEN_EVALUATOR_ONLY" not in program
                 return {"exit_code":0,"stdout":json.dumps({"base_commit":item["base_commit"],"env_hash":item["env_hash"],"source_sha256":"a"*64})}
-            assert "HIDDEN_EVALUATOR_ONLY" in program
-            return {"exit_code":0,"stdout":json.dumps({"test_exit_status":0 if self.verdict == "pass" else 1})}
+            if "proof = run_native_tests" in program:
+                assert "HIDDEN_EVALUATOR_ONLY" not in program
+                return {"exit_code":0,"stdout":json.dumps({"test_exit_status":0 if self.verdict == "pass" else 1})}
+            if "\napply_grading_inputs(" in program:
+                assert "HIDDEN_EVALUATOR_ONLY" in program
+            else:
+                assert "HIDDEN_EVALUATOR_ONLY" not in program
+            return {"exit_code":0,"stdout":""}
         async def _import(self, ident, data, path, prefix):
             assert prefix == "evaluator_" and data == patch
-            assert "proof = prepare_evaluator" in self.programs[-1][1]
+            assert "proof = finish_evaluator_setup" in self.programs[-1][1]
             self.imported.append((ident["evaluator_retry"], data))
         async def _export(self, ident, path, destination, prefix):
             assert prefix == "evaluator_"

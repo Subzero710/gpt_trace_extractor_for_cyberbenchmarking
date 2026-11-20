@@ -8,15 +8,16 @@ def _versioned_host_subprocess_timeout():
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned host subprocess deadline')
     with policy.open('rb') as stream:
-        value = tomllib.load(stream)['build']['golden_provision_timeout_hours']
-    if type(value) is not int or value < 1:
+        value = tomllib.load(stream)['acquisition']['timeout_seconds']
+    if type(value) is not int or not 1 <= value <= 180:
         raise RuntimeError('invalid versioned host subprocess deadline')
-    return value * 3600
+    return value
 
 
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -275,12 +276,20 @@ def verify_manifests(root: Path) -> None:
     run(["docker", "run", "--rm", "--entrypoint", "python", image, "-c", code])
 
 
+def _workstation_image_builder(root):
+    path = root / "infra/workstation/image/build.py"
+    spec = importlib.util.spec_from_file_location("workstation_image_builder", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def build_workstation_base_image(root: Path) -> None:
-    run([sys.executable, str(root / "infra/workstation/image/build.py"), "--local"])
+    _workstation_image_builder(root).build()
 
 
 def verify_workstation_image(root: Path) -> None:
-    run([sys.executable, str(root / "infra/workstation/image/build.py"), "--verify"])
+    _workstation_image_builder(root).verify()
 
 
 def build_control_plane(root: Path) -> None:

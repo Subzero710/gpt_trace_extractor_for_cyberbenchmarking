@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -25,6 +26,9 @@ class Agent:
             self.identity.update(purpose="evaluator", evaluator_retry=identity["evaluator_retry"])
         self.secret = identity["secret"]
         limits = identity["limits"]
+        self.frame_timeout = limits["guest_agent_timeout_seconds"]
+        if type(self.frame_timeout) is not int or not 1 <= self.frame_timeout <= 180:
+            raise ValueError("invalid guest transport deadline")
         shell.MAX_OUTPUT = limits["max_output_bytes"]
         files.MAX_SEED = limits["max_seed_bytes"]
         files.MAX_FILE = limits["max_transfer_bytes"]
@@ -33,6 +37,38 @@ class Agent:
         self.seed = SeedSession()
         self.import_session = ImportSession()
         self.template_import = ImportSession(trusted_template=True)
+        self.execution = None
+
+    async def _execute(self, args):
+        try:
+            return {"state": "complete", "result": await exec_command(args, cleanup_timeout=self.frame_timeout)}
+        except Exception as exc:
+            return {"state": "failed", "error": str(exc)[:1000]}
+
+    def _execution(self, method, args):
+        operation_id = args.get("operation_id")
+        if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
+            raise ValueError("invalid guest execution operation ID")
+        if method == "_exec_begin":
+            if set(args) != {"operation_id", "args"} or not isinstance(args["args"], dict):
+                raise ValueError("invalid guest execution request")
+            payload = json.dumps(args["args"], sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if self.execution is not None:
+                previous, original, task = self.execution
+                if previous == operation_id:
+                    if original != payload:
+                        raise ValueError("guest execution arguments changed")
+                    return {"operation_id": operation_id, "state": "accepted"}
+                if not task.done():
+                    raise ValueError("another guest execution is active")
+            self.execution = (operation_id, payload, asyncio.create_task(self._execute(args["args"])))
+            return {"operation_id": operation_id, "state": "accepted"}
+        if set(args) != {"operation_id"}:
+            raise ValueError("invalid guest execution status request")
+        if self.execution is None or self.execution[0] != operation_id:
+            return {"operation_id": operation_id, "state": "unknown"}
+        task = self.execution[2]
+        return {"operation_id": operation_id, **(task.result() if task.done() else {"state": "pending"})}
 
     async def call(self, payload: dict) -> dict:
         if not isinstance(payload, dict) or payload.get("identity") != self.identity or not hmac.compare_digest(str(payload.get("secret", "")), self.secret):
@@ -42,7 +78,7 @@ class Agent:
         if not isinstance(args, dict): raise ValueError("RPC arguments must be an object")
         if method == "health": return {"identity": self.identity, "guest_agent_version": "3.0.0", "trusted_artifacts_version": 1}
         if self.identity.get("purpose") == "evaluator" and method not in {
-            "exec_command", "artifact_stat", "artifact_read_chunk", "artifact_import_begin",
+            "_exec_begin", "_exec_status", "artifact_stat", "artifact_read_chunk", "artifact_import_begin",
             "artifact_import_chunk", "artifact_import_end", "artifact_import_abort",
             "template_import_begin", "template_import_chunk", "template_import_end", "template_import_abort",
         }:
@@ -57,7 +93,7 @@ class Agent:
         if method == "seed_chunk": return self.seed.chunk(args)
         if method == "seed_end": return self.seed.finish(args)
         if method == "seed_abort": self.seed.abort(); return {"aborted": True}
-        if method == "exec_command": return await exec_command(args)
+        if method in {"_exec_begin", "_exec_status"}: return self._execution(method, args)
         if method == "create_terminal": return self.terminals.create(args)
         if method == "send_terminal_input": return await self.terminals.send(args)
         if method == "read_terminal_output": return await self.terminals.read(args)
@@ -81,17 +117,22 @@ class Agent:
 async def handle(connection: socket.socket, agent: Agent):
     loop = asyncio.get_running_loop()
     try:
-        header = await asyncio.wait_for(read_exact(loop, connection, 4), 30)
-        length = struct.unpack("!I", header)[0]
-        if length > MAX_FRAME: raise ValueError("request exceeds limit")
-        payload = json.loads(await asyncio.wait_for(read_exact(loop, connection, length), 30))
-        try: result = {"ok": True, "result": await asyncio.wait_for(agent.call(payload), 1810)}
-        except (ValueError, OSError, RuntimeError, KeyError, asyncio.TimeoutError) as exc:
-            result = {"ok": False, "error": str(exc)[:1000]}
-        data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
-        if len(data) > MAX_FRAME:
-            data = json.dumps({"ok": False, "error": "response exceeds limit"}).encode()
-        await loop.sock_sendall(connection, struct.pack("!I", len(data)) + data)
+        async with asyncio.timeout(agent.frame_timeout):
+            header = await read_exact(loop, connection, 4)
+            length = struct.unpack("!I", header)[0]
+            if length > MAX_FRAME:
+                raise ValueError("request exceeds limit")
+            payload = json.loads(await read_exact(loop, connection, length))
+            try:
+                result = {"ok": True, "result": await agent.call(payload)}
+            except (ValueError, OSError, RuntimeError, KeyError) as exc:
+                result = {"ok": False, "error": str(exc)[:1000]}
+            data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(data) > MAX_FRAME:
+                data = json.dumps({"ok": False, "error": "response exceeds limit"}).encode()
+            await loop.sock_sendall(connection, struct.pack("!I", len(data)) + data)
+    except (OSError, ValueError):
+        pass
     finally:
         connection.close()
 
@@ -131,6 +172,10 @@ async def main_async():
             connection.setblocking(False)
             asyncio.create_task(handle(connection, agent))
     finally:
+        if agent.execution is not None:
+            execution = agent.execution[2]
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
         agent.terminals.shutdown()
         await agent.browser.close()
         server.close()

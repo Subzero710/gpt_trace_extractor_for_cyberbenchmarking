@@ -171,7 +171,7 @@ def test_real_silent_buffered_pep517_hook_stays_observable(tmp_path, monkeypatch
     command = [sys.executable, '-m', 'pip', 'install', '--use-pep517',
                '--dry-run', '--ignore-installed', '--no-deps', '--no-index', str(project)]
     runtime['_pip_byte_progress'] = pool._NativePipByteProgress(1)
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (15, 3))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 3)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:

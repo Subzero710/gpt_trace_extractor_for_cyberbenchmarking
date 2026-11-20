@@ -611,6 +611,8 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate = pool.Pool(stage)
             golden_package_list = b'testpkg 1\n'
             (stage / 'golden-packages.txt').write_bytes(golden_package_list)
+            (stage / 'config').mkdir()
+            (stage / 'config/preparation.toml').write_bytes((ROOT / 'config/preparation.toml').read_bytes())
             golden_identity = {'apt_package_manifest_sha256': hashlib.sha256(golden_package_list).hexdigest()}
             sha = hashlib.sha256(b'key-bytes').hexdigest()
             target = candidate.objects / sha[:2] / sha
@@ -621,14 +623,21 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 self.assertEqual(identity, 'signing-key')
                 return sha
             def commands(args, *, cwd=None, capture=False, env=None):
-                if args[0] == 'gpg': return 'fpr:::::::::' + pool.KALI_SIGNING_FPR + ':\n'
+                self.assertEqual(args, ['gpg', '--show-keys', '--with-colons', target])
+                return 'fpr:::::::::' + pool.KALI_SIGNING_FPR + ':\n'
+            def apt_commands(args):
+                self.assertEqual(args[0], 'apt-get')
                 if 'install' in args:
+                    self.assertIn('--download-only', args)
                     archives = stage / 'apt/archives'
                     (archives/'testpkg_1_all.deb').write_bytes(b'fixture .deb')
-                return ''
+                else:
+                    self.assertEqual(args[-1], 'update')
+                    self.assertIn('APT::Update::Error-Mode=any', args)
             def dpkg(args, **kwargs): return 'Package: testpkg\nVersion: 1\nArchitecture: all\n'
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
+                 patch.object(pool, '_run_apt_downloads', side_effect=apt_commands), \
                  patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(['gpg'], 0)), \
                  patch.object(pool.subprocess, 'check_output', side_effect=dpkg), \
                  patch.object(pool, '_target_debian_architecture', return_value='amd64'), \
@@ -1788,7 +1797,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
                                         user_agent='test', expected_host='pypi.org')
         self.assertEqual(response, b'{"name":"dns-retry-fixture"}')
         self.assertEqual(reader.call_count, 2)
-        sleeper.assert_called_once_with(pool.DOWNLOAD_RETRY_BACKOFF[0])
+        sleeper.assert_called_once_with(pool._network_retries()[1][0])
 
     def test_permanent_dns_error_fails_without_retry_direct_and_wrapped(self):
         url = 'https://pypi.org/pypi/dns-noname-fixture/json'
@@ -1818,7 +1827,7 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
             self.assertEqual(pool._read_https(url, timeout=90, limit=1024,
                              user_agent='test', expected_host='pypi.org'), b'{}')
         self.assertEqual(reader.call_count, 2)
-        sleeper.assert_called_once_with(pool.DOWNLOAD_RETRY_BACKOFF[0])
+        sleeper.assert_called_once_with(pool._network_retries()[1][0])
 
     def test_transient_dns_failure_stops_at_configured_retry_budget(self):
         url = 'https://pypi.org/pypi/dns-budget-fixture/json'
@@ -1829,9 +1838,9 @@ class TestTemporaryDnsFailureRetries(unittest.TestCase):
              self.assertRaises(pool.socket.gaierror):
             pool._read_https(url, timeout=90, limit=1024,
                              user_agent='test', expected_host='pypi.org')
-        self.assertEqual(reader.call_count, pool.DOWNLOAD_ATTEMPTS)
+        self.assertEqual(reader.call_count, pool._network_retries()[0])
         self.assertEqual(sleeper.call_args_list,
-                         [((delay,), {}) for delay in pool.DOWNLOAD_RETRY_BACKOFF])
+                         [((delay,), {}) for delay in pool._network_retries()[1]])
 
 
 class TestNetworkRetries(unittest.TestCase):
@@ -1952,14 +1961,82 @@ class TestNetworkRetries(unittest.TestCase):
         sleeper.assert_not_called()
 
     def test_network_retry_budget_is_bounded(self):
-        url = 'https://repo.example.test/pkg.conda'
-        with tempfile.TemporaryDirectory() as tmp, \
-             patch.object(pool, '_open_https', side_effect=[TimeoutError('x')] * 5) as opener, \
-             patch.object(pool.time, 'sleep') as sleeper, \
+        attempts, backoffs = pool._network_retries()
+        limit = pool._operation_timeout()
+        clock = 0
+        budgets = []
+
+        def advance(seconds):
+            nonlocal clock
+            clock += seconds
+
+        def transfer():
+            budgets.append(pool._network_remaining())
+            advance(limit)
+            pool._network_remaining()
+
+        with patch.object(pool.time, 'monotonic', side_effect=lambda: clock), \
+             patch.object(pool.time, 'sleep', side_effect=advance), \
              self.assertRaises(TimeoutError):
-            pool.fetch(url, Path(tmp) / 'artifact')
-        self.assertEqual(opener.call_count, 5)
-        self.assertEqual(sleeper.call_count, 4)
+            pool._network_retry('fixture', transfer)
+        self.assertEqual(budgets, [limit] * attempts)
+        self.assertEqual(clock, limit * attempts + sum(backoffs))
+
+    def test_network_slot_wait_precedes_the_attempt_budget(self):
+        limit = pool._operation_timeout()
+        clock = 0
+
+        @contextlib.contextmanager
+        def slot():
+            nonlocal clock
+            clock += limit + 1
+            yield
+
+        with patch.object(pool, '_network_slots', side_effect=slot), \
+             patch.object(pool.time, 'monotonic', side_effect=lambda: clock):
+            self.assertEqual(pool._network_retry('fixture', pool._network_remaining), limit)
+
+    def test_monotonic_attempt_interrupts_a_continuously_trickling_body(self):
+        disconnected = threading.Event()
+        reader, writer = pool.socket.socketpair()
+        with reader, writer:
+            def trickle():
+                try:
+                    writer.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n')
+                    while not disconnected.wait(0.01):
+                        writer.sendall(b'x')
+                except BrokenPipeError:
+                    disconnected.set()
+
+            sender = threading.Thread(target=trickle)
+            sender.start()
+            try:
+                reader.settimeout(3)
+                with patch.object(pool, '_operation_timeout', return_value=0.2), \
+                     self.assertRaisesRegex(TimeoutError, 'attempt exceeded'):
+                    with pool._network_deadline() as attempt:
+                        attempt.watch(reader)
+                        with pool.http.client.HTTPResponse(reader) as response:
+                            response.begin()
+                            pool._read_metadata_response(response, 1024)
+                self.assertTrue(disconnected.wait(1))
+            finally:
+                disconnected.set()
+                sender.join()
+
+    def test_dns_timeout_reaps_the_resolver_process(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorded_pid = Path(folder) / 'resolver-pid'
+            program = ("import os,time\nfrom pathlib import Path\n"
+                       f"Path({str(recorded_pid)!r}).write_text(str(os.getpid()))\n"
+                       "time.sleep(30)")
+            with patch.object(pool, '_RESOLVE_HTTPS_ADDRESS', program), \
+                 patch.object(pool, '_operation_timeout', return_value=0.5), \
+                 self.assertRaises(TimeoutError):
+                with pool._network_deadline():
+                    pool._network_connect(('fixture.invalid', 443), 30, None)
+            pid = int(recorded_pid.read_text())
+            self.assertFalse(Path('/proc', str(pid)).exists())
 
     def test_checksum_mismatch_retries_from_zero_and_discards_bad_bytes(self):
         url = 'https://repo.example.test/pkg.conda'
@@ -1983,15 +2060,15 @@ class TestNetworkRetries(unittest.TestCase):
     def test_checksum_mismatch_retry_budget_is_bounded(self):
         url = 'https://repo.example.test/pkg.conda'
         expected = hashlib.sha256(b'good bytes').hexdigest()
-        responses = [self.Response(url, [b'bad bytes', b'']) for _ in range(pool.DOWNLOAD_ATTEMPTS)]
+        responses = [self.Response(url, [b'bad bytes', b'']) for _ in range(pool._network_retries()[0])]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'artifact'
             with patch.object(pool, '_open_https', side_effect=responses) as opener, \
                  patch.object(pool.time, 'sleep') as sleeper, \
                  self.assertRaisesRegex(pool.DownloadIntegrityError, 'sha256 mismatch'):
                 pool.fetch(url, path, sha=expected)
-            self.assertEqual(opener.call_count, pool.DOWNLOAD_ATTEMPTS)
-            self.assertEqual(sleeper.call_count, pool.DOWNLOAD_ATTEMPTS - 1)
+            self.assertEqual(opener.call_count, pool._network_retries()[0])
+            self.assertEqual(sleeper.call_count, pool._network_retries()[0] - 1)
             self.assertFalse(path.exists())
 
 
@@ -2450,12 +2527,12 @@ setup(version=dynamic_version(), **setup_args)
         self.assertNotIn('os.environ.copy()',physical)
         self.assertNotIn('dict(os.environ',physical)
         self.assertIn('PIP_CONFIG_FILE',physical)
-        self.assertIn('child.wait(timeout=cadence)',physical)
-        self.assertIn("acquisition['progress_stall_timeout_seconds']",physical)
+        self.assertIn('child.wait(timeout=cleanup_timeout)',physical)
+        self.assertIn("acquisition['unregistered_work_timeout_seconds']",physical)
         self.assertNotIn('acquisition_job_timeout_seconds',physical)
         controls = tomllib.loads((ROOT/'config/preparation.toml').read_text())
         self.assertNotIn('job_timeout_hours', controls['acquisition'])
-        self.assertGreater(controls['acquisition']['progress_stall_timeout_seconds'],
+        self.assertGreaterEqual(controls['acquisition']['unregistered_work_timeout_seconds'],
                            controls['acquisition']['timeout_seconds'])
         self.assertIn('os.killpg(child.pid, signal.SIGKILL)',physical)
 

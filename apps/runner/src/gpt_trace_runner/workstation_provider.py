@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import base64
+import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 
-from gpt_trace_transport.async_client import make_client, distributed
-from gpt_trace_transport.wire import token as broker_token
+from gpt_trace_transport.async_client import await_runtime, make_client, distributed
+from gpt_trace_transport.wire import MAX_BODY, token as broker_token
 
 from .exceptions import AppInfrastructureError
 from .models import BenchmarkTask
 from .workstation_template import validate_template_id
 
 APP_ID = "kali-workstation"
+
+
+class _BrokerCommunicationError(AppInfrastructureError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -58,10 +65,18 @@ class WorkstationProvider(Protocol):
 
 
 class LibvirtWorkstationProvider:
-    def __init__(self, socket: Path, token_file: Path, *, client: httpx.AsyncClient | None = None,
+    def __init__(self, socket: Path, token_file: Path, *, creation_request_timeout: int,
+                 creation_poll_interval: int, guest_command_timeout: int, client: httpx.AsyncClient | None = None,
                  remote: bool | None = None):
+        if (type(creation_request_timeout) is not int or not 1 <= creation_request_timeout <= 180
+                or type(creation_poll_interval) is not int or not 1 <= creation_poll_interval <= 180
+                or type(guest_command_timeout) is not int or not 1 <= guest_command_timeout <= 180):
+            raise ValueError("invalid versioned broker creation transport policy")
         self.socket = socket
         self.token_file = token_file
+        self.creation_request_timeout = creation_request_timeout
+        self.creation_poll_interval = creation_poll_interval
+        self.guest_command_timeout = guest_command_timeout
         self._owns_client = client is None
         self.remote = distributed() if remote is None else remote
         self.client = client or make_client(socket)
@@ -80,10 +95,12 @@ class LibvirtWorkstationProvider:
     async def _request(self, name: str, identity: dict) -> dict:
         try:
             token = broker_token(self.token_file, strict=self.remote)
-            response = await self.client.post(f"/v1/{name}", json=identity,
-                headers={"authorization": f"Bearer {token}"}, timeout=1900)
+            async with asyncio.timeout(self.creation_request_timeout):
+                response = await self._exchange(name, identity, token, self.creation_request_timeout)
         except (httpx.HTTPError, OSError, RuntimeError) as exc:
-            raise AppInfrastructureError(f"broker {name} communication failed; VM outcome unconfirmed; reconcile explicitly") from exc
+            raise _BrokerCommunicationError(f"broker {name} communication failed; VM outcome unconfirmed") from exc
+        if response.status_code >= 500:
+            raise _BrokerCommunicationError(f"broker {name} HTTP {response.status_code}; VM outcome unconfirmed")
         if response.status_code != 200:
             raise AppInfrastructureError(f"broker {name}: HTTP {response.status_code}: {response.text[:1000]}")
         try:
@@ -93,23 +110,54 @@ class LibvirtWorkstationProvider:
         if not isinstance(data, dict): raise AppInfrastructureError("invalid broker response")
         return data
 
-    async def _await_async_create(self, operation: str, payload: dict) -> dict:
-        """Keep long VM startup off the Cloudflare HTTP request lifetime."""
-        import asyncio
-        import uuid
+    async def _exchange(self, name, identity, token, timeout):
+        body = json.dumps(identity, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+        if len(body) > MAX_BODY:
+            raise AppInfrastructureError("broker request exceeds frame limit")
+        headers = {"authorization": f"Bearer {token}", "content-type": "application/json",
+                   "accept-encoding": "identity"}
+        async with self.client.stream("POST", f"/v1/{name}", content=body, headers=headers, timeout=timeout) as reply:
+            length = reply.headers.get("content-length")
+            if (reply.headers.get("content-encoding", "identity") != "identity" or
+                    (length is not None and (not length.isdigit() or int(length) > MAX_BODY))):
+                raise _BrokerCommunicationError(f"broker {name} returned an invalid frame")
+            received = bytearray()
+            async for chunk in reply.aiter_bytes():
+                if len(received) + len(chunk) > MAX_BODY:
+                    raise _BrokerCommunicationError(f"broker {name} response exceeds frame limit")
+                received.extend(chunk)
+            if length is not None and len(received) != int(length):
+                raise _BrokerCommunicationError(f"broker {name} response is truncated")
+            return httpx.Response(reply.status_code, content=bytes(received))
+
+    async def _await_async_create(self, operation: str, payload: dict, *, pending_id: str | None = None) -> dict:
         ident = {key: payload[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
-        operation_id = uuid.uuid4().hex
-        args = {**payload, "operation": operation, "operation_id": operation_id}
-        acknowledgement = await self._request("begin_async", args)
-        if (acknowledgement.get("state") != "accepted" or
-                acknowledgement.get("identity") != ident or acknowledgement.get("operation") != operation):
-            raise AppInfrastructureError("invalid remote creation acknowledgement; outcome unconfirmed")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 1900
-        while loop.time() < deadline:
-            status = await self._request("poll_async", {**ident, "operation": operation, "operation_id": operation_id})
-            if status.get("identity") != ident or status.get("operation") != operation:
+        operation_id = uuid.uuid4().hex if pending_id is None else pending_id
+        query = {**ident, "operation": operation, "operation_id": operation_id}
+
+        def verify_identity(response):
+            if (response.get("identity") != ident or response.get("operation") != operation
+                    or response.get("operation_id") != operation_id):
                 raise AppInfrastructureError("broker asynchronous operation identity mismatch")
+
+        acknowledgement_error = None
+        if pending_id is None:
+            try:
+                acknowledgement = await self._request("begin_async", {**payload, **query})
+            except _BrokerCommunicationError as exc:
+                # A lost acknowledgement leaves the exact mutation eligible
+                # for read-only observation by its operation ID.
+                acknowledgement_error = exc
+            else:
+                verify_identity(acknowledgement)
+                if acknowledgement.get("state") != "accepted":
+                    raise AppInfrastructureError(f"VM creation {operation_id} acknowledgement is invalid")
+        while True:
+            try:
+                status = await self._request("poll_async", query)
+            except _BrokerCommunicationError as exc:
+                raise AppInfrastructureError(f"VM creation {operation_id} status unavailable; reconcile explicitly") from exc
+            verify_identity(status)
             state = status.get("state")
             if state == "complete":
                 result = status.get("result")
@@ -118,10 +166,14 @@ class LibvirtWorkstationProvider:
                 return result
             if state == "failed":
                 raise AppInfrastructureError(f"broker {operation} failed: {status.get('detail', '')[:600]}")
+            if state == "unknown" and operation == "create_attempt":
+                reconciliation = await self._request("reconcile_attempt", ident)
+                if reconciliation.get("identity") == ident and reconciliation.get("state") == "present":
+                    return reconciliation["runtime"]
             if state != "pending":
-                raise AppInfrastructureError("broker creation outcome unknown; reconcile explicitly, never retry blindly")
-            await asyncio.sleep(2)
-        raise AppInfrastructureError("broker creation exceeded operation deadline; outcome unconfirmed, reconcile explicitly")
+                raise AppInfrastructureError(
+                    f"VM creation {operation_id} outcome unconfirmed; reconcile explicitly") from acknowledgement_error
+            await asyncio.sleep(self.creation_poll_interval)
 
     async def _resource(self, name, task, environments, fingerprint, attempt, control_token):
         identity = self._identity(task, environments, fingerprint, attempt)
@@ -130,17 +182,23 @@ class LibvirtWorkstationProvider:
         if name == "create_attempt" and task.workstation_template is not None:
             payload["template_id"] = validate_template_id(task.workstation_template)
             payload["logical_task_id"] = task.template_task_id
-        if name == "create_attempt" and self.remote:
+        if name == "create_attempt":
             reconciliation = await self._request("reconcile_attempt", identity)
-            if reconciliation.get("identity") != identity or reconciliation.get("state") not in {"present", "absent"}:
+            state = reconciliation.get("state")
+            if reconciliation.get("identity") != identity or state not in {"present", "absent", "pending"}:
                 raise AppInfrastructureError("broker reconciliation identity/outcome mismatch")
-            if reconciliation["state"] == "present":
-                details = await self._request("inspect_attempt", payload)
+            if state == "present":
+                details = reconciliation["runtime"]
+            elif state == "pending":
+                operation_id = reconciliation.get("operation_id")
+                if not isinstance(operation_id, str) or len(operation_id) != 32:
+                    raise AppInfrastructureError("broker reconciliation lacks an operation identity")
+                details = await self._await_async_create("create_attempt", payload, pending_id=operation_id)
             else:
                 details = await self._await_async_create("create_attempt", payload)
         else:
             details = await self._request(name, payload)
-        if details.get("identity") != identity or details.get("provider") != "libvirt":
+        if not isinstance(details, dict) or details.get("identity") != identity or details.get("provider") != "libvirt":
             raise AppInfrastructureError("broker attempt identity mismatch")
         if task.workstation_template is not None:
             if details.get("template_id") != task.workstation_template or any(
@@ -169,22 +227,23 @@ class LibvirtWorkstationProvider:
     async def destroy(self, task, environments, fingerprint, *, attempt):
         identity = self._identity(task, environments, fingerprint, attempt)
         if identity is not None:
-            await self._request("destroy_attempt", identity)
+            if await self._runtime(identity, "destroy_attempt", {}) != {"destroyed": True}:
+                raise AppInfrastructureError("broker destruction proof mismatch")
             if self.remote:
-                if await self._request("assert_absent", identity) != {"absent": True}:
+                if await self._runtime(identity, "assert_absent", {}) != {"absent": True}:
                     raise AppInfrastructureError("remote destruction lacks verified absence")
 
     async def assert_absent(self, task, environments, fingerprint, *, attempt):
         identity = self._identity(task, environments, fingerprint, attempt)
         if identity is not None:
-            result = await self._request("assert_absent", identity)
+            result = await self._runtime(identity, "assert_absent", {})
             if result != {"absent": True}: raise AppInfrastructureError("broker cleanup mismatch")
 
     async def preflight(self, template_ids):
         values = sorted({validate_template_id(value) for value in template_ids})
         if not values:
             return {"templates": {}}
-        result = await self._request("preflight_templates", {"template_ids": values})
+        result = await self._runtime({}, "preflight_templates", {"template_ids": values})
         if set(result.get("templates", {})) != set(values):
             raise AppInfrastructureError("template preflight selection mismatch")
         return result
@@ -193,7 +252,26 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None:
             raise AppInfrastructureError("internal guest RPC requires a workstation")
-        return await self._request("rpc", {**ident, "method": method, "args": args})
+        return await self._guest_call(ident, method, args)
+
+    def _runtime_identity(self, ident, prefix):
+        return {**ident, "purpose": "evaluator"} if prefix == "evaluator_" else ident
+
+    async def _runtime(self, ident, operation, args, prefix=""):
+        try:
+            return await await_runtime(self._request, self._runtime_identity(ident, prefix), operation, args,
+                                       poll_interval=self.creation_poll_interval,
+                                       communication_error=_BrokerCommunicationError)
+        except RuntimeError as exc:
+            raise AppInfrastructureError(str(exc)) from exc
+
+    async def _guest_call(self, ident, method, args, prefix=""):
+        if method == "exec_command":
+            limits = {"timeout_seconds": self.guest_command_timeout, **args}
+            if type(limits["timeout_seconds"]) is not int or not 1 <= limits["timeout_seconds"] <= self.guest_command_timeout:
+                raise AppInfrastructureError("guest command exceeds the versioned deadline")
+            return await self._runtime(ident, method, limits, prefix)
+        return await self._request(prefix + "rpc", {**ident, "method": method, "args": args})
 
     async def export(self, task, environments, fingerprint, *, attempt, path, destination):
         ident = self._identity(task, environments, fingerprint, attempt)
@@ -202,7 +280,7 @@ class LibvirtWorkstationProvider:
         return await self._export(ident, path, destination)
 
     async def _export(self, ident, path, destination, prefix=""):
-        info = await self._request(prefix + "artifact_export", {**ident, "args": {"path": path}})
+        info = await self._runtime(ident, "artifact_export", {"path": path}, prefix)
         size, sha = info.get("size"), info.get("sha256")
         if type(size) is not int or not 0 <= size <= 268435456 or info.get("artifact_id") != sha:
             raise AppInfrastructureError("invalid exported artifact record")
@@ -250,8 +328,8 @@ class LibvirtWorkstationProvider:
                     "content_base64": base64.b64encode(data[offset:offset+1048576]).decode()}})
             info = await self._request(prefix + "artifact_stage_end", {**ident, "args": {"upload_id": upload["upload_id"],
                 "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}})
-            result = await self._request(prefix + "artifact_import", {**ident, "args": {"artifact_id": info["artifact_id"],
-                                                                              "path": path, "overwrite": True}})
+            result = await self._runtime(ident, "artifact_import", {"artifact_id": info["artifact_id"],
+                                                                    "path": path, "overwrite": True}, prefix)
             if result.get("sha256") != hashlib.sha256(data).hexdigest() or result.get("size") != len(data) or result.get("path") != path:
                 raise AppInfrastructureError("guest import did not preserve exact candidate bytes")
             return result
@@ -263,15 +341,14 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None:
             raise AppInfrastructureError("template artifact requires an attempt")
-        return await self._request("materialize_template_artifact", {**ident, "artifact_id": artifact_id})
+        return await self._runtime(ident, "materialize_template_artifact", {"artifact_id": artifact_id})
 
     async def create_evaluator(self, task, environments, fingerprint, *, attempt, abandon_stale=False):
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is None or task.workstation_template is None:
             raise AppInfrastructureError("isolated evaluation requires an immutable workstation template")
         payload = {**ident, "abandon_stale": abandon_stale}
-        result = (await self._await_async_create("create_evaluator", payload) if self.remote
-                  else await self._request("create_evaluator", payload))
+        result = await self._await_async_create("create_evaluator", payload)
         evaluator = result.get("identity", {})
         if any(evaluator.get(key) != value for key, value in ident.items()) or evaluator.get("purpose") != "evaluator" or result.get("template_id") != task.workstation_template or result.get("network") is not None:
             raise AppInfrastructureError("isolated evaluator identity/template/network mismatch")
@@ -281,9 +358,10 @@ class LibvirtWorkstationProvider:
         ident = self._identity(task, environments, fingerprint, attempt)
         if ident is not None:
             if task.workstation_template is not None:
-                await self._request("abandon_evaluators", ident)
-            await self._request("abandon_attempt", ident)
-            if self.remote and await self._request("assert_absent", ident) != {"absent": True}:
+                await self._runtime(ident, "abandon_evaluators", {})
+            if await self._runtime(ident, "abandon_attempt", {}) != {"destroyed": True}:
+                raise AppInfrastructureError("broker abandonment proof mismatch")
+            if self.remote and await self._runtime(ident, "assert_absent", {}) != {"absent": True}:
                 raise AppInfrastructureError("remote abandonment lacks verified absence")
 
 
@@ -342,10 +420,11 @@ class EvaluatorRuntime:
         return {**ident, "evaluator_retry": self.record["identity"]["evaluator_retry"]}
 
     async def call(self, method, args):
-        return await self.teacher.provider._request("evaluator_rpc", {**self.request_identity, "method": method, "args": args})
+        return await self.teacher.provider._guest_call(self.request_identity, method, args, "evaluator_")
 
     async def materialize_template_artifact(self, artifact_id):
-        return await self.teacher.provider._request("evaluator_materialize_template_artifact", {**self.request_identity, "artifact_id": artifact_id})
+        return await self.teacher.provider._runtime(self.request_identity, "materialize_template_artifact",
+                                                    {"artifact_id": artifact_id}, "evaluator_")
 
     async def import_bytes(self, data, path):
         return await self.teacher.provider._import(self.request_identity, data, path, prefix="evaluator_")
@@ -356,4 +435,7 @@ class EvaluatorRuntime:
         return await self.teacher.provider._export(self.request_identity, path, self.artifact_root / name, prefix="evaluator_")
 
     async def destroy(self):
-        return await self.teacher.provider._request("destroy_evaluator", self.request_identity)
+        result = await self.teacher.provider._runtime(self.request_identity, "destroy_evaluator", {}, "evaluator_")
+        if result != {"destroyed": True}:
+            raise AppInfrastructureError("broker evaluator destruction proof mismatch")
+        return result

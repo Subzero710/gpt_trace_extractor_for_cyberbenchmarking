@@ -26,6 +26,7 @@ def _versioned_config() -> dict[str, Any]:
     if set(payload) != {"runner", "workstation"} or not isinstance(payload["runner"], dict) or not isinstance(payload["workstation"], dict):
         raise RuntimeError("runner.toml must contain [runner] and [workstation] tables")
     allowed = {"provider", "broker_socket", "gateway_container", "boot_timeout_seconds", "guest_agent_timeout_seconds", "memory_mb", "vcpus", "overlay_quota_gb", "screenshot_max_bytes", "max_terminals", "max_output_bytes", "max_transfer_bytes", "max_seed_bytes", "egress_allow_cidrs"}
+    allowed.update({"creation_request_timeout_seconds", "creation_poll_interval_seconds", "guest_command_timeout_seconds"})
     if set(payload["workstation"]) != allowed:
         raise RuntimeError("workstation configuration has missing or unknown fields")
     return {**payload["runner"], **{"workstation_" + k: v for k, v in payload["workstation"].items()}}
@@ -54,8 +55,11 @@ class Settings(BaseSettings):
     workstation_provider: Literal["libvirt"] = "libvirt"
     workstation_broker_socket: Path = Path("/run/workstation-broker/broker.sock")
     workstation_gateway_container: str = "gpt-trace-workstation-gateway"
-    workstation_boot_timeout_seconds: int = Field(default=120, ge=30, le=600)
-    workstation_guest_agent_timeout_seconds: int = Field(default=60, ge=10, le=300)
+    workstation_boot_timeout_seconds: int = Field(default=120, ge=30, le=180)
+    workstation_creation_request_timeout_seconds: int | None = Field(default=None, ge=1, le=180)
+    workstation_creation_poll_interval_seconds: int | None = Field(default=None, ge=1, le=180)
+    workstation_guest_command_timeout_seconds: int | None = Field(default=None, ge=1, le=180)
+    workstation_guest_agent_timeout_seconds: int = Field(default=60, ge=10, le=180)
     workstation_memory_mb: int = Field(default=8192, ge=1024, le=65536)
     workstation_vcpus: int = Field(default=4, ge=1, le=32)
     workstation_overlay_quota_gb: int = Field(default=16, ge=4, le=128)

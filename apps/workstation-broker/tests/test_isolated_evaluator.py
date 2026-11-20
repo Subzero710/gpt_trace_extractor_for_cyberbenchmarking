@@ -59,9 +59,13 @@ def host(files, tmp_path, monkeypatch):
     monkeypatch.setattr(broker, "_firewall", lambda ident, *args: firewall.add(suffix(ident)))
     monkeypatch.setattr(broker, "_remove_firewall", lambda ident: firewall.discard(suffix(ident)))
     monkeypatch.setattr(server.subprocess, "run", lambda args, **kwargs: SimpleNamespace(returncode=0 if args[-1].removeprefix("gt_") in firewall else 1))
-    async def rpc(ident, method, args):
+    def health(ident):
         return {"identity":ident,"guest_agent_version":"3.0.0","trusted_artifacts_version":1}
+    async def rpc(ident, method, args):
+        return health(ident)
     monkeypatch.setattr(broker, "rpc", rpc)
+    monkeypatch.setattr(broker, "_guest_exchange",
+                        lambda data, ident, method, args, *, deadline: health(ident))
     return SimpleNamespace(broker=broker, files=files, xmls=xmls, domains=domains, networks=networks,
                            firewall=firewall, backings=backings, states=states)
 

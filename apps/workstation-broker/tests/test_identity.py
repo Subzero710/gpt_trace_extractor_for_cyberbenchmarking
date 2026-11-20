@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 import xml.etree.ElementTree as ET
 import httpx
@@ -152,3 +153,50 @@ async def test_template_preparation_and_vm_creation_are_mutually_exclusive(tmp_p
         assert blocked_preparation.status_code == 409
         assert "workstation VM resources are active" in blocked_preparation.json()["detail"]
         assert broker.preparations.start_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_creation_identity_remains_pollable_after_broker_restart(tmp_path):
+    class FakeBroker:
+        root = tmp_path / "attempts"
+        admin_token = "a" * 40
+        controller_token = "c" * 40
+        draining = False
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.finish = asyncio.Event()
+            self.calls = 0
+
+        def _paths(self, ident):
+            return "", "", self.root / suffix(ident)
+
+        async def create(self, ident, template_id, logical_task_id):
+            self.calls += 1
+            self.started.set()
+            await self.finish.wait()
+            return {"identity": ident, "provider": "libvirt"}
+
+    broker = FakeBroker()
+    headers = {"authorization": "Bearer " + broker.admin_token}
+    payload = {**IDENT, "operation": "create_attempt", "operation_id": "b" * 32}
+
+    def client():
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(broker)),
+                                 base_url="http://broker", headers=headers)
+
+    async with client() as original:
+        accepted = await original.post("/v1/begin_async", json=payload)
+        assert accepted.status_code == 200
+        await asyncio.wait_for(broker.started.wait(), timeout=2)
+        pending = await original.post("/v1/reconcile_attempt", json=IDENT)
+        assert pending.json() == {"state": "pending", "identity": IDENT, "operation_id": payload["operation_id"]}
+        broker.finish.set()
+        await asyncio.sleep(0)
+        terminal = await original.post("/v1/poll_async", json=payload)
+        assert terminal.json()["state"] == "complete"
+
+    async with client() as restarted:
+        assert (await restarted.post("/v1/poll_async", json=payload)).json() == terminal.json()
+        assert (await restarted.post("/v1/begin_async", json=payload)).json() == accepted.json()
+    assert broker.calls == 1

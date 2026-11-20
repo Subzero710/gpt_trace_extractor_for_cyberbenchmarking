@@ -13,6 +13,8 @@ import termios
 import time
 import uuid
 
+from ..contracts import DEFAULT_COMMAND_SECONDS, MAX_COMMAND_SECONDS
+
 MAX_OUTPUT = 1024 * 1024
 MAX_STDIN = 4 * 1024 * 1024
 ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -29,16 +31,16 @@ def environment(values: dict | None) -> dict[str, str]:
     return {**os.environ, **values}
 
 
-async def exec_command(args: dict) -> dict:
+async def exec_command(args: dict, *, cleanup_timeout=None) -> dict:
     command = args["command"]
     cwd = args.get("cwd", "/home/kali/workspace")
-    timeout = args.get("timeout_seconds", 120)
+    timeout = args.get("timeout_seconds", DEFAULT_COMMAND_SECONDS)
     stdin = args.get("stdin", "")
     if not isinstance(command, str) or not command or len(command) > 131072:
         raise ValueError("command is invalid or too long")
     if not isinstance(cwd, str) or not os.path.isdir(cwd):
         raise ValueError("cwd is not a directory")
-    if type(timeout) is not int or not 1 <= timeout <= 1800:
+    if type(timeout) is not int or not 1 <= timeout <= MAX_COMMAND_SECONDS:
         raise ValueError("timeout is out of range")
     if not isinstance(stdin, str) or len(stdin.encode()) > MAX_STDIN:
         raise ValueError("stdin is too large")
@@ -63,22 +65,32 @@ async def exec_command(args: dict) -> dict:
             saved.extend(chunk[:available])
             truncated |= len(chunk) > available
         return bytes(saved), truncated
-    input_task = asyncio.create_task(feed())
-    stdout_task = asyncio.create_task(drain(process.stdout))
-    stderr_task = asyncio.create_task(drain(process.stderr))
+    work = asyncio.gather(feed(), drain(process.stdout), drain(process.stderr), process.wait())
+
+    def stop():
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    cleanup_timeout = timeout if cleanup_timeout is None else cleanup_timeout
     timed_out = False
     try:
-        await asyncio.wait_for(process.wait(), timeout)
+        _, (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(
+            asyncio.shield(work), timeout)
     except asyncio.TimeoutError:
         timed_out = True
-        os.killpg(process.pid, signal.SIGKILL)
-        await process.wait()
-    finally:
-        if not input_task.done(): input_task.cancel()
-    stdout, stdout_truncated = await stdout_task
-    stderr, stderr_truncated = await stderr_task
-    if input_task.done() and not input_task.cancelled():
-        input_task.result()
+        stop()
+        _, (stdout, stdout_truncated), (stderr, stderr_truncated), _ = await asyncio.wait_for(work, cleanup_timeout)
+    except BaseException:
+        stop()
+        try:
+            await asyncio.wait_for(work, cleanup_timeout)
+        finally:
+            await asyncio.wait_for(process.wait(), cleanup_timeout)
+        raise
+    else:
+        stop()
     return {"exit_code": process.returncode, "timed_out": timed_out,
             "stdout": stdout.decode(errors="replace"), "stderr": stderr.decode(errors="replace"),
             "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated}

@@ -14,7 +14,9 @@ import io
 import math
 import json
 import os
+import resource
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -106,47 +108,71 @@ def _uint(number, width):
 
 
 class _Wire:
-    def __init__(self, child, frame_limit, *, deadline=None):
+    def __init__(self, child, frame_limit, *, ipc_timeout):
         self.reader = child.stdout
         self.writer = child.stdin
         self.limit = frame_limit
-        self.deadline = deadline
+        self.ipc_timeout = ipc_timeout
+        self.read_deadline = None
+        self.read_size = 0
+        for stream in (self.reader, self.writer):
+            if not isinstance(stream, io.BytesIO):
+                os.set_blocking(stream.fileno(), False)
+
+    @staticmethod
+    def _remaining(deadline, direction):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('native resolver IPC ' + direction + ' deadline exceeded')
+        return remaining
+
+    def _wait(self, descriptor, event, deadline, direction):
+        poll = select.poll()
+        poll.register(descriptor, event)
+        if not poll.poll(math.ceil(self._remaining(deadline, direction) * 1000)):
+            raise TimeoutError('native resolver IPC ' + direction + ' deadline exceeded')
 
     def _write(self, payload):
+        offset = self.writer.tell() if isinstance(self.writer, io.BytesIO) else 0
+        if offset + len(payload) > self.limit:
+            raise RuntimeError('native resolver IPC output message exceeds frame limit')
         if isinstance(self.writer, io.BytesIO):
             self.writer.write(payload)
             return
         descriptor = self.writer.fileno()
         view = memoryview(payload)
+        deadline = time.monotonic() + self.ipc_timeout
         while view:
-            if self.deadline is None:
-                raise RuntimeError('mandatory Rust IPC write deadline missing')
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('native Rust dependency solve exceeded configured deadline during IPC write')
-            _, writable, _ = select.select([], [descriptor], [], remaining)
-            if not writable:
-                raise TimeoutError('native Rust IPC write deadline exceeded')
-            written = os.write(descriptor, view)
+            self._remaining(deadline, 'write')
+            try:
+                written = os.write(descriptor, view)
+            except BlockingIOError:
+                self._wait(descriptor, select.POLLOUT, deadline, 'write')
+                continue
             if written <= 0:
                 raise RuntimeError('native Rust IPC write failed')
             view = view[written:]
 
+    def opcode(self):
+        self.read_deadline = time.monotonic() + self.ipc_timeout
+        self.read_size = 0
+        return self.exact(1)
+
     def exact(self, count):
-        if count < 0 or count > self.limit:
+        if count < 0 or self.read_size + count > self.limit:
             raise RuntimeError('verified resolver exceeded IPC frame limit')
-        if self.deadline is None:
-            raise RuntimeError('mandatory verified resolver IPC read deadline missing')
+        if self.read_deadline is None:
+            raise RuntimeError('verified resolver IPC read must begin with an opcode')
         received = bytearray()
+        self.read_size += count
         descriptor = self.reader.fileno()
         while len(received) < count:
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError('native Rust dependency solve exceeded configured deadline during IPC')
-            readable, _, _ = select.select([descriptor], [], [], remaining)
-            if not readable:
-                raise TimeoutError('native Rust dependency solve exceeded configured deadline during IPC')
-            block = os.read(descriptor, count - len(received))
+            self._remaining(self.read_deadline, 'read')
+            try:
+                block = os.read(descriptor, count - len(received))
+            except BlockingIOError:
+                self._wait(descriptor, select.POLLIN, self.read_deadline, 'read')
+                continue
             if not block:
                 raise RuntimeError('verified resolver terminated during IPC')
             received.extend(block)
@@ -182,28 +208,23 @@ class _Wire:
         for value in values:
             self.send_string(value)
 
-    def response(self, result):
-        # Encode the entire successful result before publishing its success bit.
-        # A failed metadata probe must never leave a partial success response.
+    def encode(self, render):
         destination = self.writer
         output = io.BytesIO()
         try:
             self.writer = output
-            result()
+            render()
         finally:
             self.writer = destination
-        self._write(b'\x01' + output.getvalue())
+        return output.getvalue()
 
     def error(self, exc):
-        self._write(b'\x00')
-        self.send_string(type(exc).__name__ + ': ' + str(exc))
+        self._write(b'\x00' + self.encode(
+            lambda: self.send_string(type(exc).__name__ + ': ' + str(exc))))
 
     def rejected_source(self, exc):
-        # Distinct protocol status: definitively invalid target-language source.
-        # Other errors MUST still abort the solver.
-        self._write(b'\x02')
-        self.send_string(str(exc))
-
+        # A definitive source syntax rejection is a distinct protocol status.
+        self._write(b'\x02' + self.encode(lambda: self.send_string(str(exc))))
 
 
 def _send_candidate(wire, ref, candidate_by_id, transmitted):
@@ -230,9 +251,11 @@ def _policy(root):
         controls = tomllib.load(stream)['acquisition']
     fields = ('pip_solver_max_decisions', 'pip_solver_max_depth',
               'pip_solver_cache_max_bytes', 'pip_solver_max_frame_bytes',
-              'pip_total_timeout_seconds')
+              'pip_solver_compute_timeout_seconds', 'timeout_seconds')
     if any(type(controls.get(name)) is not int or controls[name] < 1 for name in fields):
         raise RuntimeError('invalid versioned Rust solver resource controls')
+    if any(controls[field] > 180 for field in ('timeout_seconds', 'pip_solver_compute_timeout_seconds')):
+        raise RuntimeError('Rust solver operation timeout exceeds 180 seconds')
     if controls['pip_solver_max_frame_bytes'] >= 2 ** 32:
         raise RuntimeError('Rust IPC frame size exceeds protocol capacity')
     return {key: controls[key] for key in fields}
@@ -315,23 +338,15 @@ def _verify_solution(host, target, roots, constraints_by_name, records, *, no_de
 
 
 def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
-          resolver_cache=None, materialize=True, preferred_versions=None, deadline=None):
+          resolver_cache=None, materialize=True, preferred_versions=None):
     """One required Rust binary per independent closure; Python supplies exact PyPI evidence."""
     target = host['_coerce_target'](target)
     target_root = Path(host['__file__']).resolve().parents[1]
     program = _binary(target_root)
     policy = _policy(target_root)
-    expires = time.monotonic() + policy['pip_total_timeout_seconds']
-    if deadline is not None:
-        if (type(deadline) not in (float, int) or not math.isfinite(deadline)):
-            raise RuntimeError('invalid inherited mandatory Pip closure deadline')
-        expires = min(expires, deadline)
-
-    def remaining():
-        seconds = expires - time.monotonic()
-        if seconds <= 0:
-            raise TimeoutError('native Rust dependency solve exceeded configured closure deadline')
-        return seconds
+    ipc_timeout = policy['timeout_seconds']
+    compute_timeout = policy['pip_solver_compute_timeout_seconds']
+    observe_operation = host['_registered_operation']
 
     constraints_by_name = host['_constraint_map'](constraints, target)
     resolver_cache = {} if resolver_cache is None else resolver_cache
@@ -397,7 +412,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     pubgrub_universes = {}
 
     def universe(name, first_requirement):
-        remaining()
         existing = pubgrub_universes.get(name)
         if existing is not None:
             raise RuntimeError('duplicate PubGrub universe registration')
@@ -424,7 +438,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         return tuple((ref, ranks[ref]) for ref in ordered)
 
     def intervals(name, requirement):
-        remaining()
         if name not in pubgrub_universes:
             raise RuntimeError('PubGrub requested a range before its universe')
         parsed = host['_parse_registry_requirement'](requirement)
@@ -443,7 +456,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         return result
 
     def domain(name, requirements):
-        remaining()
         raw = tuple(requirements)
         cache_key = name, raw
         if cache_key in domain_cache:
@@ -467,7 +479,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
         return identity
 
     def record(ref):
-        remaining()
         if ref not in candidate_by_id:
             raise RuntimeError('Rust returned a candidate absent from the verified registry')
         with probe_lock:
@@ -512,11 +523,24 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
             observed_metadata.add(host['_normalized_package_name'](candidate['name']))
         return value
 
+    outstanding = set()
+    outstanding_lock = threading.Lock()
+
+    def finish_metadata(future):
+        with outstanding_lock:
+            outstanding.discard(future)
+
+    def await_metadata(future):
+        return host['_shared_future_result'](future)
+
     def submit(fn, *args, speculative=False):
-        remaining()
         submitter = (resolver_cache.get('metadata_speculative_submit') if speculative
                      else None) or executor.submit
-        return submitter(contextvars.copy_context().run, fn, *args)
+        future = submitter(contextvars.copy_context().run, fn, *args)
+        with outstanding_lock:
+            outstanding.add(future)
+        future.add_done_callback(finish_metadata)
+        return future
 
     prefetch = _BoundedPrefetch(executor, record,
                                speculative_submit=(lambda fn, ref: submit(fn, ref, speculative=True))
@@ -537,33 +561,40 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
     current_query = None
     pending_metadata = {}
     with tempfile.TemporaryFile(mode='w+b') as errors:
-        child = subprocess.Popen([str(program)], cwd=target_root,
+        child = subprocess.Popen([str(program), str(ipc_timeout)], cwd=target_root,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
                 close_fds=True, start_new_session=True)
-        wire = _Wire(child, policy['pip_solver_max_frame_bytes'], deadline=expires)
-        # Every closure has a mandatory versioned monotonic deadline, enforced
-        # independently in Rust and in this Python IPC/metadata bridge.
         result = None
         outcome = None
         summary = None
         try:
-            wire.send_int(wire.limit, 8)
-            wire.send_int(policy['pip_solver_max_decisions'], 8)
-            wire.send_int(policy['pip_solver_max_depth'], 8)
-            wire.send_int(policy['pip_solver_cache_max_bytes'], 8)
-            wire.send_int(math.ceil(remaining()), 8)
-            wire.send_int(prefetch_width, 8)
-            wire.send_int(int(bool(no_deps)), 1)
-            wire.send_int(len(roots))
-            for requirement in roots:
-                name = host['_normalized_package_name'](requirement.name)
-                wire.send_string(name)
-                wire.send_string(str(requirement))
-                wire.send_strings(sorted(requirement.extras))
-            wire.writer.flush()
+            # The child initially waits for the header, so the kernel budget
+            # is installed before it can run PubGrub.
+            resource.prlimit(child.pid, resource.RLIMIT_CPU, (compute_timeout, compute_timeout))
+            wire = _Wire(child, policy['pip_solver_max_frame_bytes'], ipc_timeout=ipc_timeout)
+
+            def initialize():
+                wire.send_int(wire.limit, 8)
+                wire.send_int(policy['pip_solver_max_decisions'], 8)
+                wire.send_int(policy['pip_solver_max_depth'], 8)
+                wire.send_int(policy['pip_solver_cache_max_bytes'], 8)
+                wire.send_int(compute_timeout, 8)
+                wire.send_int(prefetch_width, 8)
+                wire.send_int(int(bool(no_deps)), 1)
+                wire.send_int(len(roots))
+                for requirement in roots:
+                    name = host['_normalized_package_name'](requirement.name)
+                    wire.send_string(name)
+                    wire.send_string(str(requirement))
+                    wire.send_strings(sorted(requirement.extras))
+
+            with observe_operation('initialize resolver request'):
+                payload = wire.encode(initialize)
+            with observe_operation('write resolver request', limit=ipc_timeout, process=child.pid, supervised=True):
+                wire._write(payload)
             while True:
-                remaining()
-                op = wire.exact(1)
+                with observe_operation('read resolver opcode', limit=ipc_timeout, process=child.pid, supervised=True):
+                    op = wire.opcode()
                 current_opcode = op.decode('ascii', errors='replace')
                 current_query = None
                 pending_metadata = {}
@@ -574,7 +605,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         if executor is None:
                             refs = universe(name, first)
                         else:
-                            refs = submit(universe, name, first).result(timeout=remaining())
+                            refs = await_metadata(submit(universe, name, first))
                         wire.send_int(len(refs))
                         for ref, rank in refs:
                             _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
@@ -594,7 +625,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         else:
                             futures = [submit(universe, name, first) for name, first in requests]
                             try:
-                                answers = [future.result(timeout=remaining()) for future in futures]
+                                answers = [await_metadata(future) for future in futures]
                             except BaseException:
                                 for future in futures:
                                     future.cancel()
@@ -610,7 +641,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     name, requirement = wire.string(), wire.string()
                     current_query = {'project': name, 'requirement': requirement}
                     def deliver_range():
-                        segments = intervals(name, requirement)
+                        with observe_operation('compute resolver version intervals'):
+                            segments = intervals(name, requirement)
                         wire.send_int(len(segments))
                         for lower, upper in segments:
                             wire.send_int(lower)
@@ -625,7 +657,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                         if executor is None:
                             refs = domain(name, requirements)
                         else:
-                            refs = submit(domain, name, requirements).result(timeout=remaining())
+                            refs = await_metadata(submit(domain, name, requirements))
                         wire.send_int(len(refs))
                         for ref in refs:
                             _send_candidate(wire, ref, candidate_by_id, transmitted_candidates)
@@ -645,7 +677,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                             pending = [submit(domain, name, rows)
                                        for name, rows in requests]
                             try:
-                                results = [future.result(timeout=remaining()) for future in pending]
+                                results = [await_metadata(future) for future in pending]
                             except BaseException:
                                 for future in pending:
                                     future.cancel()
@@ -751,7 +783,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                     pending.append(future)
                                     pending_metadata[ref] = future
                             for future in pending:
-                                future.result(timeout=remaining())
+                                await_metadata(future)
                         except BaseException:
                             for future in pending:
                                 future.cancel()
@@ -780,7 +812,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     else:
                         pending = [submit(record, ref) for ref in selected]
                         try:
-                            result = [future.result(timeout=remaining()) for future in pending]
+                            result = [await_metadata(future) for future in pending]
                         except BaseException:
                             for future in pending:
                                 future.cancel()
@@ -796,8 +828,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 else:
                     raise RuntimeError('invalid mandatory Rust solver IPC opcode')
                 try:
-                    wire.response(action)
-                except BaseException as exc:
+                    response = wire.encode(action)
+                except Exception as exc:
                     if isinstance(exc, socket.gaierror) and exc.errno == socket.EAI_AGAIN:
                         print('[pool] native Rust resolver DNS traceback: '
                               + json.dumps({'closure': key,
@@ -806,7 +838,6 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                            sort_keys=True, ensure_ascii=False),
                               file=sys.stderr, flush=True)
                         traceback.print_exception(exc, file=sys.stderr)
-                    remaining()
                     rejected = host.get('_IncompatibleSourceSyntax')
                     if (op == b'M' and len(references) == 1
                             and isinstance(rejected, type) and isinstance(exc, rejected)):
@@ -814,8 +845,12 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                     else:
                         wire.error(exc)
                         # Infrastructure and unverified metadata remain fatal.
+                else:
+                    with observe_operation('write resolver response', limit=ipc_timeout, process=child.pid,
+                                           supervised=True):
+                        wire._write(b'\x01' + response)
             wire.writer.close()
-            status = child.wait(timeout=min(30, remaining()))
+            status = child.wait(timeout=ipc_timeout)
             if status != 0 and outcome == 'success':
                 raise RuntimeError('Rust solver exited with nonzero status after reporting success')
             if outcome == 'error':
@@ -825,16 +860,14 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                    + detail + ('; ' + stats if stats else ''))
             if outcome != 'success':
                 raise RuntimeError('native Rust resolver provided no solution')
-            remaining()
-            _verify_solution(host, target, roots, constraints_by_name, result, no_deps=no_deps)
-            remaining()
+            with observe_operation('verify resolver solution'):
+                _verify_solution(host, target, roots, constraints_by_name, result, no_deps=no_deps)
             if host.get('_POOL_PROGRESS') is None:
                 print('[pool] Rust resolver ' + key + ': solved ' + str(len(result)) + ' packages; '
                       + summary, flush=True)
             selected = (host['_materialize_solution'](
                         pool, result, key, target, artifact_cache, executor=executor,
                         source_probe=source_probe) if materialize else result)
-            remaining()
             withdrawn = sorted(row['name'] + '==' + row['version']
                                for row in selected if row.get('yanked') is True)
             if withdrawn:
@@ -842,7 +875,7 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                       ', '.join(withdrawn), flush=True)
             return selected
         except BaseException as exc:
-            if isinstance(exc, TimeoutError) or time.monotonic() >= expires:
+            if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
                 candidates = []
                 for ref, future in sorted(pending_metadata.items()):
                     candidate = candidate_by_id.get(ref)
@@ -867,12 +900,15 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                       + json.dumps(evidence, sort_keys=True, ensure_ascii=False),
                       file=sys.stderr, flush=True)
             if child.poll() is None:
-                child.kill()
-            child.wait(timeout=policy['pip_total_timeout_seconds'])
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            child.wait(timeout=ipc_timeout)
             errors.seek(max(0, errors.tell() - 8192))
             text = errors.read().decode(errors='replace')
             if text:
-                raise RuntimeError(str(exc) + '; Rust stderr: ' + text) from exc
+                exc.add_note('Rust stderr: ' + text)
             raise
         finally:
             prefetch.close()
@@ -880,3 +916,8 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                 child.stdin.close()
             if child.stdout is not None and not child.stdout.closed:
                 child.stdout.close()
+            with outstanding_lock:
+                pending = tuple(outstanding)
+            # A running producer retains ownership of its resources until it
+            # finishes its supervised operations, even when a solve fails.
+            concurrent.futures.wait(future for future in pending if not future.cancel())

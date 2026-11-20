@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -174,6 +176,69 @@ def test_exceptions_propagate_without_killing_metadata_workers():
         with pytest.raises(ValueError, match='verified metadata failure'):
             first.result(timeout=5)
         assert second.result(timeout=5) == 'still alive'
+
+
+@pytest.mark.parametrize('mode', ['blocked', 'successive', 'owned'])
+def test_shutdown_terminates_isolated_workers_or_waits_for_owned_operations(tmp_path, mode):
+    scripts = Path(__file__).resolve().parents[2] / 'scripts'
+    marker = tmp_path / 'verified'
+    program = """
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import superbench_pool as pool
+
+marker, mode = Path(sys.argv[2]), sys.argv[3]
+cleanup = marker.with_name('cleanup')
+pool._conda_progress_interval = lambda: 0.02
+pool._unregistered_work_timeout = lambda: 0.35
+pool._operation_timeout = lambda: 0.35
+entered = threading.Event()
+blocked = threading.Event()
+
+def acquire():
+    if mode == 'blocked':
+        marker.write_bytes(b'verified')
+        entered.set()
+        with pool._registered_operation('stalled metadata'):
+            blocked.wait()
+        marker.write_bytes(b'unverified')
+    else:
+        for attempt in range(3):
+            with pool._registered_operation('metadata source'):
+                entered.set()
+                time.sleep(0.18)
+        marker.write_bytes(b'verified')
+
+executor = pool._PriorityMetadataExecutor(2 if mode == 'owned' else 1)
+producer = executor.submit(acquire)
+if mode == 'owned':
+    waiting = threading.Event()
+    def dependency():
+        waiting.set()
+        return pool._shared_future_result(producer)
+    consumer = executor.submit(dependency)
+    assert waiting.wait(1)
+assert entered.wait(1)
+try:
+    executor.shutdown()
+finally:
+    cleanup.write_bytes(b'unwound')
+assert all(not thread.is_alive() for thread in executor._threads)
+producer.result(timeout=0)
+if mode == 'owned':
+    consumer.result(timeout=0)
+"""
+    result = subprocess.run([sys.executable, '-c', program, str(scripts), str(marker), mode],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == (1 if mode == 'blocked' else 0), result.stderr
+    if mode == 'blocked':
+        assert 'metadata workers exceeded their shutdown deadline' in result.stderr
+    assert marker.with_name('cleanup').read_bytes() == b'unwound'
+    assert marker.read_bytes() == b'verified'
 
 
 def test_existing_queued_prefetch_is_promoted_when_rust_requires_it():

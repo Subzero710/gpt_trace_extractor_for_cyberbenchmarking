@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import http.client
+import io
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -16,15 +18,17 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 MAX_BODY = 32 * 1024 * 1024
+MAX_REQUEST_SECONDS = 180
 CONTROLLER_ACTIONS = frozenset({
     "inspect_attempt", "rpc", "capture_screen", "send_input",
+    "begin_runtime", "poll_runtime",
     "artifact_stage_begin", "artifact_stage_chunk", "artifact_stage_end",
     "artifact_stage_abort", "artifact_export", "artifact_import", "artifact_read",
 })
 READ_ACTIONS = frozenset({
     "probe", "inventory", "reconcile_attempt", "inspect_attempt", "assert_absent",
     "inspect_evaluators", "preflight_templates", "artifact_read", "evaluator_artifact_read",
-    "template_preparation_probe", "template_preparation_status", "shutdown_status",
+    "template_preparation_probe", "template_preparation_status", "shutdown_status", "poll_runtime",
 })
 PRIVATE = tuple(ipaddress.ip_network(x) for x in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 
@@ -110,7 +114,7 @@ class Endpoint:
     key: Path | None = None
     server_sha256: str = ""
     connect_timeout: float = 10.0
-    operation_timeout: float = 1900.0
+    operation_timeout: float = MAX_REQUEST_SECONDS
 
     @classmethod
     def from_env(cls, socket_path: Path) -> "Endpoint":
@@ -198,8 +202,10 @@ class WireClient:
         if len(body) > MAX_BODY or "\r" in authorization or "\n" in authorization:
             raise TransportFailure("invalid broker frame")
         endpoint = self.endpoint
-        duration = endpoint.operation_timeout if timeout is None else min(timeout, endpoint.operation_timeout)
-        if duration <= 0:
+        duration = min(endpoint.operation_timeout, MAX_REQUEST_SECONDS)
+        if timeout is not None:
+            duration = min(timeout, duration)
+        if not math.isfinite(duration) or duration <= 0:
             raise TransportFailure("invalid operation timeout")
         connection = http.client.HTTPConnection("broker", timeout=endpoint.connect_timeout)
         sock = None
@@ -207,12 +213,14 @@ class WireClient:
         try:
             if endpoint.mode == "unix":
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(endpoint.connect_timeout)
+                sock.settimeout(min(endpoint.connect_timeout, _remaining(deadline)))
                 sock.connect(str(endpoint.socket_path))
             else:
                 parsed = urlsplit(endpoint.url)
                 sock = socket.create_connection(((parsed.hostname if endpoint.mode == 'https' else endpoint.address),
-                                                 (443 if endpoint.mode == 'https' else parsed.port)), endpoint.connect_timeout)
+                                                 (443 if endpoint.mode == 'https' else parsed.port)),
+                                                min(endpoint.connect_timeout, _remaining(deadline)))
+                sock.settimeout(min(endpoint.connect_timeout, _remaining(deadline)))
                 sock = self.context.wrap_socket(sock, server_hostname=parsed.hostname)
                 if endpoint.mode == 'mtls':
                     digest = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
@@ -220,15 +228,16 @@ class WireClient:
                         raise IdentityFailure("broker certificate fingerprint mismatch")
                 connection.host = parsed.hostname
                 connection.port = 443 if endpoint.mode == 'https' else parsed.port
-            connection.sock = sock
-            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            connection.sock = _DeadlineSocket(sock, deadline)
             headers = {"Authorization": authorization, "Content-Type": "application/json",
                 "Content-Length": str(len(body)), "Connection": "close", "Accept-Encoding": "identity"}
             if endpoint.mode == 'https':
                 headers['Host'] = parsed.hostname
             connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            return response.status, bounded_read(response, connection, MAX_BODY, deadline)
+            with connection.getresponse() as response:
+                raw = bounded_read(response, connection, MAX_BODY, deadline)
+                _remaining(deadline)
+                return response.status, raw
         except ssl.SSLError as exc:
             raise IdentityFailure("TLS certificate/handshake validation failed") from exc
         except (OSError, http.client.HTTPException) as exc:
@@ -250,3 +259,53 @@ class WireClient:
         if not isinstance(result, dict):
             raise TransportFailure("broker returned a non-object")
         return result
+
+
+def _remaining(deadline):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError("broker transport deadline exceeded")
+    return seconds
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, owner):
+        self.owner = owner
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.owner.socket.settimeout(_remaining(self.owner.deadline))
+        return self.owner.socket.recv_into(buffer)
+
+    def close(self):
+        super().close()
+        if self.owner.closed:
+            self.owner.socket.close()
+
+
+class _DeadlineSocket:
+    def __init__(self, sock, deadline):
+        self.socket = sock
+        self.deadline = deadline
+        self.reader = None
+        self.closed = False
+
+    def sendall(self, data):
+        self.socket.settimeout(_remaining(self.deadline))
+        self.socket.sendall(data)
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("broker transport expects a binary response")
+        self.reader = _DeadlineReader(self)
+        return io.BufferedReader(self.reader)
+
+    def settimeout(self, _seconds):
+        self.socket.settimeout(_remaining(self.deadline))
+
+    def close(self):
+        self.closed = True
+        if self.reader is None or self.reader.closed:
+            self.socket.close()

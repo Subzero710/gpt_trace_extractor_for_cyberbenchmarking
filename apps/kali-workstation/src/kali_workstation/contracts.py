@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 APP_ID = "kali-workstation"
 VERSION = "3.0.0"
+DEFAULT_COMMAND_SECONDS = 120
+MAX_COMMAND_SECONDS = 180
 
 
 class Strict(BaseModel):
@@ -19,7 +21,7 @@ class Empty(Strict): pass
 class Command(Strict):
     command: str = Field(min_length=1, max_length=131072)
     cwd: str = Field(default="/home/kali/workspace", max_length=4096)
-    timeout_seconds: int = Field(default=120, ge=1, le=1800)
+    timeout_seconds: int = Field(default=DEFAULT_COMMAND_SECONDS, ge=1, le=MAX_COMMAND_SECONDS)
     stdin: str = Field(default="", max_length=4194304)
     environment: dict[str, str] = Field(default_factory=dict, max_length=128)
 

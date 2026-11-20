@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+from gpt_trace_transport.operation_watch import host_operation, run_host_entry
 from gpt_trace_transport.local_templates import atomic_json, safe
 from workstation_broker.preparation import same_process, PreparationManager
 
@@ -24,10 +25,12 @@ def main():
                     "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}
         if record.get("deployment") != expected: raise RuntimeError("local broker process record belongs to another deployment")
         if same_process(record["broker_identity"]): raise RuntimeError("recorded broker is still alive; use its authenticated shutdown barrier")
-    status = subprocess.check_output(["systemctl", "show", "--property=ActiveState", "--value",
-        "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
-    pid = subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value",
-        "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
+    with host_operation("systemd-active-state"):
+        status = subprocess.check_output(["systemctl", "show", "--property=ActiveState", "--value",
+            "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
+    with host_operation("systemd-main-pid"):
+        pid = subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value",
+            "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
     if status not in {"inactive", "failed"} or pid != "0":
         raise RuntimeError("managed broker is not proved inactive")
     # Cover an explicitly launched native broker, rather than infer absence from
@@ -50,6 +53,7 @@ def main():
         token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"]),
         memory_mb=limits["memory_mb"], vcpus=limits["vcpus"],
         boot_timeout_seconds=limits["boot_timeout_seconds"], guest_agent_timeout_seconds=limits["guest_agent_timeout_seconds"],
+        guest_command_timeout_seconds=limits["guest_command_timeout_seconds"],
         overlay_quota_gb=limits["overlay_quota_gb"], screenshot_max_bytes=limits["screenshot_max_bytes"],
         max_terminals=limits["max_terminals"], max_output_bytes=limits["max_output_bytes"],
         max_transfer_bytes=limits["max_transfer_bytes"], max_seed_bytes=limits["max_seed_bytes"],
@@ -67,4 +71,4 @@ def main():
         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}))
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": run_host_entry(main)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import hashlib
@@ -13,7 +14,8 @@ from typing import Any
 
 import httpx
 
-from gpt_trace_transport.async_client import make_client
+from gpt_trace_transport.async_client import await_runtime, make_client
+from gpt_trace_transport.wire import TransportFailure
 import mcp.types as types
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager, TransportSecuritySettings
@@ -47,11 +49,16 @@ def model_content(name: str, result: dict[str, Any]) -> list[Any]:
 
 class WorkstationController:
     def __init__(self, broker_socket: Path, token: str, broker_token: str,
-                 max_seed: int = 268435456, max_transfer: int = 67108864):
+                 max_seed: int = 268435456, max_transfer: int = 67108864, *,
+                 request_timeout: int, poll_interval: int):
+        if not 1 <= poll_interval < request_timeout <= 180:
+            raise ValueError("invalid workstation transport policy")
         self.token = token
         self.broker_token = broker_token
         self.max_seed = max_seed
         self.max_transfer = max_transfer
+        self.request_timeout = request_timeout
+        self.poll_interval = poll_interval
         self.client = make_client(broker_socket)
         self.active: dict | None = None
 
@@ -64,14 +71,24 @@ class WorkstationController:
                         f"Bearer {self.backend_token(candidate['environment_id'])}"))
 
     async def broker(self, operation: str, ident: dict, *, method: str | None = None, args: dict | None = None) -> dict:
+        if operation in {"artifact_import", "artifact_export"} or (operation == "rpc" and method == "exec_command"):
+            runtime_operation = method if operation == "rpc" else operation
+            return await await_runtime(self._broker_request, ident, runtime_operation, args or {},
+                                       poll_interval=self.poll_interval, communication_error=TransportFailure)
         payload = {**ident}
         if method is not None: payload["method"] = method
         if args is not None: payload["args"] = args
+        return await self._broker_request(operation, payload)
+
+    async def _broker_request(self, operation, payload):
         try:
-            response = await self.client.post(f"/v1/{operation}", json=payload,
-                headers={"authorization": f"Bearer {self.broker_token}"})
-        except httpx.HTTPError as exc:
-            raise RuntimeError("broker connection failed; workstation outcome unconfirmed") from exc
+            async with asyncio.timeout(self.request_timeout):
+                response = await self.client.post(f"/v1/{operation}", json=payload, timeout=self.request_timeout,
+                    headers={"authorization": f"Bearer {self.broker_token}"})
+        except (httpx.HTTPError, TimeoutError) as exc:
+            raise TransportFailure("broker connection failed; workstation outcome unconfirmed") from exc
+        if response.status_code >= 500:
+            raise TransportFailure(f"broker {operation} HTTP {response.status_code}; outcome unconfirmed")
         if response.status_code != 200:
             raise RuntimeError(f"broker {operation} failed: {response.text[:1000]}")
         try:
@@ -264,7 +281,9 @@ def main():
     if len(broker_token) < 32: raise RuntimeError("missing workstation broker token")
     config = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
     controller = WorkstationController(Path(os.environ["WORKSTATION_BROKER_SOCKET"]), token, broker_token,
-                                       config["max_seed_bytes"], config["max_transfer_bytes"])
+                                       config["max_seed_bytes"], config["max_transfer_bytes"],
+                                       request_timeout=config["creation_request_timeout_seconds"],
+                                       poll_interval=config["creation_poll_interval_seconds"])
     uvicorn.run(create_app(controller), host="0.0.0.0", port=8000)
 
 

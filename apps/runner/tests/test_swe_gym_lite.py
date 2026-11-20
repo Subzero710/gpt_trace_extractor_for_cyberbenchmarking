@@ -124,16 +124,26 @@ async def test_provider_create_selects_template_but_identity_remains_exact(tmp_p
         body = json.loads(request.content)
         calls.append((request.url.path, body))
         ident = {key: body[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
-        return httpx.Response(200, json={"identity": ident, "provider": "libvirt",
+        if request.url.path == "/v1/reconcile_attempt":
+            return httpx.Response(200, json={"state": "absent", "identity": ident})
+        if request.url.path == "/v1/begin_async":
+            return httpx.Response(200, json={"state": "accepted", "identity": ident,
+                "operation": body["operation"], "operation_id": body["operation_id"]})
+        result = {"identity": ident, "provider": "libvirt",
             "template_id": task.workstation_template, "backing_path": "/trusted/python_mypy.qcow2",
-            "backing_sha256": "b"*64, "template_generation": "c"*64, "template_source_fingerprint": "d"*64})
+            "backing_sha256": "b"*64, "template_generation": "c"*64, "template_source_fingerprint": "d"*64}
+        if request.url.path == "/v1/poll_async":
+            return httpx.Response(200, json={"state": "complete", "identity": ident, "result": result,
+                "operation": body["operation"], "operation_id": body["operation_id"]})
+        return httpx.Response(200, json=result)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://broker") as client:
-        provider = LibvirtWorkstationProvider(tmp_path/"sock", token, client=client, remote=False)
+        provider = LibvirtWorkstationProvider(tmp_path/"sock", token, client=client, remote=False,
+                                              creation_request_timeout=2, creation_poll_interval=1, guest_command_timeout=180)
         created = await provider.create(task, {"kali-workstation": "env"}, "a"*64, attempt=1, control_token="s"*40)
-        assert calls[0][1]["template_id"] == task.workstation_template
+        assert calls[1][1]["template_id"] == task.workstation_template
         assert created.metadata()["apps"]["kali-workstation"]["template_generation"] == "c"*64
         await provider.discover(task, {"kali-workstation": "env"}, "a"*64, attempt=1, control_token="s"*40)
-        assert "template_id" not in calls[1][1]
+        assert "template_id" not in calls[-1][1]
 
 
 @pytest.mark.asyncio
@@ -255,7 +265,7 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
         compile(program, "trusted-guest-validation", "exec")
         programs.append(program)
         targets.append(runtime.purpose)
-        if "proof = prepare_evaluator" in program:
+        if "proof = finish_evaluator_setup" in program:
             return {"stdout":json.dumps({"base_commit":item["base_commit"],"env_hash":item["env_hash"],"source_sha256":"a"*64})}
         if "workspace = Path('/home/kali/workspace')" in program:
             return {"stdout": json.dumps({"base_commit": item["base_commit"], "env_hash": item["env_hash"]})}
@@ -307,9 +317,11 @@ async def test_hidden_patch_is_only_in_native_grading_program(monkeypatch, tmp_p
     result = await adapter.evaluate_runtime(task, prepared=prepared, captured=CapturedConversation("conv", []),
                                              candidate=candidate, runtime=runtime)
     assert result.verdict == "pass"
-    assert "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" not in programs[1]
-    assert "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" in programs[2]
+    hidden = [index for index, program in enumerate(programs) if "HIDDEN_TEST_PATCH_ONLY_FOR_GRADING" in program]
+    assert len(hidden) == 1 and "\napply_grading_inputs(" in programs[hidden[0]]
+    assert "proof = run_native_tests" in programs[hidden[0] + 1]
+    assert "proof = finish_evaluator_setup" in programs[hidden[0] - 1]
     assert all("GOLD_CODE_NEVER_DELIVERED" not in program for program in programs)
 
-    assert targets == ['teacher','evaluator','evaluator']
+    assert targets == ['teacher', 'teacher', 'evaluator', 'evaluator', 'evaluator', 'evaluator', 'evaluator']
     assert runtime.evaluator.destroyed

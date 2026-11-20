@@ -41,6 +41,7 @@ GOLDEN_BUILD_COMMAND_PACKAGES = {
     "virt-ls": "libguestfs-tools",
     "7z": "p7zip-full",
     "virt-copy-out": "libguestfs-tools",
+    "virt-tar-in": "libguestfs-tools",
     "dpkg-deb": "dpkg",
 }
 

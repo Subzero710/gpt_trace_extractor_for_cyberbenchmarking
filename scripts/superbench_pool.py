@@ -20,6 +20,7 @@ import gzip
 import configparser
 import hashlib
 import io
+import itertools
 import json
 import os
 import re
@@ -42,6 +43,7 @@ import ssl
 import tarfile
 import zipfile
 import urllib.error
+import weakref
 from collections import defaultdict
 from pathlib import Path
 
@@ -99,13 +101,96 @@ def _pinned_npm_version():
     if not isinstance(value, str) or not re.fullmatch(r'v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?', value):
         raise RuntimeError('verified Kali dependency identity lacks the pinned npm tool identity')
     return value
-DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
-DOWNLOAD_RETRY_BACKOFF = (1, 2, 4, 8)
 # GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1
 PIP_ARTIFACT_MODEL = 'global-content-addressed-pip-v2-target-provenance'
 
 
+_OPERATION_EVENT_FD = None
+_OPERATION_IDS = itertools.count(1)
+_OPERATION_ACTORS = weakref.WeakKeyDictionary()
+_OPERATION_ACTORS_LOCK = threading.Lock()
+
+
+class _OperationActor:
+    def __init__(self):
+        self.changed = time.monotonic()
+        self.active = {}
+
+
+def _actor(thread, *, register=False):
+    with _OPERATION_ACTORS_LOCK:
+        actor = _OPERATION_ACTORS.get(thread)
+        if actor is None and register:
+            actor = _OperationActor()
+            _OPERATION_ACTORS[thread] = actor
+        return actor
+
+
+def _operation_event(event):
+    descriptor = _OPERATION_EVENT_FD
+    data = json.dumps(event, separators=(',', ':')).encode('ascii') + b'\n'
+    if len(data) > os.fpathconf(descriptor, 'PC_PIPE_BUF'):
+        raise RuntimeError('acquisition operation event exceeds atomic pipe capacity')
+    deadline = time.monotonic() + _operation_timeout()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('acquisition supervisor event channel stopped accepting records')
+        _, ready, _ = select.select([], [descriptor], [], remaining)
+        if ready:
+            try:
+                if os.write(descriptor, data) != len(data):
+                    raise RuntimeError('partial acquisition operation event')
+            except BlockingIOError:
+                continue
+            return
+
+
+@contextlib.contextmanager
+def _registered_operation(label, *, limit=None, process=None, started=None, supervised=False):
+    report = _OPERATION_EVENT_FD is not None
+    actor = _actor(threading.current_thread(), register=report)
+    if actor is None:
+        yield
+        return
+    operation = next(_OPERATION_IDS)
+    tid = threading.get_native_id()
+    limit = _operation_timeout() if limit is None else limit
+    started = time.monotonic() if started is None else started
+    with _OPERATION_ACTORS_LOCK:
+        actor.active[operation] = started + limit
+    try:
+        if report:
+            _operation_event({'event': 'begin', 'operation': operation, 'thread': tid,
+                              'label': label, 'started': started, 'limit': limit,
+                              'process': process, 'supervised': supervised})
+        try:
+            yield
+        except BaseException:
+            if report:
+                _operation_event({'event': 'failed', 'operation': operation, 'thread': tid,
+                                  'finished': time.monotonic()})
+            raise
+        else:
+            if report:
+                _operation_event({'event': 'end', 'operation': operation, 'thread': tid,
+                                  'finished': time.monotonic()})
+    finally:
+        with _OPERATION_ACTORS_LOCK:
+            del actor.active[operation]
+            actor.changed = time.monotonic()
+
+
+def _supervised_operation(function):
+    @functools.wraps(function)
+    def run(*args, **kwargs):
+        with _registered_operation(function.__name__):
+            return function(*args, **kwargs)
+    return run
+
+
+@_supervised_operation
 def digest(path):
     path = Path(path)
     before = path.lstat()
@@ -352,25 +437,10 @@ def _pool_progress(stage, completed=None, total=None, unit='', details='', *, fo
 
 
 
-@functools.lru_cache(maxsize=1)
-def _subprocess_timeout():
-    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
-    if policy.is_symlink() or not policy.is_file():
-        raise RuntimeError('missing versioned subprocess timeout policy')
-    with policy.open('rb') as stream:
-        controls = tomllib.load(stream)['acquisition']
-    value = controls['subprocess_timeout_seconds']
-    stall = controls['progress_stall_timeout_seconds']
-    if (type(value) is not int or value <= 0
-            or type(stall) is not int or stall < value):
-        raise RuntimeError('invalid versioned subprocess timeout budget')
-    return value
-
-
 def invoke(argv, *, cwd=None, capture=False, env=None, timeout=None):
     command = [str(v) for v in argv]
     if timeout is None:
-        timeout = _subprocess_timeout()
+        timeout = _operation_timeout()
     if type(timeout) not in (int, float) or not 0 < timeout:
         raise ValueError('invalid subprocess timeout')
     if _POOL_PROGRESS is None:
@@ -417,6 +487,7 @@ def invoke(argv, *, cwd=None, capture=False, env=None, timeout=None):
     return None
 
 
+@_supervised_operation
 def write_new(path, data):
     """Publish complete durable bytes exclusively; an interrupted write is not a record."""
     path = Path(path)
@@ -464,6 +535,7 @@ def sri_parts(sri):
     return [part for part in candidates if hashlib.new(part[0]).digest_size == strongest]
 
 
+@_supervised_operation
 def verify_sri(path, sri):
     candidates = sri_parts(sri)
     if candidates is None:
@@ -522,19 +594,6 @@ def _retryable_network_error(exc):
     return False
 
 
-_NATIVE_CLOSURE_DEADLINE = contextvars.ContextVar('native_pip_closure_deadline', default=None)
-
-
-def _native_closure_remaining():
-    deadline = _NATIVE_CLOSURE_DEADLINE.get()
-    if deadline is None:
-        return None
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError('native Pip closure exceeded its configured total deadline')
-    return remaining
-
-
 @functools.lru_cache(maxsize=1)
 def _operation_timeout():
     # A limit on each operation, never on the complete acquisition job.
@@ -542,53 +601,114 @@ def _operation_timeout():
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned acquisition timeout policy')
     with policy.open('rb') as stream:
-        value = tomllib.load(stream)['acquisition']['timeout_seconds']
-    if type(value) is not int or value < 1:
+        controls = tomllib.load(stream)['acquisition']
+    if 'pip_metadata_elementary_timeout_overrides' in controls:
+        raise RuntimeError('Pip metadata cannot override the elementary operation limit')
+    value = controls['timeout_seconds']
+    if type(value) is not int or not 1 <= value <= 180:
         raise RuntimeError('invalid versioned operation timeout')
     return value
 
 
+@functools.lru_cache(maxsize=1)
+def _unregistered_work_timeout():
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned acquisition timeout policy')
+    with policy.open('rb') as stream:
+        value = tomllib.load(stream)['acquisition']['unregistered_work_timeout_seconds']
+    if type(value) is not int or not 1 <= value <= 180:
+        raise RuntimeError('invalid versioned unregistered work timeout')
+    return value
 
-def _bounded_wait_seconds():
-    remaining = _native_closure_remaining()
-    return _operation_timeout() if remaining is None else min(remaining, _operation_timeout())
 
 
 def _bounded_completed(futures):
     pending = set(futures)
     while pending:
+        settled = {future for future in pending if future.done()}
+        if settled:
+            pending.difference_update(settled)
+            yield from settled
+            continue
         completed, pending = concurrent.futures.wait(
-            pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            pending, timeout=_conda_progress_interval(),
+            return_when=concurrent.futures.FIRST_COMPLETED)
+        with _FUTURE_WAITS_LOCK:
+            for future in pending:
+                _verify_future_producer(future)
         yield from completed
 
 
-def _bounded_future_result(future):
-    return future.result(timeout=_bounded_wait_seconds())
+class _OwnedFuture(concurrent.futures.Future):
+    def __init__(self, *, executor=None):
+        super().__init__()
+        self.executor = executor
+        self.producer = threading.current_thread() if executor is None else None
+        self.completed_at = None
+
+    def set_result(self, result):
+        self.completed_at = time.monotonic()
+        super().set_result(result)
+
+    def set_exception(self, exception):
+        self.completed_at = time.monotonic()
+        super().set_exception(exception)
+
+
+_FUTURE_WAITS = {}
+_FUTURE_WAITS_LOCK = threading.Lock()
+
+
+def _verify_future_producer(future, owner=None):
+    seen = set()
+    while isinstance(future, _OwnedFuture) and not future.done():
+        producer = future.producer
+        if producer is None:
+            if not any(thread.is_alive() for thread in future.executor._threads):
+                raise RuntimeError('queued metadata work has no live producer')
+            break
+        if not producer.is_alive():
+            if future.done():
+                break
+            raise RuntimeError('future producer exited without a result')
+        if producer in seen:
+            raise RuntimeError('cyclic future dependency')
+        seen.add(producer)
+        owner = producer
+        future = _FUTURE_WAITS.get(producer)
+    completion = future.completed_at if isinstance(future, _OwnedFuture) and future.done() else None
+    return owner, completion
 
 
 def _shared_future_result(future):
     """Await the real owner, not a synthetic per-operation deadline.
 
-    An owner can perform several individually bounded Conda/Pip/Git operations.
-    The administrative parent independently enforces the acquisition progress
-    watchdog. An active native Pip closure still has its mandatory deadline.
-    Each wait uses the versioned observation cadence.
+    Independent operations belong to their producer. The acquisition
+    supervisor observes the producer and its registered operations.
     """
     cadence = _conda_progress_interval()
-    while True:
-        remaining = _native_closure_remaining()
-        interval = cadence if remaining is None else min(cadence, remaining)
-        completed, _ = concurrent.futures.wait(
-            (future,), timeout=interval,
-            return_when=concurrent.futures.FIRST_COMPLETED)
-        if completed:
-            return future.result(timeout=interval)
-        _native_closure_remaining()
+    waiter = threading.current_thread()
+    with _FUTURE_WAITS_LOCK:
+        _FUTURE_WAITS[waiter] = future
+    try:
+        while not future.done():
+            with _FUTURE_WAITS_LOCK:
+                _verify_future_producer(future)
+            concurrent.futures.wait((future,), timeout=cadence)
+        return future.result(timeout=0)
+    finally:
+        with _FUTURE_WAITS_LOCK:
+            actor = _actor(waiter)
+            if actor is not None and future.done():
+                with _OPERATION_ACTORS_LOCK:
+                    actor.changed = time.monotonic()
+            del _FUTURE_WAITS[waiter]
 
 
 @contextlib.contextmanager
 def _bounded_lock(lock):
-    if not lock.acquire(timeout=_bounded_wait_seconds()):
+    if not lock.acquire(timeout=_operation_timeout()):
         raise TimeoutError('versioned acquisition lock deadline reached')
     try:
         yield
@@ -596,36 +716,98 @@ def _bounded_lock(lock):
         lock.release()
 
 
-_NETWORK_CALL_DEADLINE = contextvars.ContextVar('fetch_network_call_deadline', default=None)
+class _OwnedLock:
+    def __init__(self):
+        self.guard = threading.Lock()
+        self.owner = None
+
+    def __enter__(self):
+        while True:
+            with _bounded_lock(self.guard):
+                owner = self.owner
+                if owner is None:
+                    self.owner = _OwnedFuture()
+                    return
+            _shared_future_result(owner)
+
+    def __exit__(self, *_):
+        with _bounded_lock(self.guard):
+            finished = self.owner
+            self.owner = None
+        finished.set_result(None)
+
+
+_NETWORK_ATTEMPT = contextvars.ContextVar('fetch_network_attempt', default=None)
+
+
+class _NetworkAttempt:
+    def __init__(self, limit):
+        self.deadline = time.monotonic() + limit
+        self.sockets = []
+        self.lock = threading.Lock()
+        self.timer = threading.Timer(self.remaining(), self.interrupt)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('dependency network attempt exceeded versioned deadline')
+        return remaining
+
+    def watch(self, sock):
+        with self.lock:
+            self.remaining()
+            # A TLS wrapper takes ownership of the original descriptor.
+            # The duplicate still refers to the same TCP connection.
+            self.sockets.append(sock.dup())
+
+    def interrupt(self):
+        with self.lock:
+            for sock in self.sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self):
+        self.timer.cancel()
+        self.timer.join(timeout=_operation_timeout())
+        if self.timer.is_alive():
+            raise TimeoutError('network interrupt worker did not exit')
+        for sock in self.sockets:
+            sock.close()
 
 
 def _network_remaining():
-    deadline = _NETWORK_CALL_DEADLINE.get()
-    if deadline is None:
+    attempt = _NETWORK_ATTEMPT.get()
+    if attempt is None:
         raise RuntimeError('network operation has no mandatory monotonic deadline')
-    remaining = deadline - time.monotonic()
-    closure = _native_closure_remaining()
-    if closure is not None:
-        remaining = min(remaining, closure)
-    if remaining <= 0:
-        raise TimeoutError('dependency network operation exceeded versioned deadline')
-    return remaining
+    return attempt.remaining()
 
 
 @contextlib.contextmanager
 def _network_deadline():
-    deadline = time.monotonic() + _operation_timeout()
-    inherited = _NETWORK_CALL_DEADLINE.get()
+    inherited = _NETWORK_ATTEMPT.get()
     if inherited is not None:
-        deadline = min(deadline, inherited)
-    closure = _NATIVE_CLOSURE_DEADLINE.get()
-    if closure is not None:
-        deadline = min(deadline, closure)
-    token = _NETWORK_CALL_DEADLINE.set(deadline)
+        yield inherited
+        return
+    attempt = _NetworkAttempt(_operation_timeout())
+    token = _NETWORK_ATTEMPT.set(attempt)
     try:
-        yield
+        try:
+            yield attempt
+        except Exception as exc:
+            try:
+                attempt.remaining()
+            except TimeoutError as timeout:
+                raise timeout from exc
+            raise
+        else:
+            attempt.remaining()
     finally:
-        _NETWORK_CALL_DEADLINE.reset(token)
+        _NETWORK_ATTEMPT.reset(token)
+        attempt.close()
 
 
 def _bounded_network_entrypoint(function):
@@ -638,35 +820,42 @@ def _bounded_network_entrypoint(function):
     return execute
 
 
+@functools.lru_cache(maxsize=1)
+def _network_retries():
+    policy = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError('missing versioned network retry policy')
+    with policy.open('rb') as stream:
+        controls = tomllib.load(stream)['acquisition']
+    attempts = controls['network_attempts']
+    backoffs = controls['network_retry_backoff_seconds']
+    if (type(attempts) is not int or attempts < 1
+            or not isinstance(backoffs, list) or len(backoffs) != attempts - 1
+            or any(type(delay) is not int or delay < 0 for delay in backoffs)):
+        raise RuntimeError('invalid versioned network retry policy')
+    return attempts, tuple(backoffs)
+
+
 def _network_retry(label, operation, *, cleanup=None):
-    with _network_deadline():
-        return _bounded_network_retry(label, operation, cleanup=cleanup)
-
-
-def _bounded_network_retry(label, operation, *, cleanup=None):
-    for attempt in range(1, DOWNLOAD_ATTEMPTS+1):
-        _network_remaining()
-        if cleanup is not None: cleanup()
+    attempts, backoffs = _network_retries()
+    if _NETWORK_ATTEMPT.get() is not None:
+        raise RuntimeError('network retry cannot run inside an active transfer attempt')
+    if cleanup is not None:
+        cleanup()
+    for attempt in range(1, attempts + 1):
         try:
-            slots = _network_slots()
-            remaining = _native_closure_remaining()
-            acquired = slots.acquire(timeout=_bounded_wait_seconds())
-            if not acquired:
-                raise TimeoutError('native Pip closure exceeded network-slot deadline')
-            try:
+            with _network_slots(), _registered_operation('HTTPS attempt', supervised=True), _network_deadline():
                 return operation()
-            finally:
-                slots.release()
         except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
             if not _retryable_network_error(exc): raise
-            if cleanup is not None: cleanup()
-            if attempt >= DOWNLOAD_ATTEMPTS: raise
-            delay=DOWNLOAD_RETRY_BACKOFF[attempt-1]
-            remaining = _native_closure_remaining()
-            if remaining is not None and delay >= remaining:
-                raise TimeoutError('native Pip closure deadline reached during network retry') from exc
+            if cleanup is not None:
+                cleanup()
+            if attempt >= attempts: raise
+            delay = backoffs[attempt - 1]
             detail=('HTTP '+str(exc.code)) if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
-            print(f'[pool] network retry {attempt+1}/{DOWNLOAD_ATTEMPTS} in {delay}s after {detail}: {label}',
+            print(f'[pool] network retry {attempt+1}/{attempts} in {delay}s after {detail}: {label}',
                   file=sys.stderr, flush=True)
             time.sleep(delay)
     raise AssertionError('unreachable network retry loop')
@@ -675,7 +864,30 @@ def _bounded_network_retry(label, operation, *, cleanup=None):
 @functools.lru_cache(maxsize=1)
 def _network_slots():
     """One HTTP budget across metadata and artifact worker pools."""
-    return threading.BoundedSemaphore(_acquisition_workers())
+    return _NetworkSlots(_acquisition_workers())
+
+
+class _NetworkSlots:
+    def __init__(self, limit):
+        self.limit = limit
+        self.condition = threading.Condition()
+        self.owners = set()
+
+    def __enter__(self):
+        with self.condition:
+            owner = threading.current_thread()
+            if owner in self.owners:
+                raise RuntimeError('network slot acquisition is recursive')
+            while len(self.owners) >= self.limit:
+                if any(not thread.is_alive() for thread in self.owners):
+                    raise RuntimeError('network slot owner exited without releasing its slot')
+                self.condition.wait(timeout=_conda_progress_interval())
+            self.owners.add(owner)
+
+    def __exit__(self, *_):
+        with self.condition:
+            self.owners.remove(threading.current_thread())
+            self.condition.notify()
 
 
 _HTTPS_CONNECTIONS=threading.local()
@@ -757,12 +969,68 @@ class _ValidatedHTTPSRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 
+_RESOLVE_HTTPS_ADDRESS = """
+import json
+import socket
+import sys
+
+try:
+    addresses = socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), type=socket.SOCK_STREAM)
+except socket.gaierror as error:
+    result = {"error": error.args}
+else:
+    result = {"addresses": addresses}
+print(json.dumps(result))
+"""
+
+
+def _network_connect(address, timeout, source_address):
+    # A socket timeout cannot interrupt a resolver blocked in getaddrinfo.
+    # The subprocess is reaped before the caller releases its attempt slot.
+    host, port = address
+    try:
+        resolved = subprocess.run(
+            [sys.executable, '-IB', '-c', _RESOLVE_HTTPS_ADDRESS, host, str(port)],
+            stdin=subprocess.DEVNULL, capture_output=True, check=True, text=True,
+            timeout=min(timeout, _network_remaining()))
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError('dependency HTTPS name resolution exceeded its attempt deadline') from exc
+    result = json.loads(resolved.stdout)
+    if 'error' in result:
+        raise socket.gaierror(*result['error'])
+    last_error = None
+    for family, kind, protocol, _canonical, destination in result['addresses']:
+        sock = socket.socket(family, kind, protocol)
+        try:
+            sock.settimeout(min(timeout, _network_remaining()))
+            if source_address is not None:
+                sock.bind(source_address)
+            sock.connect(tuple(destination))
+            _NETWORK_ATTEMPT.get().watch(sock)
+            return sock
+        except OSError as exc:
+            sock.close()
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise OSError('HTTPS name resolution returned no stream addresses')
+
+
+def _network_https_connection(host, **kwargs):
+    connection = http.client.HTTPSConnection(host, **kwargs)
+    connection._create_connection = _network_connect
+    return connection
+
+
+class _MonitoredHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(_network_https_connection, request, context=self._context)
+
+
 def _open_https(request, *, timeout, expected_host=None):
     _validate_https_endpoint(request.full_url,expected_host)
-    remaining = _native_closure_remaining()
-    if remaining is not None:
-        timeout = min(timeout, remaining)
-    return urllib.request.build_opener(_ValidatedHTTPSRedirect(expected_host)).open(
+    return urllib.request.build_opener(
+        _ValidatedHTTPSRedirect(expected_host), _MonitoredHTTPSHandler()).open(
         request,timeout=min(timeout, _network_remaining()))
 
 
@@ -770,21 +1038,18 @@ def _open_https(request, *, timeout, expected_host=None):
 def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host, accept=None):
     parsed=_validate_https_endpoint(url,expected_host)
     timeout = min(timeout, _network_remaining())
-    remaining = _native_closure_remaining()
-    if remaining is not None:
-        timeout = min(timeout, remaining)
     connections=getattr(_HTTPS_CONNECTIONS,'connections',None)
     if connections is None:
         connections={}
         _HTTPS_CONNECTIONS.connections=connections
     connection=connections.get(expected_host)
-    reused_socket = connection is not None and connection.sock is not None
     if connection is None:
-        connection=http.client.HTTPSConnection(expected_host,timeout=timeout)
+        connection=_network_https_connection(expected_host,timeout=timeout)
         connections[expected_host]=connection
     else:
         connection.timeout = timeout
         if connection.sock is not None:
+            _NETWORK_ATTEMPT.get().watch(connection.sock)
             connection.sock.settimeout(timeout)
     path=urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
     try:
@@ -812,15 +1077,6 @@ def _read_expected_https_once(url, *, timeout, limit, user_agent, expected_host,
             raise urllib.error.HTTPError(url,response.status,response.reason,response.headers,io.BytesIO(b''))
         else:
             raw=_read_metadata_response(response,limit)
-    except http.client.RemoteDisconnected:
-        _drop_expected_https_connection(expected_host)
-        if reused_socket:
-            # A pooled socket closed before response headers is stale. The
-            # request is a read-only GET; reconnect once, without a backoff.
-            return _read_expected_https_once(
-                url, timeout=timeout, limit=limit, user_agent=user_agent,
-                expected_host=expected_host, accept=accept)
-        raise
     except BaseException:
         _drop_expected_https_connection(expected_host)
         raise
@@ -858,7 +1114,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
     label=(parsed.hostname or '')+parsed.path
     def transfer():
         request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
-        with _open_https(request,timeout=180) as response:
+        with _open_https(request,timeout=_operation_timeout()) as response:
             if urllib.parse.urlsplit(response.url).scheme != 'https':
                 raise RuntimeError('untrusted download redirect')
             if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
@@ -926,7 +1182,7 @@ class _StaticGitReadCache:
             pending = self.trees.get(key)
             owner = pending is None
             if owner:
-                pending = concurrent.futures.Future()
+                pending = _OwnedFuture()
                 self.trees[key] = pending
         if owner:
             try:
@@ -945,7 +1201,7 @@ class _StaticGitReadCache:
                 pending.set_exception(exc)
             else:
                 pending.set_result(oid)
-        return _bounded_future_result(pending)
+        return _shared_future_result(pending)
 
     def _blob(self, mirror, oid):
         key = (str(mirror), oid)
@@ -956,7 +1212,7 @@ class _StaticGitReadCache:
             pending = self.blob_futures.get(key)
             owner = pending is None
             if owner:
-                pending = concurrent.futures.Future()
+                pending = _OwnedFuture()
                 self.blob_futures[key] = pending
         if owner:
             try:
@@ -980,7 +1236,7 @@ class _StaticGitReadCache:
                         self.blobs[key] = content
                         self.blob_bytes += size
                 pending.set_result(content)
-        return _bounded_future_result(pending)
+        return _shared_future_result(pending)
 
     def read(self, mirror, commit, path, *, required=False):
         path = path.removeprefix('./')
@@ -1088,8 +1344,8 @@ def _git_acquisition_controls():
         raise RuntimeError('invalid versioned Git acquisition controls')
     if values['git_fetch_workers'] > _acquisition_workers():
         raise RuntimeError('Git worker budget exceeds acquisition worker budget')
-    if values['git_fetch_attempt_timeout_seconds'] > _subprocess_timeout():
-        raise RuntimeError('Git attempt deadline exceeds versioned subprocess budget')
+    if values['git_fetch_attempt_timeout_seconds'] > _operation_timeout():
+        raise RuntimeError('Git attempt deadline exceeds versioned elementary budget')
     backoff = acquisition.get('git_fetch_retry_backoff_seconds')
     if (not isinstance(backoff, list)
             or len(backoff) != values['git_fetch_attempts'] - 1
@@ -1106,7 +1362,7 @@ def _git_mirror_lock(folder):
     key = str(Path(folder).absolute())
     with _GIT_MIRROR_LOCK_GUARD:
         if key not in _GIT_MIRROR_LOCKS:
-            _GIT_MIRROR_LOCKS[key] = threading.Lock()
+            _GIT_MIRROR_LOCKS[key] = _OwnedLock()
         return _GIT_MIRROR_LOCKS[key]
 
 
@@ -1204,7 +1460,11 @@ def _git_run_fetch(command, *, timeout, repo):
                 continue
             data = os.read(process.stderr.fileno(), 65536)
             if not data:
-                result = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout,
+                                                    stderr=bytes(tail).decode(errors='replace'))
+                result = process.wait(timeout=remaining)
                 return subprocess.CompletedProcess(
                     command, result, stdout='', stderr=bytes(tail).decode(errors='replace'))
             tail.extend(data)
@@ -1213,13 +1473,8 @@ def _git_run_fetch(command, *, timeout, repo):
             progress.feed(data)
     except BaseException:
         if process is not None:
-            # Git launches upload-pack helpers and index-pack descendants. A
-            # timeout must terminate the private group, not just the Git leader.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=_subprocess_timeout())
+            _stop_native_process_group(process, cleanup_limit=_operation_timeout(),
+                                       cadence=_conda_progress_interval())
         raise
     finally:
         if process is not None and process.stderr is not None:
@@ -1258,7 +1513,8 @@ def _git_fetch(folder, repo, refspecs, *, explicit_tags=False, timeout=None, ref
         attempts = controls['git_fetch_attempts']
         for attempt in range(1, attempts + 1):
             try:
-                result = _git_run_fetch(command, timeout=attempt_limit, repo=repo)
+                with _registered_operation('Git fetch attempt', limit=attempt_limit, supervised=True):
+                    result = _git_run_fetch(command, timeout=attempt_limit, repo=repo)
                 if result.returncode == 0:
                     return
                 last_detail = (result.stderr or result.stdout
@@ -1306,7 +1562,7 @@ def _git_tree_closure_issue(folder, commits):
         result = subprocess.run(
             ['git', '--git-dir', str(folder), 'fsck', '--full', '--connectivity-only',
              '--no-reflogs', '--no-progress', '--no-dangling', *refs],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=_subprocess_timeout())
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=_operation_timeout())
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError('pinned Git tree-closure verification timed out') from exc
     if result.returncode == 0:
@@ -1423,7 +1679,7 @@ def _acquire_git_mirrors(stage, repositories, *, label='git', freeze_version_ref
         futures=[executor.submit(acquire,repo,commits) for repo,commits in ordered]
         try:
             for future in _bounded_completed(futures):
-                repo,mirror,version_refs=_bounded_future_result(future)
+                repo,mirror,version_refs=_shared_future_result(future)
                 results[repo]=mirror;refs[repo]=version_refs
                 _pool_progress(phase,len(results),len(ordered),'repositories',f'{workers} workers')
         except BaseException:
@@ -3013,7 +3269,8 @@ class Pool:
                 if not destination.is_file() or not destination.samefile(source):
                     raise RuntimeError('CAS hardlink destination differs from verified object')
             else:
-                os.link(source, destination)
+                with _registered_operation('verified CAS link'):
+                    os.link(source, destination)
             if not destination.is_file() or not destination.samefile(source):
                 raise RuntimeError('CAS hardlink identity changed')
             self._verified_signatures[sha] = self._object_signature(source.lstat())
@@ -3046,17 +3303,14 @@ class Pool:
         size = path.stat().st_size
         with _bounded_lock(self._state_lock):
             target = self.objects / sha[:2] / sha
-            target.parent.mkdir(exist_ok=True)
-            if not target.exists():
-                os.link(path, target)
-            elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
-                raise RuntimeError('content-addressed pool collision/changed object')
-            if durable:
-                # Persist the CAS hardlink before deleting its staging source.
-                # Completed bytes survive ordinary worker/process failures.
-                descriptor=os.open(target.parent,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                try:os.fsync(descriptor)
-                finally:os.close(descriptor)
+            with _registered_operation('publish CAS object'):
+                target.parent.mkdir(exist_ok=True)
+                if not target.exists():
+                    os.link(path, target)
+                elif target.is_symlink() or not target.is_file() or target.stat().st_size != size:
+                    raise RuntimeError('content-addressed pool collision/changed object')
+                if durable:
+                    _sync_directory(target.parent)
             self.verified_objects.add(sha)
             return self.reference(sha, category, identity, size)
 
@@ -3092,7 +3346,7 @@ class Pool:
             identities.add(('sha256', sha))
         identities.update((algorithm, value.hex()) for algorithm, value in (sri_parts(sri) or ()))
         with _bounded_lock(self._state_lock):
-            locks = [self._download_locks.setdefault(key, threading.Lock())
+            locks = [self._download_locks.setdefault(key, _OwnedLock())
                      for key in sorted(identities)]
         with contextlib.ExitStack() as stack:
             for lock in locks:
@@ -3578,7 +3832,7 @@ def acquire_locked_conda(pool,lock):
                     pending,timeout=progress.interval,return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in finished:
                     if future.cancelled():continue
-                    try:_bounded_future_result(future)
+                    try:_shared_future_result(future)
                     except BaseException as exc:
                         if first_error is None:first_error=exc
                 if first_error is not None:
@@ -3628,6 +3882,26 @@ def _target_debian_architecture():
     mapping={'x86_64':'amd64','aarch64':'arm64'}
     try:return mapping[architecture]
     except KeyError as exc:raise RuntimeError('unsupported golden architecture for Debian packages: '+architecture) from exc
+
+
+@functools.lru_cache(maxsize=1)
+def _apt_download_module():
+    path = Path(__file__).resolve().parents[1] / 'infra/workstation/image/apt_downloads.py'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing versioned APT download supervisor')
+    spec = importlib.util.spec_from_file_location('verified_apt_downloads', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_apt_downloads(arguments):
+    limit = _operation_timeout()
+    cadence = _conda_progress_interval()
+    _apt_download_module().run_downloads(
+        arguments, limit=limit, cadence=cadence, observe=_registered_operation,
+        terminate=lambda process: _stop_native_process_group(process, cleanup_limit=limit, cadence=cadence),
+    )
 
 
 def apt_closure(pool,packages):
@@ -3682,8 +3956,9 @@ def apt_closure(pool,packages):
           '-o','APT::Get::AllowUnauthenticated=false',
           '-o','Acquire::AllowInsecureRepositories=false',
           '-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
-    invoke(['apt-get',*opts,'update'])
-    invoke(['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)])
+    opts.extend(('-o', 'Acquire::Retries=' + str(_network_retries()[0] - 1)))
+    _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
+    _run_apt_downloads(['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)])
     debs=sorted((apt/'archives').glob('*.deb'))
     if not debs:
         raise RuntimeError('signed Kali resolution lacks any required new Debian archives')
@@ -3795,7 +4070,7 @@ class _SingleFlightCache:
             future=self._pending.get(key)
             owner=future is None
             if owner:
-                future=concurrent.futures.Future()
+                future=_OwnedFuture()
                 self._pending[key]=future
         if not owner:return _shared_future_result(future)
         try:
@@ -3837,7 +4112,7 @@ class _BoundedCoreMetadataCache:
             future = self._pending.get(key)
             owner = future is None
             if owner:
-                future = concurrent.futures.Future()
+                future = _OwnedFuture()
                 self._pending[key] = future
         if not owner:
             return _shared_future_result(future)
@@ -4495,7 +4770,7 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
             raise
 
     def _enqueue(self, priority, fn, args, kwargs):
-        future = concurrent.futures.Future()
+        future = _OwnedFuture(executor=self)
         with self._condition:
             if self._shutdown:
                 raise RuntimeError('cannot submit to shutdown metadata executor')
@@ -4538,10 +4813,12 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
             }
 
     def _worker(self):
+        thread = threading.current_thread()
+        actor = _actor(thread, register=True)
         while True:
             with self._condition:
                 while not self._jobs and not self._shutdown:
-                    self._condition.wait(timeout=_native_pip_timeouts()[1])
+                    self._condition.wait(timeout=_conda_progress_interval())
                 if not self._jobs:
                     return
                 _priority, _order, generation, future = heapq.heappop(self._jobs)
@@ -4552,6 +4829,9 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
                 _priority, _order, _generation, fn, args, kwargs = item
             if not future.set_running_or_notify_cancel():
                 continue
+            future.producer = thread
+            with _OPERATION_ACTORS_LOCK:
+                actor.changed = time.monotonic()
             with self._condition:
                 self._active[threading.get_ident()] = _priority
             try:
@@ -4563,6 +4843,23 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
             finally:
                 with self._condition:
                     self._active.pop(threading.get_ident())
+                with _OPERATION_ACTORS_LOCK:
+                    actor.changed = time.monotonic()
+
+    def _exit_deadline(self, thread, shutdown_started, idle_limit, active):
+        if thread.ident not in active:
+            actor = _actor(thread)
+            with _OPERATION_ACTORS_LOCK:
+                last = max(shutdown_started, actor.changed) if actor is not None else shutdown_started
+            return last + idle_limit
+        with _FUTURE_WAITS_LOCK:
+            thread, completion = _verify_future_producer(_FUTURE_WAITS.get(thread), thread)
+        actor = _actor(thread)
+        with _OPERATION_ACTORS_LOCK:
+            if actor is not None:
+                last = max(actor.changed, completion) if completion is not None else actor.changed
+                return min(actor.active.values(), default=last + idle_limit)
+        return shutdown_started + idle_limit
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         cancelled = ()
@@ -4578,11 +4875,29 @@ class _PriorityMetadataExecutor(concurrent.futures.Executor):
         for future in cancelled:
             future.cancel()
         if wait:
-            deadline = time.monotonic() + _native_pip_timeouts()[0]
-            for thread in self._threads:
-                thread.join(timeout=max(0, deadline - time.monotonic()))
-                if thread.is_alive():
-                    raise TimeoutError('versioned metadata executor shutdown deadline exceeded')
+            cadence = _conda_progress_interval()
+            idle_limit = _unregistered_work_timeout()
+            started = time.monotonic()
+            while alive := [thread for thread in self._threads if thread.is_alive()]:
+                with self._condition:
+                    active = frozenset(self._active)
+                try:
+                    deadline = min(self._exit_deadline(thread, started, idle_limit, active)
+                                   for thread in alive)
+                except RuntimeError as exc:
+                    self.shutdown(wait=False, cancel_futures=True)
+                    raise RuntimeError('cannot verify metadata worker ownership during shutdown') from exc
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Let the acquisition process unwind. Fossil reaps its private
+                    # cgroup before handling the failed stage.
+                    names = ', '.join(thread.name for thread in alive)
+                    self.shutdown(wait=False, cancel_futures=True)
+                    raise TimeoutError('metadata workers exceeded their shutdown deadline: ' + names)
+                alive[0].join(timeout=min(cadence, remaining))
+            with self._condition:
+                if self._pending or self._active:
+                    raise RuntimeError('metadata workers exited with unresolved work')
 
 
 class _ResolverActivity:
@@ -4660,8 +4975,8 @@ def _resolver_runtime_identity():
 
 
 @functools.lru_cache(maxsize=1)
-def _native_pip_timeouts():
-    """Read operational deadlines from the staged, versioned preparation policy."""
+def _native_pip_stall_timeout():
+    """Read the versioned inactivity limit for one Pip process."""
     path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     if path.is_symlink() or not path.is_file():
         raise RuntimeError('missing staged native pip timeout policy')
@@ -4669,78 +4984,10 @@ def _native_pip_timeouts():
         policy = tomllib.load(stream).get('acquisition')
     if not isinstance(policy, dict):
         raise RuntimeError('invalid native pip acquisition controls')
-    total = policy.get('pip_total_timeout_seconds')
     stall = policy.get('pip_stall_timeout_seconds')
-    if (type(total) is not int or total < 1 or type(stall) is not int
-            or stall < 1 or stall >= total):
-        raise RuntimeError('invalid native pip total/stall timeout controls')
-    return total, stall
-
-
-@functools.lru_cache(maxsize=1)
-def _native_pip_metadata_timeout_overrides():
-    """Read verified-source metadata build limits from the versioned policy."""
-    path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError('missing staged native pip metadata timeout policy')
-    with path.open('rb') as stream:
-        acquisition = tomllib.load(stream).get('acquisition')
-    if not isinstance(acquisition, dict):
-        raise RuntimeError('invalid native pip acquisition policy')
-    rows = acquisition.get('pip_metadata_elementary_timeout_overrides')
-    if not isinstance(rows, list) or not rows:
-        raise RuntimeError('missing native pip metadata timeout declarations')
-    default = _operation_timeout()
-    overrides = {}
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != {'kind', 'identity', 'timeout_seconds'}:
-            raise RuntimeError('invalid native pip metadata timeout rule schema')
-        kind = row['kind']
-        identity = row['identity']
-        seconds = row['timeout_seconds']
-        if (type(identity) is not str or type(seconds) is not int
-                or seconds <= default
-                or (kind == 'pinned-git-checkout' and REPO.fullmatch(identity) is None)
-                or (kind == 'pypi-sdist' and (not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', identity)
-                                               or _normalized_package_name(identity) != identity))
-                or kind not in {'pinned-git-checkout', 'pypi-sdist'}):
-            raise RuntimeError('invalid native pip metadata timeout rule')
-        key = (kind, identity)
-        if key in overrides:
-            raise RuntimeError('duplicate native pip metadata timeout rule')
-        overrides[key] = seconds
-    return overrides
-
-
-def _native_pip_elementary_timeout(runtime, *, metadata_build=False):
-    """Raise only the elementary subprocess lifetime for matching source metadata."""
-    default = _operation_timeout()
-    if not metadata_build:
-        return default
-    overrides = _native_pip_metadata_timeout_overrides()
-    context = runtime.get('_native_source_context')
-    if not isinstance(context, dict):
-        return default
-    kind = context.get('kind')
-    if kind == 'pinned-git-checkout':
-        mirror = context.get('mirror')
-        commit = context.get('commit')
-        if type(mirror) is not str or type(commit) is not str or COMMIT.fullmatch(commit) is None:
-            return default
-        path = Path(mirror)
-        if not path.is_absolute() or path.parent.name != 'git':
-            return default
-        for (source_kind, repository), seconds in overrides.items():
-            if (source_kind == kind
-                    and path.name == repository.replace('/', '_') + '.git'):
-                return seconds
-    elif kind == 'pypi-sdist':
-        name = context.get('name')
-        sha = context.get('sha256')
-        if type(name) is not str or type(sha) is not str or SHA.fullmatch(sha) is None:
-            return default
-        return overrides.get((kind, _normalized_package_name(name)), default)
-    return default
+    if type(stall) is not int or not 1 <= stall <= _operation_timeout():
+        raise RuntimeError('invalid native Pip stall timeout')
+    return stall
 
 
 # Native pip is responsible for PyPI resolution; the surrounding pipeline still
@@ -4787,7 +5034,7 @@ def _native_pool_runtime(pool):
                   '_pip_byte_progress': _NativePipByteProgress(_conda_progress_interval()),
                   'prefixes': {}, 'bootstrapped': False,
                   'submodule_lock': threading.RLock(),
-                  'conda_install_lock': threading.RLock()}
+                  'conda_install_lock': _OwnedLock()}
         pool._native_runtime = native
         return native
 
@@ -4987,13 +5234,15 @@ def _native_process_tree_snapshot(root_pid):
             fields = line.rsplit(') ', 1)[1].split()
             pid = int(entry.name)
             row = {'pid': pid, 'ppid': int(fields[1]), 'state': fields[0],
+                   'pgid': int(fields[2]), 'session': int(fields[3]),
                    'start_ticks': int(fields[19]),
                    'cpu_ticks': int(fields[11]) + int(fields[12]),
                    'reaped_cpu_ticks': int(fields[13]) + int(fields[14])}
         except (OSError, IndexError, ValueError):
             continue  # The process exited while procfs was being sampled.
         observed[pid] = row
-    selected = {root_pid}
+    selected = {root_pid} | {pid for pid, row in observed.items()
+                             if row['pgid'] == root_pid and row['session'] == root_pid}
     while True:
         children = {pid for pid, row in observed.items() if row['ppid'] in selected}
         extended = selected | children
@@ -5025,6 +5274,20 @@ def _native_process_tree_snapshot(root_pid):
             row['io_read_error'] = str(exc)
         results.append(row)
     return results
+
+
+def _stop_native_process_group(process, *, cleanup_limit, cadence):
+    deadline = time.monotonic() + cleanup_limit
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+    while any(row['state'] != 'Z' for row in _native_process_tree_snapshot(process.pid)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('native process group remained active after SIGKILL')
+        time.sleep(min(remaining, cadence))
 
 
 def _native_process_activity(before, after, sample_seconds):
@@ -5060,20 +5323,11 @@ def _native_backend_is_executing(activity):
 
 
 def _conda_elementary_entry():
-    import functools
-    import inspect
-    import itertools
-    import runpy
-    import threading
-    import time
-
     fd_raw = os.environ.pop('GPT_TRACE_CONDA_EVENT_FD')
     fd = int(fd_raw)
     if fd < 3:
         raise RuntimeError('untrusted Conda action event descriptor')
-    events = itertools.count(1)
     writer_lock = threading.Lock()
-    thread_scope = threading.local()
 
     def emit(event, ident, label):
         payload = (json.dumps({'event': event, 'id': ident, 'label': label,
@@ -5085,75 +5339,9 @@ def _conda_elementary_entry():
             if os.write(fd, payload) != len(payload):
                 raise RuntimeError('short Conda action event write')
 
-    from conda.core import link, package_cache_data, path_actions
-
-    def wrap(function, label):
-        @functools.wraps(function)
-        def observed(*args, **kwargs):
-            ident = next(events)
-            description = label
-            if args:
-                subject = args[0]
-                attributes = vars(subject) if hasattr(subject, '__dict__') else {}
-                detail = attributes.get('target_short_path')
-                if detail is None:
-                    detail = attributes.get('source_short_path')
-                if detail is not None:
-                    description += ':' + str(detail)[:200]
-            stack = getattr(thread_scope, 'stack', None)
-            if stack is None:
-                stack = []
-                thread_scope.stack = stack
-            if stack:
-                emit('pause', stack[-1][0], stack[-1][1])
-            emit('begin', ident, description)
-            stack.append((ident, description))
-            try:
-                return function(*args, **kwargs)
-            finally:
-                stack.pop()
-                emit('end', ident, description)
-                if stack:
-                    emit('resume', stack[-1][0], stack[-1][1])
-        return observed
-
-    def descendants(parent):
-        for subtype in parent.__subclasses__():
-            yield subtype
-            yield from descendants(subtype)
-
-    classes = list(dict.fromkeys((path_actions._Action, *descendants(path_actions._Action))))
-    instrumented = 0
-    for cls in classes:
-        for name in ('execute', 'verify'):
-            function = cls.__dict__.get(name)
-            if inspect.isfunction(function) and not getattr(function, '__isabstractmethod__', False):
-                setattr(cls, name, wrap(function, 'conda:' + cls.__name__ + '.' + name))
-                instrumented += 1
-    if instrumented < 2:
-        raise RuntimeError('Conda elementary action instrumentation is unavailable')
-
-    # Each explicit archive gets its own preparation budget. This is not the
-    # deadline for ProgressiveFetchExtract.execute, which handles many archives.
-    original_record = package_cache_data.ProgressiveFetchExtract.make_actions_for_record
-    package_cache_data.ProgressiveFetchExtract.make_actions_for_record = staticmethod(
-        wrap(original_record, 'conda:prepare_package'))
-    link.run_script = wrap(link.run_script, 'conda:package_script')
-    package_cache_data.do_extract_action = wrap(
-        package_cache_data.do_extract_action, 'conda:extract_package')
-    package_cache_data.do_cache_action = wrap(
-        package_cache_data.do_cache_action, 'conda:cache_package')
-    emit('ready', 0, 'conda:instrumented')
-    sys.argv = ['conda', *sys.argv[2:]]
-    try:
-        runpy.run_module('conda', run_name='__main__', alter_sys=True)
-    except SystemExit as exc:
-        if exc.code is None or exc.code == 0:
-            emit('complete', 0, 'conda:complete')
-        raise
-    else:
-        emit('complete', 0, 'conda:complete')
-
+    source = Path(__file__).resolve().parents[1] / "infra/workstation/image/conda_trace.py"
+    run = __import__("runpy").run_path(str(source))["run_conda_actions"]
+    run(sys.argv[2:], emit)
 
 
 def _native_run_conda_elementary(command, runtime, environment):
@@ -5173,6 +5361,7 @@ def _native_run_conda_elementary(command, runtime, environment):
     with tempfile.TemporaryFile(mode='w+b') as output:
         process = None
         active = {}
+        scopes = {}
         paused = {}
         ready = False
         complete = False
@@ -5232,22 +5421,34 @@ def _native_run_conda_elementary(command, runtime, environment):
                                 raise RuntimeError('unexpected Conda action transition')
                             elif kind == 'begin' and ident > 0 and ident not in active and ident not in paused:
                                 active[ident] = (instant, label)
+                                scope = _registered_operation(label, process=process.pid, started=instant,
+                                                              supervised=True)
+                                scope.__enter__()
+                                scopes[ident] = scope
                                 last_event = instant
                             elif kind == 'pause' and ident in active:
                                 started, original_label = active.pop(ident)
                                 if instant - started >= limit:
                                     raise TimeoutError('Conda elementary action exceeded '
                                                        + str(limit) + ' seconds: ' + original_label)
-                                paused[ident] = original_label
+                                scopes.pop(ident).__exit__(None, None, None)
+                                paused[ident] = (instant - started, original_label)
                                 last_event = instant
                             elif kind == 'resume' and ident in paused:
-                                active[ident] = (instant, paused.pop(ident))
+                                used, original_label = paused.pop(ident)
+                                started = instant - used
+                                active[ident] = (started, original_label)
+                                scope = _registered_operation(original_label, process=process.pid, started=started,
+                                                              supervised=True)
+                                scope.__enter__()
+                                scopes[ident] = scope
                                 last_event = instant
                             elif kind == 'end' and ident in active:
                                 started, original_label = active.pop(ident)
                                 if instant - started >= limit:
                                     raise TimeoutError('Conda elementary action exceeded '
                                                        + str(limit) + ' seconds: ' + original_label)
+                                scopes.pop(ident).__exit__(None, None, None)
                                 last_event = instant
                             else:
                                 raise RuntimeError('unexpected Conda action transition')
@@ -5258,7 +5459,7 @@ def _native_run_conda_elementary(command, runtime, environment):
                     if now - started >= limit:
                         raise TimeoutError('Conda elementary action exceeded '
                                            + str(limit) + ' seconds: ' + label)
-                if not active and not paused and now - last_event >= limit:
+                if not active and now - last_event >= limit:
                     raise TimeoutError('Conda uninstrumented internal phase exceeded '
                                        + str(limit) + ' seconds without an action event')
             output.seek(0)
@@ -5299,19 +5500,15 @@ def _native_run_conda_elementary(command, runtime, environment):
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
+            for scope in scopes.values():
+                scope.__exit__(None, None, None)
 
 
 
 def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=False):
-    import signal
-
     cadence = _conda_progress_interval()
-    limit = _native_pip_elementary_timeout(runtime, metadata_build=metadata_build)
-    _total, stall = _native_pip_timeouts()
-    if limit != _operation_timeout():
-        print('[pool] scoped Pip metadata timeout: '
-              + json.dumps({'source': runtime.get('_native_source_context'),
-                            'limit_seconds': limit}, sort_keys=True), flush=True)
+    limit = _operation_timeout()
+    stall = _native_pip_stall_timeout()
     with _bounded_lock(_NATIVE_POOL_LOCK):
         meter = runtime.get('_pip_byte_progress')
         if meter is None:
@@ -5323,41 +5520,39 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
         ('\0'.join(command) + str(threading.get_ident())).encode()).hexdigest()[:12]
     meter.begin(identity)
     tail = bytearray()
-    reader_errors = []
-    last_output = [time.monotonic()]
-    output_lock = threading.Lock()
+    last_output = time.monotonic()
+    buffered = bytearray()
     process = None
+    leaf_scopes = {}
     try:
         environment = {**environment, 'PIP_DEFAULT_TIMEOUT': str(limit)}
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
 
-        def consume():
-            try:
-                for line in iter(process.stdout.readline, b''):
-                    byte_progress = meter.observe(identity, line)
-                    with output_lock:
-                        if line.strip():
-                            last_output[0] = time.monotonic()
-                    if not byte_progress:
-                        tail.extend(line)
-                        if len(tail) > 65536:
-                            del tail[:-65536]
-            except BaseException as error:
-                reader_errors.append(error)
-            finally:
-                process.stdout.close()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        pipe_open = True
 
-        reader = threading.Thread(target=consume, name='native-pip-output-reader', daemon=True)
-        reader.start()
+        def consume(line):
+            nonlocal last_output
+            if line.strip():
+                last_output = time.monotonic()
+            if not meter.observe(identity, line):
+                tail.extend(line)
+                if len(tail) > 65536:
+                    del tail[:-65536]
+
         leaf_since = {}
+        leaf_time = {}
         previous_leaves = set()
+        observed_parents = set()
+        ticks_per_second = os.sysconf('SC_CLK_TCK')
         started = time.monotonic()
 
         def expired(kind, seconds, message, snapshot):
             diagnostic = {
-                'timeout': kind, 'limit_seconds': seconds,
+                'timeout': kind, 'limit_seconds': seconds, 'metadata_build': metadata_build,
                 'elapsed_seconds': time.monotonic() - started,
                 'source': runtime.get('_native_source_context'),
                 'processes': [{key: row[key] for key in
@@ -5371,65 +5566,104 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
             suffix = tail[-5000:].decode(errors='replace')
             raise TimeoutError(message + ('; last output: ' + suffix if suffix else ''))
 
-        while process.poll() is None:
+        while True:
+            status = process.poll()
+            if status is not None and not pipe_open:
+                break
             now = time.monotonic()
             snapshot = _native_process_tree_snapshot(process.pid)
-            parents = {row['ppid'] for row in snapshot}
-            leaves = set()
-            for row in snapshot:
-                pid = row['pid']
-                if pid == process.pid or pid in parents or row['state'] == 'Z':
-                    continue
-                marker = (pid, row['start_ticks'])
-                leaves.add(marker)
-                born = leaf_since.setdefault(marker, now)
+            live = {(row['pid'], row['start_ticks']): row for row in snapshot if row['state'] != 'Z'}
+            parents = {row['ppid'] for row in live.values()}
+            leaves = {marker for marker in live if marker[0] != process.pid and marker[0] not in parents}
+            observed_parents.update(marker for marker in live if marker[0] in parents)
+            observed_parents.intersection_update(live)
+            for marker in tuple(leaf_since):
+                if marker not in leaves:
+                    consumed = now - leaf_since.pop(marker)
+                    if marker in live:
+                        leaf_time[marker] = consumed
+                    leaf_scopes.pop(marker).__exit__(None, None, None)
+            for marker in tuple(leaf_time):
+                if marker not in live:
+                    del leaf_time[marker]
+            for marker in sorted(leaves):
+                pid, start_ticks = marker
+                row = live[marker]
+                if marker not in leaf_since:
+                    if marker in observed_parents:
+                        born = now - leaf_time.get(marker, 0)
+                    else:
+                        age = time.clock_gettime(time.CLOCK_BOOTTIME) - start_ticks / ticks_per_second
+                        born = now - max(0, age)
+                    leaf_since[marker] = born
+                    scope = _registered_operation('Pip subprocess', limit=limit,
+                                                  process=pid, started=born, supervised=True)
+                    scope.__enter__()
+                    leaf_scopes[marker] = scope
+                else:
+                    born = leaf_since[marker]
                 if now - born >= limit:
                     expired('elementary', limit, 'Pip elementary subprocess exceeded '
                             + str(limit) + ' seconds: '
                             + str(row.get('command', pid))[:800], snapshot)
-            for marker in tuple(leaf_since):
-                if marker not in leaves:
-                    del leaf_since[marker]
+            for marker, row in live.items():
+                if marker[0] != process.pid and row['cpu_ticks'] / ticks_per_second >= limit:
+                    expired('elementary', limit, 'Pip elementary subprocess exceeded '
+                            + str(limit) + ' CPU seconds: ' + str(row.get('command', marker[0]))[:800], snapshot)
             if leaves != previous_leaves:
-                with output_lock:
-                    last_output[0] = now
+                last_output = now
                 previous_leaves = leaves
-            with output_lock:
-                idle = now - last_output[0]
+            idle = now - last_output
             # Without an active operation, Pip's own stall deadline catches a
             # backend that is neither producing output nor spawning work.
-            if not leaves and idle >= stall:
+            if status is None and not leaves and idle >= stall:
                 expired('stall', stall, 'Pip emitted no output and started no elementary '
                         + 'subprocess for ' + str(stall) + ' seconds', snapshot)
-            try:
-                process.wait(timeout=cadence)
-            except subprocess.TimeoutExpired:
-                pass
-        reader.join(timeout=cadence)
-        if reader.is_alive():
-            raise RuntimeError('Pip output reader remained alive after subprocess exit')
-        if reader_errors:
-            raise RuntimeError('Pip output reader failed') from reader_errors[0]
+            next_check = min((born + limit for born in leaf_since.values()),
+                             default=last_output + stall)
+            delay = min(cadence, max(0, next_check - time.monotonic())) if status is None else 0
+            if pipe_open:
+                readable, _, _ = select.select([descriptor], [], [], delay)
+                if readable:
+                    block = os.read(descriptor, 65536)
+                    if block:
+                        buffered.extend(block)
+                        while b'\n' in buffered:
+                            line, _, rest = buffered.partition(b'\n')
+                            buffered = bytearray(rest)
+                            consume(line + b'\n')
+                        if len(buffered) > 65536:
+                            consume(buffered[:65536])
+                            del buffered[:65536]
+                    else:
+                        pipe_open = False
+                        if buffered:
+                            consume(buffered)
+                elif status is not None:
+                    raise RuntimeError('Pip exited while a descendant still owns its output')
+            else:
+                try:
+                    process.wait(timeout=delay)
+                except subprocess.TimeoutExpired:
+                    pass
+        if any(row['pid'] != process.pid and row['state'] != 'Z'
+               for row in _native_process_tree_snapshot(process.pid)):
+            raise RuntimeError('Pip exited while its process group still has live descendants')
         if process.returncode:
             raise RuntimeError('native Pip invocation failed (exit '
                                + str(process.returncode) + '): '
                                + tail[-5000:].decode(errors='replace'))
         return bytes(tail)
     except BaseException:
-        if process is not None and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=cadence)
+        if process is not None:
+            _stop_native_process_group(process, cleanup_limit=_operation_timeout(), cadence=cadence)
         raise
     finally:
+        if process is not None:
+            process.stdout.close()
+        for scope in leaf_scopes.values():
+            scope.__exit__(None, None, None)
         meter.end(identity)
-
-
-def _native_run_pip_with_byte_progress(command, runtime, environment, timeout, *, metadata_build=False):
-    return _native_run_pip_elementary(command, runtime, environment,
-                                      metadata_build=metadata_build)
 
 
 def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build=False):
@@ -5444,10 +5678,6 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     command = [str(arg) for arg in argv]
     if not command:
         raise RuntimeError('empty native package command')
-    if timeout is None:
-        timeout = _operation_timeout()
-    if type(timeout) is not int or timeout < 1:
-        raise RuntimeError('invalid native elementary command timeout')
     environment = dict(runtime['env'])
     base_bin = Path(runtime['root']) / 'conda' / 'bin'
     paths = [str(base_bin)]
@@ -5480,21 +5710,34 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     for index in range(len(command) - 2):
         if command[index:index + 3] == ['-m', 'pip', 'install']:
             command.insert(index + 3, '--progress-bar=raw')
-            return _native_run_pip_with_byte_progress(
-                command, runtime, environment, timeout, metadata_build=metadata_build)
+            return _native_run_pip_elementary(
+                command, runtime, environment, metadata_build=metadata_build)
     if (len(command) >= 4 and command[1:4] == ['-m', 'conda', 'create']
             and '--offline' in command):
         return _native_run_conda_elementary(command, runtime, environment)
-    remaining = _native_closure_remaining()
-    if remaining is not None:
-        timeout = min(timeout, remaining)
-    output = subprocess.run(command, cwd=runtime['root'], env=environment,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=timeout)
-    if output.returncode:
+    if timeout is None:
+        timeout = _operation_timeout()
+    if type(timeout) is not int or not 1 <= timeout <= _operation_timeout():
+        raise RuntimeError('invalid native elementary command timeout')
+    started = time.monotonic()
+    with _registered_operation('native package subprocess', limit=timeout, started=started, supervised=True):
+        process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            output, _ = process.communicate(timeout=max(0, started + timeout - time.monotonic()))
+            if any(row['state'] != 'Z' for row in _native_process_tree_snapshot(process.pid)):
+                raise RuntimeError('native package command exited with live descendants')
+        except BaseException:
+            _stop_native_process_group(process, cleanup_limit=_operation_timeout(),
+                                       cadence=_conda_progress_interval())
+            raise
+        finally:
+            process.stdout.close()
+    if process.returncode:
         raise RuntimeError('native package command failed (exit '
-            + str(output.returncode) + '): ' + output.stdout[-5000:].decode(errors='replace'))
-    return output.stdout
+            + str(process.returncode) + '): ' + output[-5000:].decode(errors='replace'))
+    return output
 
 
 def _native_build_requirements(scratch):
@@ -5642,7 +5885,7 @@ def _native_locked_python(pool, target):
             if not candidates:
                 raise RuntimeError('locked target interpreter artifact absent from Conda transactions: ' + sha)
             _length, key, packages = min(candidates, key=lambda row: (row[0], row[1]))
-            pending = concurrent.futures.Future()
+            pending = _OwnedFuture()
             pending_by_sha[sha] = pending
     if not owner:
         return _shared_future_result(pending)
@@ -5765,12 +6008,8 @@ class _IncompatibleSourceSyntax(RuntimeError):
     """
 
 
-def _check_legacy_setup_syntax(archive, interpreter):
-    """Compile, never execute, setuptools' setup.py with the LOCKED target Python.
-
-    Read only the archive members at its distribution root; no extraction or
-    import of untrusted package code. Do not preflight non-setuptools backends.
-    """
+@_supervised_operation
+def _legacy_setup_entries(archive):
     archive = Path(archive)
     entries = {}
     if archive.name.endswith('.zip'):
@@ -5810,6 +6049,16 @@ def _check_legacy_setup_syntax(archive, interpreter):
                     if len(raw) > MAX_SOURCE:
                         raise RuntimeError('verified source setup metadata exceeds size limit')
                     entries[name] = raw
+    return entries
+
+
+def _check_legacy_setup_syntax(archive, interpreter):
+    """Compile, never execute, setuptools' setup.py with the LOCKED target Python.
+
+    Read only the archive members at its distribution root; no extraction or
+    import of untrusted package code. Do not preflight non-setuptools backends.
+    """
+    entries = _legacy_setup_entries(archive)
     setup_names = [name for name in entries if name.split('/')[-1] == 'setup.py']
     if not setup_names:
         return
@@ -5838,7 +6087,7 @@ def _check_legacy_setup_syntax(archive, interpreter):
               "    print('valid')\n")
     completed = subprocess.run([str(interpreter), '-I', '-B', '-c', script],
                                input=entries[setup_name], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, timeout=_native_pip_timeouts()[0])
+                               stderr=subprocess.PIPE, timeout=_operation_timeout())
     if completed.returncode != 0:
         raise RuntimeError('locked target Python setup.py syntax probe failed: '
                            + completed.stderr[-1000:].decode(errors='replace'))
@@ -6081,7 +6330,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
         pending = inflight.get(identity)
         owner = pending is None
         if owner:
-            pending = concurrent.futures.Future()
+            pending = _OwnedFuture()
             inflight[identity] = pending
     if not owner:
         dependencies, remote = _shared_future_result(pending)
@@ -6183,6 +6432,7 @@ def _native_close(pool):
     if cache.is_dir():
         shutil.rmtree(cache)
 
+@_supervised_operation
 def _validate_pip_plan_graph(plan):
     """Independently check the complete recorded graph before checkpoint/reuse."""
     target=_coerce_target(plan['target'])
@@ -6480,12 +6730,12 @@ class _PipVersionAdmissionCache:
             pending = self.pending.get(key)
             owner = pending is None
             if owner:
-                pending = (universe, concurrent.futures.Future())
+                pending = (universe, _OwnedFuture())
                 self.pending[key] = pending
             elif pending[0] is not universe:
                 raise RuntimeError('Pip admission computation identity collision')
         if not owner:
-            return _bounded_future_result(pending[1])
+            return _shared_future_result(pending[1])
         try:
             packed = bytearray((len(universe) + 7) // 8)
             for index, (version, _artifact) in enumerate(universe):
@@ -6644,6 +6894,7 @@ def _core_metadata_fields(raw, *, expected_name=None, expected_version=None, tar
     return name,version,parsed.get_all('Requires-Dist') or [],parsed.get_all('Provides-Extra') or []
 
 
+@_supervised_operation
 def _wheel_core_metadata(path, *, expected_name=None, expected_version=None, target=None):
     import zipfile
     path=Path(path)
@@ -6909,20 +7160,17 @@ def _materialize_solution(pool,records,key,target,artifact_cache,executor=None,s
                                +expected['name']+'=='+expected['version'])
         return actual
     if executor is None or len(records)<2:
-        result = [materialize(expected) for expected in records]
-        _native_closure_remaining()
-        return result
+        return [materialize(expected) for expected in records]
     context = contextvars.copy_context()
-    futures = [executor.submit(context.copy().run, materialize, expected) for expected in records]
+    futures = []
     try:
-        result = []
-        for future in futures:
-            remaining = _native_closure_remaining()
-            result.append(_bounded_future_result(future))
-        return result
-    except BaseException:
-        for future in futures:future.cancel()
-        raise
+        for expected in records:
+            futures.append(executor.submit(context.copy().run, materialize, expected))
+        return [_shared_future_result(future) for future in futures]
+    finally:
+        running = (future for future in futures if not future.cancel())
+        for _ in _bounded_completed(running):
+            pass
 
 
 def _candidate_satisfies(candidate,requirements,constraints):
@@ -6947,8 +7195,7 @@ def _resolve_registry_plan(pool,target,reqs,constraints,key,*,no_deps=False,reso
     spec.loader.exec_module(module)
     return module.solve(globals(),pool,target,reqs,constraints,key,no_deps=no_deps,
                         resolver_cache=resolver_cache,materialize=materialize,
-                        preferred_versions=preferred_versions,
-                        deadline=_NATIVE_CLOSURE_DEADLINE.get())
+                        preferred_versions=preferred_versions)
 
 
 def _pip_plan_path(stage, key):
@@ -7159,7 +7406,7 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None,phase=None,selection=
         locks=getattr(pool,'_native_group_locks',None)
         if locks is None:
             locks={};pool._native_group_locks=locks
-        lock=locks.setdefault(key,threading.RLock())
+        lock=locks.setdefault(key,_OwnedLock())
         if not hasattr(pool, '_native_group_context'):
             pool._native_group_context = threading.local()
             pool._native_group_edges = defaultdict(set)
@@ -7177,26 +7424,14 @@ def acquire_pip_group(pool,key,group,*,resolver_cache=None,phase=None,selection=
                     seen.add(current)
                     pending.extend(pool._native_group_edges[current])
             pool._native_group_edges[parent].add(key)
-    inherited = _NATIVE_CLOSURE_DEADLINE.get()
-    deadline = time.monotonic() + _native_pip_timeouts()[0]
-    if inherited is not None:
-        deadline = min(deadline, inherited)
     try:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or not lock.acquire(timeout=remaining):
-            raise TimeoutError('native Pip closure deadline expired while awaiting its group lock')
-        try:
+        with lock:
             pool._native_group_context.stack = (*stack, key)
-            token = _NATIVE_CLOSURE_DEADLINE.set(deadline)
             try:
-                _native_closure_remaining()
                 return _native_pip_group_locked(pool,key,group,phase=phase,selection=selection,
                                                 preferences_override=preferences_override)
             finally:
-                _NATIVE_CLOSURE_DEADLINE.reset(token)
                 pool._native_group_context.stack = stack
-        finally:
-            lock.release()
     finally:
         if stack:
             with _bounded_lock(pool._state_lock):
@@ -7246,7 +7481,6 @@ def _native_pip_group_locked(pool,key,group,*,phase=None,selection=None,preferen
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
     try:
-        _native_closure_remaining()
         if phase == 'publish':
             if selection['status'] != 'planned':
                 raise RuntimeError('invalid native pip publication selection')
@@ -7262,28 +7496,10 @@ def _native_pip_group_locked(pool,key,group,*,phase=None,selection=None,preferen
                 preferred_versions=(preferences_override if preferences_override is not None
                                     else group.get('preferred_versions')),
                 materialize=(phase is None))
-        _native_closure_remaining()
         if phase == 'plan':
             return {'status':'planned', 'packages':packages}
         build_plans = _native_acquire_build_dependencies(pool,target,packages)
-        _native_closure_remaining()
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-        deadline = _NATIVE_CLOSURE_DEADLINE.get()
-        if deadline is not None and time.monotonic() >= deadline:
-            evidence = {
-                'closure': key,
-                'requirements': sorted(set(group['requirements'])),
-                'constraints': sorted(set(group['constraints'])),
-                'preferred_versions': _canonical_pip_preferences(group.get('preferred_versions')),
-                'no_deps': group['no_deps'],
-                'tasks': sorted(set(group['tasks'])),
-                'target_python': target.python_full_version,
-                'target_fingerprint': _target_fingerprint(target),
-            }
-            print('[pool] timed-out pip closure input evidence: '
-                  + json.dumps(evidence, sort_keys=True, ensure_ascii=False),
-                  file=sys.stderr, flush=True)
-            raise RuntimeError('native Pip closure exceeded configured total deadline: ' + key) from exc
         detail = str(exc)
         if isinstance(exc, subprocess.TimeoutExpired) and exc.output:
             detail += '; last pip output: ' + exc.output[-5000:].decode(errors='replace')
@@ -7311,7 +7527,6 @@ def _native_pip_group_locked(pool,key,group,*,phase=None,selection=None,preferen
             'no_deps':group['no_deps'],'optional_failed':str(exc),
             'packages':[],'files':[],'source_archives':[]},sort_keys=True))
         return 'optional-failed'
-    _native_closure_remaining()
     _write_pip_plan(pool,target,group['requirements'],key,packages,
                     constraints=group['constraints'],no_deps=group['no_deps'],build_plans=build_plans,
                     preferred_versions=group.get('preferred_versions'))
@@ -7579,7 +7794,7 @@ def acquire_pip_groups(pool, groups):
                         for future in _bounded_completed(futures):
                             key = futures[future]
                             try:
-                                completed[key] = _bounded_future_result(future)
+                                completed[key] = _shared_future_result(future)
                                 if phase == 'plan':
                                     _pool_progress('Pip planning',len(planned)+len(completed),
                                                    len(all_groups),'closures','verified Rust metadata')
@@ -7831,7 +8046,7 @@ def _download_sri_closure(pool, urls, category, identity=None):
         futures=[executor.submit(transfer,url,sri) for url,sri in ordered]
         try:
             for future in _bounded_completed(futures):
-                url,sha=_bounded_future_result(future);results[url]=sha
+                url,sha=_shared_future_result(future);results[url]=sha
                 _pool_progress(phase,len(results),len(ordered),'archives',f'{workers} workers')
         except BaseException:
             for future in futures:future.cancel()
@@ -8129,15 +8344,21 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
 
 
 def main(argv=None):
-    global _POOL_PROGRESS
+    global _POOL_PROGRESS, _OPERATION_EVENT_FD
     p=argparse.ArgumentParser()
     p.add_argument('--repo-root',required=True,type=Path)
     p.add_argument('--stage',required=True,type=Path)
     p.add_argument('--operation-id',required=True)
+    p.add_argument('--operation-events-fd', required=True, type=int)
     p.add_argument('--reuse-from',type=Path)
     args=p.parse_args(argv)
     if os.geteuid()==0:raise RuntimeError('refusing privileged fetch account')
     if not SHA.fullmatch(args.operation_id):raise RuntimeError('invalid operation ID')
+    if args.operation_events_fd <= 2 or not stat.S_ISFIFO(os.fstat(args.operation_events_fd).st_mode):
+        raise RuntimeError('acquisition requires a private operation event channel')
+    _OPERATION_EVENT_FD = args.operation_events_fd
+    os.set_inheritable(_OPERATION_EVENT_FD, False)
+    os.set_blocking(_OPERATION_EVENT_FD, False)
     if args.stage.exists() or args.stage.is_symlink():raise RuntimeError('candidate stage already exists; refusing overwrite')
     repo_root=args.repo_root.resolve(strict=True)
     adapter=repo_root/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'

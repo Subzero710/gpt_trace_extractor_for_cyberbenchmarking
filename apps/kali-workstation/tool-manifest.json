@@ -24,7 +24,7 @@
           },
           "timeout_seconds": {
             "default": 120,
-            "maximum": 1800,
+            "maximum": 180,
             "minimum": 1,
             "title": "Timeout Seconds",
             "type": "integer"

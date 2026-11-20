@@ -253,7 +253,9 @@ def test_make_reset_recovery_is_explicit_and_never_starts_dependencies() -> None
     assert '"reset-recovery": "superbench-reset-recovery"' in control
     assert 'if not args.task: raise ValueError("TASK is required")' in control
     assert 'arguments = [args.task, "--yes"]' in control
-    assert 'compose("run", "--rm", "--no-deps"' in control
+    assert '_run_compose_job("runner", mapping[action], *arguments' in control
+    launch = distributed.split("def _run_compose_job(", 1)[1].split("class _BuildKitWatch", 1)[0]
+    assert 'compose("run", "--detach", "--no-deps", "--name"' in launch
 
 
 def test_runner_deletes_completed_remote_conversation_before_app_reset() -> None:

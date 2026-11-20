@@ -274,14 +274,14 @@ def main() -> int:
 
     # Establish the authenticated mutation barrier first, destroy temporary VM
     # attempts, then perform the one explicitly authorized persistent-template wipe.
-    barrier = distributed.broker(cfg, "begin_shutdown", timeout=90)
+    barrier = distributed.broker_operation(cfg, "begin_shutdown")
     if barrier.get("draining") is not True:
         raise ThrowError("execution host did not acknowledge THROW shutdown barrier")
-    distributed.broker(cfg, "destroy_all", timeout=300)
-    proof = distributed.broker(cfg, "inventory", timeout=60)
+    distributed.broker_operation(cfg, "destroy_all")
+    proof = distributed.broker_operation(cfg, "inventory")
     if proof.get("absent") is not True:
         raise ThrowError("temporary execution-host resources remain before THROW")
-    thrown = distributed.broker(cfg, "throw_template_storage", {"confirmation": "THROW"}, timeout=1800)
+    thrown = distributed.broker_operation(cfg, "throw_template_storage", {"confirmation": "THROW"})
     if thrown.get("thrown") is not True:
         raise ThrowError("execution host did not confirm persistent template wipe")
 

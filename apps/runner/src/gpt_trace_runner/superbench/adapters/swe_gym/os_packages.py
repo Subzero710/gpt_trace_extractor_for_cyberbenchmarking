@@ -1,15 +1,58 @@
 """Two-phase APT closure resolution and network-disabled artifact replay."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import runpy
+import signal
 import subprocess
 from pathlib import Path
 
 PACKAGES = ("build-essential", "cmake", "libpq-dev", "locales", "locales-all", "openjdk-21-jdk",
             "openjdk-21-jre", "pipx", "nodejs", "npm", "libffi-dev", "libtiff-dev", "jq", "cloud-guest-utils")
+
+
+@contextlib.contextmanager
+def _template_operation(name):
+    if os.environ.get("GPTTRACE_TEMPLATE_TRACE") != "1":
+        yield
+        return
+    with Path("/dev/ttyS0").open("w", buffering=1) as serial:
+        serial.write("GPTTRACE_TEMPLATE begin " + name + "\n")
+        try:
+            yield
+        finally:
+            serial.write("GPTTRACE_TEMPLATE end " + name + "\n")
+
+
+def _install_archives(command, log):
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    if env.get("GPTTRACE_TEMPLATE_TRACE") != "1":
+        subprocess.run(command, env=env, check=True, stdout=log, stderr=subprocess.STDOUT)
+        return
+    bundle = Path("/opt/gpt-trace/bundle")
+    limits = json.loads((bundle / "guest-contract.json").read_bytes())
+    limit = int(env["GPTTRACE_TEMPLATE_TIMEOUT"])
+    cleanup = limits["cleanup_timeout_seconds"]
+    cadence = limits["progress_interval_seconds"]
+    if not (type(cleanup) is type(cadence) is int and 1 <= cadence <= limit <= 180
+            and 1 <= cleanup <= limit):
+        raise RuntimeError("invalid offline APT package deadlines")
+
+    def terminate(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=cleanup)
+
+    run_install = runpy.run_path(str(bundle / "apt_downloads.py"))["run_install"]
+    executable = command.index("apt-get")
+    run_install(command[executable + 1:], launcher=command[:executable], limit=limit, cadence=cadence,
+                observe=_template_operation, terminate=terminate, env=env, stdout=log, stderr=subprocess.STDOUT)
 
 
 def digest(path):
@@ -21,7 +64,8 @@ def digest(path):
 
 
 def installed():
-    raw = subprocess.check_output(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${Status}\n"], text=True)
+    with _template_operation("apt-installed-inventory"):
+        raw = subprocess.check_output(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${Status}\n"], text=True)
     result = {}
     for line in raw.splitlines():
         name, version, arch, status = line.split("\t", 3)
@@ -31,7 +75,8 @@ def installed():
 
 
 def deb_identity(path):
-    raw = subprocess.check_output(["dpkg-deb", "-f", str(path), "Package", "Version", "Architecture"], text=True)
+    with _template_operation("apt-package-identity"):
+        raw = subprocess.check_output(["dpkg-deb", "-f", str(path), "Package", "Version", "Architecture"], text=True)
     values = {}
     for line in raw.splitlines():
         key, value = line.split(": ", 1)
@@ -78,7 +123,7 @@ def install(folder, manifest, *, compare_final=True):
                "-o", "Dir::Cache::Archives=" + str(folder), "install"]
     command += [str(folder / name) for name in sorted(manifest["artifacts"])]
     with (folder / "install.log").open("wb") as log:
-        subprocess.run(command, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}, check=True, stdout=log, stderr=subprocess.STDOUT)
+        _install_archives(command, log)
     actual = installed()
     if compare_final and actual != manifest["installed_after"]:
         raise RuntimeError("installed OS inventory differs from resolved artifact closure")
@@ -134,7 +179,8 @@ def resolve_from_pool(folder, source):
             raise RuntimeError('downloaded OS bytes differ')
         if deb_identity(original) != {k:record[k] for k in ('package','version','architecture')}:
             raise RuntimeError('downloaded OS package identity differs')
-        shutil.copyfile(original, folder / filename)
+        with _template_operation("apt-copy-package"):
+            shutil.copyfile(original, folder / filename)
     manifest = {'schema_version': 1, 'requested': requested,
                 'installed_before': before, 'artifacts': records,
                 'repository_metadata': evidence.get('repository_metadata', {})}

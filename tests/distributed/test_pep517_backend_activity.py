@@ -27,7 +27,7 @@ def test_native_pip_cpu_active_child_has_a_per_process_limit(tmp_path, monkeypat
     runtime = _fake_pip(tmp_path,
         'import subprocess, sys\n'
         'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -44,7 +44,7 @@ def test_native_pip_does_not_enforce_a_cumulative_build_deadline(tmp_path, monke
                                   'while time.monotonic() < finish:\n'
                                   '    pass\n'
                                   'print("finished",flush=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (1, 10))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 10)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
@@ -55,9 +55,32 @@ def test_native_pip_does_not_enforce_a_cumulative_build_deadline(tmp_path, monke
     assert b'finished' in result
 
 
+def test_backend_parent_pauses_while_independent_build_children_own_work(tmp_path, monkeypatch):
+    backend = (
+        "import subprocess, sys, time\n"
+        "time.sleep(0.12)\n"
+        "for phase in range(3):\n"
+        "    subprocess.run([sys.executable, '-c', 'import time; time.sleep(0.55)'], check=True)\n"
+        "time.sleep(0.35)\n"
+    )
+    runtime = _fake_pip(tmp_path, "import subprocess, sys\n"
+                        f"subprocess.run([sys.executable, '-c', {backend!r}], check=True)\n"
+                        "print('metadata generated', flush=True)\n")
+    runtime['_pip_byte_progress'] = pool._NativePipByteProgress(1)
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 0.02)
+    monkeypatch.setattr(pool, '_operation_timeout', lambda: 1)
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            result = pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'], runtime)
+        finally:
+            runtime['_pip_byte_progress'].close()
+    assert b'metadata generated' in result
+
+
 def test_pip_observation_uses_only_the_spawned_root(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path, 'print("backend completed", flush=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (7, 2))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     original = pool._native_process_tree_snapshot
     def scoped(pid):
@@ -86,7 +109,7 @@ def test_native_pip_active_hook_output_keeps_stall_budget(tmp_path, monkeypatch)
         'for index in range(7):\n'
         '    print(f"build step {index}", flush=True)\n'
         '    time.sleep(0.3)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (6, 1))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 1)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
@@ -103,7 +126,7 @@ def test_parallel_silent_pip_workers_release_slots(tmp_path, monkeypatch):
     runtime = _fake_pip(tmp_path,
         'import subprocess, sys\n'
         'subprocess.run([sys.executable, "-c", "while True: pass"], check=True)\n')
-    monkeypatch.setattr(pool, '_native_pip_timeouts', lambda: (8, 2))
+    monkeypatch.setattr(pool, '_native_pip_stall_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_operation_timeout', lambda: 2)
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     start = time.monotonic()
@@ -120,3 +143,27 @@ def test_parallel_silent_pip_workers_release_slots(tmp_path, monkeypatch):
     assert time.monotonic() - start < 10
 
 
+def test_pip_rejects_and_stops_descendant_that_outlives_its_parent(tmp_path, monkeypatch):
+    pid_path = tmp_path / 'child-pid'
+    child = (
+        'import os, signal, time\n'
+        'from pathlib import Path\n'
+        'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        f'Path({str(pid_path)!r}).write_text(str(os.getpid()))\n'
+        'time.sleep(30)\n'
+    )
+    runtime = _fake_pip(tmp_path, 'import subprocess, sys, time\n'
+        'from pathlib import Path\n'
+        f'subprocess.Popen([sys.executable, "-c", {child!r}])\n'
+        f'while not Path({str(pid_path)!r}).exists(): time.sleep(0.01)\n')
+    monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            with pytest.raises(RuntimeError, match='Pip exited while'):
+                pool._native_run([sys.executable, '-m', 'pip', 'install', 'fixture'], runtime)
+        finally:
+            runtime['_pip_byte_progress'].close()
+    pid = pid_path.read_text()
+    stat = Path('/proc') / pid / 'stat'
+    if stat.exists():
+        assert stat.read_text().rsplit(') ', 1)[1].split()[0] == 'Z'

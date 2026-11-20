@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import select
 import shutil
@@ -28,6 +29,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+from gpt_trace_transport.operation_watch import host_operation
 from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonical,
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
     verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, fetch_runtime_build_identity_path,
@@ -471,7 +473,8 @@ class PreparationManager:
     def lock(self):
         fd = self._lock_file("manager.lock")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            with host_operation("preparation-manager-lock"):
+                fcntl.flock(fd, fcntl.LOCK_EX)
             yield
         finally: os.close(fd)
 
@@ -975,20 +978,22 @@ class PreparationManager:
                     members = []
                     forced_drain = True
                 if members:
-                    JobScope.terminate(state)
-                    deadline = time.monotonic() + 30
-                    while busy(state) and time.monotonic() < deadline:
-                        self._reap()
-                        time.sleep(0.1)
+                    with host_operation("terminate-preparation-scope"):
+                        JobScope.terminate(state)
+                        deadline = time.monotonic() + 30
+                        while busy(state) and time.monotonic() < deadline:
+                            self._reap()
+                            time.sleep(0.1)
                 if busy(state):
                     # The cgroup path comes only from the durable operation ID,
                     # attempt and current boot and is checked before signalling.
                     forced_drain = True
-                    JobScope.kill(state)
-                    deadline = time.monotonic() + 10
-                    while busy(state) and time.monotonic() < deadline:
-                        self._reap()
-                        time.sleep(0.1)
+                    with host_operation("reap-preparation-scope"):
+                        JobScope.kill(state)
+                        deadline = time.monotonic() + 10
+                        while busy(state) and time.monotonic() < deadline:
+                            self._reap()
+                            time.sleep(0.1)
                 if busy(state):
                     raise RuntimeError('owned preparation cgroup remained populated after kill')
                 state = self._reconcile(self._read(state['operation_id']))
@@ -1136,7 +1141,7 @@ def _integrate_published_pool(manager, state, ready, result):
     spec.loader.exec_module(builder)
     args = types.SimpleNamespace(
         operation_id=state["operation_id"], virtual_gib=builder.VIRTUAL_GIB,
-        free_space_gib=builder.FREE_SPACE_GIB, build_timeout_hours=builder.BUILD_TIMEOUT_HOURS,
+        free_space_gib=builder.FREE_SPACE_GIB,
     )
     final = builder.build(args)
     generation = Path(final).name
@@ -1180,6 +1185,89 @@ def _kill_verified_fetch_descendants(state, timeout, cadence):
             finally:
                 os.close(descriptor)
         time.sleep(min(remaining, cadence))
+
+
+class _FetchOperationWatch:
+    def __init__(self, pid, maximum, cleanup_limit):
+        self.pid = pid
+        self.maximum = maximum
+        self.cleanup_limit = cleanup_limit
+        self.active = {}
+        self.latest_by_thread = {}
+        self.last_transition = time.monotonic()
+        self.pending = bytearray()
+        self.missing = {}
+
+    def feed(self, chunk):
+        self.pending.extend(chunk)
+        while b'\n' in self.pending:
+            line, _, remainder = self.pending.partition(b'\n')
+            self.pending = bytearray(remainder)
+            if len(line) > 4096:
+                raise RuntimeError('oversized acquisition operation event')
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise RuntimeError('invalid acquisition operation event')
+            kind, operation, thread = (event.get(name) for name in ('event', 'operation', 'thread'))
+            if type(operation) is not int or operation < 1 or type(thread) is not int or thread < 1:
+                raise RuntimeError('invalid acquisition operation identity')
+            if kind == 'begin':
+                started, limit = event.get('started'), event.get('limit')
+                label, process = event.get('label'), event.get('process')
+                supervised = event.get('supervised')
+                if (set(event) != {'event', 'operation', 'thread', 'label', 'started', 'limit', 'process', 'supervised'}
+                        or operation in self.active or operation <= self.latest_by_thread.get(thread, 0)
+                        or not isinstance(label, str)
+                        or not label or len(label) > 512 or type(started) is not float
+                        or not math.isfinite(started) or started > time.monotonic()
+                        or type(limit) is not int or not 1 <= limit <= self.maximum
+                        or (process is not None and (type(process) is not int or process < 1))
+                        or type(supervised) is not bool):
+                    raise RuntimeError('invalid acquisition operation registration')
+                self.active[operation] = event
+                self.latest_by_thread[thread] = operation
+            elif kind in {'end', 'failed'}:
+                owner = self.active.pop(operation, None)
+                self.missing.pop(operation, None)
+                finished = event.get('finished')
+                if (set(event) != {'event', 'operation', 'thread', 'finished'}
+                        or owner is None or owner['thread'] != thread or type(finished) is not float
+                        or not owner['started'] <= finished <= time.monotonic()):
+                    raise RuntimeError('unmatched acquisition operation result')
+                if (finished >= owner['started'] + owner['limit']
+                        and (kind == 'end' or not owner['supervised'])):
+                    raise TimeoutError('acquisition operation exceeded its deadline: ' + owner['label'])
+            else:
+                raise RuntimeError('unknown acquisition operation transition')
+            self.last_transition = time.monotonic()
+        if len(self.pending) > 4096:
+            raise RuntimeError('oversized acquisition operation event')
+
+    def deadline(self, event):
+        reaping = event['process'] is None or event['operation'] in self.missing
+        cleanup = self.cleanup_limit if event['supervised'] and reaping else 0
+        return event['started'] + event['limit'] + cleanup
+
+    def next_deadline(self, ordinary_check):
+        return min(ordinary_check, min(map(self.deadline, self.active.values()), default=ordinary_check))
+
+    def inspect(self, *, idle_limit, descendants):
+        now = time.monotonic()
+        for operation, event in self.active.items():
+            owner = PROC / str(self.pid) / 'task' / str(event['thread'])
+            if not owner.is_dir():
+                raise RuntimeError('acquisition operation has no live thread: ' + event['label'])
+            if event['process'] is not None and event['process'] not in descendants:
+                # The supervising thread may still be reaping an exited leaf.
+                absent_since = self.missing.setdefault(operation, now)
+                if now - absent_since >= self.cleanup_limit:
+                    raise RuntimeError('acquisition operation lost its process: ' + event['label'])
+            else:
+                self.missing.pop(operation, None)
+            if now >= self.deadline(event):
+                raise TimeoutError('acquisition operation exceeded its deadline: ' + event['label'])
+        if not self.active and now - self.last_transition >= idle_limit:
+            raise TimeoutError('acquisition worker blocked outside a registered operation')
 
 
 def _prepare(manager, state):
@@ -1264,62 +1352,78 @@ def _prepare(manager, state):
 
     # Use only the local audited worker file, with fixed validated arguments.
     # No shell, no template builder, no qemu, no guest execution.
-    child = subprocess.Popen([str(interpreter), "-I", "-B", str(program), "--repo-root",
-                    str(source_root), "--stage", str(stage),
-                    "--operation-id", state["operation_id"],
-                    *(["--reuse-from",str(reuse)] if reuse is not None else [])],
-                   cwd=source_root, env=env, preexec_fn=drop_privileges,
-                   stdin=subprocess.DEVNULL, start_new_session=True)
     policy = manager.source_root / 'config/preparation.toml'
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned preparation watchdog policy')
     with policy.open('rb') as stream:
         acquisition = tomllib.load(stream)['acquisition']
     cadence = acquisition['progress_interval_seconds']
-    stall_limit = acquisition['progress_stall_timeout_seconds']
-    if (type(cadence) is not int or cadence < 1
-            or type(stall_limit) is not int or stall_limit <= cadence):
+    idle_limit = acquisition['unregistered_work_timeout_seconds']
+    elementary_limit = acquisition['timeout_seconds']
+    cleanup_timeout = _broker_cleanup_timeout(manager.source_root)
+    if (type(cadence) is not int or type(idle_limit) is not int or not 1 <= cadence < idle_limit <= 180
+            or type(elementary_limit) is not int or not 1 <= elementary_limit <= 180):
         raise RuntimeError('invalid versioned preparation watchdog controls')
-    last_observation = None
-    last_activity = time.monotonic()
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     try:
-        # Each wait is bounded. There is deliberately no whole-job deadline.
-        while True:
+        try:
+            child = subprocess.Popen([str(interpreter), "-I", "-B", str(program), "--repo-root",
+                            str(source_root), "--stage", str(stage),
+                            "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
+                            *(["--reuse-from",str(reuse)] if reuse is not None else [])],
+                           cwd=source_root, env=env, preexec_fn=drop_privileges, pass_fds=(write_fd,),
+                           stdin=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            os.close(write_fd)
+        watch = _FetchOperationWatch(child.pid, elementary_limit, cleanup_timeout)
+        last_observation = None
+        next_check = time.monotonic() + cadence
+        try:
+            while True:
+                check_at = watch.next_deadline(next_check)
+                readable, _, _ = select.select([read_fd], [], [], max(0, check_at - time.monotonic()))
+                if readable:
+                    chunk = os.read(read_fd, 65536)
+                    if chunk:
+                        watch.feed(chunk)
+                    else:
+                        exitcode = child.wait(timeout=cleanup_timeout)
+                        if exitcode == 0 and (watch.active or watch.pending):
+                            raise RuntimeError('acquisition worker exited with unresolved operation records')
+                        break
+                if time.monotonic() < watch.next_deadline(next_check):
+                    continue
+                progress = manager._progress(state)
+                if progress is not None:
+                    observation = (progress['stage'], progress['completed'],
+                                   progress['network_bytes'], progress['pip_bytes'])
+                    if observation != last_observation:
+                        last_observation = observation
+                        watch.last_transition = time.monotonic()
+                descendants = {stamp['pid'] for stamp in JobScope.members(state)}
+                watch.inspect(idle_limit=idle_limit, descendants=descendants)
+                next_check = time.monotonic() + cadence
+        except BaseException:
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             try:
-                exitcode = child.wait(timeout=cadence)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            progress = manager._progress(state)
-            if progress is not None:
-                observation = (progress['stage'], progress['completed'],
-                               progress['network_bytes'], progress['pip_bytes'])
-                if observation != last_observation:
-                    last_observation = observation
-                    last_activity = time.monotonic()
-            if time.monotonic() - last_activity >= stall_limit:
-                raise TimeoutError('acquisition made no verified progress for '
-                                   + str(stall_limit) + ' seconds')
-    except BaseException:
-        # A non-cooperative Python thread cannot be interrupted safely in-process.
-        # The independent privileged parent enforces the deadline on the private
-        # downloader process group, preserving the durable incomplete stage.
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        cleanup_timeout = _broker_cleanup_timeout(manager.source_root)
-        try:
-            child.wait(timeout=cleanup_timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError('download worker remained unreaped after group SIGKILL; stage preserved') from exc
-        _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
-        raise
+                child.wait(timeout=cleanup_timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError('download worker remained unreaped after group SIGKILL; stage preserved') from exc
+            _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
+            raise
+    finally:
+        os.close(read_fd)
     if exitcode != 0:
+        _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
         raise subprocess.CalledProcessError(exitcode, child.args)
     # Package build backends may spawn children. A successful downloader exit
     # cannot authorize publication while any descendant can still write bytes.
     if any(member['pid'] != os.getpid() for member in JobScope.members(state)):
+        _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
         raise RuntimeError('acquisition descendants remain; pool publication refused')
     remove_fetch_sources(source_root)
     inventory_path = stage / "inventory.json"

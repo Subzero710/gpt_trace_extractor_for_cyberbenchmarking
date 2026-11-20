@@ -171,6 +171,9 @@ class ManualKaliManager:
             runtime=LibvirtWorkstationProvider(
                 settings.workstation_broker_socket,
                 settings.workstation_broker_token_file,
+                creation_request_timeout=settings.workstation_creation_request_timeout_seconds,
+                creation_poll_interval=settings.workstation_creation_poll_interval_seconds,
+                guest_command_timeout=settings.workstation_guest_command_timeout_seconds,
             ),
         )
 

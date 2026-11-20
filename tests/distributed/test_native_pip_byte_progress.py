@@ -90,8 +90,7 @@ def test_timeout_retains_partial_pip_output():
             'PYTHONDONTWRITEBYTECODE': '1'}}
         # Le superviseur Pip utilise un délai de stagnation par phase,
         # et non un délai global d'invocation.
-        with patch.object(pool, '_native_pip_timeouts',
-                          return_value=(pool._operation_timeout(), 1)):
+        with patch.object(pool, '_native_pip_stall_timeout', return_value=1):
             with contextlib.redirect_stdout(io.StringIO()):
                 with pytest.raises(TimeoutError, match='Pip emitted no output') as error:
                     pool._native_run([sys.executable, '-m', 'pip', 'install', 'fake-package'],

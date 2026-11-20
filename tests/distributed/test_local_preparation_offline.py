@@ -915,7 +915,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
             if action == "shutdown": return {"project": "gpt-trace-extractor", "absent": True,
                 "shutdown": True, "shutdown_id": payload["shutdown_id"]}
             return {}
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(self.dispatch, "host"), patch.object(self.dispatch, "config", return_value=cfg), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "run", side_effect=command), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch, "confirm_remote_shutdown", side_effect=RuntimeError("native broker still running")):
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(self.dispatch, "host"), patch.object(self.dispatch, "config", return_value=cfg), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "run", side_effect=command), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch, "broker_operation", side_effect=broker), patch.object(self.dispatch, "confirm_remote_shutdown", side_effect=RuntimeError("native broker still running")):
             with self.assertRaisesRegex(RuntimeError, "still running"):
                 self.dispatch.global_down(cfg)
             self.assertFalse((Path(temp) / "state/distributed/last-cleanup.json").exists())

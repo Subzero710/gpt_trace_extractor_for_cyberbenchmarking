@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -24,7 +25,8 @@ pip_solver_max_decisions = 1000
 pip_solver_max_depth = 100
 pip_solver_cache_max_bytes = 100000
 pip_solver_max_frame_bytes = 100000
-pip_total_timeout_seconds = 20
+timeout_seconds = 20
+pip_solver_compute_timeout_seconds = 20
 ''')
     (root/'scripts/superbench_pool.py').write_text('# dummy module path\n')
     child=root/'rust-test-oracle'
@@ -92,6 +94,7 @@ o.write(b'S');sendnum(1);sendnum(candidate);sendstr('solver decisions=0');o.flus
         def peek(self, key):
             return self.get(key)
     host={
+        '_registered_operation': lambda *args, **kwargs: nullcontext(),
         '__file__':str(root/'scripts/superbench_pool.py'),
         '_coerce_target':lambda v:v,
         '_packaging_symbols':lambda :(None, None, Version, InvalidVersion, None),
@@ -125,12 +128,6 @@ def test_native_solver_deadline_contract_is_mandatory(tmp_path):
     import os
 
     location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
-    rust = (Path(__file__).resolve().parents[2] /
-            'rust/verified-resolver/src/main.rs').read_text()
-    assert 'deadline: Instant' in rust
-    assert 'deadline: Option<Instant>' not in rust
-    assert 'mandatory_deadline(deadline_seconds)?' in rust
-    assert 'if seconds == 0' in rust
     spec = importlib.util.spec_from_file_location('resolver_deadline_contract', location)
     bridge = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge)
@@ -138,20 +135,20 @@ def test_native_solver_deadline_contract_is_mandatory(tmp_path):
     policy = tmp_path / 'config/preparation.toml'
     policy.write_text('[acquisition]\npip_solver_max_decisions=1\n'
                       'pip_solver_max_depth=1\npip_solver_cache_max_bytes=1\n'
-                      'pip_solver_max_frame_bytes=1024\npip_total_timeout_seconds=1\n')
-    assert bridge._policy(tmp_path)['pip_total_timeout_seconds'] == 1
-    policy.write_text(policy.read_text().replace('pip_total_timeout_seconds=1',
-                                                 'pip_total_timeout_seconds=0'))
+                      'pip_solver_max_frame_bytes=1024\ntimeout_seconds=1\npip_solver_compute_timeout_seconds=1\n')
+    assert bridge._policy(tmp_path)['pip_solver_compute_timeout_seconds'] == 1
+    policy.write_text(policy.read_text().replace('pip_solver_compute_timeout_seconds=1',
+                                                 'pip_solver_compute_timeout_seconds=0'))
     with pytest.raises(RuntimeError, match='resource controls'):
         bridge._policy(tmp_path)
 
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    wire = bridge._Wire(child, 1024, deadline=time.monotonic() + 0.05)
+    wire = bridge._Wire(child, 1024, ipc_timeout=0.05)
     start = time.monotonic()
     try:
         with pytest.raises(TimeoutError, match='deadline'):
-            wire.exact(1)
+            wire.opcode()
         assert time.monotonic() - start < 2
     finally:
         child.kill()
@@ -160,7 +157,7 @@ def test_native_solver_deadline_contract_is_mandatory(tmp_path):
         child.stdout.close()
 
 
-def test_compiled_rust_rejects_zero_global_deadline():
+def test_compiled_rust_rejects_zero_compute_budget():
     location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
     spec = importlib.util.spec_from_file_location('resolver_compiled_deadline_test', location)
     bridge = importlib.util.module_from_spec(spec)
@@ -168,9 +165,45 @@ def test_compiled_rust_rejects_zero_global_deadline():
     program = bridge._binary(location.parents[1])
     header = b''.join(number.to_bytes(8, 'big') for number in (1024, 1, 1, 1, 0, 1))
     request = header + b'\x00' + (0).to_bytes(4, 'big')
-    finished = subprocess.run([str(program)], input=request, capture_output=True, timeout=10)
+    finished = subprocess.run([str(program), '1'], input=request, capture_output=True, timeout=10)
     assert finished.returncode != 0
-    assert b'nonzero closure deadline' in finished.stdout
+    assert b'time limit must be between 1 and 180 seconds' in finished.stdout
+
+
+def test_compiled_rust_waits_for_metadata_then_expires_partial_ipc_reply():
+    import struct
+    import time
+
+    location = Path(__file__).resolve().parents[2] / 'scripts/verified_resolver_bridge.py'
+    spec = importlib.util.spec_from_file_location('resolver_compiled_ipc_test', location)
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    program = bridge._binary(location.parents[1])
+    timeout = 1
+    child = subprocess.Popen([str(program), str(timeout)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wire = bridge._Wire(child, 1024, ipc_timeout=timeout)
+    try:
+        header = struct.pack('>6QBI', 1024, 100, 100, 1024, timeout, 1, 0, 1)
+        root = struct.pack('>I4sI7sI', 4, b'demo', 7, b'demo==1', 0)
+        wire._write(header + root)
+        assert wire.opcode() == b'V'
+        assert (wire.string(), wire.string()) == ('demo', 'demo==1')
+        time.sleep(timeout + 0.1)
+        assert child.poll() is None
+        wire._write(b'\x01' + struct.pack('>I', 0))
+        assert wire.opcode() == b'R'
+        assert (wire.string(), wire.string()) == ('demo', 'demo==1')
+        wire._write(b'\x01')
+        assert child.wait(timeout=3) != 0
+        assert b'IPC deadline expired' in child.stderr.read()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+        child.stdin.close()
+        child.stdout.close()
+        child.stderr.close()
 
 
 def test_bridge_versions_use_pep440_not_string_spelling():
@@ -309,7 +342,8 @@ pip_solver_max_decisions = 1000000
 pip_solver_max_depth = 1024
 pip_solver_cache_max_bytes = 67108864
 pip_solver_max_frame_bytes = 16777216
-pip_total_timeout_seconds = 900
+timeout_seconds = 20
+pip_solver_compute_timeout_seconds = 180
 ''')
     (tmp_path / 'scripts/superbench_pool.py').write_text('# fixture path\n')
     names = {f'pkg{index:05d}' for index in range(80)}
@@ -325,6 +359,7 @@ pip_total_timeout_seconds = 900
         return value
     monkeypatch.setattr(bridge._Wire, 'exact', track)
     host = {
+        '_registered_operation': lambda *args, **kwargs: nullcontext(),
         '__file__': str(tmp_path / 'scripts/superbench_pool.py'),
         '_coerce_target': lambda target: target,
         '_packaging_symbols': lambda: (None, None, Version, InvalidVersion, None),
@@ -367,7 +402,7 @@ def test_candidate_identity_is_interned_once_per_python_bridge():
     bridge = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge)
     output = io.BytesIO()
-    wire = bridge._Wire(SimpleNamespace(stdout=io.BytesIO(), stdin=output), 1 << 20)
+    wire = bridge._Wire(SimpleNamespace(stdout=io.BytesIO(), stdin=output), 1 << 20, ipc_timeout=1)
     candidates = {7: {'kind': 'wheel', 'version': '1.2', 'filename': 'example-1.2.whl'}}
     transmitted = set()
     bridge._send_candidate(wire, 7, candidates, transmitted)
@@ -461,7 +496,8 @@ pip_solver_max_decisions=100
 pip_solver_max_depth=100
 pip_solver_cache_max_bytes=100000
 pip_solver_max_frame_bytes=100000
-pip_total_timeout_seconds=30
+timeout_seconds=30
+pip_solver_compute_timeout_seconds=30
 ''')
     (tmp_path / 'scripts/superbench_pool.py').write_text('# test source\n')
     worker = tmp_path / 'pubgrub-batch-oracle'
@@ -537,6 +573,7 @@ out.flush()
         return {**candidate, 'requirements': []}
 
     host = {
+        '_registered_operation': lambda *args, **kwargs: nullcontext(),
         '__file__': str(tmp_path / 'scripts/superbench_pool.py'),
         '_coerce_target': lambda value: value,
         '_packaging_symbols': lambda: (Requirement, None, Version, InvalidVersion, None),
@@ -546,6 +583,7 @@ out.flush()
         '_marker_active': lambda *_args: True,
         '_normalized_package_name': str.lower,
         '_candidate_versions': versions,
+        '_shared_future_result': lambda future: future.result(timeout=5),
         '_candidate_artifact_identity': lambda value: (
             value['item']['digests']['sha256'], value['item']['url']),
         '_target_fingerprint': lambda target: target.python_artifact_sha256,

@@ -7,13 +7,16 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +36,109 @@ def load_builder():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_golden_serial_gives_subsequent_guest_operations_independent_deadlines(monkeypatch):
+    b = load_builder()
+    now = 0.0
+    monkeypatch.setattr(b.time, "monotonic", lambda: now)
+    watch = b._GuestProvisionWatch(180)
+    for operation in (b"filesystem", b"pip-download", b"pip-install-wheel", b"completion-proof"):
+        watch.feed(b"GPTTRACE_GOLDEN beg")
+        watch.feed(b"in " + operation + b"\r\n")
+        now += 179
+        assert watch.check() == 1
+        watch.feed(b"GPTTRACE_GOLDEN end " + operation + b"\r\n")
+    watch.feed(b"GPTTRACE_GOLDEN shutdown complete\r\n")
+    assert watch.outcome == b"complete" and now > 180
+    now += 180
+    with pytest.raises(TimeoutError, match="shutdown"):
+        watch.check()
+
+
+def test_golden_boot_watchdog_ignores_console_output_and_requires_matching_result(monkeypatch):
+    b = load_builder()
+    now = 0.0
+    monkeypatch.setattr(b.time, "monotonic", lambda: now)
+    watch = b._GuestProvisionWatch(180)
+    now = 179.0
+    watch.feed(b"kernel console output\n")
+    now = 180.0
+    with pytest.raises(TimeoutError, match="boot or unregistered"):
+        watch.check()
+    watch = b._GuestProvisionWatch(180)
+    watch.feed(b"GPTTRACE_GOLDEN begin pip-install-wheel\n")
+    with pytest.raises(ValueError, match="invalid golden guest operation transition"):
+        watch.feed(b"GPTTRACE_GOLDEN end different-operation\n")
+
+
+def test_golden_apt_methods_are_supervised_independently(monkeypatch):
+    b = load_builder()
+    now = 0.0
+    monkeypatch.setattr(b.time, "monotonic", lambda: now)
+    watch = b._GuestProvisionWatch(180)
+    watch.feed(b"GPTTRACE_GOLDEN begin apt-https-item\n")
+    now = 178
+    watch.feed(b"GPTTRACE_GOLDEN begin apt-store-item\n")
+    now = 179
+    watch.feed(b"GPTTRACE_GOLDEN end apt-store-item\n")
+    assert watch.check() == 1
+    now = 180
+    with pytest.raises(TimeoutError, match="apt-https-item"):
+        watch.check()
+
+
+@pytest.mark.parametrize("events", [
+    b"GPTTRACE_GOLDEN shutdown failed\n",
+    b"GPTTRACE_GOLDEN begin completion-proof\n"
+    b"GPTTRACE_GOLDEN end completion-proof\n"
+    b"GPTTRACE_GOLDEN shutdown failed\n",
+])
+def test_failed_guest_shutdown_is_rejected_even_when_qemu_exits_zero(events):
+    b = load_builder()
+    process = SimpleNamespace(poll=lambda: 0, args=["qemu-system-x86_64"])
+    with pytest.raises(RuntimeError, match="reported a failed shutdown"):
+        b._wait_guest_provision(process, io.BytesIO(events), b._GuestProvisionWatch(180), 1)
+
+
+def test_zero_qemu_exit_requires_provisioning_proof_and_complete_shutdown():
+    b = load_builder()
+    process = SimpleNamespace(poll=lambda: 0, args=["qemu-system-x86_64"])
+    with pytest.raises(ValueError, match="invalid golden guest operation transition"):
+        b._wait_guest_provision(process, io.BytesIO(b"GPTTRACE_GOLDEN shutdown complete\n"),
+                                b._GuestProvisionWatch(180), 1)
+    events = (b"GPTTRACE_GOLDEN begin completion-proof\n"
+              b"GPTTRACE_GOLDEN end completion-proof\n"
+              b"GPTTRACE_GOLDEN shutdown complete\n")
+    b._wait_guest_provision(process, io.BytesIO(events), b._GuestProvisionWatch(180), 1)
+
+
+def test_qemu_supervision_reaps_timed_out_process_and_keeps_serial_log(tmp_path, monkeypatch):
+    b = load_builder()
+    original = subprocess.Popen
+    started = []
+
+    def fake_qemu(command, **kwargs):
+        assert command[0] == "qemu-system-x86_64"
+        assert kwargs["start_new_session"]
+        serial = command[command.index("-serial") + 1].removeprefix("file:")
+        program = ("from pathlib import Path; import sys, time; "
+                   "Path(sys.argv[1]).write_bytes(b'GPTTRACE_GOLDEN begin blocked\\n'); time.sleep(60)")
+        process = original([sys.executable, "-c", program, serial], **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr(b, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(b, "safe", lambda path, **_kwargs: path)
+    monkeypatch.setattr(b, "_acquisition_controls", lambda: {
+        "timeout_seconds": 2, "progress_interval_seconds": 1, "broker_read_timeout_seconds": 1,
+    })
+    monkeypatch.setattr(b.subprocess, "Popen", fake_qemu)
+    with pytest.raises(TimeoutError, match="blocked"):
+        b.provision_in_real_guest(tmp_path / "image.qcow2")
+    assert started[0].returncode == -signal.SIGKILL
+    log, = tmp_path.glob("guest-serial-*.log")
+    assert log.read_bytes() == b"GPTTRACE_GOLDEN begin blocked\n"
 
 
 def encoded(value):
@@ -123,6 +229,11 @@ class VMFixture:
 @pytest.fixture
 def vm(tmp_path, monkeypatch):
     return VMFixture(tmp_path / "storage", monkeypatch)
+
+
+@pytest.fixture(scope="module")
+def download_policy():
+    return load_builder().guest_contract()["download"]
 
 
 def fail_once(monkeypatch, module, name, *, phase=None, after=False):
@@ -445,19 +556,19 @@ def browser_source(tmp_path, monkeypatch):
                            public=base64.b64encode(public).decode())
 
 
-def test_signed_browser_cache_is_reused_without_network(browser_source):
+def test_signed_browser_cache_is_reused_without_network(browser_source, download_policy):
     s = browser_source
-    archive, evidence = assets.browser_archive(s.cache, s.identity)
+    archive, evidence = assets.browser_archive(s.cache, s.identity, policy=download_policy)
     count = len(s.calls)
-    second, proof = assets.browser_archive(s.cache, s.identity)
+    second, proof = assets.browser_archive(s.cache, s.identity, policy=download_policy)
     assert count == 3 and len(s.calls) == count
     assert archive == second and evidence == proof
 
 
-def test_host_authenticates_cache_from_hash_locked_wheel_before_kvm(browser_source):
+def test_host_authenticates_cache_from_hash_locked_wheel_before_kvm(browser_source, download_policy):
     import host_cache
     s = browser_source
-    archive, _proof = assets.browser_archive(s.cache, s.identity)
+    archive, _proof = assets.browser_archive(s.cache, s.identity, policy=download_policy)
     code = ("PLATFORM_CHROMIUM_VERSIONS = " + repr({s.identity["platform"]: s.identity["version"]}) + "\n"
         + "SUPPORTED_PLATFORMS = " + repr({("Linux", "x86_64"): s.identity["platform"]}) + "\n"
         + "BINARY_SIGNING_PUBKEYS = " + repr([s.public]) + "\n")
@@ -525,9 +636,13 @@ def test_offline_injection_uses_fingerprint_verified_private_snapshots(tmp_path,
     fingerprint = b.golden_build_input_sha256()
     state = {"fingerprint": fingerprint, "repo_commit": "a"*40}
     virtual_guest = {}
+    operations = []
     inputs = {path: path.read_bytes() for path in b.input_files()}
-    def customize(*args):
+    def customize(*args, timeout):
         assert args[0] == "virt-customize" and "--no-network" in args
+        assert timeout == assets.operation_timeout(b._acquisition_controls())
+        assert len(args) == 6
+        operations.append(args[4])
         for index, token in enumerate(args):
             if token != "--copy-in":
                 continue
@@ -543,6 +658,7 @@ def test_offline_injection_uses_fingerprint_verified_private_snapshots(tmp_path,
     monkeypatch.setattr(b, "run", customize)
     monkeypatch.setattr(b, "guest_read", lambda image, path: virtual_guest[path])
     b.prepare_offline(tmp_path / "image.qcow2", tmp_path, state)
+    assert operations == ["--mkdir", *["--copy-in"] * 5, "--run-command"]
     source_root = ROOT / "apps/kali-workstation/src"
     for path, content in inputs.items():
         if path.is_relative_to(source_root):
@@ -555,30 +671,38 @@ def test_offline_injection_uses_fingerprint_verified_private_snapshots(tmp_path,
 
 
 @pytest.mark.parametrize("attack", ["signature", "hash"])
-def test_invalid_browser_signature_or_hash_cannot_be_activated(browser_source, attack):
+def test_invalid_browser_signature_or_hash_cannot_be_activated(browser_source, attack, download_policy):
     s = browser_source
     name = "SHA256SUMS.sig" if attack == "signature" else next(k for k in s.source if k.endswith(".tar.gz"))
     s.source[name] = b"corrupt-download"
     with pytest.raises((ValueError, RuntimeError), match="signature|hash"):
-        assets.browser_archive(s.cache, s.identity)
+        assets.browser_archive(s.cache, s.identity, policy=download_policy)
     assert not list(s.cache.rglob("*.tar.gz"))
 
 
-def test_partial_browser_transport_failure_preserves_part_without_activation(browser_source, monkeypatch):
+def test_partial_browser_transport_failure_preserves_part_without_activation(browser_source, monkeypatch, download_policy):
     s = browser_source
     original = assets.subprocess.run
+    delays = []
+    budgets = []
     def interrupted(argv, **kwargs):
         if argv[-1].endswith(".tar.gz"):
-            Path(argv[argv.index("--output") + 1]).write_bytes(b"partial")
+            part = Path(argv[argv.index("--output") + 1])
+            assert part.read_bytes() == (b"partial" if budgets else b"")
+            part.write_bytes(b"partial")
+            budgets.append(kwargs["timeout"])
             raise subprocess.CalledProcessError(28, argv)
         return original(argv, **kwargs)
     monkeypatch.setattr(assets.subprocess, "run", interrupted)
+    monkeypatch.setattr(assets.time, "sleep", delays.append)
     with pytest.raises(subprocess.CalledProcessError):
-        assets.browser_archive(s.cache, s.identity)
+        assets.browser_archive(s.cache, s.identity, policy=download_policy)
+    assert budgets == [download_policy["timeout_seconds"]] * download_policy["golden_download_attempts"]
+    assert delays == download_policy["golden_download_retry_backoff_seconds"]
     assert list(s.cache.rglob("*.part")) and not list(s.cache.rglob("*.tar.gz"))
 
 
-def test_kali_part_uses_resume_and_verified_atomic_promotion(tmp_path, monkeypatch):
+def test_kali_part_uses_resume_and_verified_atomic_promotion(tmp_path, monkeypatch, download_policy):
     target = tmp_path / "kali.7z"
     target.with_name(target.name + ".part").write_bytes(b"partial")
     expected = hashlib.sha256(b"complete-archive").hexdigest()
@@ -589,20 +713,67 @@ def test_kali_part_uses_resume_and_verified_atomic_promotion(tmp_path, monkeypat
         calls.append(argv)
         Path(argv[argv.index("--output") + 1]).write_bytes(b"complete-archive")
     monkeypatch.setattr(assets.subprocess, "run", curl)
-    assert assets.download("https://fixture.invalid/kali", target, expected).read_bytes() == b"complete-archive"
-    assets.download("https://fixture.invalid/kali", target, expected)
+    assert assets.download("https://fixture.invalid/kali", target, expected, policy=download_policy).read_bytes() == b"complete-archive"
+    assets.download("https://fixture.invalid/kali", target, expected, policy=download_policy)
     assert len(calls) == 1
 
 
-def test_complete_hash_valid_part_recovers_without_any_network(tmp_path, monkeypatch):
+def test_complete_hash_valid_part_recovers_without_any_network(tmp_path, monkeypatch, download_policy):
     target = tmp_path / "artifact.tar.gz"
     raw = b"hash-proven-download-finished-before-parent-crash"
     target.with_name(target.name + ".part").write_bytes(raw)
     def forbidden(*args, **kwargs):
         pytest.fail("a complete hash-valid partial must not trigger a download")
     monkeypatch.setattr(assets.subprocess, "run", forbidden)
-    assert assets.download("https://fixture.invalid/artifact", target, hashlib.sha256(raw).hexdigest()).read_bytes() == raw
+    assert assets.download("https://fixture.invalid/artifact", target, hashlib.sha256(raw).hexdigest(),
+                           policy=download_policy).read_bytes() == raw
     assert not target.with_name(target.name + ".part").exists()
+
+
+def test_curl_timeout_closes_slow_transfer_then_resumes_with_verified_bytes(tmp_path, download_policy):
+    payload = b"verified archive fixture"
+    prefix = payload[:8]
+    ranges = []
+    resumed = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested = self.headers.get("Range")
+            ranges.append(requested)
+            if requested is None:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(prefix)
+                resumed.wait(timeout=5)
+                return
+            if requested != f"bytes={len(prefix)}-":
+                self.send_error(416)
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {len(prefix)}-{len(payload) - 1}/{len(payload)}")
+            self.send_header("Content-Length", str(len(payload) - len(prefix)))
+            self.end_headers()
+            self.wfile.write(payload[len(prefix):])
+            resumed.set()
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        listener = threading.Thread(target=server.serve_forever)
+        listener.start()
+        try:
+            target = tmp_path / "download"
+            result = assets.download(f"http://127.0.0.1:{server.server_port}/archive", target,
+                                     hashlib.sha256(payload).hexdigest(),
+                                     policy={**download_policy, "timeout_seconds": 1,
+                                             "golden_download_attempts": 2,
+                                             "golden_download_retry_backoff_seconds": [0]})
+            assert result.read_bytes() == payload
+            assert ranges == [None, f"bytes={len(prefix)}-"]
+            assert not target.with_name(target.name + ".part").exists()
+        finally:
+            resumed.set()
+            server.shutdown()
+            listener.join()
 
 
 def test_host_archive_downloader_inherits_the_actual_exclusive_lock(tmp_path, monkeypatch):

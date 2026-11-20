@@ -6,6 +6,7 @@ during the host build and a network namespace, so a missing cache fails closed.
 from __future__ import annotations
 
 import errno
+import contextlib
 import hashlib
 import json
 import os
@@ -21,11 +22,35 @@ from pathlib import Path
 
 ROOT = Path("/opt/swe-gym-lite")
 CONDA = Path("/opt/miniconda3/bin/conda")
+CONDA_TRACE = Path("/opt/gpt-trace/bundle/conda_trace.py")
+
+
+def _conda_trace_command():
+    return (str(CONDA.with_name("python")), "-I", "-B", str(CONDA_TRACE))
+
+
+@contextlib.contextmanager
+def _template_operation(label):
+    if os.environ.get("GPTTRACE_TEMPLATE_TRACE") != "1":
+        yield
+        return
+    with Path("/dev/ttyS0").open("w", buffering=1) as serial:
+        serial.write("GPTTRACE_TEMPLATE begin " + label + "\n")
+        try:
+            yield
+        finally:
+            serial.write("GPTTRACE_TEMPLATE end " + label + "\n")
 
 
 def run(*args, cwd=None, env=None, input=None):
-    return subprocess.run(args, cwd=cwd, env=env, input=input, check=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    if (os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1" and Path(args[0]) == CONDA
+            and (args[1:2] == ("create",) or args[1:3] == ("env", "remove"))):
+        return subprocess.run([*_conda_trace_command(), *args[1:]], cwd=cwd, env=env, input=input,
+                              check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    name = re.sub(r"[^A-Za-z0-9._+-]", "-", Path(args[0]).name)[:100]
+    with _template_operation("tool-" + name):
+        return subprocess.run(args, cwd=cwd, env=env, input=input, check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
@@ -100,7 +125,22 @@ def prime_shared_pip_cache(item):
     return True
 
 
+def _template_script(commands):
+    for index, command in enumerate(commands):
+        # Each pinned recipe entry is a complete Bash fragment. Keep it in the
+        # same shell so activation, variables, cwd and failure semantics persist.
+        if command.startswith(str(CONDA) + " create "):
+            yield shlex.join(_conda_trace_command()) + " " + command.removeprefix(str(CONDA) + " ")
+            continue
+        label = f"recipe-{index}"
+        yield f"printf 'GPTTRACE_TEMPLATE begin {label}\\n' >/dev/ttyS0"
+        yield command
+        yield f"printf 'GPTTRACE_TEMPLATE end {label}\\n' >/dev/ttyS0"
+
+
 def shell(commands, *, cwd, env=None, offline=False, log=None):
+    if os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1":
+        commands = _template_script(commands)
     script = "set -eo pipefail\n" + "\n".join(commands) + "\n"
     argv = ["/bin/bash", "-c", script]
     if offline:
@@ -115,7 +155,7 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
 
 def stream_digest(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
+    with _template_operation("hash-artifact"), Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1048576), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -247,8 +287,10 @@ def clean_checkout(item, artifact, destination):
     if destination.exists():
         shutil.rmtree(destination)
     tools = source_tools()
-    tools.extract(artifact["path"], destination, sha256=artifact["sha256"], size=artifact["size"])
-    tools.validate_checkout(destination, item["base_commit"])
+    with _template_operation("extract-source"):
+        tools.extract(artifact["path"], destination, sha256=artifact["sha256"], size=artifact["size"])
+    with _template_operation("verify-source"):
+        tools.validate_checkout(destination, item["base_commit"])
 
 
 def setup_commands(item, destination, prefix):
@@ -473,11 +515,20 @@ def evaluation_setup(item, prefix, commands, folder, *, destination="/testbed"):
     verify_os_packages()
 
 
-def prepare_evaluator(item, artifact, setup, folder, *, destination="/testbed"):
+def prepare_evaluator_repository(item, artifact, folder, *, destination="/testbed"):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    prefix = prepare(item, artifact=artifact, log=folder / "setup.log", destination=destination)
-    evaluation_setup(item, prefix, setup, folder, destination=destination)
+    return prepare(item, artifact=artifact, log=folder / "setup.log", destination=destination)
+
+
+def finish_evaluator_setup(item, artifact, setup, folder, *, destination="/testbed"):
+    evaluation_setup(item, recovery_env_prefix(item), setup, Path(folder), destination=destination)
+    return {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "source_sha256": artifact["sha256"]}
+
+
+def prepare_evaluator(item, artifact, setup, folder, *, destination="/testbed"):
+    prefix = prepare_evaluator_repository(item, artifact, folder, destination=destination)
+    evaluation_setup(item, prefix, setup, Path(folder), destination=destination)
     return {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "source_sha256": artifact["sha256"]}
 
 
@@ -490,19 +541,30 @@ def evaluate_clean(item, artifact, candidate, *, candidate_sha256, candidate_siz
                           test_prelude=test_prelude, destination=destination)
 
 
-def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
-                   test_command, folder, test_prelude=(), destination="/testbed"):
-    folder = Path(folder)
+def apply_grading_inputs(item, candidate, *, candidate_sha256, candidate_size, hidden, folder, destination="/testbed"):
     apply_candidate(candidate, destination, sha256=candidate_sha256, size=candidate_size)
-    shell(hidden, cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "hidden.log")
+    shell(hidden, cwd=destination, env=runtime_environment(item, offline=True), offline=True,
+          log=Path(folder) / "hidden.log")
+
+
+def run_native_tests(item, test_command, *, folder, test_prelude=(), destination="/testbed"):
+    folder = Path(folder)
     script = '\n'.join(test_prelude) + '\nsource /opt/miniconda3/bin/activate testbed\nset +e\n' + test_command
     script += ' >' + shlex.quote(str(folder / 'tests.log')) + ' 2>&1\nstatus=$?\n'
     script += 'printf "%s\\n" "$status" >' + shlex.quote(str(folder / 'tests.exit')) + '\nexit 0\n'
-    shell([script], cwd=destination, env=runtime_environment(item, offline=True), offline=True, log=folder / "test-launch.log")
+    shell([script], cwd=destination, env=runtime_environment(item, offline=True),
+          offline=True, log=folder / "test-launch.log")
     status = int((folder / "tests.exit").read_text())
     if status < 0 or status in (126, 127) or status >= 128:
         raise RuntimeError("native test process failed to execute")
     return {"test_exit_status": status}
+
+
+def grade_prepared(item, candidate, *, candidate_sha256, candidate_size, hidden,
+                   test_command, folder, test_prelude=(), destination="/testbed"):
+    apply_grading_inputs(item, candidate, candidate_sha256=candidate_sha256, candidate_size=candidate_size,
+                         hidden=hidden, folder=folder, destination=destination)
+    return run_native_tests(item, test_command, folder=folder, test_prelude=test_prelude, destination=destination)
 
 
 def _reset_task_warm_outputs(item):

@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from .wire import (CONTROLLER_ACTIONS, MAX_BODY, Endpoint, WireClient,
+from .wire import (CONTROLLER_ACTIONS, MAX_BODY, MAX_REQUEST_SECONDS, Endpoint, WireClient,
                    TransportFailure, certificate_sha, private_address, safe_file, token)
 
 
@@ -21,7 +21,7 @@ class Gateway(http.server.ThreadingHTTPServer):
     block_on_close = False
     allow_reuse_address = True
 
-    def __init__(self, address, context, upstream, roles, allowed_peer, timeout=1900):
+    def __init__(self, address, context, upstream, roles, allowed_peer, timeout=MAX_REQUEST_SECONDS):
         self.context, self.upstream = context, upstream
         self.roles, self.allowed_peer, self.operation_timeout = roles, allowed_peer, timeout
         self.slots = threading.BoundedSemaphore(16)
@@ -123,7 +123,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.fail(503, "broker communication failed; VM outcome unconfirmed; reconcile before any retry")
 
 
-def start_from_env(socket_path: Path | None, *, upstream=None, operation_timeout=1900):
+def start_from_env(socket_path: Path | None, *, upstream=None, operation_timeout=MAX_REQUEST_SECONDS):
     if os.environ.get("WORKSTATION_BROKER_LISTENER", "unix") == "unix":
         return None
     if os.environ["WORKSTATION_BROKER_LISTENER"] != "mtls":

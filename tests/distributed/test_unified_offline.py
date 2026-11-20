@@ -174,7 +174,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
                 calls.append(("prepare", args))
                 deferred.append(kwargs["fetch_source"])
 
-            with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "compose", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=prepare):
+            with patch.object(self.dispatch, "host"), patch.object(self.dispatch, "environment"), patch.object(self.dispatch, "verify_storage"), patch.object(self.dispatch, "run", side_effect=lambda *a, **k: calls.append(("project", a))), patch.object(self.dispatch, "_run_compose_job", side_effect=lambda *a, **k: calls.append(("fetch", a))), patch.object(self.dispatch, "preparation_fetch", side_effect=prepare):
                 self.dispatch.control(cfg, "superbench-fetch", SimpleNamespace(adapter=adapter))
                 if adapter == "swe-gym-lite":
                     self.assertEqual([row[0] for row in calls], ["project", "prepare"])
@@ -185,7 +185,7 @@ class InterfaceAndShutdownTests(unittest.TestCase):
                 else:
                     self.assertEqual([row[0] for row in calls], ["project", "fetch"])
                     self.assertFalse(deferred)
-                self.assertEqual(calls[-1], ("fetch", ("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", adapter)))
+                self.assertEqual(calls[-1], ("fetch", ("benchmark-fetch", "--adapter", adapter)))
 
     def test_no_image_build_in_up_run_or_resume(self):
         parsed = ast.parse((ROOT / "scripts/distributed.py").read_bytes())

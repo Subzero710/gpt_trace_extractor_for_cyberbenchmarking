@@ -5,6 +5,7 @@ No Cloudflare account, Docker or KVM deployment is simulated as a live success.
 from __future__ import annotations
 import hashlib
 import http.server
+import http.client
 import json
 import os
 import socket
@@ -19,7 +20,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT/'shared')]
-from gpt_trace_transport.wire import Endpoint, IdentityFailure, WireClient
+from gpt_trace_transport.wire import Endpoint, IdentityFailure, WireClient, _DeadlineSocket
 from gpt_trace_transport.unix_confirmation import start_confirmation
 from gpt_trace_transport.wire import token_value
 
@@ -30,6 +31,31 @@ class TunnelWireTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
         self.endpoint=Endpoint('https',Path('/unused'),'https://broker.example.org')
+
+    def test_fragmented_header_stops_at_the_original_response_deadline(self):
+        clock = 0.0
+        observed = []
+        fragments = iter([b"HTTP/1.1 200 OK\r\n", b"Content-", b"Length: 2\r\n", b"\r\n{}"])
+
+        class Socket:
+            def settimeout(self, seconds):
+                observed.append(seconds)
+
+            def recv_into(self, buffer):
+                nonlocal clock
+                fragment = next(fragments)
+                buffer[:len(fragment)] = fragment
+                clock += 1
+                return len(fragment)
+
+            def close(self):
+                pass
+
+        with patch("gpt_trace_transport.wire.time.monotonic", side_effect=lambda: clock):
+            with http.client.HTTPResponse(_DeadlineSocket(Socket(), 3.0)) as response:
+                with self.assertRaises(TimeoutError):
+                    response.begin()
+        self.assertEqual(observed, [3.0, 2.0, 1.0])
 
     def test_https_from_env_with_system_tls(self):
         with patch.dict(os.environ, {'WORKSTATION_BROKER_TRANSPORT':'https',

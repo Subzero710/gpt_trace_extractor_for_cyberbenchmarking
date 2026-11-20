@@ -96,12 +96,22 @@ def test_shared_wait_propagates_real_owner_error_without_timeout_masking():
         assert not thread.is_alive()
 
 
-def test_shared_wait_obeys_inherited_pip_closure_deadline():
-    pending = concurrent.futures.Future()
-    token = pool._NATIVE_CLOSURE_DEADLINE.set(time.monotonic() + 0.05)
-    try:
-        with patch.object(pool, '_conda_progress_interval', return_value=0.01):
-            with pytest.raises(TimeoutError, match='native Pip closure exceeded'):
-                pool._shared_future_result(pending)
-    finally:
-        pool._NATIVE_CLOSURE_DEADLINE.reset(token)
+def test_shared_wait_detects_a_disappeared_producer():
+    futures = []
+    owner = threading.Thread(target=lambda: futures.append(pool._OwnedFuture()))
+    owner.start()
+    owner.join(timeout=2)
+    with pytest.raises(RuntimeError, match='producer exited'):
+        pool._shared_future_result(futures[0])
+
+
+def test_owned_future_detects_a_dependency_on_its_own_producer():
+    with pytest.raises(RuntimeError, match='cyclic future dependency'):
+        pool._shared_future_result(pool._OwnedFuture())
+
+
+def test_group_lock_rejects_recursive_ownership():
+    lock = pool._OwnedLock()
+    with lock:
+        with pytest.raises(RuntimeError, match='cyclic future dependency'), lock:
+            pytest.fail('recursive lock was acquired')

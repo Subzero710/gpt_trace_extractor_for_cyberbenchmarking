@@ -19,7 +19,7 @@ async def test_controller_binds_exact_attempt_and_checks_result_schema(tmp_path)
         if request.url.path.endswith('inspect_attempt'):
             return httpx.Response(200,json={'identity':args,'provider':'libvirt'})
         return httpx.Response(200,json={'status':'ready',**IDENT})
-    controller=WorkstationController(tmp_path/'broker.sock',TOKEN,BROKER_TOKEN)
+    controller=WorkstationController(tmp_path/'broker.sock',TOKEN,BROKER_TOKEN,request_timeout=90,poll_interval=2)
     await controller.client.aclose()
     controller.client=httpx.AsyncClient(transport=httpx.MockTransport(broker),base_url='http://broker')
     app=create_app(controller)

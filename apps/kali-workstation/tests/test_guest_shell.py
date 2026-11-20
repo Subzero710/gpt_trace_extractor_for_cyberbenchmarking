@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import os
+from pathlib import Path
 import pytest
 from kali_workstation.guest.shell import Terminals, exec_command
 
@@ -14,6 +15,18 @@ async def test_exec_stdin_cwd_environment_timeout_and_bounded_output(tmp_path):
     assert bounded['stdout_truncated'] is True and len(bounded['stdout'])<=1048576
     timeout=await exec_command({'command':'sleep 10','cwd':str(tmp_path),'timeout_seconds':1})
     assert timeout['timed_out'] is True
+
+
+@pytest.mark.asyncio
+async def test_exec_deadline_stops_background_process_that_keeps_stdout_open(tmp_path):
+    result = await exec_command({
+        "command": "sleep 30 & echo $! > child.pid; exit 0",
+        "cwd": str(tmp_path), "timeout_seconds": 1,
+    }, cleanup_timeout=1)
+    assert result["timed_out"]
+    stat = Path("/proc") / (tmp_path / "child.pid").read_text().strip() / "stat"
+    if stat.exists():
+        assert stat.read_text().rsplit(") ", 1)[1].split()[0] == "Z"
 
 @pytest.mark.asyncio
 async def test_real_unix_pty_resize_and_ctrl_c(tmp_path):

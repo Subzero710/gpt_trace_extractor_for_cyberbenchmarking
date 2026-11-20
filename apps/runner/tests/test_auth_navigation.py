@@ -223,7 +223,9 @@ def test_make_run_and_resume_use_no_deps_superbench_commands() -> None:
     control = distributed.split("def control(", 1)[1].split("def execution(", 1)[0]
     assert '"run": "superbench-run"' in control
     assert '"resume": "superbench-resume-active"' in control
-    assert 'compose("run", "--rm", "--no-deps"' in control
+    assert '_run_compose_job("runner", mapping[action], *arguments' in control
+    launch = distributed.split("def _run_compose_job(", 1)[1].split("class _BuildKitWatch", 1)[0]
+    assert 'compose("run", "--detach", "--no-deps", "--name"' in launch
 
 
 def test_superbench_run_does_not_invoke_doctor_preflight_per_task() -> None:

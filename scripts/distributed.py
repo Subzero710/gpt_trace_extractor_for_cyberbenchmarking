@@ -11,7 +11,9 @@ import os
 import platform
 import secrets
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,7 +24,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "shared"))
-from gpt_trace_transport.wire import Endpoint, WireClient, token_value, TransportFailure, IdentityFailure, RemoteFailure, READ_ACTIONS
+from gpt_trace_transport.operation_watch import HOST_PHASE_FD, HOST_PREFIX, OperationWatch
+from gpt_trace_transport.wire import Endpoint, WireClient, token_value, TransportFailure, IdentityFailure, RemoteFailure, READ_ACTIONS, MAX_BODY
 
 PROJECT = "gpt-trace-extractor"
 VOLUMES = ("postgres_data", "browser_profile", "runner_state", "benchmark_sources")
@@ -36,7 +39,7 @@ def _distributed_operation_timeout():
     with policy.open('rb') as stream:
         settings = tomllib.load(stream)['acquisition']
     seconds = settings['timeout_seconds']
-    if type(seconds) is not int or seconds <= 0:
+    if type(seconds) is not int or not 1 <= seconds <= 180:
         raise RuntimeError('invalid versioned distributed operation timeout')
     return seconds
 
@@ -226,21 +229,384 @@ def broker(cfg, action, payload=None, *, local=False, timeout=None):
     return result
 
 
-def _distributed_long_command_timeout():
-    # Docker builds/runner invocations are long workflows, not 180-second probes.
-    policy = ROOT / 'config/preparation.toml'
-    with policy.open('rb') as stream:
-        hours = tomllib.load(stream)['build']['timeout_hours']
-    if type(hours) is not int or hours < 1:
-        raise RuntimeError('invalid configured build/runner command timeout')
-    return hours * 3600
+
+def broker_operation(cfg, operation, args=None, *, local=False):
+    policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
+    probe = policy["broker_read_timeout_seconds"]
+    interval = policy["progress_interval_seconds"]
+    if type(probe) is not int or type(interval) is not int or not 1 <= interval <= probe <= _distributed_operation_timeout():
+        raise RuntimeError("invalid broker operation transport policy")
+    operation_id = secrets.token_hex(16)
+    query = {"operation": operation, "operation_id": operation_id}
+    expected = {**query, "identity": {}}
+
+    def verify(response):
+        if any(response.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("broker deployment operation identity differs")
+
+    lost = None
+    try:
+        accepted = broker(cfg, "begin_runtime", {**query, "args": args or {}}, local=local, timeout=probe)
+    except IdentityFailure:
+        raise
+    except TransportFailure as exc:
+        if isinstance(exc, RemoteFailure) and exc.status < 500:
+            raise
+        lost = exc
+    else:
+        verify(accepted)
+        if accepted.get("state") != "accepted":
+            raise RuntimeError("invalid deployment operation acknowledgement")
+
+    while True:
+        try:
+            result = broker(cfg, "poll_runtime", query, local=local, timeout=probe)
+        except TransportFailure as exc:
+            raise RuntimeError(f"broker {operation} {operation_id} observation unavailable") from exc
+        verify(result)
+        state = result.get("state")
+        if state == "complete" and isinstance(result.get("result"), dict):
+            return result["result"]
+        if state == "failed":
+            raise RuntimeError(f"broker {operation} {operation_id} failed: {result.get('detail', '')}")
+        if state != "pending":
+            raise RuntimeError(f"broker {operation} {operation_id} outcome unconfirmed") from lost
+        time.sleep(interval)
 
 
-def compose(*arguments, capture=False):
+def compose(*arguments, capture=False, timeout=None):
     command = ["docker", "compose", "--profile", "runner", "--profile", "app-tunnels", "--profile", "benchmark-fetch", *arguments]
-    # Long-running Compose commands use the independently configured build limit.
-    limit = _distributed_long_command_timeout() if arguments and arguments[0] in ('build', 'run') else None
-    return run(command, capture=capture, timeout=limit)
+    return run(command, capture=capture, timeout=timeout)
+
+
+def _compose_controls():
+    budget = _distributed_operation_timeout()
+    policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["compose"]
+    probe = policy["status_timeout_seconds"]
+    interval = policy["status_interval_seconds"]
+    if (type(probe) is not int or type(interval) is not int
+            or not 1 <= interval <= probe <= budget):
+        raise RuntimeError("invalid versioned Compose status controls")
+    return budget, probe, interval
+
+
+def _compose_job_state(name, service, *, timeout):
+    rows = json.loads(run(["docker", "container", "inspect", name], capture=True, timeout=timeout))
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise RuntimeError("incomplete Compose job inspection")
+    row = rows[0]
+    if not isinstance(row, dict):
+        raise RuntimeError("invalid Compose job inspection")
+    configuration = row.get("Config")
+    labels = configuration.get("Labels") if isinstance(configuration, dict) else None
+    identity, state = row.get("Id"), row.get("State")
+    if (row.get("Name") != "/" + name or not isinstance(identity, str)
+            or re.fullmatch(r"[0-9a-f]{64}", identity) is None or not isinstance(labels, dict)
+            or labels.get("com.docker.compose.project") != PROJECT
+            or labels.get("com.docker.compose.service") != service
+            or str(labels.get("com.docker.compose.oneoff", "")).lower() != "true"):
+        raise RuntimeError("Compose job ownership differs")
+    if not isinstance(state, dict) or not isinstance(state.get("Status"), str):
+        raise RuntimeError("invalid Compose job state")
+    return identity, state
+
+
+def _reap_command(process, timeout):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=timeout)
+
+
+def _reconcile_compose_job(name, service, expected, *, budget, probe, interval):
+    identity, state = _compose_job_state(name, service, timeout=probe)
+    if expected is not None and identity != expected:
+        raise RuntimeError("Compose job identity changed before reconciliation")
+    if state["Status"] in {"exited", "dead"}:
+        return identity, state["Status"]
+    if state["Status"] not in {"created", "running", "paused", "restarting", "removing"}:
+        raise RuntimeError("unknown Compose job state during reconciliation")
+    observation_error = None
+    if state["Status"] != "removing":
+        try:
+            run(["docker", "container", "stop", "--time", str(probe), identity], capture=True, timeout=budget)
+        except (OSError, subprocess.SubprocessError) as exc:
+            observation_error = exc
+    deadline = time.monotonic() + budget
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            observed, state = _compose_job_state(name, service, timeout=min(probe, remaining))
+        except (OSError, subprocess.SubprocessError) as exc:
+            observation_error = exc
+        else:
+            if observed != identity:
+                raise RuntimeError("Compose job identity changed during reconciliation")
+            if state["Status"] in {"exited", "dead"}:
+                return identity, state["Status"]
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
+    raise TimeoutError("Compose job stop remains unconfirmed") from observation_error
+
+
+def _run_compose_job(service, *arguments, entrypoint=None, environment=()):
+    budget, probe, interval = _compose_controls()
+    name = f"{PROJECT}-{service}-{secrets.token_hex(16)}"
+    options = ["--entrypoint", entrypoint] if entrypoint is not None else []
+    for variable in environment:
+        options.extend(("-e", variable))
+    identity = None
+    terminal = False
+    try:
+        try:
+            launched = compose("run", "--detach", "--no-deps", "--name", name, *options,
+                               service, *arguments, capture=True, timeout=budget)
+        except subprocess.TimeoutExpired:
+            # Query the reserved name after transport loss without launching again.
+            launched = None
+        if launched is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", launched) is None:
+                raise RuntimeError("invalid Compose launch identity")
+            identity = launched
+        observed, state = _compose_job_state(name, service, timeout=probe)
+        if identity is not None and observed != identity:
+            raise RuntimeError("Compose launch identity differs from Docker inspection")
+        identity = observed
+        logs = subprocess.Popen(["docker", "container", "logs", "--follow", identity],
+                                cwd=ROOT, stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            while True:
+                try:
+                    status = state["Status"]
+                    if status == "exited":
+                        terminal = True
+                        exit_code = state.get("ExitCode")
+                        if type(exit_code) is not int:
+                            raise RuntimeError("invalid Compose job exit status")
+                        if logs.wait(timeout=probe) != 0:
+                            raise RuntimeError("Docker did not finish delivering Compose job logs")
+                        if exit_code != 0:
+                            raise subprocess.CalledProcessError(exit_code, [service, *arguments])
+                        run(["docker", "container", "rm", identity], capture=True, timeout=probe)
+                        return
+                    if status != "running":
+                        raise RuntimeError("unexpected Compose job state: " + status)
+                    if logs.poll() is not None and logs.returncode != 0:
+                        raise RuntimeError("Docker log stream failed")
+                    time.sleep(interval)
+                    observed, state = _compose_job_state(name, service, timeout=probe)
+                    if observed != identity:
+                        raise RuntimeError("Compose job identity changed")
+                except KeyboardInterrupt:
+                    if state["Status"] == "running":
+                        run(["docker", "container", "kill", "--signal=SIGINT", identity], timeout=probe)
+                    raise
+        finally:
+            _reap_command(logs, probe)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        if not terminal:
+            try:
+                _reconcile_compose_job(name, service, identity, budget=budget, probe=probe, interval=interval)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as cleanup:
+                raise RuntimeError(
+                    f"Compose job {name} failed: {exc}; stop unconfirmed: {cleanup}; "
+                    f"reconcile --compose-job {name}" + (f" --container-id {identity}" if identity else "")
+                ) from exc
+        raise RuntimeError(f"Compose job {name} failed: {exc}; container stop verified") from exc
+
+
+class _BuildKitWatch:
+    def __init__(self, limit):
+        self.limit = limit
+        self.vertices = {}
+        self.statuses = {}
+        self.completed = set()
+        self.finished_statuses = set()
+        self.idle_deadline = time.monotonic() + limit
+        self.observed_vertex = False
+
+    def feed(self, update):
+        now = time.monotonic()
+        for vertex in update.get("vertexes", ()):
+            digest = vertex["digest"]
+            if digest in self.completed:
+                continue
+            if vertex.get("completed"):
+                active = self.vertices.get(digest)
+                if active is not None:
+                    name, started, budget = active
+                    if started is not None and now - started >= budget:
+                        raise TimeoutError("BuildKit operation exceeded its deadline: " + name)
+                self.observed_vertex = True
+                self.vertices.pop(digest, None)
+                self.completed.add(digest)
+                self.idle_deadline = now + self.limit
+            elif vertex.get("started") and digest not in self.vertices:
+                self.observed_vertex = True
+                self.vertices[digest] = (vertex["name"], now, self.limit)
+        for status in update.get("statuses", ()):
+            key = (status["vertex"], status["id"])
+            if key in self.finished_statuses:
+                continue
+            if status.get("completed"):
+                active = self.statuses.get(key)
+                if active is not None and now >= active[1]:
+                    raise TimeoutError("BuildKit operation exceeded its deadline: " + active[0])
+                self.statuses.pop(key, None)
+                self.finished_statuses.add(key)
+                self.idle_deadline = now + self.limit
+            elif status.get("started") and key not in self.statuses:
+                self.statuses[key] = (status.get("name") or status["id"], now + self.limit)
+        children = {vertex for vertex, _ in self.statuses}
+        for digest, (name, started, remaining) in self.vertices.items():
+            if digest in children and started is not None:
+                self.vertices[digest] = (name, None, remaining - (now - started))
+            elif digest not in children and started is None:
+                self.vertices[digest] = (name, now, remaining)
+
+    def remaining(self):
+        deadlines = [(started + budget, name) for name, started, budget in self.vertices.values()
+                     if started is not None]
+        deadlines.extend((deadline, name) for name, deadline in self.statuses.values())
+        deadline, name = min(deadlines, default=(self.idle_deadline, "build startup or unregistered work"))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("BuildKit operation exceeded its deadline: " + name)
+        return remaining
+
+
+def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
+    budget, probe, interval = _compose_controls()
+    with tempfile.NamedTemporaryFile(prefix="gpttrace-buildkit-", suffix=".log", delete=False) as raw:
+        watch = _BuildKitWatch(budget)
+        process = subprocess.Popen(command, cwd=ROOT, stdin=stdin, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        pending = b""
+        try:
+            while True:
+                readable, _, _ = select.select([process.stdout], [], [], min(interval, watch.remaining()))
+                if monitor is not None:
+                    monitor()
+                if not readable:
+                    continue
+                block = os.read(process.stdout.fileno(), 65536)
+                if not block:
+                    break
+                raw.write(block)
+                lines = (pending + block).split(b"\n")
+                pending = lines.pop()
+                if len(pending) > MAX_BODY or any(len(line) > MAX_BODY for line in lines):
+                    raise RuntimeError("BuildKit progress frame exceeds size limit")
+                for line in lines:
+                    if line.startswith(b"{"):
+                        watch.feed(json.loads(line))
+                    else:
+                        print(line.decode(errors="replace"), flush=True)
+            status = process.wait(timeout=min(probe, watch.remaining()))
+            if status != 0:
+                raise subprocess.CalledProcessError(status, command)
+            if pending or not watch.observed_vertex or watch.vertices or watch.statuses:
+                raise RuntimeError("BuildKit exited without settling its build operations")
+        except BaseException as exc:
+            raw.flush()
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                    process.wait(timeout=probe)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    _reap_command(process, probe)
+            raise RuntimeError(f"BuildKit operation failed; log {raw.name}: {exc}") from exc
+        finally:
+            process.stdout.close()
+        Path(raw.name).unlink()
+
+
+
+def _build_compose_services(builder, services):
+    budget, _, _ = _compose_controls()
+    plan = compose("build", "--print", *services, capture=True, timeout=budget)
+    if not set(services) <= set(json.loads(plan)["target"]):
+        raise RuntimeError("Compose Bake plan does not cover the requested services")
+    command = ["docker", "buildx", "bake", "--builder", builder, "--file", "-", "--progress", "rawjson",
+               "--load", *services]
+    with tempfile.TemporaryFile() as specification:
+        specification.write(plan.encode())
+        specification.seek(0)
+        _run_buildkit(command, stdin=specification)
+
+
+def _compose_service_order(requested):
+    manifest = json.loads((ROOT / "compose.control.yaml").read_text())
+    if manifest["name"] != PROJECT:
+        raise RuntimeError("unexpected Compose deployment identity")
+    services = manifest["services"]
+    pending, ordered = set(), {}
+
+    def visit(name):
+        if name in pending:
+            raise RuntimeError("cyclic Compose service dependency: " + name)
+        if name in ordered:
+            return
+        pending.add(name)
+        for dependency in services[name].get("depends_on", {}):
+            visit(dependency)
+        pending.remove(name)
+        ordered[name] = None
+
+    for name in requested:
+        visit(name)
+    return ordered.keys()
+
+
+def _wait_compose_service(service, *, budget, probe_timeout, interval):
+    deadline = time.monotonic() + budget
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("Compose service readiness expired: " + service)
+        return seconds
+
+    while True:
+        ids = compose("ps", "--all", "--quiet", service, capture=True,
+                      timeout=min(probe_timeout, remaining())).splitlines()
+        if any(re.fullmatch(r"[0-9a-f]{12,64}", identity) is None for identity in ids):
+            raise RuntimeError("invalid Compose container identity for " + service)
+        if ids:
+            inspected = json.loads(run(["docker", "container", "inspect", *ids], capture=True,
+                                       timeout=min(probe_timeout, remaining())))
+            if len(inspected) != len(ids):
+                raise RuntimeError("incomplete Compose service observation for " + service)
+            owned = []
+            for identity, container in zip(ids, inspected):
+                labels = container["Config"]["Labels"]
+                if (not container["Id"].startswith(identity)
+                        or labels.get("com.docker.compose.project") != PROJECT
+                        or labels.get("com.docker.compose.service") != service):
+                    raise RuntimeError("Compose container ownership differs for " + service)
+                if labels.get("com.docker.compose.oneoff", "").lower() != "true":
+                    owned.append(container["State"])
+            if len(owned) > 1:
+                raise RuntimeError("multiple Compose containers own service " + service)
+            if owned:
+                state = owned[0]
+                health = state.get("Health")
+                if state["Status"] in {"dead", "exited"} or (health and health["Status"] == "unhealthy"):
+                    raise RuntimeError("Compose service failed to become healthy: " + service)
+                if state["Status"] == "running" and (health is None or health["Status"] == "healthy"):
+                    remaining()
+                    return
+        time.sleep(min(interval, remaining()))
+
+
+def _start_compose_services(services):
+    budget, probe, interval = _compose_controls()
+    for service in _compose_service_order(services):
+        compose("up", "--detach", "--no-deps", "--no-build", service, timeout=budget)
+        _wait_compose_service(service, budget=budget, probe_timeout=probe, interval=interval)
 
 
 def verify_storage(cfg):
@@ -455,8 +821,7 @@ def doctor_tests(role):
         raise RuntimeError(role + " host prerequisites failed")
     if role == "control":
         for service in ("runner", "storage", "workstation-gateway", "kali-workstation-controller"):
-            compose("run", "--rm", "--no-deps", "--entrypoint", "python", service,
-                    "-m", "pytest", "-q")
+            _run_compose_job(service, "-m", "pytest", "-q", entrypoint="python")
         compose("exec", "-T", "teacher-browser", "python3", "-m", "unittest",
                 "discover", "-s", "/opt/gpt-trace-browser/tests",
                 "-p", "test_*.py", "-v")
@@ -848,6 +1213,53 @@ def execution_tunnel(cfg, action):
     return run(['docker', 'compose', '-f', str(ROOT / 'compose.execution-tunnel.yaml'), *options])
 
 
+def _run_execution_helper(module):
+    limit = _distributed_operation_timeout()
+    policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
+    cadence = policy["progress_interval_seconds"]
+    cleanup = policy["broker_read_timeout_seconds"]
+    if (type(cadence) is not int or type(cleanup) is not int
+            or not 1 <= cadence <= cleanup <= limit):
+        raise RuntimeError("invalid execution helper supervision policy")
+    command = [ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", module]
+    watch = OperationWatch(limit, prefix=HOST_PREFIX, description=module, requires_proof=False)
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        read_fd, write_fd = os.pipe()
+        try:
+            try:
+                process = subprocess.Popen(command, cwd=ROOT, stdout=stdout, stderr=stderr,
+                    stdin=subprocess.DEVNULL, env={**os.environ, HOST_PHASE_FD: str(write_fd)},
+                    pass_fds=(write_fd,), start_new_session=True)
+            finally:
+                os.close(write_fd)
+            try:
+                while True:
+                    readable, _, _ = select.select([read_fd], [], [], min(cadence, watch.check()))
+                    if not readable:
+                        if process.poll() is not None:
+                            raise RuntimeError(module + " left its operation stream open")
+                        continue
+                    data = os.read(read_fd, 65536)
+                    if not data:
+                        break
+                    watch.feed(data)
+                status = process.wait(timeout=watch.check())
+                if status:
+                    stderr.seek(0, os.SEEK_END)
+                    stderr.seek(max(0, stderr.tell() - 8000))
+                    raise subprocess.CalledProcessError(status, command, stderr=stderr.read().decode(errors="replace"))
+                watch.require_complete()
+            finally:
+                _reap_command(process, cleanup)
+        finally:
+            os.close(read_fd)
+        stdout.seek(0)
+        proof = stdout.read(MAX_BODY + 1)
+        if len(proof) > MAX_BODY:
+            raise RuntimeError(module + " exceeded the execution proof size")
+        return proof.decode().strip()
+
+
 def local_down(cfg):
     print("scope=execution-local; global=false; control host campaign/services are not stopped by this command. Run make down on control host for global shutdown.", flush=True)
     execution_environment(cfg)
@@ -880,10 +1292,8 @@ def local_down(cfg):
                     or current.get("execution_id") != expected["execution_id"]):
                 raise RuntimeError("active execution broker did not prove its deployment identity")
         else:
-            python = ROOT / ".venv-workstation-broker/bin/python"
             try:
-                raw = run([python, "-B", "-m", "workstation_broker.local_shutdown"],
-                          capture=True, timeout=900)
+                raw = _run_execution_helper("workstation_broker.local_shutdown")
             except subprocess.CalledProcessError as exc:
                 details = (exc.stderr or "").strip()
                 raise RuntimeError("execution-local offline cleanup failed: " +
@@ -895,11 +1305,11 @@ def local_down(cfg):
                 raise RuntimeError("local offline cleanup lacks verified absence")
             print("execution host local shutdown complete; control host global shutdown remains separate; permanent data/images retained.")
             return result
-    barrier = broker(cfg, "begin_shutdown", local=True, timeout=90)
+    barrier = broker_operation(cfg, "begin_shutdown", local=True)
     if barrier.get("draining") is not True or barrier.get("project") != PROJECT:
         raise RuntimeError("local mutation barrier unconfirmed")
-    broker(cfg, "destroy_all", local=True)
-    proof = broker(cfg, "inventory", local=True)
+    broker_operation(cfg, "destroy_all", local=True)
+    proof = broker_operation(cfg, "inventory", local=True)
     if proof.get("absent") is not True or proof.get("project") != PROJECT:
         raise RuntimeError("local temporary resources remain")
     shutdown_id = secrets.token_hex(32)
@@ -959,13 +1369,13 @@ def global_down(cfg):
     try:
         full = config("control")
         environment(full)
-        draining = broker(full, "begin_shutdown")
+        draining = broker_operation(full, "begin_shutdown")
         if draining.get("draining") is not True or draining.get("project") != PROJECT:
             raise RuntimeError("execution host did not acknowledge the shutdown mutation barrier")
-        before = broker(full, "inventory")
+        before = broker_operation(full, "inventory")
         if before.get("project") != PROJECT: raise RuntimeError("remote project identity differs")
-        broker(full, "destroy_all")
-        proof = broker(full, "inventory")
+        broker_operation(full, "destroy_all")
+        proof = broker_operation(full, "inventory")
         if proof.get("absent") is not True or proof.get("project") != PROJECT:
             raise RuntimeError("execution host cleanup has no authenticated absence proof")
         shutdown_id = secrets.token_hex(32)
@@ -1004,12 +1414,22 @@ def control_up(cfg, *, minimal=False):
     run([sys.executable, "scripts/project_state.py", "core"])
     broker(cfg, "probe")
     services = ("kali-workstation-controller", "workstation-gateway") if minimal else CORE
-    compose("up", "-d", "--wait", "--wait-timeout", "300", *services)
+    _start_compose_services(services)
 
 
 def control(cfg, action, args):
     if action == "down": return global_down(cfg)
     host("control", cfg, build_tools=action in {"build", "requirements"})
+    if action == "reconcile" and getattr(args, "compose_job", None):
+        name = args.compose_job
+        match = re.fullmatch(re.escape(PROJECT) + r"-([a-z0-9][a-z0-9_-]*)-[0-9a-f]{32}", name)
+        if match is None:
+            raise ValueError("invalid Compose job reconciliation name")
+        budget, probe, interval = _compose_controls()
+        identity, status = _reconcile_compose_job(
+            name, match[1], args.container_id, budget=budget, probe=probe, interval=interval)
+        print(json.dumps({"name": name, "container_id": identity, "state": status}))
+        return
     if action == "init-storage": return init_storage(cfg)
     if action == "restore": return restore(cfg, args.directory)
     if action == "requirements":
@@ -1023,8 +1443,8 @@ def control(cfg, action, args):
         init_storage(cfg)
         import build
         build.ensure_builder(ROOT)
-        compose("build", "--builder", build.BUILDER_NAME, "storage", "teacher-browser",
-                "kali-workstation-controller", "workstation-gateway", "runner", "benchmark-fetch")
+        _build_compose_services(build.BUILDER_NAME, ("storage", "teacher-browser",
+                                "kali-workstation-controller", "workstation-gateway", "runner", "benchmark-fetch"))
         build.verify_manifests(ROOT)
         return
     if action in {"up", "kali_control"}:
@@ -1042,8 +1462,7 @@ def control(cfg, action, args):
         broker(cfg, "probe")
         if action == "acceptance":
             values = ["--adapter", args.adapter] if args.adapter else []
-            return compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner",
-                           "/app/tools/distributed_acceptance.py", *values)
+            return _run_compose_job("runner", "/app/tools/distributed_acceptance.py", *values, entrypoint="python")
         doctor_tests("control")
         node = Path("/dev/dri/renderD128")
         driver = Path("/sys/class/drm/renderD128/device/driver")
@@ -1052,8 +1471,8 @@ def control(cfg, action, args):
         if not node.is_char_device() or not driver.exists():
             raise RuntimeError("control host needs a working GPU DRM render node")
         compose("exec", "-T", "teacher-browser", "/usr/local/bin/browser-healthcheck")
-        compose("run", "--rm", "--no-deps", "--entrypoint", "python", "runner", "/app/tools/teacher_gpu_doctor.py")
-        return compose("run", "--rm", "--no-deps", "runner", "doctor")
+        _run_compose_job("runner", "/app/tools/teacher_gpu_doctor.py", entrypoint="python")
+        return _run_compose_job("runner", "doctor")
     if action == "tunnels":
         control_up(cfg)
         return run([sys.executable, "scripts/tunnels.py"])
@@ -1066,9 +1485,9 @@ def control(cfg, action, args):
         if not args.adapter: raise ValueError("ADAPTER is required")
         run([sys.executable, "scripts/project_state.py", "core"])
         if args.adapter == "swe-gym-lite":
-            return preparation_fetch(cfg, fetch_source=lambda: compose(
-                "run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter))
-        compose("run", "--rm", "--no-deps", "benchmark-fetch", "--adapter", args.adapter)
+            return preparation_fetch(cfg, fetch_source=lambda: _run_compose_job(
+                "benchmark-fetch", "--adapter", args.adapter))
+        _run_compose_job("benchmark-fetch", "--adapter", args.adapter)
         return
     mapping = {"auth": "superbench-auth", "run": "superbench-run", "pause": "superbench-pause",
         "resume": "superbench-resume-active", "status": "superbench-active-status",
@@ -1087,11 +1506,36 @@ def control(cfg, action, args):
     if action == "export-parquet":
         (ROOT / "exports").mkdir(exist_ok=True)
         # Export needs PostgreSQL/storage, never a Kali or teacher browser.
-        compose("up", "-d", "--wait", "--wait-timeout", "120", "postgres", "storage")
+        _start_compose_services(("postgres", "storage"))
         arguments = ["/data/exports/corpus.parquet"]
     if action in {"run", "resume"}:
         os.environ["GPT_TRACE_RUNNER_BUILD_ID"] = run(["git", "rev-parse", "HEAD"], capture=True)
-    compose("run", "--rm", "--no-deps", "-e", "GPT_TRACE_RUNNER_BUILD_ID", "runner", mapping[action], *arguments)
+    _run_compose_job("runner", mapping[action], *arguments, environment=("GPT_TRACE_RUNNER_BUILD_ID",))
+
+
+
+def _wait_local_broker(cfg):
+    policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
+    budget = _distributed_operation_timeout()
+    probe = policy["broker_read_timeout_seconds"]
+    interval = policy["progress_interval_seconds"]
+    if (type(probe) is not int or type(interval) is not int
+            or not 1 <= interval <= probe <= budget):
+        raise RuntimeError("invalid versioned broker startup policy")
+    deadline = time.monotonic() + budget
+    last_error = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            result = broker(cfg, "probe", local=True, timeout=min(probe, remaining))
+            if result.get("project") != PROJECT or result.get("status") != "ok":
+                raise RuntimeError("execution broker startup proof differs")
+            return
+        except (OSError, RuntimeError) as exc:
+            last_error = exc
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
+    raise TimeoutError("execution host broker startup deadline exceeded") from last_error
 
 
 def execution(cfg, action, args):
@@ -1135,17 +1579,12 @@ def execution(cfg, action, args):
         install_unit(cfg)
         execution_environment(cfg)
         if (paths["base_image"].parent / "broker-drain.json").exists():
-            run([ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", "workstation_broker.admission"], timeout=900)
-        run(["systemctl", "enable", "--now", "gpt-trace-distributed-broker.service"])
-        deadline = time.monotonic() + 900
-        while True:
             try:
-                broker(cfg, "probe", local=True)
-                break
-            except (OSError, RuntimeError):
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("execution host broker startup deadline exceeded")
-                time.sleep(0.5)
+                _run_execution_helper("workstation_broker.admission")
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError("execution admission failed: " + (exc.stderr or str(exc)).strip()) from exc
+        run(["systemctl", "enable", "--now", "gpt-trace-distributed-broker.service"])
+        _wait_local_broker(cfg)
         execution_tunnel(cfg, 'up')
         if action != "doctor": return
     if action in {"status", "doctor"}:
@@ -1171,13 +1610,23 @@ def main(argv=None):
     parser.add_argument("--limit", type=int)
     parser.add_argument("--task")
     parser.add_argument("--directory")
+    parser.add_argument("--compose-job")
+    parser.add_argument("--container-id")
     args = parser.parse_args(argv)
+    if args.compose_job is not None and args.action != "reconcile":
+        parser.error("--compose-job requires reconcile")
+    if args.container_id is not None and (
+            not args.compose_job or re.fullmatch(r"[0-9a-f]{64}", args.container_id) is None):
+        parser.error("--container-id requires --compose-job and a full Docker container ID")
     if args.limit is not None and args.limit < 1: parser.error("LIMIT must be positive")
     if args.action == "superbench-fetch" and not args.adapter: parser.error("ADAPTER is required")
     if args.action == "reset-recovery" and not args.task: parser.error("TASK is required")
     if args.action in {"backup", "restore"} and not args.directory: parser.error("--directory is required")
-    cfg = config(credentials=args.action not in {"requirements", "backup", "restore", "init-storage", "down"})
+    cfg = config(credentials=(args.compose_job is None
+                              and args.action not in {"requirements", "backup", "restore", "init-storage", "down"}))
     role = cfg["deployment"]["role"]
+    if args.compose_job is not None and role != "control":
+        raise RuntimeError("Compose job reconciliation belongs to the control host")
     if args.action == "backup":
         if role != "control": raise RuntimeError("cold backup belongs to control host")
         host("control", cfg)

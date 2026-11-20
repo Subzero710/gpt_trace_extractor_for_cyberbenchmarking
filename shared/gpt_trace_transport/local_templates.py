@@ -28,6 +28,8 @@ TASK_RUNTIME_SCHEMA = 3
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "scripts/verified_resolver_bridge.py",
+    "infra/workstation/image/apt_downloads.py",
+    "infra/workstation/image/conda_trace.py",
     "shared/gpt_trace_transport/local_templates.py",
     "rust/verified-resolver/Cargo.toml",
     "rust/verified-resolver/Cargo.lock",

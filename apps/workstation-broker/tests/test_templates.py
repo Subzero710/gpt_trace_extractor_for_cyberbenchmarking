@@ -125,6 +125,8 @@ async def test_broker_overlay_inspect_destroy_and_normal_golden(files, tmp_path,
         returncode=0 if args[-1].removeprefix("gt_") in firewalls else 1))
     async def rpc(ident, method, args): return {"identity": ident, "guest_agent_version": "3.0.0"}
     monkeypatch.setattr(broker, "rpc", rpc)
+    monkeypatch.setattr(broker, "_guest_exchange", lambda data, ident, method, args, *, deadline:
+                        {"identity": ident, "guest_agent_version": "3.0.0"})
     before = {path: path.read_bytes() for path in (files.base, files.common, files.repo)}
     result = await broker.create(IDENT, ID, files.task1)
     assert result["template_id"] == ID and created_backings == [str(files.repo)]

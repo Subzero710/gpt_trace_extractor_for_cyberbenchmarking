@@ -6,6 +6,8 @@ direct runtime dependency packaging. Metadata uses the installed packaging.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import hashlib
 import importlib.metadata
 import json
@@ -13,6 +15,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,9 +24,10 @@ import zipfile
 from pathlib import Path
 
 from golden_assets import (BROWSER, CACHE_MOUNT, atomic_bytes, atomic_json,
-                           browser_archive, browser_identity, digest,
-                           extract_browser, inventory, mkdir, safe, sync)
+                           browser_archive, browser_identity, digest, download,
+                           extract_browser, inventory, mkdir, operation_timeout, safe, sync)
 import golden_lock
+from apt_downloads import run_downloads, run_install
 
 BUNDLE = Path("/opt/gpt-trace/bundle")
 VENV = Path("/opt/gpt-trace/venv")
@@ -42,12 +46,61 @@ MANIFESTS = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _provision_contract():
+    return json.loads(safe(BUNDLE / "guest-contract.json").read_bytes())
+
+
+@contextlib.contextmanager
+def _operation(label):
+    if re.fullmatch(r"[a-zA-Z0-9._+-]{1,128}", label) is None:
+        raise ValueError("invalid golden operation name")
+    with Path("/dev/ttyS0").open("w", buffering=1) as serial:
+        serial.write("GPTTRACE_GOLDEN begin " + label + "\n")
+        try:
+            yield
+        finally:
+            serial.write("GPTTRACE_GOLDEN end " + label + "\n")
+
+
+def _run(*args, label=None, **kwargs):
+    name = Path(args[0]).name if label is None else label
+    contract = _provision_contract()
+    limit = operation_timeout(contract["download"])
+    with _operation(name):
+        return subprocess.run(["timeout", "--signal=KILL", str(limit), *(str(x) for x in args)], **kwargs)
+
+
 def command(*args):
-    subprocess.run([str(x) for x in args], check=True)
+    _run(*args, check=True)
 
 
 def output(*args):
-    return subprocess.check_output([str(x) for x in args], text=True).strip()
+    return _run(*args, check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def _terminate_apt(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=_provision_contract()["cleanup_timeout_seconds"])
+
+
+def _apt_acquire(*args):
+    contract = _provision_contract()
+    run_downloads(
+        ["apt-get", *args], limit=operation_timeout(contract["download"]),
+        cadence=contract["progress_interval_seconds"], terminate=_terminate_apt,
+        observe=lambda label, **_: _operation(label.lower().replace(" ", "-")),
+    )
+
+
+def _apt_install(*packages, env):
+    contract = _provision_contract()
+    run_install(("--no-download", "-y", "install", *packages),
+        limit=operation_timeout(contract["download"]), cadence=contract["progress_interval_seconds"],
+        observe=_operation, terminate=_terminate_apt, env=env)
 
 
 def input_identity():
@@ -67,7 +120,8 @@ def apt():
     manifest = Path(MANIFESTS["packages"])
     if stamp.exists() or stamp.is_symlink():
         old = json.loads(safe(stamp).read_bytes())
-        measured = subprocess.check_output(["dpkg-query", "-W", "-f=${Package} ${Version}\n"])
+        measured = _run("dpkg-query", "-W", "-f=${Package} ${Version}\n",
+                        check=True, stdout=subprocess.PIPE).stdout
         if (old != {"identity": identity, "manifest_sha256": hashlib.sha256(measured).hexdigest()}
                 or not manifest.exists() or manifest.read_bytes() != measured):
             raise ValueError("APT checkpoint differs from the actual installed packages")
@@ -78,15 +132,16 @@ def apt():
     if sources.is_symlink():
         raise ValueError("unsafe original Kali APT source")
     sources.unlink(missing_ok=True)
-    command("apt-get", "-o", "Acquire::Retries=5", "update")
+    fetch_options = ("-o", "Acquire::Retries=" + str(_provision_contract()["apt_network_retries"]))
+    _apt_acquire(*fetch_options, "-o", "APT::Update::Error-Mode=any", "update")
+    _apt_acquire(*fetch_options, "--download-only", "-y", "install", *contract["packages"])
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-    subprocess.run(["apt-get", "-o", "Acquire::Retries=5", "-y", "install", *contract["packages"]],
-                   check=True, env=env)
+    _apt_install(*contract["packages"], env=env)
     # Verify every explicit guest dependency before recording success.
     for package in contract["packages"]:
         if output("dpkg-query", "-W", "-f=${Status}", package) != "install ok installed":
             raise ValueError("guest dependency was not installed: " + package)
-    raw = subprocess.check_output(["dpkg-query", "-W", "-f=${Package} ${Version}\n"])
+    raw = _run("dpkg-query", "-W", "-f=${Package} ${Version}\n", check=True, stdout=subprocess.PIPE).stdout
     atomic_bytes(manifest, raw, 0o444)
     atomic_json(stamp, {"identity": identity, "manifest_sha256": hashlib.sha256(raw).hexdigest()})
 
@@ -106,7 +161,7 @@ def filesystem():
     if not re.fullmatch(r"[A-Za-z0-9_-]+", parent) or not re.fullmatch(r"[1-9][0-9]*", number):
         raise ValueError("golden root partition identity is invalid")
     disk = "/dev/" + parent
-    probe = subprocess.run(["growpart", "--dry-run", disk, number], capture_output=True, text=True)
+    probe = _run("growpart", "--dry-run", disk, number, capture_output=True, text=True)
     if probe.returncode == 0:
         command("growpart", disk, number)
     elif probe.returncode != 1 or not (probe.stdout + probe.stderr).lstrip().startswith("NOCHANGE:"):
@@ -216,7 +271,8 @@ def python_dependencies():
     if output(python, "-c", "import sys; print(sys.version)") != expected:
         raise ValueError("existing golden virtualenv has a different system interpreter")
     # Run selection in the venv so it uses the same pip/ABI as installation.
-    command(python, BUNDLE / "guest_build.py", "install-python")
+    # The venv process owns separate wheel download and installation deadlines.
+    os.execv(python, [str(python), str(BUNDLE / "guest_build.py"), "install-python"])
 
 
 def install_python():
@@ -227,11 +283,13 @@ def install_python():
     selected = wheelhouse(CACHE_MOUNT, BUNDLE)
     with tempfile.TemporaryDirectory(prefix="gpt-trace-wheelhouse-") as raw:
         house = Path(raw)
-        for path in selected.values():
-            shutil.copyfile(path, house / path.name)
-        command(sys.executable, "-m", "pip", "--isolated", "install", "--no-index",
-                "--find-links", house, "--only-binary=:all:", "--require-hashes",
-                "-r", BUNDLE / "requirements.lock")
+        for row in value["packages"]:
+            path = selected[row["name"]]
+            requirement = house / "requirement.txt"
+            hashes = " ".join("--hash=sha256:" + sha for sha in row["hashes"])
+            atomic_bytes(requirement, (path.as_uri() + " " + hashes + "\n").encode())
+            _run(sys.executable, "-m", "pip", "--isolated", "install", "--no-index", "--no-deps",
+                 "--only-binary=:all:", "--require-hashes", "-r", requirement, label="pip-install-wheel", check=True)
     command(sys.executable, "-m", "pip", "check")
     from packaging.requirements import Requirement
     from packaging.markers import default_environment
@@ -261,7 +319,10 @@ def browser():
     pin = next(row["version"] for row in locked["packages"] if row["name"] == "cloakbrowser")
     if identity["wrapper"] != pin:
         raise ValueError("installed browser wrapper differs from frozen graph")
-    archive, evidence = browser_archive(CACHE_MOUNT, identity)
+    contract = json.loads(safe(BUNDLE / "guest-contract.json").read_bytes())
+    def fetch(url, destination, expected=None, *, policy):
+        return download(url, destination, expected, policy=policy, observe=lambda: _operation("browser-download"))
+    archive, evidence = browser_archive(CACHE_MOUNT, identity, policy=contract["download"], fetch=fetch)
     record = Path(MANIFESTS["browser_runtime"])
     if BROWSER.exists() or BROWSER.is_symlink():
         previous = json.loads(safe(record).read_bytes())
@@ -273,8 +334,9 @@ def browser():
         safe(parent, directory=True)
         with tempfile.TemporaryDirectory(prefix=".extract-", dir=parent) as raw:
             staged = Path(raw) / "chromium"
-            extract_browser(archive, staged)
-            files = inventory(staged)
+            with _operation("browser-extract"):
+                extract_browser(archive, staged)
+                files = inventory(staged)
             # Record intent before activation. A crash after rename is fully
             # verifiable; a crash before rename can repeat extraction offline.
             atomic_json(record, {"schema": 2, "artifact": evidence, "files": files}, 0o444)
@@ -283,7 +345,7 @@ def browser():
     safe(BROWSER / "chrome")
     if not os.access(BROWSER / "chrome", os.X_OK):
         raise ValueError("verified Chromium is not executable")
-    result = subprocess.run(["ldd", str(BROWSER / "chrome")], capture_output=True, text=True)
+    result = _run("ldd", BROWSER / "chrome", capture_output=True, text=True)
     if result.returncode != 0 or "not found" in result.stdout + result.stderr:
         raise ValueError("Chromium has unresolved shared libraries: " + result.stdout + result.stderr)
     binary_version = output(BROWSER / "chrome", "--version")
@@ -335,7 +397,7 @@ def metadata():
         else:
             atomic_json(Path(MANIFESTS[name]), {"version": version,
                 "executable": str(path), "sha256": digest(path)}, 0o444)
-    raw = subprocess.check_output([sys.executable, "-m", "pip", "freeze", "--all"])
+    raw = _run(sys.executable, "-m", "pip", "freeze", "--all", check=True, stdout=subprocess.PIPE).stdout
     atomic_bytes(Path(MANIFESTS["python_packages"]), raw, 0o444)
     # An import failure must precede the global success marker.
     command(sys.executable, "-c", "import packaging, cloakbrowser; import kali_workstation.guest.agent")

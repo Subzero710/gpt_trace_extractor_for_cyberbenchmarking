@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib
 import importlib.util
+from contextlib import nullcontext
 import io
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ spec.loader.exec_module(bridge)
 
 def test_syntax_rejection_is_distinct_from_metadata_infrastructure_error():
     child=SimpleNamespace(stdin=io.BytesIO(),stdout=io.BytesIO())
-    wire=bridge._Wire(child,1000)
+    wire=bridge._Wire(child,1000,ipc_timeout=1)
     rejection=pool._IncompatibleSourceSyntax('target syntax error')
     wire.rejected_source(rejection)
     output=child.stdin.getvalue()
@@ -29,7 +30,7 @@ def test_syntax_rejection_is_distinct_from_metadata_infrastructure_error():
     length=int.from_bytes(output[1:5],'big')
     assert output[5:5+length] == b'target syntax error'
     child.stdin=io.BytesIO()
-    wire=bridge._Wire(child,1000)
+    wire=bridge._Wire(child,1000,ipc_timeout=1)
     wire.error(RuntimeError('network unavailable'))
     assert child.stdin.getvalue()[0:1] == b'\x00'
 
@@ -42,7 +43,8 @@ pip_solver_max_decisions = 1000
 pip_solver_max_depth = 100
 pip_solver_cache_max_bytes = 100000
 pip_solver_max_frame_bytes = 100000
-pip_total_timeout_seconds = 20
+timeout_seconds = 20
+pip_solver_compute_timeout_seconds = 20
 ''')
     source=tmp_path/'scripts/superbench_pool.py'
     source.write_text('# offline host fixture\n')
@@ -95,7 +97,8 @@ out.write(b'S');sendnum(1);sendnum(new);sendstr('solver decisions=2');out.flush(
     def probe(_pool,candidate,key,target):
         assert candidate is old
         raise pool._IncompatibleSourceSyntax('source setup.py cannot compile on target Python')
-    host={'__file__':str(source), '_coerce_target':lambda target:target,
+    host={'_registered_operation':lambda *args, **kwargs:nullcontext(),
+          '__file__':str(source), '_coerce_target':lambda target:target,
           '_packaging_symbols':lambda: (Requirement,None,Version,InvalidVersion,None),
           '_constraint_map':lambda c,t:{},'_SingleFlightCache':dict,
           '_parse_registry_requirement':Requirement,

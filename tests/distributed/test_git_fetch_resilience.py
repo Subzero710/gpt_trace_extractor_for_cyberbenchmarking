@@ -150,7 +150,7 @@ def test_git_fetch_does_not_change_remote_or_pinned_refs(monkeypatch, tmp_path):
     ('git_fetch_batch_size', lambda c: 0),
     ('git_fetch_attempts', lambda c: 0),
     ('git_fetch_attempt_timeout_seconds', lambda c: 0),
-    ('git_fetch_attempt_timeout_seconds', lambda c: c['subprocess_timeout_seconds'] + 1),
+    ('git_fetch_attempt_timeout_seconds', lambda c: c['timeout_seconds'] + 1),
     ('git_fetch_retry_backoff_seconds', lambda c: c['git_fetch_retry_backoff_seconds'][:-1]),
     ('git_fetch_retry_backoff_seconds', lambda c:
         [True, *c['git_fetch_retry_backoff_seconds'][1:]]),

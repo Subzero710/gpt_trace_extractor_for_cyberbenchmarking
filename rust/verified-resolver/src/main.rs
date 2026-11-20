@@ -9,7 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 type Range = Ranges<u32>;
@@ -18,38 +20,143 @@ fn failure(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::Other, message.into())
 }
 
+fn time_limit(seconds: u64) -> Result<Duration, io::Error> {
+    if !(1..=180).contains(&seconds) {
+        return Err(failure("native resolver time limit must be between 1 and 180 seconds"));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn process_cpu_time() -> Result<Duration, io::Error> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, timestamp.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let timestamp = unsafe { timestamp.assume_init() };
+    Ok(Duration::new(timestamp.tv_sec as u64, timestamp.tv_nsec as u32))
+}
+
+fn nonblocking(fd: RawFd) -> Result<(), io::Error> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn ipc_remaining(deadline: Instant) -> Result<Duration, io::Error> {
+    deadline.checked_duration_since(Instant::now()).filter(|left| !left.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "native resolver IPC deadline expired"))
+}
+
+fn wait_ready(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<(), io::Error> {
+    let mut descriptor = libc::pollfd { fd, events, revents: 0 };
+    loop {
+        let millis = match deadline {
+            Some(end) => ipc_remaining(end)?.as_millis().max(1) as libc::c_int,
+            None => -1,
+        };
+        let status = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if status > 0 {
+            return Ok(());
+        }
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
 struct Wire {
-    input: BufReader<io::Stdin>,
-    output: BufWriter<io::Stdout>,
+    input: BufReader<File>,
+    output: File,
+    message: Vec<u8>,
     max_frame: usize,
+    ipc_timeout: Duration,
+    input_deadline: Option<Instant>,
+    input_size: usize,
 }
 impl Wire {
-    fn new() -> Self {
-        Self { input: BufReader::new(io::stdin()), output: BufWriter::new(io::stdout()),
-            max_frame: u32::MAX as usize }
+    fn new(ipc_timeout: Duration) -> Result<Self, io::Error> {
+        nonblocking(libc::STDIN_FILENO)?;
+        nonblocking(libc::STDOUT_FILENO)?;
+        // The protocol exclusively owns both standard descriptors.
+        let input = unsafe { File::from_raw_fd(libc::STDIN_FILENO) };
+        let output = unsafe { File::from_raw_fd(libc::STDOUT_FILENO) };
+        Ok(Self {
+            input: BufReader::new(input),
+            output,
+            message: Vec::new(),
+            max_frame: u32::MAX as usize,
+            ipc_timeout,
+            input_deadline: Some(Instant::now() + ipc_timeout),
+            input_size: 0,
+        })
     }
+
+    fn read_exact(&mut self, mut bytes: &mut [u8]) -> Result<(), io::Error> {
+        if self.input_size.saturating_add(bytes.len()) > self.max_frame {
+            return Err(failure("IPC input message exceeds frame limit"));
+        }
+        self.input_size += bytes.len();
+        while !bytes.is_empty() {
+            if let Some(end) = self.input_deadline {
+                ipc_remaining(end)?;
+            }
+            match self.input.read(bytes) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete resolver IPC response")),
+                Ok(count) => bytes = &mut bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_ready(self.input.get_ref().as_raw_fd(), libc::POLLIN, self.input_deadline)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn response_status(&mut self) -> Result<u8, io::Error> {
+        // The bridge sends the status only after the metadata producer finishes.
+        // EOF abandons this dependency if the bridge exits.
+        self.input_deadline = None;
+        self.input_size = 0;
+        let status = self.u8()?;
+        self.input_deadline = Some(Instant::now() + self.ipc_timeout);
+        Ok(status)
+    }
+
     fn u8(&mut self) -> Result<u8, io::Error> {
-        let mut bytes = [0u8; 1]; self.input.read_exact(&mut bytes)?; Ok(bytes[0])
+        let mut bytes = [0u8; 1]; self.read_exact(&mut bytes)?; Ok(bytes[0])
     }
     fn u32(&mut self) -> Result<u32, io::Error> {
-        let mut bytes = [0u8; 4]; self.input.read_exact(&mut bytes)?;
+        let mut bytes = [0u8; 4]; self.read_exact(&mut bytes)?;
         Ok(u32::from_be_bytes(bytes))
     }
     fn u64(&mut self) -> Result<u64, io::Error> {
-        let mut bytes = [0u8; 8]; self.input.read_exact(&mut bytes)?;
+        let mut bytes = [0u8; 8]; self.read_exact(&mut bytes)?;
         Ok(u64::from_be_bytes(bytes))
     }
     fn string(&mut self) -> Result<String, io::Error> {
         let size = self.u32()? as usize;
         if size > self.max_frame { return Err(failure("IPC string exceeds frame limit")); }
-        let mut bytes = vec![0; size]; self.input.read_exact(&mut bytes)?;
+        let mut bytes = vec![0; size]; self.read_exact(&mut bytes)?;
         String::from_utf8(bytes).map_err(|e| failure(e.to_string()))
     }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), io::Error> {
+        if self.message.len().saturating_add(bytes.len()) > self.max_frame {
+            return Err(failure("IPC output message exceeds frame limit"));
+        }
+        self.message.extend_from_slice(bytes);
+        Ok(())
+    }
     fn put8(&mut self, value: u8) -> Result<(), io::Error> {
-        self.output.write_all(&[value])
+        self.append(&[value])
     }
     fn put32(&mut self, value: u32) -> Result<(), io::Error> {
-        self.output.write_all(&value.to_be_bytes())
+        self.append(&value.to_be_bytes())
     }
     fn put_len(&mut self, value: usize) -> Result<(), io::Error> {
         self.put32(u32::try_from(value).map_err(|e| failure(e.to_string()))?)
@@ -57,11 +164,28 @@ impl Wire {
     fn put_string(&mut self, value: &str) -> Result<(), io::Error> {
         if value.len() > self.max_frame { return Err(failure("IPC outbound string exceeds frame limit")); }
         self.put_len(value.len())?;
-        self.output.write_all(value.as_bytes())
+        self.append(value.as_bytes())
     }
-    fn flush(&mut self) -> Result<(), io::Error> { self.output.flush() }
+    fn flush(&mut self) -> Result<(), io::Error> {
+        let deadline = Instant::now() + self.ipc_timeout;
+        let mut bytes = self.message.as_slice();
+        while !bytes.is_empty() {
+            ipc_remaining(deadline)?;
+            match self.output.write(bytes) {
+                Ok(0) => return Err(failure("native resolver IPC write made no progress")),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_ready(self.output.as_raw_fd(), libc::POLLOUT, Some(deadline))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+        self.message.clear();
+        Ok(())
+    }
     fn ack(&mut self) -> Result<(), io::Error> {
-        match self.u8()? {
+        match self.response_status()? {
             1 => Ok(()),
             0 => Err(failure(self.string()?)),
             other => Err(failure(format!("invalid IPC response {other}"))),
@@ -73,12 +197,23 @@ impl Wire {
         self.put_string(detail)?; self.flush()
     }
     fn unsat(&mut self, detail: &str, decisions: u64) -> Result<(),io::Error> {
-        self.put8(b'U')?; self.put_string(detail)?;
-        self.put_string(&format!("pubgrub decisions={decisions}; conflict derivation; no solution"))?;
+        let stats = format!("pubgrub decisions={decisions}; conflict derivation; no solution");
+        let mut end = detail.len().min(self.max_frame.saturating_sub(9 + stats.len()));
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.put8(b'U')?;
+        self.put_string(&detail[..end])?;
+        self.put_string(&stats)?;
         self.flush()
     }
     fn error(&mut self, detail: &str) -> Result<(),io::Error> {
-        self.put8(b'F')?; self.put_string(detail)?; self.flush()
+        self.message.clear();
+        let mut end = detail.len().min(self.max_frame.saturating_sub(5));
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.put8(b'F')?; self.put_string(&detail[..end])?; self.flush()
     }
 }
 
@@ -112,9 +247,10 @@ struct Universe {
     by_rank: HashMap<u32,u32>,
 }
 struct Requirement { name: String, requirement: String, extras: Vec<String> }
-struct Oracle {
-    wire: Wire,
-    deadline: Instant,
+struct Oracle<'a> {
+    wire: &'a mut Wire,
+    compute_started: Duration,
+    compute_limit: Duration,
     no_deps: bool,
     roots: Vec<Requirement>,
     candidates: HashMap<u32,Candidate>,
@@ -125,10 +261,10 @@ struct Oracle {
     decisions: Cell<u64>,
     max_decisions: u64,
 }
-impl Oracle {
+impl Oracle<'_> {
     fn check_time(&self) -> Result<(),io::Error> {
-        if Instant::now() >= self.deadline {
-            Err(failure("PubGrub solve exceeded configured deadline"))
+        if process_cpu_time()?.saturating_sub(self.compute_started) >= self.compute_limit {
+            Err(failure("PubGrub solve exceeded configured active computation budget"))
         } else { Ok(()) }
     }
     fn read_candidate(&mut self) -> Result<u32,io::Error> {
@@ -273,7 +409,7 @@ impl Oracle {
         self.check_time()?;
         self.wire.put8(b'M')?; self.wire.put_len(1)?; self.wire.put32(id)?;
         self.wire.flush()?;
-        match self.wire.u8()? {
+        match self.wire.response_status()? {
             1 => {self.checked.insert(id);Ok(None)},
             2 => {
                 let reason = self.wire.string()?;
@@ -366,8 +502,8 @@ impl Oracle {
     }
 }
 
-struct Provider { oracle: RefCell<Oracle> }
-impl DependencyProvider for Provider {
+struct Provider<'a> { oracle: RefCell<Oracle<'a>> }
+impl DependencyProvider for Provider<'_> {
     type P = Pkg;
     type V = u32;
     type VS = Range;
@@ -409,12 +545,6 @@ impl DependencyProvider for Provider {
     }
 }
 
-fn mandatory_deadline(seconds:u64)->Result<Instant,io::Error> {
-    if seconds == 0 { return Err(failure("native Rust resolver requires a nonzero closure deadline")); }
-    Instant::now().checked_add(Duration::from_secs(seconds))
-        .ok_or_else(||failure("invalid mandatory deadline"))
-}
-
 fn run(wire: &mut Wire) -> Result<(),io::Error> {
     let frame=wire.u64()?;
     if frame==0 || frame>u32::MAX as u64 { return Err(failure("invalid IPC frame capacity")); }
@@ -422,7 +552,7 @@ fn run(wire: &mut Wire) -> Result<(),io::Error> {
     let max_decisions=wire.u64()?;
     let max_depth=wire.u64()?;
     let max_cache_bytes=wire.u64()?;
-    let deadline_seconds=wire.u64()?;
+    let compute_limit=time_limit(wire.u64()?)?;
     let prefetch_width=wire.u64()?;
     let no_deps=wire.u8()? != 0;
     if max_decisions==0 || max_depth==0 || max_cache_bytes==0 || prefetch_width==0 {
@@ -440,13 +570,13 @@ fn run(wire: &mut Wire) -> Result<(),io::Error> {
         for _ in 0..extra_count { extras.push(wire.string()?); }
         roots.push(Requirement{name,requirement,extras});
     }
-    let deadline=mandatory_deadline(deadline_seconds)?;
-    let oracle=Oracle {wire:Wire::new(),deadline,no_deps,roots,
+    let oracle=Oracle {wire,compute_started:process_cpu_time()?,compute_limit,no_deps,roots,
         candidates:HashMap::new(),universes:HashMap::new(),ranges:HashMap::new(),
         rejected:HashMap::new(),checked:HashSet::new(),decisions:Cell::new(0),max_decisions};
     let provider=Provider {oracle:RefCell::new(oracle)};
     let outcome=resolve(&provider,Pkg::Root,1u32);
-    let mut oracle=provider.oracle.into_inner();
+    let oracle=provider.oracle.into_inner();
+    oracle.check_time()?;
     match outcome {
         Ok(solution)=>{
             let mut refs=BTreeMap::<String,u32>::new();
@@ -470,20 +600,28 @@ fn run(wire: &mut Wire) -> Result<(),io::Error> {
         Err(PubGrubError::NoSolution(mut tree))=>{
             tree.collapse_no_versions();
             let detail=DefaultStringReporter::report(&tree);
-            let limit=oracle.wire.max_frame;
-            if detail.len()>limit {
-                let mut end=limit;
-                while !detail.is_char_boundary(end) {end-=1;}
-                oracle.wire.unsat(&detail[..end],oracle.decisions.get())
-            } else { oracle.wire.unsat(&detail,oracle.decisions.get()) }
+            oracle.wire.unsat(&detail,oracle.decisions.get())
         },
-        Err(other)=>oracle.wire.error(&format!("{other:?}")),
+        Err(other)=>Err(failure(format!("{other:?}"))),
     }
 }
 fn main() {
-    let mut wire=Wire::new();
+    let ipc_timeout = std::env::args().nth(1)
+        .ok_or_else(|| failure("missing native resolver IPC time limit"))
+        .and_then(|arg| arg.parse::<u64>().map_err(|_| failure("invalid native resolver IPC time limit")))
+        .and_then(time_limit);
+    let mut wire = match ipc_timeout.and_then(Wire::new) {
+        Ok(wire) => wire,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
     if let Err(error)=run(&mut wire) {
-        let _=wire.error(&error.to_string());
+        if error.kind() != io::ErrorKind::TimedOut {
+            let _=wire.error(&error.to_string());
+        }
+        eprintln!("{error}");
         std::process::exit(1);
     }
 }
@@ -492,9 +630,22 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
-    fn deadline_is_mandatory() {
-        assert!(mandatory_deadline(0).is_err());
-        assert!(mandatory_deadline(1).is_ok());
+    fn computation_budget_is_mandatory_and_bounded() {
+        assert!(time_limit(0).is_err());
+        assert!(time_limit(1).is_ok());
+        assert!(time_limit(181).is_err());
+    }
+
+    #[test]
+    fn process_computation_clock_excludes_time_spent_waiting() {
+        let started = process_cpu_time().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let after_wait = process_cpu_time().unwrap();
+        assert!(after_wait - started < Duration::from_millis(100));
+        while process_cpu_time().unwrap() - after_wait < Duration::from_millis(10) {
+            std::hint::spin_loop();
+        }
+        assert!(process_cpu_time().unwrap() - started >= Duration::from_millis(10));
     }
     #[test]
     fn interval_ranges_eliminate_incompatible_candidates() {

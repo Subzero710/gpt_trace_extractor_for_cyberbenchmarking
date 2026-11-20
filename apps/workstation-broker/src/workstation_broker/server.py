@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import time
 import struct
 import subprocess
@@ -21,7 +22,7 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -31,7 +32,8 @@ from starlette.routing import Route
 from .computer import capture, input_events
 from .templates import TemplateRegistry, backing
 from .preparation_resources import ResourceObservationUnavailable
-from gpt_trace_transport.wire import CONTROLLER_ACTIONS
+from gpt_trace_transport.operation_watch import host_operation
+from gpt_trace_transport.wire import CONTROLLER_ACTIONS, safe_file
 
 PORT = 17171
 MAX_BODY = 32 * 1024 * 1024
@@ -50,13 +52,20 @@ def _broker_command_timeout():
         raise RuntimeError('missing versioned broker command timeout')
     with source.open('rb') as stream:
         seconds = tomllib.load(stream)['acquisition']['timeout_seconds']
-    if type(seconds) is not int or seconds < 1:
+    if type(seconds) is not int or not 1 <= seconds <= 180:
         raise RuntimeError('invalid versioned broker command timeout')
     return seconds
 
 
+def _guest_poll_interval():
+    source = Path(__file__).resolve().parents[4] / "config/runner.toml"
+    with source.open("rb") as stream:
+        return tomllib.load(stream)["workstation"]["creation_poll_interval_seconds"]
+
+
 def run(*args: str, input: bytes | None = None, ok: tuple[int, ...] = (0,)) -> bytes:
-    result = subprocess.run(args, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    with host_operation("native-" + Path(args[0]).name):
+        result = subprocess.run(args, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     if result.returncode not in ok:
         raise RuntimeError(f"{args[0]} {args[1] if len(args)>1 else ''} failed: {result.stderr[:500]!r}")
     return result.stdout
@@ -164,13 +173,18 @@ class Broker:
     max_seed_bytes: int = 268435456
     egress_allow_cidrs: tuple[str, ...] = ()
     template_root: Path | None = None
+    guest_poll_interval_seconds: int = field(default_factory=_guest_poll_interval)
+    guest_command_timeout_seconds: int = 180
 
     def __post_init__(self):
         if not self.base.is_file() or self.base.is_symlink():
             raise RuntimeError(f"missing immutable Kali base image: {self.base}")
         if not 1024 <= self.memory_mb <= 65536 or not 1 <= self.vcpus <= 32:
             raise RuntimeError("invalid VM resource limits")
-        if not 1 <= self.boot_timeout_seconds <= 600 or not 1 <= self.guest_agent_timeout_seconds <= 180:
+        if (not 1 <= self.boot_timeout_seconds <= 180
+                or not 1 <= self.guest_poll_interval_seconds < self.guest_agent_timeout_seconds <= 180
+                or type(self.guest_command_timeout_seconds) is not int
+                or not 1 <= self.guest_command_timeout_seconds <= 180):
             raise RuntimeError("invalid guest time limits")
         if not 4 <= self.overlay_quota_gb <= 128 or not 1024 <= self.screenshot_max_bytes <= 16 * 1024 * 1024:
             raise RuntimeError("invalid disk/screen limits")
@@ -362,7 +376,8 @@ add rule inet {table} input iifname "{bridge}" drop
                 await asyncio.to_thread(self._create_network, ident, network, directory)
             (directory / "identity.json").write_text(json.dumps({**ident, "secret": secret,
                 "limits": {"max_terminals": self.max_terminals, "max_output_bytes": self.max_output_bytes,
-                           "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes}}))
+                           "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes,
+                           "guest_agent_timeout_seconds": self.guest_agent_timeout_seconds}}))
             os.chmod(directory / "identity.json", 0o600)
             await asyncio.to_thread(run, "xorriso", "-as", "mkisofs", "-quiet", "-o", str(iso), "-V", "GPTTRACE", str(directory / "identity.json"))
             os.chown(iso, self.qemu_uid, -1)
@@ -373,17 +388,18 @@ add rule inet {table} input iifname "{bridge}" drop
             self._write_state(directory / "state.json", state)
             await asyncio.to_thread(run, "virsh", "-c", "qemu:///system", "start", name)
             # One real, monotonic deadline; individual VSOCK probes are bounded.
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + self.boot_timeout_seconds
-            while loop.time() < deadline:
+            deadline = time.monotonic() + self.boot_timeout_seconds
+            while time.monotonic() < deadline:
                 try:
-                    remaining = deadline - loop.time()
-                    reply = await asyncio.wait_for(self.rpc(ident, "health", {}), timeout=min(6.0, remaining))
-                    if reply.get("identity") == ident:
-                        return await self.inspect_verified(ident)
+                    probe_deadline = min(deadline, time.monotonic() + self.guest_agent_timeout_seconds)
+                    reply = await asyncio.to_thread(self._guest_exchange, state, ident, "health", {},
+                                                    deadline=probe_deadline)
+                    if reply.get("identity") == ident and reply.get("guest_agent_version") == "3.0.0":
+                        verified = await asyncio.to_thread(self.inspect, ident)
+                        return {**verified, "guest_agent_version": reply["guest_agent_version"]}
                 except (OSError, TimeoutError, ValueError):
                     pass
-                await asyncio.sleep(min(1.0, max(0.0, deadline - loop.time())))
+                await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
             raise TimeoutError("guest agent did not become ready within configured boot timeout")
         except BaseException:
             if template_id is None:
@@ -604,14 +620,16 @@ add rule inet {table} input iifname "{bridge}" drop
         self._remove_firewall(ident)
         self._unmount(directory)
         if directory.exists():
-            shutil.rmtree(directory, ignore_errors=False)
+            with host_operation("remove-attempt-state"):
+                shutil.rmtree(directory, ignore_errors=False)
         self.assert_absent(ident)
 
     def assert_absent(self, ident: dict) -> None:
         name, network, directory = self._paths(ident)
         key = suffix(ident)
-        firewall_present = subprocess.run(("nft", "list", "table", "inet", "gt_" + key),
-                                          capture_output=True, timeout=_broker_command_timeout()).returncode == 0
+        with host_operation("inspect-firewall"):
+            firewall_present = subprocess.run(("nft", "list", "table", "inet", "gt_" + key),
+                                              capture_output=True, timeout=_broker_command_timeout()).returncode == 0
         if (directory.exists() or (directory / "disk").is_mount() or firewall_present
                 or name in run("virsh", "-c", "qemu:///system", "list", "--all", "--name").decode().splitlines()
                 or network in run("virsh", "-c", "qemu:///system", "net-list", "--all", "--name").decode().splitlines()):
@@ -647,7 +665,8 @@ add rule inet {table} input iifname "{bridge}" drop
             if directory.is_symlink() or not directory.is_dir():
                 raise ValueError(f"unsafe attempt state entry: {directory}")
             self._unmount(directory)
-            shutil.rmtree(directory, ignore_errors=False)
+            with host_operation("remove-orphan-attempt-state"):
+                shutil.rmtree(directory, ignore_errors=False)
 
     def destroy_all(self) -> dict:
         inventory(self)  # Audit ownership before the first mutation.
@@ -703,31 +722,74 @@ add rule inet {table} input iifname "{bridge}" drop
             raise ValueError("authenticated cleanup audit still finds project resources")
         return {"removed": removed, "orphaned": sorted(set(orphaned))}
 
-    async def rpc(self, ident: dict, method: str, args: dict) -> dict:
+    async def rpc(self, ident: dict, method: str, args: dict, *, operation_id=None) -> dict:
+        if not isinstance(method, str) or method.startswith("_"):
+            raise ValueError("invalid guest RPC method")
+        if method != "exec_command":
+            data = await asyncio.to_thread(self._read, ident)
+            return await self._guest_request(data, ident, method, args)
+        if not isinstance(args, dict):
+            raise ValueError("invalid guest command arguments")
+        duration = args.get("timeout_seconds", self.guest_command_timeout_seconds)
+        if type(duration) is not int or not 1 <= duration <= self.guest_command_timeout_seconds:
+            raise ValueError("guest command exceeds the versioned deadline")
+        args = {**args, "timeout_seconds": duration}
         data = await asyncio.to_thread(self._read, ident)
+        operation_id = uuid.uuid4().hex if operation_id is None else operation_id
+        query = {"operation_id": operation_id}
+        begin_error = None
+        try:
+            acknowledgement = await self._guest_request(data, ident, "_exec_begin", {**query, "args": args})
+            if acknowledgement != {**query, "state": "accepted"}:
+                raise ValueError("invalid guest execution acknowledgement")
+        except OSError as exc:
+            begin_error = exc
+        # The guest bounds Bash execution and process-group cleanup separately.
+        # A daemon returning pending forever cannot extend either budget.
+        try:
+            async with asyncio.timeout(duration + self.guest_agent_timeout_seconds):
+                while True:
+                    state = await self._guest_request(data, ident, "_exec_status", query)
+                    if state.get("operation_id") != operation_id:
+                        raise ValueError("guest execution status identity mismatch")
+                    if state.get("state") == "complete" and isinstance(state.get("result"), dict):
+                        return state["result"]
+                    if state.get("state") == "failed":
+                        raise ValueError(str(state.get("error", "guest execution failed"))[:1000])
+                    if state.get("state") != "pending":
+                        raise TimeoutError("guest no longer owns the operation") from begin_error
+                    await asyncio.sleep(self.guest_poll_interval_seconds)
+        except OSError as exc:
+            raise TimeoutError(f"guest execution {operation_id} outcome unconfirmed") from exc
+
+    async def _guest_request(self, data, ident, method, args):
+        deadline = time.monotonic() + self.guest_agent_timeout_seconds
+        return await asyncio.to_thread(self._guest_exchange, data, ident, method, args, deadline=deadline)
+
+    def _guest_exchange(self, data: dict, ident: dict, method: str, args: dict, *, deadline: float) -> dict:
         if not isinstance(method, str) or not re.fullmatch(r"[a-z_]{1,40}", method):
             raise ValueError("invalid guest RPC method")
+        if (type(deadline) not in (int, float)
+                or not 0 < deadline - time.monotonic() <= self.guest_agent_timeout_seconds):
+            raise TimeoutError("guest transport requires a current bounded deadline")
         body = json.dumps({"identity": ident, "secret": data["secret"], "method": method, "args": args}).encode()
         if len(body) > MAX_BODY:
             raise ValueError("guest RPC too large")
-        def exchange() -> dict:
-            with socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM) as connection:
-                # Probing health never needs a 30-minute RPC timeout.
-                is_probe = method == "health"
-                connection.settimeout(min(5.0, self.guest_agent_timeout_seconds) if is_probe else self.guest_agent_timeout_seconds)
-                connection.connect((data["metadata"]["cid"], PORT))
-                connection.settimeout(5.0 if is_probe else 1850)
-                connection.sendall(struct.pack("!I", len(body)) + body)
-                size = struct.unpack("!I", recv_exact(connection, 4))[0]
-                if size > MAX_BODY:
-                    raise ValueError("guest response too large")
-                response = json.loads(recv_exact(connection, size))
-                if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
-                    raise ValueError("invalid guest response")
-                if not response["ok"]:
-                    raise ValueError(str(response.get("error", "guest RPC failed"))[:1000])
-                return response["result"]
-        return await asyncio.to_thread(exchange)
+        with socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM) as connection:
+            connection.settimeout(guest_time_left(deadline))
+            connection.connect((data["metadata"]["cid"], PORT))
+            connection.settimeout(guest_time_left(deadline))
+            connection.sendall(struct.pack("!I", len(body)) + body)
+            size = struct.unpack("!I", recv_exact(connection, 4, deadline=deadline))[0]
+            if size > MAX_BODY:
+                raise ValueError("guest response too large")
+            response = json.loads(recv_exact(connection, size, deadline=deadline))
+            guest_time_left(deadline)
+        if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+            raise ValueError("invalid guest response")
+        if not response["ok"]:
+            raise ValueError(str(response.get("error", "guest RPC failed"))[:1000])
+        return response["result"]
 
     def screen(self, ident: dict) -> dict:
         data = self._read(ident)
@@ -859,17 +921,17 @@ add rule inet {table} input iifname "{bridge}" drop
             raise
 
 
-def recv_exact(connection: socket.socket, length: int) -> bytes:
+def guest_time_left(deadline):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError("guest response exceeded its socket deadline")
+    return seconds
+
+
+def recv_exact(connection: socket.socket, length: int, *, deadline: float) -> bytes:
     result = bytearray()
-    socket_timeout = connection.gettimeout()
-    if socket_timeout is None or socket_timeout <= 0:
-        raise RuntimeError('guest transport requires a finite socket deadline')
-    deadline = time.monotonic() + socket_timeout
     while len(result) < length:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError('guest response exceeded its socket deadline')
-        connection.settimeout(remaining)
+        connection.settimeout(guest_time_left(deadline))
         chunk = connection.recv(length - len(result))
         if not chunk:
             raise OSError("guest transport closed")
@@ -936,10 +998,183 @@ def create_app(broker: Broker) -> Starlette:
     # Serializing native actions makes the shutdown barrier wait for every
     # in-flight transfer/create/input operation before absence can be proved.
     operation_lock = asyncio.Lock()
-    """Cloudflare-safe async broker operation admission"""
-    # Results remain available to repeated authenticated polls for this broker
-    # process lifetime; a restarted process will refuse to infer any VM outcome.
     operations: dict[tuple[str, str], dict] = {}
+    runtime_operations = {}
+
+    def creation_record_path(operation, operation_id):
+        directory = broker.root.with_name(broker.root.name + "-creations")
+        return directory / f"{operation}-{operation_id}.json"
+
+    def read_creation(operation, operation_id):
+        path = creation_record_path(operation, operation_id)
+        try:
+            record = json.loads(safe_file(path, secret=True))
+        except FileNotFoundError:
+            return None
+        if (not isinstance(record, dict) or record.get("operation") != operation
+                or record.get("operation_id") != operation_id
+                or record.get("state") not in {"pending", "complete", "failed", "unknown"}
+                or not isinstance(record.get("payload"), dict)
+                or identity(record["payload"]) != record.get("identity")
+                or record["payload"].get("operation_id") != operation_id
+                or record["payload"].get("operation") != operation):
+            raise RuntimeError("invalid durable creation record")
+        return record
+
+    def write_operation(path, record):
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        info = path.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise RuntimeError("untrusted creation record directory")
+        Broker._write_state(path, {key: value for key, value in record.items() if key != "task"})
+
+    def write_creation(record):
+        write_operation(creation_record_path(record["operation"], record["operation_id"]), record)
+
+    deployment_runtime = {"preflight_templates", "begin_shutdown", "destroy_all", "inventory", "throw_template_storage"}
+    runtime_admin = deployment_runtime | {
+        "destroy_attempt", "abandon_attempt", "assert_absent", "abandon_evaluators", "destroy_evaluator",
+    }
+    drain_runtime = runtime_admin - {"preflight_templates", "abandon_evaluators", "destroy_evaluator"}
+    guest_runtime = {"exec_command", "artifact_export", "artifact_import", "materialize_template_artifact"}
+
+    async def begin_shutdown():
+        marker = getattr(broker, "drain_file", None)
+        if marker is not None:
+            from workstation_broker.admission import mark_draining
+            await asyncio.to_thread(mark_draining, marker)
+        broker.draining = True
+        manager = getattr(broker, "preparations", None)
+        if manager is not None:
+            await asyncio.to_thread(manager.cancel_all)
+        return {"draining": True, "project": PROJECT}
+
+    def administer_runtime(operation, ident, args):
+        if operation == "inventory":
+            return inventory(broker)
+        if operation == "destroy_all":
+            return broker.destroy_all()
+        if operation == "throw_template_storage":
+            manager = getattr(broker, "preparations", None)
+            if manager is None:
+                raise RuntimeError("native administrative preparation manager is unavailable")
+            if not getattr(broker, "draining", False):
+                raise RuntimeError("persistent template deletion requires an established shutdown barrier")
+            if inventory(broker).get("absent") is not True:
+                raise RuntimeError("temporary execution resources remain; refusing persistent THROW")
+            return manager.throw_persistent_storage(args)
+        if operation == "preflight_templates":
+            return broker.preflight_templates(args.get("template_ids"))
+        if operation == "assert_absent":
+            broker.assert_absent(ident)
+            return {"absent": True}
+        if operation == "abandon_evaluators":
+            return broker.abandon_evaluators(ident)
+        if operation == "destroy_evaluator":
+            teacher = {key: ident[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
+            return broker.destroy_evaluator(teacher, ident["evaluator_retry"])
+        if operation == "destroy_attempt":
+            broker.destroy(ident)
+        else:
+            broker.destroy(ident, strict=False)
+        return {"destroyed": True}
+
+    async def execute_runtime(record, args, path):
+        try:
+            async with operation_lock:
+                operation = record["operation"]
+                if getattr(broker, "draining", False) and operation not in drain_runtime:
+                    raise RuntimeError("broker is draining; runtime operation blocked")
+                ident = record["identity"]
+                if operation == "begin_shutdown":
+                    result = await begin_shutdown()
+                elif operation in runtime_admin:
+                    result = await asyncio.to_thread(administer_runtime, operation, ident, args)
+                else:
+                    if ident.get("purpose") == "evaluator":
+                        teacher = {key: ident[key] for key in ("task_id", "attempt", "environment_id", "fingerprint")}
+                        ident = await asyncio.to_thread(broker.evaluator_identity, teacher, ident["evaluator_retry"])
+                    if operation == "exec_command":
+                        result = await broker.rpc(ident, operation, args, operation_id=record["operation_id"])
+                    elif operation == "artifact_export":
+                        result = await broker.export_artifact(ident, args)
+                    elif operation == "artifact_import":
+                        result = await broker.import_artifact(ident, args)
+                    else:
+                        result = await broker.materialize_template_artifact(ident, args.get("artifact_id"))
+        except asyncio.CancelledError:
+            write_operation(path, {**record, "state": "unknown"})
+            raise
+        except OSError:
+            write_operation(path, {**record, "state": "unknown"})
+        except Exception as exc:
+            write_operation(path, {**record, "state": "failed", "detail": str(exc)[:1000]})
+        else:
+            write_operation(path, {**record, "state": "complete", "result": result})
+        finally:
+            runtime_operations.pop(path)
+
+    def runtime_request(action, payload, principal):
+        operation = payload.get("operation")
+        operation_id = payload.get("operation_id")
+        if (not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None
+                or not isinstance(operation, str) or operation not in runtime_admin | guest_runtime):
+            raise ValueError("invalid runtime operation identity")
+        ident = {} if operation in deployment_runtime else identity(payload)
+        if principal != "admin" and (operation in runtime_admin or ident.get("purpose") == "evaluator"
+                                     or operation == "materialize_template_artifact"):
+            return JSONResponse({"detail": "trusted runtime operation forbidden for controller token"}, status_code=403)
+        if operation in runtime_admin and (ident.get("purpose") == "evaluator") != (operation == "destroy_evaluator"):
+            raise ValueError("administrative operation has an unexpected attempt purpose")
+        query = {"operation": operation, "operation_id": operation_id, "identity": ident}
+        path = broker.root.with_name(broker.root.name + "-runtime-operations") / (operation_id + ".json")
+        live = runtime_operations.get(path)
+        if live is not None:
+            old = live
+        else:
+            try:
+                old = json.loads(safe_file(path, secret=True))
+            except FileNotFoundError:
+                old = None
+        if old is not None and (not isinstance(old, dict)
+                                or any(old.get(key) != value for key, value in query.items())
+                                or old.get("principal") != principal
+                                or old.get("state") not in {"pending", "complete", "failed", "unknown"}):
+            raise ValueError("runtime operation ownership differs")
+        expected = set(ident) | {"operation", "operation_id"}
+        if action == "poll_runtime":
+            if set(payload) != expected:
+                raise ValueError("invalid runtime observation payload")
+            if old is None or (live is None and old["state"] == "pending"):
+                return JSONResponse({**query, "state": "unknown"})
+            return JSONResponse({**query, **{key: old[key] for key in ("state", "detail", "result") if key in old}})
+        if set(payload) != expected | {"args"} or not isinstance(payload["args"], dict):
+            raise ValueError("invalid runtime operation payload")
+        if operation in runtime_admin:
+            fields = {"preflight_templates": {"template_ids"}, "throw_template_storage": {"confirmation"}}
+            if (set(payload["args"]) != fields.get(operation, set())
+                    or (operation == "throw_template_storage" and payload["args"] != {"confirmation": "THROW"})):
+                raise ValueError("invalid administrative runtime arguments")
+        args_digest = hashlib.sha256(json.dumps(
+            payload["args"], sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        if old is not None:
+            if old["args_sha256"] != args_digest:
+                raise ValueError("runtime operation arguments changed")
+            return JSONResponse({**query, "state": "accepted"})
+        if ((getattr(broker, "draining", False) and operation not in drain_runtime)
+                or len(runtime_operations) >= 10000):
+            raise RuntimeError("runtime operation admission unavailable")
+        record = {**query, "principal": principal, "state": "pending", "args_sha256": args_digest}
+        write_operation(path, record)
+        record["task"] = asyncio.create_task(execute_runtime(record, payload["args"], path))
+        runtime_operations[path] = record
+        return JSONResponse({**query, "state": "accepted"})
+
+    def pending_creation(operation, ident):
+        for (kind, operation_id), record in operations.items():
+            if kind == operation and record["identity"] == ident and not record["task"].done():
+                return operation_id
+        return None
 
     async def reject_active_preparation_for_vm_creation() -> None:
         manager = getattr(broker, "preparations", None)
@@ -963,15 +1198,16 @@ def create_app(broker: Broker) -> Starlette:
                     result = await broker.create(ident, payload.get("template_id"), payload.get("logical_task_id"))
                 else:
                     result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
-            record["result"] = result
-            record["state"] = "complete"
         except asyncio.CancelledError:
-            record["state"] = "unknown"
+            write_creation({**record, "state": "unknown"})
             raise
         except Exception as exc:
             logging.getLogger(__name__).exception("broker background %s failed", operation)
-            record["error"] = f"{type(exc).__name__}: {str(exc)[:600]}"
-            record["state"] = "failed"
+            write_creation({**record, "state": "failed", "error": f"{type(exc).__name__}: {str(exc)[:600]}"})
+        else:
+            write_creation({**record, "state": "complete", "result": result})
+        finally:
+            operations.pop((operation, record["operation_id"]))
 
     async def health(request: Request):
         authorization = request.headers.get("authorization", "")
@@ -996,6 +1232,8 @@ def create_app(broker: Broker) -> Starlette:
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("broker request must be an object")
+            if action in {"begin_runtime", "poll_runtime"}:
+                return runtime_request(action, payload, "admin" if admin else "controller")
             # Status is deliberately lock-free. Long VM preparation is serialized
             # by operation_lock, but may outlive Cloudflare's request deadline.
             if action == "poll_async":
@@ -1007,16 +1245,27 @@ def create_app(broker: Broker) -> Starlette:
                 if not isinstance(operation_id, str) or re.fullmatch(r"[0-9a-f]{32}", operation_id) is None:
                     raise ValueError("invalid asynchronous operation ID")
                 record = operations.get((operation, operation_id))
+                live = record is not None and not record["task"].done()
+                if not live:
+                    record = read_creation(operation, operation_id)
+                response = {"state": "unknown", "identity": ident,
+                            "operation": operation, "operation_id": operation_id}
                 if record is None:
-                    return JSONResponse({"state": "unknown", "identity": ident, "operation": operation})
+                    return JSONResponse(response)
                 if record["identity"] != ident:
                     raise ValueError("asynchronous operation identity mismatch")
-                response = {"state": record["state"], "identity": ident, "operation": operation}
+                if live or record["state"] != "pending":
+                    response["state"] = record["state"]
                 if record["state"] == "complete":
                     response["result"] = record["result"]
                 if record["state"] == "failed":
                     response["detail"] = record["error"]
                 return JSONResponse(response)
+            if action == "reconcile_attempt":
+                ident = identity(payload)
+                operation_id = pending_creation("create_attempt", ident)
+                if operation_id is not None:
+                    return JSONResponse({"state": "pending", "identity": ident, "operation_id": operation_id})
             if action == "template_preparation_status":
                 manager = getattr(broker, "preparations", None)
                 if manager is None:
@@ -1044,41 +1293,37 @@ def create_app(broker: Broker) -> Starlette:
                     if set(payload) - allowed:
                         raise ValueError("unknown asynchronous creation argument")
                     key = (operation, operation_id)
-                    previous = operations.get(key)
+                    acknowledgement = {"state": "accepted", "identity": ident,
+                                       "operation": operation, "operation_id": operation_id}
+                    previous = read_creation(operation, operation_id)
                     if previous is not None:
                         if previous["payload"] != payload:
                             raise ValueError("attempt creation parameters changed; preserve existing operation")
-                        return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
+                        return JSONResponse(acknowledgement)
                     if len(operations) >= 10000:
                         raise RuntimeError("broker operation registry capacity reached; preserve history")
-                    if any(op == operation and item["identity"] == ident and item["state"] == "pending"
-                           for (op, _), item in operations.items()):
+                    if pending_creation(operation, ident) is not None:
                         raise ValueError("creation already in progress for this identity; reconcile before retry")
                     # In particular, never retry blindly after a broker restart.
                     if operation == "create_attempt" and broker._paths(ident)[2].exists():
                         raise ValueError("attempt resources already exist; reconcile existing VM explicitly")
-                    record = {"state": "pending", "payload": dict(payload), "identity": ident}
-                    operations[key] = record
+                    record = {"state": "pending", "payload": dict(payload), "identity": ident,
+                              "operation": operation, "operation_id": operation_id}
+                    write_creation(record)
                     record["task"] = asyncio.create_task(execute_background(record, operation, ident, payload))
-                    return JSONResponse({"state": "accepted", "identity": ident, "operation": operation})
+                    operations[key] = record
+                    return JSONResponse(acknowledgement)
             async with operation_lock:
                 if action == "begin_shutdown":
                     if payload: raise ValueError("shutdown barrier takes no parameters")
-                    marker = getattr(broker, "drain_file", None)
-                    if marker is not None:
-                        from workstation_broker.admission import mark_draining
-                        mark_draining(marker)
-                    broker.draining = True
-                    manager = getattr(broker, "preparations", None)
-                    if manager is not None: await asyncio.to_thread(manager.cancel_all)
-                    return JSONResponse({"draining": True, "project": PROJECT})
+                    return JSONResponse(await begin_shutdown())
                 if getattr(broker, "draining", False) and action not in {
                         "probe", "inventory", "deployment_probe", "destroy_all", "destroy_attempt",
                         "abandon_attempt", "assert_absent", "shutdown", "shutdown_status", "template_preparation_status",
                         "throw_template_storage"}:
                     raise RuntimeError("broker is draining for global shutdown; attempt mutations are blocked")
                 if action == "shutdown":
-                    proof = inventory(broker)
+                    proof = await asyncio.to_thread(inventory, broker)
                     callback = getattr(broker, "shutdown_callback", None)
                     if not proof["absent"] or not getattr(broker, "draining", False) or callback is None:
                         raise RuntimeError("broker shutdown requires drained, absent project resources")
@@ -1092,31 +1337,26 @@ def create_app(broker: Broker) -> Starlette:
                 if action == "shutdown_status":
                     from workstation_broker.shutdown_observer import pending_status
                     return JSONResponse(pending_status(payload))
-                if action in {"template_preparation_probe", "prepare_templates", "throw_template_storage"}:
+                if action == "throw_template_storage":
+                    return JSONResponse(await asyncio.to_thread(administer_runtime, action, {}, payload))
+                if action in {"template_preparation_probe", "prepare_templates"}:
                     manager = getattr(broker, "preparations", None)
                     if manager is None: raise RuntimeError("native administrative preparation manager is unavailable")
-                    if action == "throw_template_storage":
-                        if not getattr(broker, "draining", False):
-                            raise RuntimeError("persistent template deletion requires an established shutdown barrier")
-                        proof = inventory(broker)
-                        if proof.get("absent") is not True:
-                            raise RuntimeError("temporary execution resources remain; refusing persistent THROW")
-                        return JSONResponse(await asyncio.to_thread(manager.throw_persistent_storage, payload))
                     if action == "prepare_templates":
                         await reject_runtime_for_template_preparation()
                     handler = {"template_preparation_probe": manager.probe,
                         "prepare_templates": manager.start}[action]
                     return JSONResponse(await asyncio.to_thread(handler, payload))
                 if action == "probe": return JSONResponse({"status": "ok", "project": PROJECT})
-                if action == "inventory": return JSONResponse(inventory(broker))
+                if action == "inventory":
+                    return JSONResponse(await asyncio.to_thread(administer_runtime, action, {}, {}))
                 if action == "deployment_probe":
                     configured = tomllib.loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
                     return JSONResponse({"status": "ok", "project": PROJECT,
                         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"],
                         "workstation_sha256": hashlib.sha256(json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
-                if action == "destroy_all": return JSONResponse(broker.destroy_all())
-                if action == "preflight_templates":
-                    return JSONResponse(broker.preflight_templates(payload.get("template_ids")))
+                if action in {"destroy_all", "preflight_templates"}:
+                    return JSONResponse(await asyncio.to_thread(administer_runtime, action, {}, payload))
                 ident = identity(payload)
                 if controller and not admin and (ident.get("purpose") == "evaluator" or
                         (action == "rpc" and str(payload.get("method", "")).startswith("template_import_"))):
@@ -1132,8 +1372,10 @@ def create_app(broker: Broker) -> Starlette:
                     await reject_active_preparation_for_vm_creation()
                     result = await broker.create_evaluator(ident, abandon_stale=payload.get("abandon_stale", False))
                 elif action == "inspect_evaluators": result = broker.inspect_evaluators(ident)
-                elif action == "destroy_evaluator": result = broker.destroy_evaluator(ident, payload.get("evaluator_retry"))
-                elif action == "abandon_evaluators": result = broker.abandon_evaluators(ident)
+                elif action == "destroy_evaluator":
+                    result = await asyncio.to_thread(broker.destroy_evaluator, ident, payload.get("evaluator_retry"))
+                elif action == "abandon_evaluators":
+                    result = await asyncio.to_thread(broker.abandon_evaluators, ident)
                 elif action == "materialize_template_artifact":
                     result = await broker.materialize_template_artifact(ident, payload.get("artifact_id"))
                 elif action.startswith("evaluator_"):
@@ -1152,18 +1394,14 @@ def create_app(broker: Broker) -> Starlette:
                     else: raise ValueError("unknown evaluator operation")
                 elif action == "reconcile_attempt":
                     try:
-                        broker.assert_absent(ident)
+                        await asyncio.to_thread(broker.assert_absent, ident)
                     except ValueError:
                         result = {"state": "present", "identity": ident, "runtime": await broker.inspect_verified(ident)}
                     else:
                         result = {"state": "absent", "identity": ident}
                 elif action == "inspect_attempt": result = await broker.inspect_verified(ident)
-                elif action == "destroy_attempt":
-                    broker.destroy(ident); result = {"destroyed": True}
-                elif action == "abandon_attempt":
-                    broker.destroy(ident, strict=False); result = {"destroyed": True}
-                elif action == "assert_absent":
-                    broker.assert_absent(ident); result = {"absent": True}
+                elif action in drain_runtime:
+                    result = await asyncio.to_thread(administer_runtime, action, ident, {})
                 elif action == "rpc":
                     result = await broker.rpc(ident, payload.get("method"), payload.get("args", {}))
                 elif action == "capture_screen": result = await asyncio.to_thread(broker.screen, ident)
@@ -1202,6 +1440,8 @@ def main():
                     memory_mb=config["memory_mb"], vcpus=config["vcpus"],
                     boot_timeout_seconds=config["boot_timeout_seconds"],
                     guest_agent_timeout_seconds=config["guest_agent_timeout_seconds"],
+                    guest_command_timeout_seconds=config["guest_command_timeout_seconds"],
+                    guest_poll_interval_seconds=config["creation_poll_interval_seconds"],
                     overlay_quota_gb=config["overlay_quota_gb"],
                     screenshot_max_bytes=config["screenshot_max_bytes"],
                     max_terminals=config["max_terminals"], max_output_bytes=config["max_output_bytes"],
@@ -1234,7 +1474,7 @@ def main():
         "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}, 0o600)
     from gpt_trace_transport.gateway import start_from_env
-    listener = start_from_env(uds)
+    listener = start_from_env(uds, operation_timeout=config["creation_request_timeout_seconds"])
     try:
         server = uvicorn.Server(uvicorn.Config(create_app(broker), uds=str(uds), log_level="info"))
         broker.shutdown_callback = lambda: setattr(server, "should_exit", True)

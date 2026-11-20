@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from gpt_trace_transport.operation_watch import host_operation, run_host_entry
 from gpt_trace_transport.local_templates import atomic_json, safe, sync_directory
 from workstation_broker.preparation import PreparationManager, same_process
 
@@ -39,10 +40,12 @@ def reopen():
     if os.geteuid() != 0: raise RuntimeError("execution host admission requires root")
     marker = barrier_path()
     read_barrier(marker, deployment())
-    state = subprocess.check_output(["systemctl", "show", "--property=ActiveState", "--value",
-        "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
-    pid = subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value",
-        "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
+    with host_operation("systemd-active-state"):
+        state = subprocess.check_output(["systemctl", "show", "--property=ActiveState", "--value",
+            "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
+    with host_operation("systemd-main-pid"):
+        pid = subprocess.check_output(["systemctl", "show", "--property=MainPID", "--value",
+            "gpt-trace-distributed-broker.service"], text=True, timeout=30).strip()
     if state not in {"inactive", "failed"} or pid != "0":
         raise RuntimeError("drained broker must be stopped before explicit up can reopen admission")
     runtime = safe(Path(os.environ["WORKSTATION_BROKER_SOCKET"]).parent, directory=True)
@@ -69,4 +72,4 @@ def reopen():
     sync_directory(marker.parent)
 
 
-if __name__ == "__main__": reopen()
+if __name__ == "__main__": run_host_entry(reopen)
