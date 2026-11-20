@@ -102,10 +102,8 @@ def build_verified_resolver(root: Path) -> None:
         source = root / relative
         if source.is_symlink() or not source.is_file():
             raise RuntimeError('missing or unsafe mandatory Rust solver source: ' + str(source))
-    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
-           'CARGO_HOME': os.environ.get('CARGO_HOME', str(root / '.cargo-host')),
-           'CARGO_TARGET_DIR': str(project / 'target'),
-           'RUSTFLAGS': '-C debuginfo=0'}
+    from host_requirements import cargo_build_environment
+    env = cargo_build_environment(root)
     subprocess.run([cargo, 'test', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],
                    cwd=root, check=True, env=env, timeout=_versioned_host_subprocess_timeout())
     subprocess.run([cargo, 'build', '--manifest-path', str(manifest), '--release', '--locked', '--offline'],

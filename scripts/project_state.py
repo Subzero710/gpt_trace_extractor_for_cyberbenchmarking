@@ -108,12 +108,20 @@ def atomic_secret(path: Path, content: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def materialize_teacher_browser_password(values: dict[str, str]) -> None:
+def validate_teacher_browser_password(values: dict[str, str]) -> None:
     password = values.get("TEACHER_BROWSER_PASSWORD", "")
     if not 12 <= len(password) <= 128:
         raise SystemExit("TEACHER_BROWSER_PASSWORD must be 12..128 characters in .env")
     if "\n" in password or "\r" in password:
         raise SystemExit("TEACHER_BROWSER_PASSWORD must be a single line")
+    if TEACHER_BROWSER_PASSWORD.is_symlink() or (TEACHER_BROWSER_PASSWORD.exists()
+                                                  and not TEACHER_BROWSER_PASSWORD.is_file()):
+        raise SystemExit("unsafe teacher browser password destination")
+
+
+def materialize_teacher_browser_password(values: dict[str, str]) -> None:
+    validate_teacher_browser_password(values)
+    password = values["TEACHER_BROWSER_PASSWORD"]
     SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(SECRETS_DIR, 0o700)
     atomic_secret(TEACHER_BROWSER_PASSWORD, password + "\n")
@@ -121,26 +129,40 @@ def materialize_teacher_browser_password(values: dict[str, str]) -> None:
     # allowing the remapped non-root browser uid to read this one secret.
     os.chmod(TEACHER_BROWSER_PASSWORD, 0o444)
 
-def materialize_control_secrets(values: dict[str, str]) -> None:
-    mapping = {
+def control_secret_mapping() -> dict[str, str]:
+    return {
         "app_control_token": "APP_CONTROL_TOKEN",
         "workstation_broker_admin_token": "DIST_BROKER_ADMIN_TOKEN",
         "workstation_broker_controller_token": "DIST_BROKER_CONTROLLER_TOKEN",
     }
+
+
+def validate_control_secrets(values: dict[str, str]) -> None:
+    mapping = control_secret_mapping()
     for name, key in mapping.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]{32,512}", values.get(key, "")):
             raise SystemExit(f"{key} is missing or invalid in .env")
 
     if SECRETS_DIR.is_symlink():
         raise SystemExit(".secrets must not be a symlink")
-
-    SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(SECRETS_DIR, 0o700)
-
-    for name, key in mapping.items():
+    for name in mapping:
         path = SECRETS_DIR / name
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise SystemExit(f"unsafe token destination: {name}")
+
+
+def validate_core_inputs(values: dict[str, str]) -> None:
+    validate_env(values)
+    validate_teacher_browser_password(values)
+    validate_control_secrets(values)
+
+
+def materialize_control_secrets(values: dict[str, str]) -> None:
+    validate_control_secrets(values)
+    SECRETS_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(SECRETS_DIR, 0o700)
+    for name, key in control_secret_mapping().items():
+        path = SECRETS_DIR / name
         atomic_secret(path, values[key] + "\n")
         os.chmod(path, 0o444)
 
@@ -160,7 +182,7 @@ def main() -> int:
     args = parser.parse_args()
 
     values = parse_env(ENV_PATH)
-    validate_env(values)
+    validate_core_inputs(values)
     if ENV_PATH.is_symlink() or ENV_PATH.stat().st_mode & 0o077:
         raise SystemExit(".env must be a regular owner-private file (chmod 600 .env manually)")
     materialize_teacher_browser_password(values)

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
 import shutil
+import ssl
+import stat
+import tomllib
 import subprocess
 import sys
 import tempfile
@@ -33,6 +37,11 @@ COMMAND_PACKAGES = {
     "curl": "curl",
     "git": "git",
     "openssl": "openssl",
+    "findmnt": "util-linux",
+    "cargo": "cargo",
+    "rustc": "rustc",
+    "node": "nodejs",
+    "npm": "npm",
 }
 
 GOLDEN_BUILD_COMMAND_PACKAGES = {
@@ -90,9 +99,9 @@ def _package_installed(name: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "install ok installed"
 
 
-def _probe(argv: tuple[str, ...], timeout: int = 30) -> tuple[bool, str]:
+def _probe(argv: tuple[str, ...], timeout: int = 30, *, env=None, cwd=None) -> tuple[bool, str]:
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     detail = (result.stderr.strip() or result.stdout.strip())[:500]
@@ -129,14 +138,133 @@ def _probe_system_fetch_pip() -> tuple[bool, str]:
     return _probe(("/usr/bin/python3", "-I", "-B", "-m", "pip", "--version"))
 
 
-def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True, role: str | None = None) -> bool:
-    if role is None and (ROOT / "config/distributed.toml").exists():
+def _versioned_timeout(root: Path) -> int:
+    policy = root / "config/preparation.toml"
+    if policy.is_symlink() or not policy.is_file():
+        raise RuntimeError("missing versioned acquisition timeout for host prerequisites")
+    with policy.open("rb") as stream:
+        value = tomllib.load(stream)["acquisition"]["timeout_seconds"]
+    if type(value) is not int or not 1 <= value <= 180:
+        raise RuntimeError("invalid versioned acquisition timeout for host prerequisites")
+    return value
+
+
+def cargo_build_environment(root: Path) -> dict[str, str]:
+    """Exactly the environment used for Rust prefetch, offline validation and build."""
+    override = os.environ.get("CARGO_HOME")
+    cargo_home = Path(override) if override is not None and override else root / ".cargo-host"
+    if override == "" or not cargo_home.is_absolute() or any(part == ".." for part in cargo_home.parts):
+        raise RuntimeError("CARGO_HOME must be a nonempty absolute directory")
+    for path in (cargo_home, *cargo_home.parents):
+        if path.is_symlink():
+            raise RuntimeError("CARGO_HOME contains an unsafe symlink: " + str(path))
+    if cargo_home.exists() and not cargo_home.is_dir():
+        raise RuntimeError("CARGO_HOME must be a directory: " + str(cargo_home))
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "CARGO_HOME": str(cargo_home),
+        "CARGO_TARGET_DIR": str(root / "rust/verified-resolver/target"),
+        "RUSTFLAGS": "-C debuginfo=0",
+    }
+
+
+def verify_rust_dependencies(root: Path, *, acquire: bool) -> tuple[bool, str]:
+    """Acquire the locked source closure, then prove Cargo can fetch it offline."""
+    cargo = shutil.which("cargo")
+    rustc = shutil.which("rustc")
+    if not cargo or not rustc:
+        return False, "cargo and rustc executables are required on the execution host"
+    manifest = root / "rust/verified-resolver/Cargo.toml"
+    lock = manifest.with_name("Cargo.lock")
+    if any(path.is_symlink() or not path.is_file() for path in (manifest, lock)):
+        return False, "mandatory Rust manifest or lockfile is missing or unsafe"
+    try:
+        manifest_data = tomllib.loads(manifest.read_text())
+        lock_data = tomllib.loads(lock.read_text())
+        declared = manifest_data["package"]["name"]
+        if not isinstance(declared, str) or not declared or not lock_data.get("package"):
+            raise ValueError("invalid Cargo metadata")
+        if sum(row.get("name") == declared for row in lock_data["package"]) != 1:
+            raise ValueError("crate is missing/ambiguous in Cargo.lock")
+        env = cargo_build_environment(root)
+        timeout = _versioned_timeout(root)
+    except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError, RuntimeError) as exc:
+        return False, str(exc)
+    command = (cargo, "fetch", "--manifest-path", str(manifest), "--locked")
+    if acquire:
+        ok, detail = _probe(command, timeout=timeout, env=env, cwd=root)
+        if not ok:
+            return False, "locked Cargo dependency acquisition failed: " + detail
+    ok, detail = _probe((*command, "--offline"), timeout=timeout, env=env, cwd=root)
+    if not ok:
+        return False, ("locked Cargo dependency closure is unavailable offline: " + detail
+                       + "; run sudo make requirements on the execution host")
+    return True, ""
+
+
+def _verify_system_python_modules(modules: tuple[str, ...]) -> tuple[bool, str]:
+    if not modules:
+        return True, ""
+    statement = "; ".join("import " + name for name in modules)
+    return _probe(("/usr/bin/python3", "-I", "-B", "-c", statement))
+
+
+def _verify_ca_bundle() -> tuple[bool, str]:
+    path = ssl.get_default_verify_paths().cafile
+    if not path or not Path(path).is_file() or not Path(path).stat().st_size:
+        return False, "system TLS trust bundle is missing or empty"
+    return True, ""
+
+
+def _verify_docker_buildx() -> tuple[bool, str]:
+    from build import BUILDER_NAME
+    try:
+        result = subprocess.run(("docker", "buildx", "inspect", BUILDER_NAME),
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode:
+        return False, (result.stderr.strip() or result.stdout.strip())[:500]
+    if not any(line.partition(":")[2].strip() == "docker" for line in result.stdout.splitlines()
+               if line.startswith("Driver:")):
+        return False, "default Buildx builder does not use the Docker Engine driver"
+    return True, ""
+
+
+def _verify_control_devices(root: Path) -> tuple[bool, str]:
+    """Discover actual required host devices from the control Compose manifest."""
+    path = root / "compose.control.yaml"
+    if path.is_symlink() or not path.is_file():
+        return False, "missing or unsafe control Compose manifest"
+    try:
+        services = json.loads(path.read_text())["services"]
+        for service, configuration in services.items():
+            for item in configuration.get("devices", ()):
+                device = item.split(":", 1)[0] if isinstance(item, str) else item["source"]
+                source = Path(device)
+                if not source.is_absolute() or source.is_symlink():
+                    return False, "unsafe host device for Compose service " + service + ": " + device
+                if not source.exists() or not (stat.S_ISCHR(source.stat().st_mode) or stat.S_ISBLK(source.stat().st_mode)):
+                    return False, "host device required by Compose service " + service + " is missing: " + device
+                if source.parent.name == "dri":
+                    driver = Path("/sys/class/drm") / source.name / "device/driver"
+                    if not driver.exists():
+                        return False, "GPU DRM driver is missing for " + device
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return False, "invalid control host devices declaration: " + str(exc)
+    return True, ""
+
+
+def verify_host_requirements(*, require_root: bool = False, golden_build: bool = False, verbose: bool = True, role: str | None = None, acquire: bool = False) -> bool:
+    if role is None:
         from distributed import config as deployment_config
         role = deployment_config(credentials=False)["deployment"]["role"]
     if role not in {None, "execution", "control"}:
         raise ValueError("unknown distributed host role")
     if role == "control" and golden_build:
-        raise RuntimeError("local golden construction requires the execution host execution host")
+        raise RuntimeError("local golden construction requires the execution host")
+    if acquire and (role != "execution" or not golden_build):
+        raise ValueError("Rust acquisition belongs only to execution-host golden requirements")
     failures: list[str] = []
     missing_packages: list[str] = []
 
@@ -147,8 +275,6 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
             failures.append('execution host finite preparation jobs require native cgroup v2')
         if not hasattr(os, 'pidfd_open'):
             failures.append('execution host finite preparation cleanup requires Linux pidfds')
-        if shutil.which('systemctl') is None:
-            failures.append('execution host requires the existing managed systemd broker unit')
     if not _debian_like():
         failures.append("requirements.txt currently targets Ubuntu/Debian hosts")
     if shutil.which("dpkg-query") is None:
@@ -166,18 +292,20 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
         missing_packages = [package for package in packages if not _package_installed(package)]
 
     command_packages = {key: value for key, value in COMMAND_PACKAGES.items()
-                        if role != "control" or key in {"ip", "curl", "git", "openssl"}}
+                        if value in packages}
     if golden_build:
         command_packages.update(GOLDEN_BUILD_COMMAND_PACKAGES)
     for command, package in command_packages.items():
         if shutil.which(command) is None and package not in missing_packages:
             failures.append(f"{command} is missing even though {package} is installed")
+    if role == "execution" and shutil.which("systemctl") is None:
+        failures.append("systemctl is missing on execution host")
 
     if sys.version_info < (3, 12):
         failures.append(
             f"Python >=3.12 required for host scripts/broker; found {sys.version.split()[0]}"
         )
-    elif "python3-venv" not in missing_packages:
+    elif "python3-venv" in packages and "python3-venv" not in missing_packages:
         ok, detail = _probe_venv()
         if not ok:
             failures.append(
@@ -192,6 +320,22 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
                 + (f": {detail}" if detail else "")
             )
 
+    if role == "execution":
+        required_modules = {"python3-packaging": "packaging", "python3-cryptography": "cryptography"}
+        modules = tuple(module for package, module in required_modules.items()
+                        if package in packages and package not in missing_packages)
+        ok, detail = _verify_system_python_modules(modules)
+        if not ok:
+            failures.append("required system Python modules cannot be imported: " + detail)
+    if "ca-certificates" in packages and "ca-certificates" not in missing_packages:
+        ok, detail = _verify_ca_bundle()
+        if not ok:
+            failures.append(detail)
+    if role == "control":
+        ok, detail = _verify_control_devices(ROOT)
+        if not ok:
+            failures.append(detail)
+
     docker = shutil.which("docker")
     if docker is None:
         failures.append("Docker Engine CLI is missing")
@@ -199,11 +343,18 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
         for label, argv in (
             ("Docker daemon", (docker, "info", "--format", "{{.ServerVersion}}")),
             ("Docker Compose", (docker, "compose", "version")),
-            ("Docker Buildx", (docker, "buildx", "version")),
         ):
             ok, detail = _probe(argv)
             if not ok:
                 failures.append(f"{label} unavailable" + (f": {detail}" if detail else ""))
+        if role == "control":
+            ok, detail = _probe((docker, "buildx", "version"))
+            if not ok:
+                failures.append("Docker Buildx unavailable: " + detail)
+            else:
+                ok, detail = _verify_docker_buildx()
+                if not ok:
+                    failures.append("Docker Buildx builder unavailable: " + detail)
 
     if require_root and role != "control" and os.geteuid() != 0:
         failures.append("hybrid build must run as root; use `sudo make build`")
@@ -216,6 +367,11 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
         print("  sudo apt-get update", file=sys.stderr)
         print("  sudo apt-get install -y " + " ".join(missing_packages), file=sys.stderr)
 
+    if not missing_packages and not failures and role == "execution" and golden_build:
+        ok, detail = verify_rust_dependencies(ROOT, acquire=acquire)
+        if not ok:
+            failures.append(detail)
+
     if missing_packages or failures:
         if failures:
             print("Host capability failures:", file=sys.stderr)
@@ -226,7 +382,8 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
     if verbose:
         print(
             f"host requirements: ok ({len(packages)} system packages, "
-            "Python venv, Docker Engine/Compose/Buildx)"
+            + ("Python venv, Docker Engine/Compose, locked Rust offline cache)" if role == "execution"
+               else "Docker Engine/Compose/Buildx, control GPU devices)")
         )
     return True
 
@@ -249,6 +406,7 @@ def main() -> int:
     return 0 if verify_host_requirements(
         require_root=args.build or args.golden_build,
         golden_build=args.golden_build,
+        acquire=args.acquire_rust,
     ) else 2
 
 

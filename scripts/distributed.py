@@ -169,7 +169,10 @@ def host(role, cfg, *, docker=True, build_tools=False):
         raise RuntimeError("deployment requires Ubuntu 26.04")
     if docker:
         commands = [["docker", "info", "--format", "{{.ServerVersion}}"]]
-        if build_tools: commands += [["docker", "compose", "version"], ["docker", "buildx", "version"]]
+        if build_tools:
+            commands.append(["docker", "compose", "version"])
+            if role == "control":
+                commands.append(["docker", "buildx", "version"])
         for command in commands:
             run(command, capture=True, timeout=30)
     if role == "execution":
@@ -1432,11 +1435,17 @@ def control(cfg, action, args):
         return
     if action == "init-storage": return init_storage(cfg)
     if action == "restore": return restore(cfg, args.directory)
-    if action == "requirements":
+    if action in {"requirements", "build"}:
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(role="control"): raise RuntimeError("control host prerequisites failed")
-        return
+        if not verify_host_requirements(role="control", verbose=action == "build"):
+            raise RuntimeError("control host prerequisites failed")
+        import project_state
+        project_state.validate_core_inputs(project_state.parse_env(project_state.ENV_PATH))
     environment(cfg)
+    if action == "requirements":
+        compose("config", "--quiet")
+        print("requirements: ok (control; host packages, Docker Engine/Compose/Buildx, GPU devices, Compose configuration)")
+        return
     if action == "build":
         # Only empty/new persistent directories may be initialized. Existing
         # data outside the declared storage root is never migrated implicitly.
@@ -1550,12 +1559,26 @@ def execution(cfg, action, args):
         execution_tunnel(cfg, 'down')
         return result
     if action == "requirements":
+        tunnel_token = cfg["local"]["DIST_BROKER_TUNNEL_TOKEN"]
+        if not 30 <= len(tunnel_token) <= 2048 or not re.fullmatch(r"[A-Za-z0-9._=-]+", tunnel_token):
+            raise ValueError("invalid DIST_BROKER_TUNNEL_TOKEN")
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="execution", golden_build=True): raise RuntimeError("execution host prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="execution", golden_build=True,
+                                        acquire=True, verbose=False):
+            raise RuntimeError("execution host prerequisites failed")
+        import build
+        image = build._workstation_image_builder(ROOT)
+        image.preflight()
+        image._safe_parent()
+        image.require_host_build_runtime()
+        run(["docker", "compose", "-f", str(ROOT / "compose.execution-tunnel.yaml"),
+             "config", "--quiet"])
+        print("requirements: ok (execution; host packages, KVM/libvirt, locked offline Rust crates, Kali golden preflight, tunnel Compose)")
         return
     if action == "build":
         from host_requirements import verify_host_requirements
-        if not verify_host_requirements(require_root=True, role="execution", golden_build=True): raise RuntimeError("execution host prerequisites failed")
+        if not verify_host_requirements(require_root=True, role="execution", golden_build=True):
+            raise RuntimeError("execution host prerequisites failed; run sudo make requirements")
         domains = run(["virsh", "-c", "qemu:///system", "list", "--all", "--name"], capture=True).splitlines()
         if any(x.startswith("gpt-trace-ws-") for x in domains):
             raise RuntimeError("preserve existing attempts before installing broker/images")
@@ -1623,7 +1646,7 @@ def main(argv=None):
     if args.action == "reset-recovery" and not args.task: parser.error("TASK is required")
     if args.action in {"backup", "restore"} and not args.directory: parser.error("--directory is required")
     cfg = config(credentials=(args.compose_job is None
-                              and args.action not in {"requirements", "backup", "restore", "init-storage", "down"}))
+                              and args.action not in {"backup", "restore", "init-storage", "down"}))
     role = cfg["deployment"]["role"]
     if args.compose_job is not None and role != "control":
         raise RuntimeError("Compose job reconciliation belongs to the control host")

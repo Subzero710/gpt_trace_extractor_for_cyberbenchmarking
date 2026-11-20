@@ -131,6 +131,27 @@ make start_kali
 make status_kali
 ```
 
+`sudo make requirements` has different success criteria for the two roles. On
+**execution** it checks host packages and executable capabilities, local Python
+modules, KVM/libvirt, the dedicated image mount and golden source contracts,
+validates the tunnel Compose configuration, and downloads every Rust crate
+pinned in `rust/verified-resolver/Cargo.lock` into the same `CARGO_HOME` used
+by `make build` (default: `.cargo-host` under the checkout). A subsequent
+`cargo fetch --locked --offline` proves the exact dependency closure is
+available. This is the only networked Cargo acquisition stage; the actual
+release tests and build retain `--locked --offline`. A nonempty absolute
+`CARGO_HOME` override can be supplied to both operations; unsafe symlink
+paths are rejected. A missing or incomplete Rust cache makes `make build`
+fail with instructions to run `sudo make requirements` rather than attempting
+a networked Rust compilation. On **control**, the Rust cache and native
+KVM toolchain are intentionally irrelevant. Control checks the Docker Engine
+Buildx builder, device nodes and DRM driver from the control Compose manifest,
+the validated `.env` control-plane secrets and the Compose configuration; it does not require an execution-host Rust
+cache, QEMU, libvirt, or the golden-image filesystem. Neither role claims
+success before the complete local preflight succeeds. `make requirements`
+checks/prepares dependencies but does not automatically install missing apt
+packages or guarantee availability of external image download servers.
+
 `make up` on execution starts the native broker systemd unit and the dedicated
 cloudflared Compose service. Configure the Cloudflare Tunnel published route before control can probe the broker.
 The teacher-browser Cloudflare Tunnel and its credentials remain independent.
