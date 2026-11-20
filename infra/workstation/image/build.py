@@ -187,12 +187,16 @@ def input_files():
     return files
 
 
-def guest_contract():
-    operations = _acquisition_controls()
+def guest_installation_contract():
     return {"schema": 2, "source": SOURCE + ARCHIVE, "source_sha256": ARCHIVE_SHA256,
             "source_architecture": SOURCE_ARCHITECTURE,
             "virtual_disk_gib": VIRTUAL_DISK_GIB, "root_min_gib": ROOT_MIN_GIB,
-            "apt_suite": APT_SUITE, "packages": list(GUEST_PACKAGES),
+            "apt_suite": APT_SUITE, "packages": list(GUEST_PACKAGES)}
+
+
+def guest_contract():
+    operations = _acquisition_controls()
+    return {**guest_installation_contract(),
             "download": _golden_download_policy(),
             "apt_network_retries": operations["network_attempts"],
             "progress_interval_seconds": operations["progress_interval_seconds"],
@@ -227,7 +231,7 @@ def golden_build_input_sha256(payloads=None):
     if set(payloads) != set(paths):
         raise ValueError("frozen input snapshot does not cover the exact guest input set")
     h = hashlib.sha256()
-    _hash_component(h, "guest-contract", golden_lock.canonical(guest_contract()))
+    _hash_component(h, "guest-contract", golden_lock.canonical(guest_installation_contract()))
     _hash_component(h, "firstboot", firstboot_script(payloads[HERE / "firstboot.sh.in"].decode()).encode())
     for path in sorted(paths):
         _hash_component(h, path.relative_to(ROOT).as_posix(), guest_source_bytes(path, payloads[path]))
