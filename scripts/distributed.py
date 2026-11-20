@@ -1202,15 +1202,23 @@ def execution_environment(cfg):
     })
 
 
+def execution_tunnel_environment(cfg, *, require_token):
+    """Derive Compose interpolation from trusted role configuration, not caller env."""
+    directory = cfg['paths']['broker_runtime_directory']
+    if not isinstance(directory, Path) or not directory.is_absolute():
+        raise ValueError('execution broker runtime directory must be a resolved absolute path')
+    variables = {'DIST_BROKER_RUNTIME_DIR': str(directory)}
+    if require_token:
+        value = cfg['local'].get('DIST_BROKER_TUNNEL_TOKEN', '')
+        if not isinstance(value, str) or not 30 <= len(value) <= 2048 or not re.fullmatch(r'[A-Za-z0-9._=-]+', value):
+            raise ValueError('invalid/missing DIST_BROKER_TUNNEL_TOKEN')
+        variables['DIST_BROKER_TUNNEL_TOKEN'] = value
+    return variables
+
+
 def execution_tunnel(cfg, action):
     if action not in {'up', 'down', 'ps'}: raise ValueError('invalid execution tunnel action')
-    local = cfg['local']
-    if action == 'up':
-        value = local.get('DIST_BROKER_TUNNEL_TOKEN','')
-        if not 30 <= len(value) <= 2048 or not re.fullmatch(r'[A-Za-z0-9._=-]+', value):
-            raise ValueError('invalid/missing DIST_BROKER_TUNNEL_TOKEN')
-        os.environ['DIST_BROKER_TUNNEL_TOKEN'] = value
-    os.environ['DIST_BROKER_RUNTIME_DIR'] = str(cfg['paths']['broker_runtime_directory'])
+    os.environ.update(execution_tunnel_environment(cfg, require_token=action == 'up'))
     # Separate project: control-host Docker teardown never touches this tunnel.
     options = ['up', '-d', '--wait', '--wait-timeout', '120'] if action == 'up' else [action]
     return run(['docker', 'compose', '-f', str(ROOT / 'compose.execution-tunnel.yaml'), *options])
@@ -1559,9 +1567,9 @@ def execution(cfg, action, args):
         execution_tunnel(cfg, 'down')
         return result
     if action == "requirements":
-        tunnel_token = cfg["local"]["DIST_BROKER_TUNNEL_TOKEN"]
-        if not 30 <= len(tunnel_token) <= 2048 or not re.fullmatch(r"[A-Za-z0-9._=-]+", tunnel_token):
-            raise ValueError("invalid DIST_BROKER_TUNNEL_TOKEN")
+        # Use the same interpolation values as the real execution-tunnel launch.
+        # Compose does not read broker_runtime_directory from distributed.toml.
+        os.environ.update(execution_tunnel_environment(cfg, require_token=True))
         from host_requirements import verify_host_requirements
         if not verify_host_requirements(require_root=True, role="execution", golden_build=True,
                                         acquire=True, verbose=False):

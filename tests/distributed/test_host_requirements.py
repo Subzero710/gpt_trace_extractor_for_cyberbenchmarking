@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -182,8 +183,19 @@ def test_execution_requirements_validate_goldens_and_compose_without_buildx(monk
         require_host_build_runtime=lambda: events.append(("golden", "tools")),
     )
     monkeypatch.setitem(sys.modules, "build", SimpleNamespace(_workstation_image_builder=lambda root: image))
-    monkeypatch.setattr(distributed, "run", lambda args, **kw: events.append(("command", tuple(map(str, args)))))
-    cfg = {"local": {"DIST_BROKER_TUNNEL_TOKEN": "a" * 40}, "paths": {}}
+    runtime = (Path(__file__).resolve().parents[2] / "state" / "broker").resolve()
+    token = "a" * 40
+    monkeypatch.setenv("DIST_BROKER_RUNTIME_DIR", "/stale/unrelated/runtime")
+    monkeypatch.setenv("DIST_BROKER_TUNNEL_TOKEN", "stale-token")
+
+    def capture_command(args, **kw):
+        events.append(("command", tuple(map(str, args))))
+        assert os.environ["DIST_BROKER_RUNTIME_DIR"] == str(runtime)
+        assert os.environ["DIST_BROKER_TUNNEL_TOKEN"] == token
+
+    monkeypatch.setattr(distributed, "run", capture_command)
+    cfg = {"local": {"DIST_BROKER_TUNNEL_TOKEN": token},
+           "paths": {"broker_runtime_directory": runtime}}
     distributed.execution(cfg, "requirements", SimpleNamespace())
     assert ("verify", {"require_root": True, "role": "execution", "golden_build": True, "acquire": True, "verbose": False}) in events
     assert ("golden", "pins") in events
@@ -235,3 +247,44 @@ def test_control_preflight_uses_pure_runtime_secret_validation(tmp_path, monkeyp
     project_state.SECRETS_DIR.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(SystemExit, match=".secrets must not be a symlink"):
         project_state.validate_core_inputs(values)
+
+
+def test_execution_tunnel_requirements_and_runtime_share_interpolation(tmp_path, monkeypatch):
+    from scripts import distributed
+
+    runtime = tmp_path / "broker"
+    token = "token_" + "b" * 36
+    cfg = {"local": {"DIST_BROKER_TUNNEL_TOKEN": token},
+           "paths": {"broker_runtime_directory": runtime}}
+    observed = []
+    monkeypatch.setenv("DIST_BROKER_RUNTIME_DIR", "/wrong/from/host")
+    monkeypatch.setenv("DIST_BROKER_TUNNEL_TOKEN", "wrong-from-host")
+
+    def record(command, **kwargs):
+        observed.append((tuple(map(str, command)), os.environ["DIST_BROKER_RUNTIME_DIR"],
+                         os.environ["DIST_BROKER_TUNNEL_TOKEN"]))
+
+    monkeypatch.setattr(distributed, "run", record)
+    distributed.execution_tunnel(cfg, "up")
+    assert len(observed) == 1
+    assert observed[0][0][-5:] == ("up", "-d", "--wait", "--wait-timeout", "120")
+    assert observed[0][1:] == (str(runtime), token)
+    assert distributed.execution_tunnel_environment(cfg, require_token=True) == {
+        "DIST_BROKER_RUNTIME_DIR": str(runtime), "DIST_BROKER_TUNNEL_TOKEN": token}
+
+
+def test_execution_tunnel_interpolation_rejects_invalid_inputs(tmp_path):
+    from scripts import distributed
+
+    cfg = {"local": {"DIST_BROKER_TUNNEL_TOKEN": "a" * 40},
+           "paths": {"broker_runtime_directory": tmp_path / "broker"}}
+    for token in ("", "bad value", "a" * 29, "x" * 2049):
+        with pytest.raises(ValueError, match="DIST_BROKER_TUNNEL_TOKEN"):
+            distributed.execution_tunnel_environment(
+                {**cfg, "local": {"DIST_BROKER_TUNNEL_TOKEN": token}}, require_token=True)
+    for path in ("relative", Path("relative"), None):
+        with pytest.raises(ValueError, match="absolute"):
+            distributed.execution_tunnel_environment(
+                {**cfg, "paths": {"broker_runtime_directory": path}}, require_token=True)
+    assert distributed.execution_tunnel_environment(cfg, require_token=False) == {
+        "DIST_BROKER_RUNTIME_DIR": str(tmp_path / "broker")}
