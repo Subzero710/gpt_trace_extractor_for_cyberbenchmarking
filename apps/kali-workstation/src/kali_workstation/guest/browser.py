@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -14,12 +15,14 @@ from urllib.parse import urlparse
 
 DOWNLOADS = Path("/home/kali/Downloads")
 MAX_BODY = 8 * 1024 * 1024
+LOG = logging.getLogger(__name__)
 
 
 class Browser:
     def __init__(self, fingerprint: str = "0" * 64):
         self.fingerprint = fingerprint
         self.context = None
+        self._startup_lock = asyncio.Lock()
         self.pages = {}
         self.current = None
         self.console = deque(maxlen=500)
@@ -28,32 +31,48 @@ class Browser:
         self.responses = {}
 
     async def start(self):
-        if self.context is not None:
-            return
-        DOWNLOADS.mkdir(parents=True, exist_ok=True)
-        binary = Path(os.environ.get("CLOAKBROWSER_BINARY_PATH", ""))
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise RuntimeError("the image-pinned CloakBrowser binary is missing")
-        from cloakbrowser import launch_persistent_context_async
-        # A fixed seed is scoped to the attempt. The wrapper supplies its own
-        # patched browser binary, stealth flags and humanized interactions.
-        seed = 10000 + int(self.fingerprint[:16], 16) % 90000
-        self.context = await launch_persistent_context_async(
-            "/home/kali/.config/gpt-trace-cloakbrowser", headless=False,
-            humanize=True, human_preset="default", viewport=None,
-            accept_downloads=True, downloads_path=str(DOWNLOADS),
-            args=[f"--fingerprint={seed}", "--no-sandbox", "--window-size=1280,800"],
-        )
-        self.context.on("page", self._register)
-        for page in self.context.pages:
-            self._register(page)
-        if not self.pages:
-            self._register(await self.context.new_page())
+        async with self._startup_lock:
+            if self.context is not None:
+                return
+            DOWNLOADS.mkdir(parents=True, exist_ok=True)
+            binary = Path(os.environ.get("CLOAKBROWSER_BINARY_PATH", ""))
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                raise RuntimeError("the image-pinned CloakBrowser binary is missing")
+            from cloakbrowser import launch_persistent_context_async
+            seed = 10000 + int(self.fingerprint[:16], 16) % 90000
+            context = None
+            try:
+                context = await launch_persistent_context_async(
+                    "/home/kali/.config/gpt-trace-cloakbrowser", headless=False,
+                    humanize=True, human_preset="default", viewport=None,
+                    accept_downloads=True, downloads_path=str(DOWNLOADS),
+                    args=[f"--fingerprint={seed}", "--no-sandbox", "--window-size=1280,800"],
+                )
+                context.on("page", self._register)
+                for page in context.pages:
+                    self._register(page)
+                if not self.pages:
+                    self._register(await context.new_page())
+            except BaseException:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        LOG.exception("failed to close partially initialized browser")
+                self.pages.clear()
+                self.current = None
+                raise
+            self.context = context
 
     async def close(self):
-        if self.context:
-            await self.context.close()
-            self.context = None
+        async with self._startup_lock:
+            if self.context is not None:
+                try:
+                    await self.context.close()
+                finally:
+                    self.context = None
+                    self.pages.clear()
+                    self.current = None
 
     def _register(self, page):
         for key, value in self.pages.items():

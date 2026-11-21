@@ -377,7 +377,8 @@ add rule inet {table} input iifname "{bridge}" drop
             (directory / "identity.json").write_text(json.dumps({**ident, "secret": secret,
                 "limits": {"max_terminals": self.max_terminals, "max_output_bytes": self.max_output_bytes,
                            "max_transfer_bytes": self.max_transfer_bytes, "max_seed_bytes": self.max_seed_bytes,
-                           "guest_agent_timeout_seconds": self.guest_agent_timeout_seconds}}))
+                           "guest_agent_timeout_seconds": self.guest_agent_timeout_seconds,
+                           "guest_poll_interval_seconds": self.guest_poll_interval_seconds}}))
             os.chmod(directory / "identity.json", 0o600)
             await asyncio.to_thread(run, "xorriso", "-as", "mkisofs", "-quiet", "-o", str(iso), "-V", "GPTTRACE", str(directory / "identity.json"))
             os.chown(iso, self.qemu_uid, -1)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import re
 import socket
@@ -17,6 +18,7 @@ from . import shell, files
 
 PORT = 17171
 MAX_FRAME = 32 * 1024 * 1024
+LOG = logging.getLogger(__name__)
 
 
 class Agent:
@@ -27,8 +29,11 @@ class Agent:
         self.secret = identity["secret"]
         limits = identity["limits"]
         self.frame_timeout = limits["guest_agent_timeout_seconds"]
-        if type(self.frame_timeout) is not int or not 1 <= self.frame_timeout <= 180:
-            raise ValueError("invalid guest transport deadline")
+        self.response_reserve = limits["guest_poll_interval_seconds"]
+        if (type(self.frame_timeout) is not int or not 1 <= self.frame_timeout <= 180
+                or type(self.response_reserve) is not int
+                or not 1 <= self.response_reserve < self.frame_timeout):
+            raise ValueError("invalid guest transport or response deadline")
         shell.MAX_OUTPUT = limits["max_output_bytes"]
         files.MAX_SEED = limits["max_seed_bytes"]
         files.MAX_FILE = limits["max_transfer_bytes"]
@@ -116,23 +121,36 @@ class Agent:
 
 async def handle(connection: socket.socket, agent: Agent):
     loop = asyncio.get_running_loop()
+    method = "<unread>"
+    deadline = loop.time() + agent.frame_timeout
     try:
-        async with asyncio.timeout(agent.frame_timeout):
+        async with asyncio.timeout_at(deadline):
             header = await read_exact(loop, connection, 4)
             length = struct.unpack("!I", header)[0]
             if length > MAX_FRAME:
                 raise ValueError("request exceeds limit")
             payload = json.loads(await read_exact(loop, connection, length))
+            if isinstance(payload, dict) and isinstance(payload.get("method"), str):
+                method = payload["method"]
             try:
-                result = {"ok": True, "result": await agent.call(payload)}
-            except (ValueError, OSError, RuntimeError, KeyError) as exc:
-                result = {"ok": False, "error": str(exc)[:1000]}
+                async with asyncio.timeout_at(deadline - agent.response_reserve):
+                    result = {"ok": True, "result": await agent.call(payload)}
+            except TimeoutError:
+                LOG.error("guest RPC %s exceeded the configured call deadline", method)
+                result = {"ok": False, "error": "TimeoutError: guest RPC " + method + " exceeded deadline"}
+            except Exception as exc:
+                LOG.exception("guest RPC %s failed", method)
+                result = {"ok": False, "error": (type(exc).__name__ + ": " + str(exc))[:1000]}
             data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
             if len(data) > MAX_FRAME:
                 data = json.dumps({"ok": False, "error": "response exceeds limit"}).encode()
             await loop.sock_sendall(connection, struct.pack("!I", len(data)) + data)
-    except (OSError, ValueError):
-        pass
+    except TimeoutError:
+        LOG.error("guest VSOCK transport timed out during RPC %s", method)
+    except (OSError, ValueError) as exc:
+        LOG.warning("guest VSOCK transport failed during RPC %s: %s", method, exc)
+    except Exception:
+        LOG.exception("unexpected guest VSOCK failure during RPC %s", method)
     finally:
         connection.close()
 
