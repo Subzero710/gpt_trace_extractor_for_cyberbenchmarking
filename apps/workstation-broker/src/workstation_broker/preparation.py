@@ -1344,12 +1344,6 @@ def _prepare(manager, state):
         "NPM_CONFIG_GLOBALCONFIG": "/dev/null",
     }
 
-    def drop_privileges():
-        os.setgroups([])
-        os.setgid(account.pw_gid)
-        os.setuid(account.pw_uid)
-        os.umask(0o077)
-
     # Use only the local audited worker file, with fixed validated arguments.
     # No shell, no template builder, no qemu, no guest execution.
     policy = manager.source_root / 'config/preparation.toml'
@@ -1367,11 +1361,12 @@ def _prepare(manager, state):
     read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     try:
         try:
-            child = subprocess.Popen([str(interpreter), "-I", "-B", str(program), "--repo-root",
-                            str(source_root), "--stage", str(stage),
-                            "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
-                            *(["--reuse-from",str(reuse)] if reuse is not None else [])],
-                           cwd=source_root, env=env, preexec_fn=drop_privileges, pass_fds=(write_fd,),
+            from workstation_broker.fetch_egress import fetch_worker_command
+            child = subprocess.Popen(fetch_worker_command(account, interpreter,
+                            [str(program), "--repo-root", str(source_root), "--stage", str(stage),
+                             "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
+                             *(["--reuse-from", str(reuse)] if reuse is not None else [])]),
+                           cwd=source_root, env=env, pass_fds=(write_fd,),
                            stdin=subprocess.DEVNULL, start_new_session=True)
         finally:
             os.close(write_fd)

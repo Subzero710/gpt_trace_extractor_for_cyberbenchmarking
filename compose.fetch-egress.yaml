@@ -1,0 +1,13 @@
+{
+  "name": "gpt-trace-fetch-egress",
+  "services": {},
+  "networks": {
+    "fetch_egress": {
+      "name": "gpt-trace-fetch-egress",
+      "driver": "bridge",
+      "driver_opts": {
+        "com.docker.network.bridge.name": "br-gpt-fetch"
+      }
+    }
+  }
+}

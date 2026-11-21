@@ -34,6 +34,7 @@ COMMAND_PACKAGES = {
     "mount": "util-linux",
     "umount": "util-linux",
     "ip": "iproute2",
+    "setpriv": "util-linux",
     "curl": "curl",
     "git": "git",
     "openssl": "openssl",
@@ -347,14 +348,13 @@ def verify_host_requirements(*, require_root: bool = False, golden_build: bool =
             ok, detail = _probe(argv)
             if not ok:
                 failures.append(f"{label} unavailable" + (f": {detail}" if detail else ""))
-        if role == "control":
-            ok, detail = _probe((docker, "buildx", "version"))
+        ok, detail = _probe((docker, "buildx", "version"))
+        if not ok:
+            failures.append("Docker Buildx unavailable: " + detail)
+        elif role == "control":
+            ok, detail = _verify_docker_buildx()
             if not ok:
-                failures.append("Docker Buildx unavailable: " + detail)
-            else:
-                ok, detail = _verify_docker_buildx()
-                if not ok:
-                    failures.append("Docker Buildx builder unavailable: " + detail)
+                failures.append("Docker Buildx builder unavailable: " + detail)
 
     if require_root and role != "control" and os.geteuid() != 0:
         failures.append("hybrid build must run as root; use `sudo make build`")

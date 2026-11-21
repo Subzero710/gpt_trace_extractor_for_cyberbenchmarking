@@ -1065,17 +1065,17 @@ def build(args):
             # Build only a source-fetch image and bind its private build cache.
             image = "gpt-trace-lite-local-source:" + digest(PINS)[:32]
             if not (inputs_root / "inputs.json").is_file():
+                from workstation_broker.fetch_egress import source_network, source_builder
                 build_steps = load_module("swegym_host_build_steps", ROOT / "scripts/distributed.py")
-                build_config = load_module("swegym_host_build_config", ROOT / "scripts/build.py")
-                build_config.ensure_builder(ROOT)
                 build_steps._run_buildkit(
-                    ["docker", "buildx", "build", "--builder", build_config.BUILDER_NAME, "--progress", "rawjson", "--load",
+                    ["docker", "buildx", "build", "--builder", source_builder(), "--progress", "rawjson", "--load",
                      "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
                      "-f", "apps/runner/Dockerfile", "."],
                     monitor=lambda: free_space(staged, margin))
                 source_cache = cache_root / "dataset"
                 source_cache.mkdir(mode=0o700, exist_ok=True)
-                cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", "bridge", "--cap-drop", "ALL",
+                cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", source_network(),
+                    "--pull", "never", "--cap-drop", "ALL",
                     "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
                     "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
                     "--mount", "type=bind,source=" + str(source_cache) + ",target=/source-cache",
