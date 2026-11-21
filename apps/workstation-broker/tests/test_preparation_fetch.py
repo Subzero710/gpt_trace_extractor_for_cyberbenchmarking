@@ -125,7 +125,7 @@ def test_fetch_worker_uses_system_python_not_broker_venv():
     )[0]
     assert "trusted_fetch_python()" in physical
     assert "state['compatibility']['golden_dependency']" in physical
-    assert 'subprocess.Popen([str(interpreter), "-I", "-B"' in physical
+    assert 'subprocess.Popen(fetch_worker_command(account, interpreter,' in physical
     assert "sys.executable" not in physical
     trusted = source.split("def trusted_fetch_python():", 1)[1].split(
         "def stage_fetch_sources", 1
