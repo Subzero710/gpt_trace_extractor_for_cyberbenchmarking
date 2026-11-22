@@ -113,16 +113,21 @@ def guest_profile(golden, image, paths, timeout, *, units=False):
     requested = {location(name): name for name in paths}
     profiles = {}
     for fields in csv.reader(raw.splitlines()):
-        if not fields or fields[-1] not in requested:
+        if len(fields) < 6:
+            fail(f'malformed guest ownership inventory row: {fields}')
+        name = fields[5]
+        if name not in requested:
             continue
         if len(fields) != 6 or fields[0] != '-' or re.fullmatch(r'0[0-7]{3,4}', fields[1]) is None:
             fail(f'unsafe guest file type or permissions: {fields}')
-        _, permissions, size, uid, gid, name = fields
-        if not all(value.isdigit() for value in (size, uid, gid)) or requested[name] in profiles:
+        _, permissions, size, uid, gid, _ = fields
+        numbers = tuple(value.strip() for value in (size, uid, gid))
+        if (not all(re.fullmatch(r'[0-9]+', value) for value in numbers)
+                or requested[name] in profiles):
             fail('untrusted guest ownership inventory')
         if int(permissions, 8) & 0o7000:
             fail('guest runtime has unsupported special mode bits')
-        profiles[requested[name]] = (int(permissions, 8), int(uid), int(gid))
+        profiles[requested[name]] = (int(permissions, 8), int(numbers[1]), int(numbers[2]))
     if set(profiles) != set(paths):
         fail('guest ownership inventory does not cover each migration file')
     return profiles
