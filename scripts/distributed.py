@@ -481,9 +481,22 @@ class _BuildKitWatch:
         return remaining
 
 
+def _buildkit_controls():
+    _, probe, interval = _compose_controls()
+    source = ROOT / 'config/preparation.toml'
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError('missing versioned BuildKit step deadline')
+    with source.open('rb') as stream:
+        budget = tomllib.load(stream)['compose']['buildkit_step_timeout_seconds']
+    if type(budget) is not int or budget < probe:
+        raise RuntimeError('invalid versioned BuildKit step deadline')
+    return budget, probe, interval
+
+
 def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
-    budget, probe, interval = _compose_controls()
+    budget, probe, interval = _buildkit_controls()
     with tempfile.NamedTemporaryFile(prefix="gpttrace-buildkit-", suffix=".log", delete=False) as raw:
+        succeeded = False
         watch = _BuildKitWatch(budget)
         process = subprocess.Popen(command, cwd=ROOT, stdin=stdin, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
@@ -513,6 +526,7 @@ def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
                 raise subprocess.CalledProcessError(status, command)
             if pending or not watch.observed_vertex or watch.vertices or watch.statuses:
                 raise RuntimeError("BuildKit exited without settling its build operations")
+            succeeded = True
         except BaseException as exc:
             raw.flush()
             if process.poll() is None:
@@ -524,8 +538,8 @@ def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
             raise RuntimeError(f"BuildKit operation failed; log {raw.name}: {exc}") from exc
         finally:
             process.stdout.close()
-        Path(raw.name).unlink()
-
+            if succeeded:
+                Path(raw.name).unlink()
 
 
 def _build_compose_services(builder, services):

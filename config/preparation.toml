@@ -60,3 +60,5 @@ miniconda_sha256 = "a098a5b1581d8fd078c430b82e27106602223e335efef708a124e723814d
 [compose]
 status_timeout_seconds = 15
 status_interval_seconds = 2
+# Maximum duration of one BuildKit build vertex, independent of Compose probes.
+buildkit_step_timeout_seconds = 900

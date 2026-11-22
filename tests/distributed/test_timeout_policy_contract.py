@@ -311,6 +311,40 @@ def test_buildkit_separate_vertices_have_independent_deadlines(monkeypatch):
         watch.remaining()
 
 
+def test_buildkit_vertex_budget_is_independent_of_compose_deadline(monkeypatch):
+    from scripts import distributed
+
+    policy = tomllib.loads((ROOT / 'config/preparation.toml').read_text())
+    budget, probe, interval = distributed._buildkit_controls()
+    assert budget == policy['compose']['buildkit_step_timeout_seconds']
+    assert budget > policy['acquisition']['timeout_seconds']
+    assert probe == policy['compose']['status_timeout_seconds']
+    assert interval == policy['compose']['status_interval_seconds']
+
+    now = 0.0
+    monkeypatch.setattr(distributed.time, 'monotonic', lambda: now)
+    watch = distributed._BuildKitWatch(budget)
+    item = {'digest': 'pip', 'name': 'RUN pip install', 'started': 'timestamp'}
+    watch.feed({'vertexes': [item]})
+    now = policy['acquisition']['timeout_seconds']
+    assert watch.remaining() == budget - now
+    now = budget - 1
+    watch.feed({'vertexes': [{**item, 'completed': 'timestamp'}]})
+    assert not watch.vertices
+
+
+def test_buildkit_budget_rejects_invalid_config(monkeypatch, tmp_path):
+    from scripts import distributed
+
+    source = tmp_path / 'config' / 'preparation.toml'
+    source.parent.mkdir()
+    source.write_text('[compose]\nbuildkit_step_timeout_seconds = "unbounded"\n')
+    monkeypatch.setattr(distributed, 'ROOT', tmp_path)
+    monkeypatch.setattr(distributed, '_compose_controls', lambda: (180, 15, 2))
+    with pytest.raises(RuntimeError, match='BuildKit step deadline'):
+        distributed._buildkit_controls()
+
+
 @pytest.mark.parametrize('blocked', [False, True])
 def test_compose_bake_supervision_consumes_raw_json_and_reaps_its_client(monkeypatch, tmp_path, blocked):
     from scripts import distributed
@@ -345,6 +379,7 @@ for name in ('load', 'build', 'export'):
         return child
 
     monkeypatch.setattr(distributed, '_compose_controls', lambda: (1, 1, 0.02))
+    monkeypatch.setattr(distributed, '_buildkit_controls', lambda: (1, 1, 0.02))
     monkeypatch.setattr(distributed, 'compose', compose)
     monkeypatch.setattr(distributed.subprocess, 'Popen', launch)
     monkeypatch.setattr(distributed.tempfile, 'NamedTemporaryFile',
