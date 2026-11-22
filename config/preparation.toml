@@ -11,6 +11,7 @@ swap_gib = 16
 free_space_gib = 64
 root_min_gib = 480
 golden_qcow2_copy_mib = 1024
+golden_compare_stall_timeout_seconds = 900
 template_payload_batch_mib = 1024
 template_payload_batch_members = 512
 

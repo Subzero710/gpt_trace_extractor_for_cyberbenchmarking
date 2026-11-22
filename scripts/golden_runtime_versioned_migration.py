@@ -336,9 +336,13 @@ def progress_command(args, timeout):
         process.stdout.close()
 
 
-def compare_with_progress(original, copy, timeout):
-    # qemu-img compare emits progress to stderr with -p. Report a stuck
-    # comparison from measured progress, not from an arbitrary total duration.
+def compare_with_progress(golden, original, copy):
+    # The comparison is allowed a separate stall budget because the
+    # entire virtual disk may need reading from mechanical storage.
+    controls = golden._preparation_build_controls()
+    timeout = controls['golden_compare_stall_timeout_seconds']
+    if type(timeout) is not int or timeout <= 0:
+        fail('invalid Golden comparison stall timeout')
     progress_command(['qemu-img', 'compare', '-p', '-f', 'qcow2', '-F', 'qcow2', str(original), str(copy)], timeout)
 
 def update_guest(golden, clone, changes, profiles, units, unit_profiles, timeout):
@@ -495,7 +499,7 @@ def apply(golden, plan, timeout):
     convert_with_progress(golden, old, clone, timeout)
     golden.image_info(clone)
     # QEMU compares the logical guest blocks before any controlled file changes.
-    compare_with_progress(old, clone, timeout)
+    compare_with_progress(golden, old, clone)
     update_guest(golden, clone, plan['changed'], plan['profiles'],
                  plan['changed_units'], plan['unit_profiles'], timeout)
     for name, value in plan['current'].items():
