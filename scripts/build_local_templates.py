@@ -65,7 +65,7 @@ def _preparation_controls():
     with path.open("rb") as stream:
         payload = tomllib.load(stream)
     build = payload.get("build")
-    required = {"virtual_disk_gib", "memory_reserve_mb", "memory_min_mb", "memory_cap_mb", "vcpu_cap", "golden_memory_mb", "golden_vcpus", "swap_gib", "free_space_gib", "root_min_gib", "golden_qcow2_copy_mib", "template_payload_batch_mib", "template_payload_batch_members"}
+    required = {"virtual_disk_gib", "memory_reserve_mb", "memory_min_mb", "memory_cap_mb", "vcpu_cap", "golden_memory_mb", "golden_vcpus", "swap_gib", "free_space_gib", "root_min_gib", "golden_qcow2_copy_mib", "golden_compare_stall_timeout_seconds", "template_payload_batch_mib", "template_payload_batch_members"}
     if not isinstance(build, dict) or set(build) != required:
         raise RuntimeError("preparation controls have missing or unknown fields")
     if any(type(build[name]) is not int or build[name] <= 0 for name in required):
