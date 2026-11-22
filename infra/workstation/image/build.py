@@ -762,9 +762,33 @@ def verify(base=None):
     validate_provenance_fields(metadata)
     if (metadata["source"] != SOURCE + ARCHIVE or metadata["source_sha256"] != ARCHIVE_SHA256
             or metadata["architecture"] != SOURCE_ARCHITECTURE
-            or metadata["build_input_sha256"] != golden_build_input_sha256()
+            or ("runtime_migration" not in metadata and metadata["build_input_sha256"] != golden_build_input_sha256())
             or metadata["python_lock_sha256"] != versioned_digest(HERE / "requirements.lock")):
         raise ValueError("golden source/lock/input fingerprint incompatible; permanent bytes preserved")
+    if "runtime_migration" in metadata:
+        record = metadata["runtime_migration"]
+        source = ROOT / "apps/kali-workstation/src"
+        paths = sorted((source / "kali_workstation/guest").rglob("*.py")) + [source / "kali_workstation/contracts.py"]
+        current = {p.relative_to(source).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+        unit_source = ROOT / "infra/workstation/systemd"
+        units = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in input_files() if p.parent == unit_source}
+        keys = {"schema", "original_base_sha256", "host_input_sha256", "files"}
+        if (not isinstance(record, dict) or type(record.get("schema")) is not int or record["schema"] not in (1, 2)
+                or set(record) != (keys | ({"units"} if record["schema"] == 2 else set()))
+                or golden_lock.SHA.fullmatch(str(record["original_base_sha256"])) is None
+                or record["host_input_sha256"] != golden_build_input_sha256() or record["files"] != current
+                or (record["schema"] == 2 and record["units"] != units)):
+            raise ValueError("golden migrated runtime provenance incompatible")
+        for relative, expected in current.items():
+            target = str(guest_build.BUNDLE / "src" / relative)
+            if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
+                raise ValueError("golden migrated runtime file differs: " + relative)
+        if record["schema"] == 2:
+            for name, expected in units.items():
+                target = str(Path("/etc/systemd/system") / name)
+                if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
+                    raise ValueError("golden migrated service unit differs: " + name)
     for path, key in ((base, "base_sha256"), (base.parent / "kali-packages.txt", "apt_package_manifest_sha256"),
                       (base.parent / "kali-python-packages.txt", "python_package_manifest_sha256")):
         if digest(path) != metadata[key]:
