@@ -355,12 +355,17 @@ def _reconcile_compose_job(name, service, expected, *, budget, probe, interval):
     raise TimeoutError("Compose job stop remains unconfirmed") from observation_error
 
 
-def _run_compose_job(service, *arguments, entrypoint=None, environment=()):
+def _run_compose_job(service, *arguments, entrypoint=None, environment=(), doctor_scratch=False):
     budget, probe, interval = _compose_controls()
     name = f"{PROJECT}-{service}-{secrets.token_hex(16)}"
     options = ["--entrypoint", entrypoint] if entrypoint is not None else []
     for variable in environment:
         options.extend(("-e", variable))
+    if doctor_scratch:
+        # The deployed service keeps its noexec /tmp mount. A one-off doctor
+        # process instead gets an isolated executable Docker-managed scratch
+        # volume for tests that create temporary executable fixtures.
+        options.extend(("--volume", "/var/tmp", "--env", "TMPDIR=/var/tmp"))
     identity = None
     terminal = False
     try:
@@ -392,8 +397,14 @@ def _run_compose_job(service, *arguments, entrypoint=None, environment=()):
                         if logs.wait(timeout=probe) != 0:
                             raise RuntimeError("Docker did not finish delivering Compose job logs")
                         if exit_code != 0:
+                            if doctor_scratch:
+                                # Only the one-off container's anonymous scratch
+                                # volume is removed, never the project's named volumes.
+                                run(["docker", "container", "rm", "--volumes", identity],
+                                    capture=True, timeout=probe)
                             raise subprocess.CalledProcessError(exit_code, [service, *arguments])
-                        run(["docker", "container", "rm", identity], capture=True, timeout=probe)
+                        run(["docker", "container", "rm", *(["--volumes"] if doctor_scratch else []),
+                             identity], capture=True, timeout=probe)
                         return
                     if status != "running":
                         raise RuntimeError("unexpected Compose job state: " + status)
@@ -838,7 +849,8 @@ def doctor_tests(role):
         raise RuntimeError(role + " host prerequisites failed")
     if role == "control":
         for service in ("runner", "storage", "workstation-gateway", "kali-workstation-controller"):
-            _run_compose_job(service, "-m", "pytest", "-q", entrypoint="python")
+            _run_compose_job(service, "-m", "pytest", "-q", entrypoint="python",
+                             doctor_scratch=True)
         compose("exec", "-T", "teacher-browser", "python3", "-m", "unittest",
                 "discover", "-s", "/opt/gpt-trace-browser/tests",
                 "-p", "test_*.py", "-v")

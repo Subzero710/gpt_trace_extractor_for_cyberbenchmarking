@@ -22,7 +22,7 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -173,7 +173,9 @@ class Broker:
     max_seed_bytes: int = 268435456
     egress_allow_cidrs: tuple[str, ...] = ()
     template_root: Path | None = None
-    guest_poll_interval_seconds: int = field(default_factory=_guest_poll_interval)
+    # A config-derived ordinary default is also available to partially
+    # constructed Broker instances, like the other dataclass defaults.
+    guest_poll_interval_seconds: int = _guest_poll_interval()
     guest_command_timeout_seconds: int = 180
     cleanup_only: bool = False
 
