@@ -48,23 +48,31 @@ def main():
     base = Path(os.environ["WORKSTATION_BASE_IMAGE"])
     limits = __import__("tomllib").loads(Path(os.environ["WORKSTATION_CONFIG"]).read_text())["workstation"]
     from gpt_trace_transport.wire import token_value
-    broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), base,
-        token_value(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN"]),
-        token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"]),
-        memory_mb=limits["memory_mb"], vcpus=limits["vcpus"],
-        boot_timeout_seconds=limits["boot_timeout_seconds"], guest_agent_timeout_seconds=limits["guest_agent_timeout_seconds"],
-        guest_command_timeout_seconds=limits["guest_command_timeout_seconds"],
-        overlay_quota_gb=limits["overlay_quota_gb"], screenshot_max_bytes=limits["screenshot_max_bytes"],
-        max_terminals=limits["max_terminals"], max_output_bytes=limits["max_output_bytes"],
-        max_transfer_bytes=limits["max_transfer_bytes"], max_seed_bytes=limits["max_seed_bytes"],
-        egress_allow_cidrs=tuple(limits["egress_allow_cidrs"]), template_root=Path(os.environ["WORKSTATION_TEMPLATE_ROOT"]))
-    broker.preparations = PreparationManager(base, broker.templates.root, broker.templates)
+    with host_operation("offline-broker-initialization"):
+        broker = Broker(Path(os.environ["WORKSTATION_BROKER_STATE"]), base,
+            token_value(os.environ["WORKSTATION_BROKER_ADMIN_TOKEN"]),
+            token_value(os.environ["WORKSTATION_BROKER_CONTROLLER_TOKEN"]),
+            memory_mb=limits["memory_mb"], vcpus=limits["vcpus"],
+            boot_timeout_seconds=limits["boot_timeout_seconds"],
+            guest_agent_timeout_seconds=limits["guest_agent_timeout_seconds"],
+            guest_command_timeout_seconds=limits["guest_command_timeout_seconds"],
+            overlay_quota_gb=limits["overlay_quota_gb"], screenshot_max_bytes=limits["screenshot_max_bytes"],
+            max_terminals=limits["max_terminals"], max_output_bytes=limits["max_output_bytes"],
+            max_transfer_bytes=limits["max_transfer_bytes"], max_seed_bytes=limits["max_seed_bytes"],
+            egress_allow_cidrs=tuple(limits["egress_allow_cidrs"]),
+            template_root=Path(os.environ["WORKSTATION_TEMPLATE_ROOT"]), cleanup_only=True)
+    with host_operation("offline-preparation-manager"):
+        broker.preparations = PreparationManager(base, broker.templates.root, broker.templates)
     from workstation_broker.admission import mark_draining, barrier_path
-    mark_draining(barrier_path())
+    with host_operation("offline-drain-barrier"):
+        mark_draining(barrier_path())
     broker.draining = True
-    broker.preparations.cancel_all()
-    broker.destroy_all()
-    proof = inventory(broker)
+    with host_operation("offline-cancel-preparations"):
+        broker.preparations.cancel_all()
+    with host_operation("offline-destroy-attempts"):
+        broker.destroy_all()
+    with host_operation("offline-final-absence"):
+        proof = inventory(broker)
     if not proof["absent"]: raise RuntimeError("local resource absence unconfirmed")
     print(json.dumps({"scope": "execution-local", "global": False, "broker_stopped": True,
         "inventory": proof, "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],

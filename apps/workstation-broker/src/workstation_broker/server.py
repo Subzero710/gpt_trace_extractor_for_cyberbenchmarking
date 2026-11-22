@@ -175,6 +175,7 @@ class Broker:
     template_root: Path | None = None
     guest_poll_interval_seconds: int = field(default_factory=_guest_poll_interval)
     guest_command_timeout_seconds: int = 180
+    cleanup_only: bool = False
 
     def __post_init__(self):
         if not self.base.is_file() or self.base.is_symlink():
@@ -202,7 +203,7 @@ class Broker:
         # Verify the immutable golden exactly once. TemplateRegistry.expected()
         # validates provenance/package manifests and hashes the base through the
         # registry digest cache, so later backing checks reuse the same digest.
-        self.base_digest = self.templates.expected()["golden_sha256"]
+        self.base_digest = None if self.cleanup_only else self.templates.expected()["golden_sha256"]
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o711)
 
@@ -296,7 +297,39 @@ add rule inet {table} input iifname "{bridge}" drop
         if node is None or json.loads(node.text or "null") != data["metadata"]:
             raise ValueError("libvirt domain identity mismatch")
         recorded = data["metadata"]
-        if recorded.get("template_id") is not None:
+        if getattr(self, "cleanup_only", False):
+            # Deletion needs authenticated resource ownership and the exact
+            # backing path, not a potentially multi-minute Golden image hash.
+            # XML metadata has already been matched to the durable state.
+            if not isinstance(recorded.get("base_sha256"), str) or not SHA256.fullmatch(recorded["base_sha256"]):
+                raise ValueError("invalid recorded base image identity")
+            if recorded.get("template_id") is not None:
+                from .templates import ID as TEMPLATE_ID, SHA as TEMPLATE_SHA, trusted
+                template_id = recorded["template_id"]
+                generation = recorded.get("template_generation")
+                if (not isinstance(template_id, str) or TEMPLATE_ID.fullmatch(template_id) is None
+                        or not isinstance(generation, str) or TEMPLATE_SHA.fullmatch(generation) is None
+                        or not isinstance(recorded.get("backing_path"), str)
+                        or not isinstance(recorded.get("backing_sha256"), str)
+                        or TEMPLATE_SHA.fullmatch(recorded["backing_sha256"]) is None
+                        or not isinstance(recorded.get("template_source_fingerprint"), str)
+                        or TEMPLATE_SHA.fullmatch(recorded["template_source_fingerprint"]) is None
+                        or recorded["base_sha256"] != recorded["backing_sha256"]):
+                    raise ValueError("invalid recorded template backing identity")
+                selected = Path(recorded["backing_path"])
+                folder = self.templates.root / template_id.split("/", 1)[0] / "generations" / generation
+                if not selected.is_relative_to(folder):
+                    raise ValueError("recorded template backing escapes its generation")
+                trusted(selected, self.templates.root)
+            else:
+                selected = self.base
+            if data["base"] != str(selected):
+                raise ValueError("recorded attempt backing path differs")
+            info = selected.stat()
+            if (selected.is_symlink() or not selected.is_file() or info.st_uid != 0
+                    or info.st_mode & 0o222):
+                raise ValueError("recorded attempt backing is not immutable and root-owned")
+        elif recorded.get("template_id") is not None:
             selection = self.templates.verify_record(recorded)
             selected = Path(selection["backing_path"])
             if recorded["base_sha256"] != selection["backing_sha256"] or data["base"] != str(selected):
@@ -339,6 +372,8 @@ add rule inet {table} input iifname "{bridge}" drop
         return {"templates": selected}
 
     async def create(self, ident: dict, template_id: str | None = None, logical_task_id=None, *, _selection=None) -> dict:
+        if getattr(self, "cleanup_only", False):
+            raise RuntimeError("offline cleanup broker cannot create guests")
         name, network, directory = self._paths(ident)
         if template_id is not None and (directory / "state.json").is_file():
             data = self._read(ident)
