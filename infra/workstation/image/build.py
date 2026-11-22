@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 HERE = ROOT / "infra/workstation/image"
 sys.path[:0] = [str(HERE), str(ROOT / "shared")]
-from gpt_trace_transport.operation_watch import OperationWatch
+from gpt_trace_transport.operation_watch import OperationWatch, host_operation, run_host_entry
 from golden_assets import (CACHE_TAG, CACHE_MOUNT, atomic_bytes, atomic_json,
                            digest, download, download_policy, mkdir, operation_timeout, read_json, safe, sync)
 import golden_lock
@@ -344,15 +344,17 @@ def cached_archive():
 
 
 def image_info(image):
-    safe(image)
-    info = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(image)],
-                                              timeout=operation_timeout(_acquisition_controls())))
-    data = info.get("format-specific", {}).get("data", {})
-    if (info.get("format") != "qcow2" or info.get("backing-filename")
-            or info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3
-            or data.get("corrupt") is True or data.get("dirty-flag") is True):
-        raise ValueError("stage is not a clean, independent QCOW2 of the configured size")
-    run("qemu-img", "check", image)
+    with host_operation("golden-qcow2-info"):
+        safe(image)
+        info = json.loads(subprocess.check_output(["qemu-img", "info", "--output=json", str(image)],
+                                                  timeout=operation_timeout(_acquisition_controls())))
+        data = info.get("format-specific", {}).get("data", {})
+        if (info.get("format") != "qcow2" or info.get("backing-filename")
+                or info.get("virtual-size") != VIRTUAL_DISK_GIB * 1024**3
+                or data.get("corrupt") is True or data.get("dirty-flag") is True):
+            raise ValueError("stage is not a clean, independent QCOW2 of the configured size")
+    with host_operation("golden-qcow2-check"):
+        run("qemu-img", "check", image)
     return info
 
 
@@ -754,17 +756,18 @@ def provenance(image, stage, state):
 
 def verify(base=None):
     base = DEST if base is None else Path(base)
-    for path in artifact_paths(base):
-        safe(path)
-        if path.stat().st_mode & 0o222:
-            raise ValueError("golden permanent/prepared bytes must be immutable")
-    metadata = read_json(base.with_suffix(".provenance.json"))
-    validate_provenance_fields(metadata)
-    if (metadata["source"] != SOURCE + ARCHIVE or metadata["source_sha256"] != ARCHIVE_SHA256
-            or metadata["architecture"] != SOURCE_ARCHITECTURE
-            or ("runtime_migration" not in metadata and metadata["build_input_sha256"] != golden_build_input_sha256())
-            or metadata["python_lock_sha256"] != versioned_digest(HERE / "requirements.lock")):
-        raise ValueError("golden source/lock/input fingerprint incompatible; permanent bytes preserved")
+    with host_operation("golden-verify-provenance"):
+        for path in artifact_paths(base):
+            safe(path)
+            if path.stat().st_mode & 0o222:
+                raise ValueError("golden permanent/prepared bytes must be immutable")
+        metadata = read_json(base.with_suffix(".provenance.json"))
+        validate_provenance_fields(metadata)
+        if (metadata["source"] != SOURCE + ARCHIVE or metadata["source_sha256"] != ARCHIVE_SHA256
+                or metadata["architecture"] != SOURCE_ARCHITECTURE
+                or ("runtime_migration" not in metadata and metadata["build_input_sha256"] != golden_build_input_sha256())
+                or metadata["python_lock_sha256"] != versioned_digest(HERE / "requirements.lock")):
+            raise ValueError("golden source/lock/input fingerprint incompatible; permanent bytes preserved")
     if "runtime_migration" in metadata:
         record = metadata["runtime_migration"]
         source = ROOT / "apps/kali-workstation/src"
@@ -781,17 +784,19 @@ def verify(base=None):
                 or (record["schema"] == 2 and record["units"] != units)):
             raise ValueError("golden migrated runtime provenance incompatible")
         for relative, expected in current.items():
-            target = str(guest_build.BUNDLE / "src" / relative)
-            if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
-                raise ValueError("golden migrated runtime file differs: " + relative)
+            with host_operation("golden-verify-guest-source"):
+                target = str(guest_build.BUNDLE / "src" / relative)
+                if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
+                    raise ValueError("golden migrated runtime file differs: " + relative)
         if record["schema"] == 2:
             for name, expected in units.items():
-                target = str(Path("/etc/systemd/system") / name)
-                if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
-                    raise ValueError("golden migrated service unit differs: " + name)
+                with host_operation("golden-verify-guest-unit"):
+                    target = str(Path("/etc/systemd/system") / name)
+                    if hashlib.sha256(guest_read(base, target)).hexdigest() != expected:
+                        raise ValueError("golden migrated service unit differs: " + name)
     for path, key in ((base, "base_sha256"), (base.parent / "kali-packages.txt", "apt_package_manifest_sha256"),
                       (base.parent / "kali-python-packages.txt", "python_package_manifest_sha256")):
-        if digest(path) != metadata[key]:
+        if digest(path, observe=lambda: host_operation("golden-verify-hash-block")) != metadata[key]:
             raise ValueError("golden artifact/provenance hash mismatch: " + str(path))
     image_info(base)
     print("Verified immutable golden: " + str(base), flush=True)
@@ -1042,6 +1047,8 @@ def main():
         preflight()
     elif args.verify:
         verify()
+        with host_operation("completion-proof"):
+            pass
     else:
         build()
     return 0
@@ -1049,4 +1056,4 @@ def main():
 
 if __name__ == "__main__":
     sys.path.insert(0, str(ROOT / "shared"))
-    raise SystemExit(main())
+    raise SystemExit(run_host_entry(main))

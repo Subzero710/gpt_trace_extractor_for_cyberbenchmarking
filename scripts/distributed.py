@@ -1250,7 +1250,7 @@ def execution_tunnel(cfg, action):
     return run(['docker', 'compose', '-f', str(ROOT / 'compose.execution-tunnel.yaml'), *options])
 
 
-def _run_execution_helper(module):
+def _run_execution_helper(module, *arguments, python=None, requires_proof=False):
     limit = _distributed_operation_timeout()
     policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
     cadence = policy["progress_interval_seconds"]
@@ -1258,8 +1258,11 @@ def _run_execution_helper(module):
     if (type(cadence) is not int or type(cleanup) is not int
             or not 1 <= cadence <= cleanup <= limit):
         raise RuntimeError("invalid execution helper supervision policy")
-    command = [ROOT / ".venv-workstation-broker/bin/python", "-B", "-m", module]
-    watch = OperationWatch(limit, prefix=HOST_PREFIX, description=module, requires_proof=False)
+    interpreter = ROOT / ".venv-workstation-broker/bin/python" if python is None else python
+    command = [interpreter, "-B", "-m", module, *arguments]
+    watch = OperationWatch(limit + cleanup if requires_proof else limit,
+                           prefix=HOST_PREFIX, description=module,
+                           requires_proof=requires_proof)
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         read_fd, write_fd = os.pipe()
         try:
@@ -1649,7 +1652,11 @@ def execution(cfg, action, args):
         print(json.dumps(broker(cfg, "inventory", local=True), indent=2))
         if action == "doctor":
             doctor_tests("execution")
-            run([sys.executable, "infra/workstation/image/build.py", "--verify"])
+            try:
+                print(_run_execution_helper("infra.workstation.image.build", "--verify",
+                                            python=sys.executable, requires_proof=True), flush=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError("golden verification failed: " + (exc.stderr or str(exc))) from exc
             limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
             if shutil.disk_usage(paths["base_image"].parent).free < limits["overlay_quota_gb"] * 1024 ** 3:
                 raise RuntimeError("execution disk cannot reserve one complete configured overlay")

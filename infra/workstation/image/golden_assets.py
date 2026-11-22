@@ -59,7 +59,7 @@ def sync(path):
         os.close(fd)
 
 
-def digest(path):
+def digest(path, *, observe=None):
     path = safe(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
@@ -68,8 +68,13 @@ def digest(path):
             raise ValueError("nonregular golden hash input")
         h = hashlib.sha256()
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                h.update(chunk)
+            while True:
+                with observe() if observe is not None else contextlib.nullcontext():
+                    chunk = handle.read(1024 * 1024)
+                    if chunk:
+                        h.update(chunk)
+                if not chunk:
+                    break
         after = os.fstat(fd)
         if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                 after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
