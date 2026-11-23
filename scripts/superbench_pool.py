@@ -742,36 +742,55 @@ _NETWORK_ATTEMPT = contextvars.ContextVar('fetch_network_attempt', default=None)
 
 class _NetworkAttempt:
     def __init__(self, limit):
+        self.limit = limit
         self.deadline = time.monotonic() + limit
         self.sockets = []
         self.lock = threading.Lock()
-        self.timer = threading.Timer(self.remaining(), self.interrupt)
-        self.timer.daemon = True
+        self.stopped = threading.Event()
+        self.timer = threading.Thread(target=self._interrupt_at_deadline, daemon=True)
         self.timer.start()
 
-    def remaining(self):
+    def _remaining_locked(self):
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError('dependency network attempt exceeded versioned deadline')
         return remaining
 
+    def remaining(self):
+        with self.lock:
+            return self._remaining_locked()
+
     def watch(self, sock):
         with self.lock:
-            self.remaining()
+            self._remaining_locked()
             # A TLS wrapper takes ownership of the original descriptor.
             # The duplicate still refers to the same TCP connection.
             self.sockets.append(sock.dup())
 
-    def interrupt(self):
+    def progress(self):
+        # Only bytes actually read and accounted for renew a streaming download.
+        # Metadata, DNS, connection setup and stalled reads keep their hard limit.
         with self.lock:
-            for sock in self.sockets:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+            self._remaining_locked()
+            self.deadline = time.monotonic() + self.limit
+
+    def _interrupt_at_deadline(self):
+        while True:
+            with self.lock:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    for sock in self.sockets:
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                    return
+            # A renewed deadline is checked again when the previous one elapses.
+            if self.stopped.wait(remaining):
+                return
 
     def close(self):
-        self.timer.cancel()
+        self.stopped.set()
         self.timer.join(timeout=_operation_timeout())
         if self.timer.is_alive():
             raise TimeoutError('network interrupt worker did not exit')
@@ -836,7 +855,7 @@ def _network_retries():
     return attempts, tuple(backoffs)
 
 
-def _network_retry(label, operation, *, cleanup=None):
+def _network_retry(label, operation, *, cleanup=None, streaming=False):
     attempts, backoffs = _network_retries()
     if _NETWORK_ATTEMPT.get() is not None:
         raise RuntimeError('network retry cannot run inside an active transfer attempt')
@@ -844,7 +863,11 @@ def _network_retry(label, operation, *, cleanup=None):
         cleanup()
     for attempt in range(1, attempts + 1):
         try:
-            with _network_slots(), _registered_operation('HTTPS attempt', supervised=True), _network_deadline():
+            # Streams register their real connect/read operations separately.
+            # One large artifact must not inherit a whole-file deadline.
+            registration = (contextlib.nullcontext() if streaming else
+                            _registered_operation('HTTPS attempt', supervised=True))
+            with _network_slots(), registration, _network_deadline():
                 return operation()
         except Exception as exc:
             if isinstance(exc, urllib.error.HTTPError):
@@ -1114,7 +1137,9 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
     label=(parsed.hostname or '')+parsed.path
     def transfer():
         request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
-        with _open_https(request,timeout=_operation_timeout()) as response:
+        with _registered_operation('HTTPS download connect', supervised=True):
+            response = _open_https(request,timeout=_operation_timeout())
+        with response:
             if urllib.parse.urlsplit(response.url).scheme != 'https':
                 raise RuntimeError('untrusted download redirect')
             if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
@@ -1131,7 +1156,8 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                 with path.open('xb') as stream:
                     while True:
                         _network_remaining()
-                        block = response.read(1048576)
+                        with _registered_operation('HTTPS download block', supervised=True):
+                            block = response.read(1048576)
                         if not block:
                             break
                         size+=len(block)
@@ -1141,6 +1167,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                         if view is not None: view.network_advance(transfer_key,len(block))
                         for other in other_hashes.values(): other.update(block)
                         for sri_hash,_ in checks: sri_hash.update(block)
+                        _NETWORK_ATTEMPT.get().progress()
                     stream.flush(); os.fsync(stream.fileno())
             finally:
                 if view is not None: view.network_end(transfer_key)
@@ -1155,7 +1182,8 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
         if integrity_digests is not None:
             integrity_digests.update({algo:h.digest() for algo,h in other_hashes.items()})
         return actual
-    return _network_retry(label, transfer, cleanup=lambda:_discard_partial_download(path))
+    return _network_retry(label, transfer, cleanup=lambda:_discard_partial_download(path),
+                          streaming=True)
 
 
 class _StaticGitReadCache:
