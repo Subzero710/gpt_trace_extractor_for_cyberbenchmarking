@@ -2332,7 +2332,7 @@ class TestPublicationRecovery(unittest.TestCase):
             (ready/'inventory.json').write_text(json.dumps(record))
             expected = {'kind':'download-only-pool','complete':True,
                         'pool_directory':str(ready),**coverage,'runtime_integrated':True,
-                        'offline_replay':True,'generation':'8'*64,
+                        'prepared_setups':True,'generation':'8'*64,
                         'manifest_sha256': hashlib.sha256((ready/'inventory.json').read_bytes()).hexdigest()}
             state = {'phase':'interrupted','operation_id':operation,
                      'publication_verified':expected, 'error':'worker died after rename'}

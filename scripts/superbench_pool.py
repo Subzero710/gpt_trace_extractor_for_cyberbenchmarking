@@ -396,6 +396,13 @@ class _PoolProgress:
             self.transfers[key] = {'name': label, 'current': 0, 'total': total}
             self._emit()
 
+    def network_resume(self, key, previous_bytes):
+        # Previously persisted bytes belong in the transfer bar but are not
+        # new network traffic; never count them again on Range retries.
+        with self.lock:
+            self.transfers[key]['current'] = previous_bytes
+            self._emit()
+
     def network_advance(self, key, amount):
         with self.lock:
             self.transfers[key]['current'] += amount
@@ -565,15 +572,6 @@ def verify_sri(path, sri):
     return tuple(matched)
 
 
-def _discard_partial_download(path):
-    path=Path(path)
-    try: info=path.lstat()
-    except FileNotFoundError: return
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise RuntimeError('unsafe partial download path: '+str(path))
-    path.unlink()
-
-
 class DownloadIntegrityError(RuntimeError):
     """A completed transfer did not match its pinned integrity identity."""
     pass
@@ -586,9 +584,9 @@ class MetadataDecodeError(RuntimeError):
 
 def _retryable_network_error(exc):
     if isinstance(exc, (DownloadIntegrityError, MetadataDecodeError)):
-        # A transport can terminate cleanly after delivering truncated/corrupted
-        # bytes, so urllib may expose no network exception. Retry from byte zero;
-        # the artifact is still accepted only after exact integrity verification.
+        # A transport may terminate cleanly after truncated/corrupt framing.
+        # Retry from the retained exact byte offset; the completed artifact
+        # is accepted only after its pinned integrity verification.
         return True
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in DOWNLOAD_RETRY_HTTP
@@ -1122,55 +1120,129 @@ def _read_https(url, *, timeout, limit, user_agent, expected_host=None, accept=N
 
 
 def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None, on_block=None):
-    parsed=urllib.parse.urlsplit(url)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-        raise RuntimeError('untrusted download endpoint: '+str(url))
-    path=Path(path)
-    label=(parsed.hostname or '')+parsed.path
+    """Resume a pinned HTTPS artifact without discarding verified final identity.
+
+    Range responses must prove their exact starting offset and total length.
+    The completed concatenation is accepted ONLY after its pinned SHA/SRI
+    matches. An endpoint that ignores Range cannot silently restart a transfer.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+            or parsed.password or parsed.fragment):
+        raise RuntimeError('untrusted download endpoint: ' + str(url))
+    path = Path(path)
+    label = (parsed.hostname or '') + parsed.path
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError('unsafe retained HTTPS artifact')
+    if path.exists() and not (sha or sri):
+        raise RuntimeError('unidentified prior artifact bytes cannot be resumed')
+    if path.exists() and path.stat().st_size > limit:
+        raise RuntimeError('retained partial exceeds download size limit')
+
     def transfer():
-        request=urllib.request.Request(url,headers={'User-Agent':'gpt-trace-dependency-pool/2'})
-        with _open_https(request,timeout=_operation_timeout()) as response:
+        offset = path.stat().st_size if path.exists() else 0
+        # Roll an accepted HTTP Range transfer before the elementary-operation
+        # deadline, without treating a deliberate segment boundary as a retry.
+        # This supports arbitrarily large pinned artifacts on a slow link while
+        # keeping EVERY individual HTTPS operation below the configured limit.
+        margin = _conda_progress_interval()
+        if not 0 < margin < _operation_timeout():
+            raise RuntimeError('no valid streaming segment budget in acquisition policy')
+        segment_deadline = time.monotonic() + _operation_timeout()
+        headers = {'User-Agent': 'gpt-trace-dependency-pool/2',
+                   'Accept-Encoding': 'identity'}
+        if offset:
+            headers['Range'] = 'bytes=' + str(offset) + '-'
+        request = urllib.request.Request(url, headers=headers)
+        with _open_https(request, timeout=_operation_timeout()) as response:
             if urllib.parse.urlsplit(response.url).scheme != 'https':
                 raise RuntimeError('untrusted download redirect')
-            if response.headers.get('Content-Length','').isdigit() and int(response.headers['Content-Length'])>limit:
-                raise RuntimeError('download exceeds limit')
-            h=hashlib.sha256(); size=0
-            other_hashes={algorithm:hashlib.new(algorithm) for algorithm in ('sha384','sha512')} if integrity_digests is not None else {}
-            checks=[(hashlib.new(algo),expected) for algo,expected in (sri_parts(sri) or ())]
+            status = response.status
+            declared = response.headers.get('Content-Length', '')
+            if status == 206 and offset:
+                received_range = response.headers.get('Content-Range', '')
+                matched = re.fullmatch(r'bytes ([0-9]+)-([0-9]+)/([0-9]+)', received_range)
+                if matched is None:
+                    raise RuntimeError('HTTPS resume has no exact Content-Range')
+                begin, end, total = map(int, matched.groups())
+                if begin != offset or end < begin or end + 1 != total or total > limit:
+                    raise RuntimeError('HTTPS resume range differs from retained prefix')
+                if declared.isdigit() and int(declared) != total - offset:
+                    raise RuntimeError('HTTPS resume Content-Length contradicts its range')
+            elif status == 200 and not offset:
+                total = int(declared) if declared.isdigit() else None
+                if total is not None and total > limit:
+                    raise RuntimeError('download exceeds size limit')
+            else:
+                raise RuntimeError('HTTPS endpoint did not honor byte-range resume')
+            size = offset
+            segmented = False
+            longest_read = 0.0
             view = _POOL_PROGRESS
             transfer_key = object()
-            declared = response.headers.get('Content-Length', '')
             if view is not None:
-                view.network_start(transfer_key, path.name, int(declared) if declared.isdigit() else 0)
+                view.network_start(transfer_key, path.name, total or 0)
+                if offset:
+                    view.network_resume(transfer_key, offset)
             try:
-                with path.open('xb') as stream:
+                mode = 'ab' if offset else 'wb' if path.exists() else 'xb'
+                with path.open(mode) as stream:
                     while True:
                         _network_remaining()
+                        if (total is not None and size > offset and size < total
+                                and time.monotonic() >= segment_deadline - margin - longest_read):
+                            segmented = True
+                            break
+                        read_started = time.monotonic()
                         block = response.read(1048576)
+                        longest_read = max(longest_read, time.monotonic() - read_started)
                         if not block:
                             break
-                        size+=len(block)
-                        if size>limit: raise RuntimeError('download exceeds limit; partial retained')
-                        stream.write(block); h.update(block)
-                        if on_block is not None: on_block(len(block))
-                        if view is not None: view.network_advance(transfer_key,len(block))
-                        for other in other_hashes.values(): other.update(block)
-                        for sri_hash,_ in checks: sri_hash.update(block)
-                    stream.flush(); os.fsync(stream.fileno())
+                        size += len(block)
+                        if size > limit or (total is not None and size > total):
+                            raise RuntimeError('download exceeds declared artifact size')
+                        stream.write(block)
+                        if on_block is not None:
+                            on_block(len(block))
+                        if view is not None:
+                            view.network_advance(transfer_key, len(block))
+                    stream.flush()
+                    os.fsync(stream.fileno())
             finally:
-                if view is not None: view.network_end(transfer_key)
-        length=response.headers.get('Content-Length','')
-        if length.isdigit() and size!=int(length):
+                if view is not None:
+                    view.network_end(transfer_key)
+        if segmented:
+            # The next independently supervised request MUST start at exactly
+            # this persisted offset and finish with a verified full-file hash.
+            return None
+        if total is not None and size != total:
             raise MetadataDecodeError('truncated HTTPS artifact response')
-        actual=h.hexdigest()
-        if sha and actual != sha:
-            raise DownloadIntegrityError('download sha256 mismatch: '+str(path))
-        if checks and not any(h.digest()==expected for h,expected in checks):
-            raise DownloadIntegrityError('download integrity mismatch: '+str(path))
+        # Validate the FULL accumulated byte stream, including the retained prefix.
+        hashes = {algorithm: hashlib.new(algorithm)
+                  for algorithm in ('sha256', 'sha384', 'sha512')}
+        with path.open('rb') as stream:
+            for block in iter(lambda: stream.read(1048576), b''):
+                for value in hashes.values():
+                    value.update(block)
+        actual = hashes['sha256'].hexdigest()
+        if sha is not None and actual != sha:
+            raise RuntimeError('resumed HTTPS artifact SHA-256 mismatch: ' + str(path))
+        checks = sri_parts(sri) or ()
+        if checks and not any(hashes[algorithm].digest() == expected
+                              for algorithm, expected in checks):
+            raise RuntimeError('resumed HTTPS artifact SRI mismatch: ' + str(path))
         if integrity_digests is not None:
-            integrity_digests.update({algo:h.digest() for algo,h in other_hashes.items()})
+            integrity_digests.update({algorithm: hashes[algorithm].digest()
+                                      for algorithm in ('sha384', 'sha512')})
         return actual
-    return _network_retry(label, transfer, cleanup=lambda:_discard_partial_download(path))
+
+    # A successful segment does not consume a retry. Transport failures still
+    # have the configured finite retry budget for each segment; none reset
+    # or increase a single operation's 180-second deadline.
+    while True:
+        completed = _network_retry(label, transfer)
+        if completed is not None:
+            return completed
 
 
 class _StaticGitReadCache:
@@ -3433,7 +3505,9 @@ class Pool:
                         raise ValueError('retained checksum mismatch')
                     if sri is not None: verify_sri(raw,sri)
                 except (ValueError,RuntimeError):
-                    raw.unlink()  # Only our new, private candidate stage.
+                    # Keep an incomplete, pinned transfer for exact HTTP Range
+                    # continuation. The full SHA/SRI is checked after completion.
+                    pass
                 else:
                     actual = candidate
             else:
@@ -3552,6 +3626,25 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
             if digest(candidate) != before or digest(destination) != before:
                 raise RuntimeError('native pip cache changed during verified recovery')
         print('[pool] restored native pip HTTP response cache', flush=True)
+    # Copy only interrupted transfers whose URLs are bound to the CURRENT
+    # pinned Conda lock. They are explicitly untrusted until a completed HTTP
+    # Range response and the final archive SHA-256 authenticate all bytes.
+    if downloads.is_dir():
+        known = {hashlib.sha256(item['url'].encode()).hexdigest(): sha
+                 for sha, item in conda_artifacts.items()
+                 if isinstance(item, dict) and isinstance(item.get('url'), str)}
+        known.update({'conda-' + sha: sha for sha in conda_artifacts})
+        for name, sha in sorted(known.items()):
+            original = downloads / name
+            target = new / 'downloads' / name
+            if (not original.is_file() or original.is_symlink()
+                    or original.stat().st_size == 0 or target.exists()
+                    or (original.stat().st_dev, original.stat().st_ino) in good):
+                continue
+            with _registered_operation('restore interrupted HTTPS transfer'):
+                shutil.copyfile(original, target)
+                if original.stat().st_size != target.stat().st_size:
+                    raise RuntimeError('interrupted transfer changed during recovery')
     # Git refs/packed objects can be mutated by a later fetch: COPY them, never
     # hardlink mutable Git objects to the failed stage. Interrupted transactions
     # leave *.lock files that must not become locks in the recovered candidate.
@@ -5567,6 +5660,7 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
         leaf_since = {}
         leaf_time = {}
         previous_leaves = set()
+        warned_leaves = set()
         observed_parents = set()
         ticks_per_second = os.sysconf('SC_CLK_TCK')
         started = time.monotonic()
@@ -5617,12 +5711,25 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
                         age = time.clock_gettime(time.CLOCK_BOOTTIME) - start_ticks / ticks_per_second
                         born = now - max(0, age)
                     leaf_since[marker] = born
-                    scope = _registered_operation('Pip subprocess', limit=limit,
+                    description = str(row.get('command') or '')
+                    # The parent broker owns the deadline. Supply exact child
+                    # identity in its persisted TimeoutError, not a generic name.
+                    label = 'Pip subprocess pid=' + str(pid) + ' cmd=' + description[:350]
+                    scope = _registered_operation(label, limit=limit,
                                                   process=pid, started=born, supervised=True)
                     scope.__enter__()
                     leaf_scopes[marker] = scope
                 else:
                     born = leaf_since[marker]
+                if now - born >= limit * 0.8 and marker not in warned_leaves:
+                    warned_leaves.add(marker)
+                    print('[pool] native pip pending deadline: ' + json.dumps({
+                        'pid': pid, 'command': row.get('command'),
+                        'source': runtime.get('_native_source_context'),
+                        'elapsed_seconds': round(now - born, 2),
+                        'wait_channel': row.get('wait_channel'),
+                        'cpu_ticks': row.get('cpu_ticks'),
+                    }, sort_keys=True), file=sys.stderr, flush=True)
                 if now - born >= limit:
                     expired('elementary', limit, 'Pip elementary subprocess exceeded '
                             + str(limit) + ' seconds: '
@@ -5873,6 +5980,90 @@ def _native_bootstrap(pool, runtime):
     return executable
 
 
+def _native_conda_package_index(pool, runtime, sha, transaction_key):
+    """Read only info/index.json from a SHA-locked Conda artifact.
+
+    Dependency names come from the *package itself*. A fully solved locked
+    transaction supplies each dependency's exact version/build; no host solver,
+    guessed ABI requirements or repository repodata is consulted.
+    """
+    with _bounded_lock(_NATIVE_POOL_LOCK):
+        cached = runtime.setdefault('conda_package_indices', {}).get(sha)
+        if cached is not None:
+            return cached
+    item = pool.conda_lock['artifacts'][sha]
+    pool.download(item['url'], 'native-python-metadata', transaction_key, sha=sha)
+    filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
+    if (not filename or Path(filename).name != filename
+            or not filename.endswith(('.conda', '.tar.bz2'))):
+        raise RuntimeError('invalid pinned Conda package filename')
+    folder = runtime['root'] / 'package-indices' / sha
+    folder.mkdir(parents=True, exist_ok=True)
+    archive = pool.link_verified_object(sha, folder / filename)
+    # The Miniconda bootstrap is shared between concurrent metadata workers.
+    with runtime['conda_install_lock']:
+        conda = _native_bootstrap(pool, runtime)
+    script = ("import conda_package_handling.api as c, json, pathlib, sys\n"
+              "archive, destination = map(pathlib.Path, sys.argv[1:])\n"
+              "c.extract(str(archive), dest_dir=str(destination), components='info')\n"
+              "metadata = json.loads((destination / 'info/index.json').read_text())\n"
+              "print(json.dumps(metadata, sort_keys=True))\n")
+    extracted = folder / 'extracted-info'
+    result = _native_run([conda.parent / 'python', '-I', '-B', '-c', script,
+                          archive, extracted], runtime,
+                         interpreter=conda.parent / 'python')
+    metadata = json.loads(result)
+    if (not isinstance(metadata, dict)
+            or any(metadata.get(name) != item[name] for name in ('name', 'version', 'build'))
+            or not isinstance(metadata.get('depends', []), list)
+            or not all(isinstance(value, str) and value for value in metadata.get('depends', []))):
+        raise RuntimeError('locked Conda package metadata differs from its pinned identity')
+    with _bounded_lock(_NATIVE_POOL_LOCK):
+        runtime['conda_package_indices'][sha] = metadata
+    return metadata
+
+
+def _native_minimal_python_packages(pool, runtime, sha):
+    """Derive only the Python+pip recursive dependency closure from one lock."""
+    candidates = []
+    for env in pool.conda_lock['environments'].values():
+        for transaction in env['transactions']:
+            packages = transaction['packages']
+            if sha in packages:
+                candidates.append((len(packages), transaction['key'], packages))
+    if not candidates:
+        raise RuntimeError('locked Python absent from Conda transactions: ' + sha)
+    _, key, solution = min(candidates, key=lambda row: (row[0], row[1]))
+    artifacts = pool.conda_lock['artifacts']
+    by_name = {}
+    for package_sha in solution:
+        name = artifacts[package_sha]['name']
+        if name in by_name:
+            raise RuntimeError('duplicate Conda package in pinned transaction: ' + name)
+        by_name[name] = package_sha
+    if by_name.get('python') != sha:
+        raise RuntimeError('selected Conda transaction has the wrong locked Python artifact')
+    required = [artifacts[sha]['name'], 'pip']
+    selected = set()
+    while required:
+        name = required.pop()
+        if name.startswith('__'):
+            continue  # Conda's virtual OS packages are not downloadable archives.
+        package_sha = by_name.get(name)
+        if package_sha is None:
+            raise RuntimeError('locked transaction lacks Python bootstrap dependency: ' + name)
+        if package_sha in selected:
+            continue
+        selected.add(package_sha)
+        metadata = _native_conda_package_index(pool, runtime, package_sha, key)
+        for dependency in metadata.get('depends', []):
+            found = re.match(r'^([A-Za-z0-9_.-]+)(?:\s|$)', dependency)
+            if found is None:
+                raise RuntimeError('malformed locked Conda dependency: ' + dependency)
+            required.append(found.group(1))
+    return key, sorted(selected)
+
+
 def _native_locked_python(pool, target):
     """Single-flight exact CPython provisioning with concurrent CAS acquisitions.
 
@@ -5897,22 +6088,15 @@ def _native_locked_python(pool, target):
         pending = pending_by_sha.get(sha)
         owner = pending is None
         if owner:
-            candidates = []
-            for env in pool.conda_lock['environments'].values():
-                for transaction in env['transactions']:
-                    packages = transaction['packages']
-                    if sha in packages:
-                        candidates.append((len(packages), transaction['key'], packages))
-            if not candidates:
-                raise RuntimeError('locked target interpreter artifact absent from Conda transactions: ' + sha)
-            _length, key, packages = min(candidates, key=lambda row: (row[0], row[1]))
             pending = _OwnedFuture()
             pending_by_sha[sha] = pending
     if not owner:
         return _shared_future_result(pending)
     try:
-        # Each target has its own hardlink directory and explicit transaction.
-        # Overlapping immutable archives consume no duplicate CAS data blocks.
+        # Resolve only the recursive dependencies of pinned Python and pip.
+        # A 300-500-package science stack must never be installed to read one
+        # local project's PEP 517 metadata.
+        key, packages = _native_minimal_python_packages(pool, runtime, sha)
         archive_root = runtime['root'] / 'archives' / sha
         archive_root.mkdir(parents=True, exist_ok=True)
         explicit = []
@@ -8583,8 +8767,38 @@ def main(argv=None):
         # explicitly supported textual transformations.
         # Native metadata is authoritative for actual local installations,
         # including static projects and --no-deps build-time requirements.
+        static_build_roots = None
         if any(step['local_project'] for step in steps):
-            reqs, vcs_task = native_project_metadata()
+            # PEP 621 requirements are authoritative for a pure declarative
+            # setuptools project. Running PEP 517 just to rediscover the same
+            # dependencies would provision a Python and arbitrary build hooks.
+            project_source = get_file('pyproject.toml')
+            setup_source = get_file('setup.py')
+            setup_config = get_file('setup.cfg')
+            declarative = False
+            if project_source and not setup_source and not setup_config:
+                parsed_project = tomllib.loads(project_source)
+                project = parsed_project.get('project')
+                build_system = parsed_project.get('build-system')
+                if (isinstance(project, dict) and isinstance(project.get('name'), str)
+                        and isinstance(project.get('dependencies', []), list)
+                        and isinstance(project.get('optional-dependencies', {}), dict)
+                        and isinstance(project.get('dynamic', []), list)
+                        and not ({'dependencies', 'optional-dependencies'}
+                                 & set(project['dynamic'] if 'dynamic' in project else []))
+                        and isinstance(build_system, dict)
+                        and build_system.get('build-backend') == 'setuptools.build_meta'
+                        and 'backend-path' not in build_system
+                        and isinstance(build_system.get('requires'), list)
+                        and all(isinstance(item, str) for item in build_system['requires'])):
+                    deps, remote, problems = static_project(project_source, extra_groups=extras)
+                    if not problems:
+                        reqs.update(deps)
+                        vcs_task.update(remote)
+                        static_build_roots = tuple(sorted(set(build_system['requires'])))
+                        declarative = True
+            if not declarative:
+                reqs, vcs_task = native_project_metadata()
         else:
             raw=get_file('pyproject.toml')
             if raw:
@@ -8631,6 +8845,15 @@ def main(argv=None):
             elif bucket=='environment':environment_steps.append(key)
             else:task_steps.append(key)
             return key
+
+        if static_build_roots:
+            build_key = pip_group_key(task_target, static_build_roots)
+            groups.setdefault(build_key, {
+                'target': task_target.as_dict(),
+                'requirements': list(static_build_roots),
+                'constraints': [], 'preferred_versions': {}, 'no_deps': False,
+                'required': True, 'tasks': [],
+                'steps': ['declared PEP 517 build-system']})
 
         # `pip:` entries embedded in environment.yml execute during the base
         # Conda transaction, not after a later Python override.

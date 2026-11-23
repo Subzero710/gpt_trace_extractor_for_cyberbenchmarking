@@ -1134,7 +1134,7 @@ def preparation_fetch(cfg, *, fetch_source=None):
                         or result.get("complete") is not True
                         or any(result.get(key)!=coverage.get(key) for key in ("tasks","repos","conda_recipes"))
                         or result.get("runtime_integrated") is not True
-                        or result.get("offline_replay") is not True
+                        or result.get("prepared_setups") is not True
                         or not isinstance(result.get("generation"), str)):
                     raise RuntimeError("broker reported no fully integrated offline SWE-Gym generation")
                 atomic_json(directory / ("preparation-" + operation_id + ".json"), {**identified, "result": result}, 0o600)

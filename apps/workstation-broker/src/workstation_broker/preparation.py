@@ -722,7 +722,7 @@ class PreparationManager:
                         or inventory.get('repos') != proof.get('repos')
                         or inventory.get('conda_recipes') != proof.get('conda_recipes')
                         or (not pending_integration and proof.get('runtime_integrated') is not True)
-                        or proof.get('offline_replay') is not True
+                        or proof.get('prepared_setups') is not True
                         or not isinstance(proof.get('generation'), str)):
                     if not pending_integration:
                         raise RuntimeError('published pool does not match the durable verified publication record')
@@ -749,7 +749,7 @@ class PreparationManager:
                 or result.get("repos") != repo_count or result.get("conda_recipes") != env_count
                 or result.get("python_versions") != locked_python_minors(self.source_root)
                 or result.get("runtime_integrated") is not True
-                or result.get("offline_replay") is not True
+                or result.get("prepared_setups") is not True
                 or not isinstance(result.get("generation"), str)
                 or state.get("compatibility") != self.expected()):
             self._write({**state, "phase": "failed", "error": "invalid pool publication record"})
@@ -1146,7 +1146,7 @@ def _integrate_published_pool(manager, state, ready, result):
     final = builder.build(args)
     generation = Path(final).name
     integrated = {**result, "runtime_integrated": True, "generation": generation,
-                  "offline_replay": True, "pool_directory": str(ready)}
+                  "prepared_setups": True, "pool_directory": str(ready)}
     manager._write({**state, "phase": "validating", "publication_verified": integrated,
                     "built_generation": generation})
     return integrated
