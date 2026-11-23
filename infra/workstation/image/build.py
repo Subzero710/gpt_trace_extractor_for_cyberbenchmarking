@@ -754,6 +754,36 @@ def provenance(image, stage, state):
     atomic_json(image.with_suffix(".provenance.json"), metadata, 0o444)
 
 
+def observed_verification_digest(path):
+    """Verify immutable host bytes with bounded, independently observed hashing.
+
+    Host supervision must not change golden_assets.py: it is a fingerprinted
+    guest-build input, including for already-installed migrated Golden images.
+    """
+    path = safe(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("nonregular golden hash input")
+        hasher = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            while True:
+                with host_operation("golden-verify-hash-block"):
+                    chunk = handle.read(1024 * 1024)
+                    if chunk:
+                        hasher.update(chunk)
+                if not chunk:
+                    break
+        after = os.fstat(fd)
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("golden artifact changed while hashing")
+        return hasher.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def verify(base=None):
     base = DEST if base is None else Path(base)
     with host_operation("golden-verify-provenance"):
@@ -796,7 +826,7 @@ def verify(base=None):
                         raise ValueError("golden migrated service unit differs: " + name)
     for path, key in ((base, "base_sha256"), (base.parent / "kali-packages.txt", "apt_package_manifest_sha256"),
                       (base.parent / "kali-python-packages.txt", "python_package_manifest_sha256")):
-        if digest(path, observe=lambda: host_operation("golden-verify-hash-block")) != metadata[key]:
+        if observed_verification_digest(path) != metadata[key]:
             raise ValueError("golden artifact/provenance hash mismatch: " + str(path))
     image_info(base)
     print("Verified immutable golden: " + str(base), flush=True)
