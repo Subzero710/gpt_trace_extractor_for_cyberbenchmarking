@@ -100,17 +100,20 @@ def test_parallel_conda_targets_share_verified_cas_archive_without_failure(tmp_p
         sha_a, cas_a = _cas(instance, b'python 3.11 verified package')
         sha_b, cas_b = _cas(instance, b'python 3.12 verified package')
         sha_common, cas_common = _cas(instance, b'common verified conda archive' * 10000)
+        sha_pip, cas_pip = _cas(instance, b'locked pip verified conda archive')
         versions = {sha_a: '3.11.8', sha_b: '3.12.5'}
         artifacts = {}
         for sha, name in ((sha_a, 'python-3.11.8-0.conda'),
                           (sha_b, 'python-3.12.5-0.conda'),
-                          (sha_common, 'shared-1-0.conda')):
+                          (sha_common, 'shared-1-0.conda'),
+                          (sha_pip, 'pip-1-0.conda')):
             artifacts[sha] = {'url': 'https://conda.anaconda.org/example/linux-64/' + name,
-                              'version': versions.get(sha, '1')}
+                              'version': versions.get(sha, '1'),
+                              'name': ('python' if sha in versions else 'pip' if sha == sha_pip else 'shared')}
         instance.conda_lock = {
             'artifacts': artifacts,
             'environments': {sha: {'transactions': [{
-                'key': sha, 'packages': (sha_common, sha)
+                'key': sha, 'packages': (sha_common, sha_pip, sha)
             }]} for sha in (sha_a, sha_b)},
         }
         runtime = {'root': root, 'env': {}, 'prefixes': {}, 'bootstrapped': True,
@@ -120,6 +123,9 @@ def test_parallel_conda_targets_share_verified_cas_archive_without_failure(tmp_p
         monkeypatch.setattr(instance, 'download', lambda url, category, key, *, sha: sha)
         fake_conda = root / 'conda' / 'bin' / 'conda'
         monkeypatch.setattr(pool_module, '_native_bootstrap', lambda *args: fake_conda)
+        monkeypatch.setattr(pool_module, '_native_conda_package_index',
+                            lambda _pool, _runtime, package_sha, _key:
+                            {'depends': ['shared']} if package_sha in versions else {'depends': []})
         def run(argv, _runtime, **kwargs):
             if 'create' in argv:
                 prefix = Path(argv[argv.index('--prefix') + 1])

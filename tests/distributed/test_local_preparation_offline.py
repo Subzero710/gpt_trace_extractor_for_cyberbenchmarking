@@ -485,7 +485,7 @@ def physical_boundary(manager,state):
               'python_versions': LOCKED_PYTHONS,
               'file_count': 0, 'manifest_sha256': hashlib.sha256((ready/'inventory.json').read_bytes()).hexdigest(),
               'pool_directory': str(ready), 'runtime_integrated': True,
-              'offline_replay': True, 'generation': GENERATION}
+              'prepared_setups': True, 'generation': GENERATION}
     return result
 jobs._prepare = physical_boundary
 try:
@@ -596,7 +596,7 @@ finally:
         self.mode = "success"
         self.start(retry=True)
         ready = self.wait_phase({"ready"})
-        self.assertTrue(ready["result"]["offline_replay"])
+        self.assertTrue(ready["result"]["prepared_setups"])
         self.assertEqual(len(self.children), 2)
         self.assertEqual(self.count.read_bytes(), b"one\none\n")
         self.assertEqual(self.files.registry_path.read_bytes(), before)
@@ -836,7 +836,7 @@ class AdministrativeAndShutdownTests(unittest.TestCase):
                 phase = next(phases)
                 return {"operation_id": operation_id, "deployment": cfg["deployment"], "phase": phase,
                     "result": {"kind": "download-only-pool", "complete": True, **recipe["coverage"],
-                        "runtime_integrated": True, "offline_replay": True,
+                        "runtime_integrated": True, "prepared_setups": True,
                         "generation": "a" * 64}}
             with patch.object(self.dispatch, "ROOT", Path(temp)), patch.object(local, "pool_contract", return_value=recipe), patch.object(self.dispatch, "broker", side_effect=broker), patch.object(self.dispatch.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
                 self.dispatch.preparation_fetch(cfg)

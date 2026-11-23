@@ -164,6 +164,13 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
     request.addfinalizer(candidate._pip_cache_context.cleanup)
     objects = candidate.objects
     artifacts = {}
+    shared_content = b'locked shared native dependency'
+    shared_sha = hashlib.sha256(shared_content).hexdigest()
+    shared_path = objects / shared_sha[:2] / shared_sha
+    shared_path.parent.mkdir(exist_ok=True)
+    shared_path.write_bytes(shared_content)
+    artifacts[shared_sha] = {'name': 'pip', 'version': '1',
+                             'url': 'https://example.invalid/pip.conda'}
     target_rows = []
     for name, version in [('alpha', '3.11.11'), ('beta', '3.12.12')]:
         content = name.encode()
@@ -176,7 +183,7 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
         destination.parent.mkdir()
         destination.write_bytes(content)
     lock = {'artifacts': artifacts, 'environments': {
-        sha: {'transactions': [{'key': sha, 'packages': [sha]}]}
+        sha: {'transactions': [{'key': sha, 'packages': [sha, shared_sha]}]}
         for sha, version in target_rows}}
     candidate.conda_lock = lock
     downloader_barrier = threading.Barrier(len(target_rows), timeout=5)
@@ -186,8 +193,9 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
     serial = threading.Lock()
 
     def download(url, category, key, sha):
+        if sha in dict(target_rows):
+            downloader_barrier.wait()
         observed_downloads.append(sha)
-        downloader_barrier.wait()
         return sha
 
     def bootstrap(candidate, runtime):
@@ -216,6 +224,7 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
     with patch.object(pool, '_native_pool_runtime', return_value=runtime), \
          patch.object(pool, '_coerce_target', side_effect=lambda t: t), \
          patch.object(pool, '_native_bootstrap', side_effect=bootstrap), \
+         patch.object(pool, '_native_conda_package_index', side_effect=lambda *_: {'depends': []}), \
          patch.object(pool, '_native_run', side_effect=run):
         candidate.download = download
         targets = [SimpleNamespace(python_artifact_sha256=sha,
@@ -225,13 +234,13 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
             actual = list(workers.map(lambda t: pool._native_locked_python(candidate, t), targets))
         assert len(set(actual)) == len(targets)
         assert peak_condas == 1
-        assert set(observed_downloads) == {sha for sha, _ in target_rows}
+        assert set(observed_downloads) == {shared_sha, *(sha for sha, _ in target_rows)}
         assert not runtime['locked_python_inflight']
         assert len(runtime['prefixes']) == len(target_rows)
         for target, interpreter in zip(targets, actual):
             assert interpreter == root / 'envs' / target.python_artifact_sha256 / 'bin' / 'python'
             assert pool._native_locked_python(candidate, target) == interpreter
-        assert len(observed_downloads) == len(targets)
+        assert len(observed_downloads) == len(targets) * 2
 
 
 def test_static_progress_tracks_actual_completion_without_reordering_results():

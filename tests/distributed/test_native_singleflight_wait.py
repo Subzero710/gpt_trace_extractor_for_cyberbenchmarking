@@ -21,22 +21,29 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
     version = '3.11.11'
     content = b'verified interpreter archive'
     sha = hashlib.sha256(content).hexdigest()
+    pip_content = b'verified pip archive'
+    pip_sha = hashlib.sha256(pip_content).hexdigest()
     object_path = tmp_path / 'objects' / sha[:2] / sha
     object_path.parent.mkdir(parents=True)
     object_path.write_bytes(content)
+    pip_object = tmp_path / 'objects' / pip_sha[:2] / pip_sha
+    pip_object.parent.mkdir(parents=True)
+    pip_object.write_bytes(pip_content)
     lock = {
         'artifacts': {
             sha: {'name': 'python', 'version': version,
-                  'url': 'https://example.invalid/locked-python.conda'}},
+                  'url': 'https://example.invalid/locked-python.conda'},
+            pip_sha: {'name': 'pip', 'version': '1',
+                      'url': 'https://example.invalid/locked-pip.conda'}},
         'environments': {'target': {'transactions': [
-            {'key': 'target', 'packages': [sha]}]}},
+            {'key': 'target', 'packages': [sha, pip_sha]}]}},
     }
     calls = []
     entered = threading.Event()
     release = threading.Event()
     candidate = SimpleNamespace(conda_lock=lock)
     candidate.download = lambda _url, _category, _key, sha: calls.append(sha)
-    candidate.link_verified_object = lambda _sha, dest: os.link(object_path, dest)
+    candidate.link_verified_object = lambda _sha, dest: os.link({sha: object_path, pip_sha: pip_object}[_sha], dest)
     runtime = {
         'root': root, 'env': {}, 'prefixes': {},
         'conda_install_lock': threading.RLock(),
@@ -60,6 +67,7 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
     with patch.object(pool, '_native_pool_runtime', return_value=runtime), \
          patch.object(pool, '_coerce_target', side_effect=lambda value: value), \
          patch.object(pool, '_native_bootstrap', return_value=conda), \
+         patch.object(pool, '_native_conda_package_index', side_effect=lambda *_: {'depends': []}), \
          patch.object(pool, '_native_run', side_effect=native_run), \
          patch.object(pool, '_operation_timeout', return_value=0.04), \
          patch.object(pool, '_conda_progress_interval', return_value=0.01):
@@ -75,7 +83,8 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
             expected = root / 'envs' / sha / 'bin' / 'python'
             assert owner.result(timeout=3) == expected
             assert waiter.result(timeout=3) == expected
-    assert calls == [sha]
+    assert set(calls) == {sha, pip_sha}
+    assert len(calls) == 2
     assert not runtime['locked_python_inflight']
 
 

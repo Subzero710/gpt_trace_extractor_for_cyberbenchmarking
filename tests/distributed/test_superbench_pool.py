@@ -1849,6 +1849,7 @@ class TestNetworkRetries(unittest.TestCase):
             self.url = url
             self.events = list(events)
             self.headers = headers or {}
+            self.status = 206 if "Content-Range" in self.headers else 200
 
         def __enter__(self): return self
         def __exit__(self, *args): return False
@@ -1859,12 +1860,16 @@ class TestNetworkRetries(unittest.TestCase):
             if isinstance(item, BaseException): raise item
             return item
 
-    def test_midstream_timeout_retries_from_zero_and_discards_partial(self):
+    def test_midstream_timeout_resumes_persisted_partial_with_exact_range(self):
         url = 'https://repo.example.test/pkg.conda'
         payload = b'complete artifact'
         expected = hashlib.sha256(payload).hexdigest()
-        first = self.Response(url, [b'partial bytes', TimeoutError('read timed out')])
-        second = self.Response(url, [payload, b''])
+        prefix = payload[:7]
+        first = self.Response(url, [prefix, TimeoutError('read timed out')],
+                              {'Content-Length': str(len(payload))})
+        second = self.Response(url, [payload[len(prefix):], b''],
+                               {'Content-Length': str(len(payload) - len(prefix)),
+                                'Content-Range': f'bytes {len(prefix)}-{len(payload)-1}/{len(payload)}'})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'artifact'
             log = io.StringIO()
@@ -1877,6 +1882,25 @@ class TestNetworkRetries(unittest.TestCase):
             self.assertEqual(opener.call_count, 2)
             sleeper.assert_called_once_with(1)
             self.assertIn('network retry 2/5 in 1s after TimeoutError', log.getvalue())
+
+    def test_resume_rejects_wrong_content_range_without_discarding_prefix(self):
+        url = 'https://repo.example.test/pkg.conda'
+        payload = b'exact verified bytes'
+        prefix = payload[:8]
+        first = self.Response(url, [prefix, TimeoutError('interrupted read')],
+                              {'Content-Length': str(len(payload))})
+        incorrect = self.Response(url, [payload[len(prefix):], b''],
+                                  {'Content-Range': f'bytes {len(prefix) + 1}-{len(payload)-1}/{len(payload)}',
+                                   'Content-Length': str(len(payload) - len(prefix))})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'artifact'
+            with patch.object(pool, '_open_https', side_effect=[first, incorrect]) as opener, \
+                 patch.object(pool.time, 'sleep') as sleeper, \
+                 self.assertRaisesRegex(RuntimeError, 'range differs from retained prefix'):
+                pool.fetch(url, path, sha=hashlib.sha256(payload).hexdigest())
+            self.assertEqual(path.read_bytes(), prefix)
+            self.assertEqual(opener.call_count, 2)
+            sleeper.assert_called_once_with(1)
 
     def test_expected_https_metadata_reuses_one_connection_per_thread(self):
         class Response:

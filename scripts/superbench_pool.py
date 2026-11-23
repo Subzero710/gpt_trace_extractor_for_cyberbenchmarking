@@ -1189,7 +1189,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                 with path.open(mode) as stream:
                     while True:
                         _network_remaining()
-                        if (total is not None and size > offset and size < total
+                        if (size > offset and (total is None or size < total)
                                 and time.monotonic() >= segment_deadline - margin - longest_read):
                             segmented = True
                             break
@@ -1226,11 +1226,13 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
                     value.update(block)
         actual = hashes['sha256'].hexdigest()
         if sha is not None and actual != sha:
-            raise RuntimeError('resumed HTTPS artifact SHA-256 mismatch: ' + str(path))
+            path.unlink()
+            raise DownloadIntegrityError('HTTPS artifact sha256 mismatch: ' + str(path))
         checks = sri_parts(sri) or ()
         if checks and not any(hashes[algorithm].digest() == expected
                               for algorithm, expected in checks):
-            raise RuntimeError('resumed HTTPS artifact SRI mismatch: ' + str(path))
+            path.unlink()
+            raise DownloadIntegrityError('HTTPS artifact SRI mismatch: ' + str(path))
         if integrity_digests is not None:
             integrity_digests.update({algorithm: hashes[algorithm].digest()
                                       for algorithm in ('sha384', 'sha512')})
