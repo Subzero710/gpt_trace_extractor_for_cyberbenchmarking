@@ -26,7 +26,7 @@ def test_git_metadata_single_flight_and_cross_commit_blob_reuse():
         return '100644 blob ' + oid + '\tpyproject.toml\n'
 
     def blob(argv, *, timeout):
-        assert argv[-2:] == ['blob', oid] and timeout == 60
+        assert argv[-2:] == ['blob', oid] and timeout == pool._operation_timeout()
         with lock:
             calls.append(('blob', oid))
         entered.set()

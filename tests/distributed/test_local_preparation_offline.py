@@ -83,7 +83,9 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         source = (ROOT / "scripts/build_local_templates.py").read_text()
         self.assertIn("recovering completed work from interrupted task warm scratch", source)
         self.assertIn("module['warm_task'](item,artifact)", source)
-        self.assertIn("module['replay_task'](item,artifact,cache)", source)
+        self.assertNotIn("module['replay_task'](item,artifact,cache)", source)
+        self.assertIn('prepared_setup_proof(item, cache_record)', source)
+        self.assertIn('audit / "prepared-setups.json"', source)
         self.assertIn("cache_disk=warm_cache, trim=False", source)
         self.assertIn("refresh_runtime=True", source)
 

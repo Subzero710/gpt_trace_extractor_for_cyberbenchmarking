@@ -27,7 +27,10 @@ def test_composed_network_identity_is_shared_by_worker_and_builder():
     assert "--reuid=2345" in command
     assert "--regid=2346" in command
     assert "--clear-groups" in command
-    assert "--umask=0077" in command
+    assert module.FETCH_WORKER_UMASK == 0o077
+    assert not any(argument.startswith("--umask") for argument in command)
+    preparation = ROOT / "apps/workstation-broker/src/workstation_broker/preparation.py"
+    assert "umask=FETCH_WORKER_UMASK" in preparation.read_text()
     assert "--no-new-privs" in command
     assert command[-4:] == ["/usr/bin/python3", "-I", "-B", "/path with spaces/worker.py"]
 
