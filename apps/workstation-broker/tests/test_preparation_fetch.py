@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import hashlib
+import subprocess
+import sys
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from workstation_broker import preparation as jobs
+from workstation_broker.fetch_egress import FETCH_WORKER_UMASK, fetch_worker_command, source_network
 from gpt_trace_transport import local_templates as templates
 
 
@@ -126,11 +129,29 @@ def test_fetch_worker_uses_system_python_not_broker_venv():
     assert "trusted_fetch_python()" in physical
     assert "state['compatibility']['golden_dependency']" in physical
     assert 'subprocess.Popen(fetch_worker_command(account, interpreter,' in physical
+    assert "umask=FETCH_WORKER_UMASK" in physical
     assert "sys.executable" not in physical
     trusted = source.split("def trusted_fetch_python():", 1)[1].split(
         "def stage_fetch_sources", 1
     )[0]
     assert '"-m", "pip", "--version"' in trusted
+
+
+def test_fetch_worker_umask_is_applied_by_subprocess_not_setpriv():
+    account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+    command = fetch_worker_command(account, sys.executable, ("worker.py",))
+    assert command[:4] == ["ip", "netns", "exec", source_network()]
+    assert "setpriv" in command
+    assert not any(argument.startswith("--umask") for argument in command)
+    for security_option in ("--clear-groups", "--no-new-privs", "--inh-caps=-all",
+                            "--ambient-caps=-all", "--bounding-set=-all"):
+        assert security_option in command
+    assert FETCH_WORKER_UMASK == 0o077
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c",
+         "import os; old = os.umask(0o077); print(oct(old))"],
+        capture_output=True, check=True, text=True, umask=FETCH_WORKER_UMASK)
+    assert result.stdout.strip() == oct(FETCH_WORKER_UMASK)
 
 
 def test_resume_compatibility_is_structural_not_fetch_source_identity():

@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 MANIFEST = Path(__file__).resolve().parents[4] / "compose.fetch-egress.yaml"
+FETCH_WORKER_UMASK = 0o077
 
 
 def source_network():
@@ -26,7 +27,7 @@ def fetch_worker_command(account, interpreter, argv):
         "ip", "netns", "exec", source_network(),
         "setpriv", "--reuid=" + str(account.pw_uid),
         "--regid=" + str(account.pw_gid), "--clear-groups",
-        "--umask=0077", "--no-new-privs", "--inh-caps=-all",
+        "--no-new-privs", "--inh-caps=-all",
         "--ambient-caps=-all", "--bounding-set=-all",
         str(interpreter), "-I", "-B", *map(str, argv),
     ]

@@ -1361,13 +1361,14 @@ def _prepare(manager, state):
     read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     try:
         try:
-            from workstation_broker.fetch_egress import fetch_worker_command
+            from workstation_broker.fetch_egress import FETCH_WORKER_UMASK, fetch_worker_command
             child = subprocess.Popen(fetch_worker_command(account, interpreter,
                             [str(program), "--repo-root", str(source_root), "--stage", str(stage),
                              "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
                              *(["--reuse-from", str(reuse)] if reuse is not None else [])]),
                            cwd=source_root, env=env, pass_fds=(write_fd,),
-                           stdin=subprocess.DEVNULL, start_new_session=True)
+                           stdin=subprocess.DEVNULL, start_new_session=True,
+                           umask=FETCH_WORKER_UMASK)
         finally:
             os.close(write_fd)
         watch = _FetchOperationWatch(child.pid, elementary_limit, cleanup_timeout)
