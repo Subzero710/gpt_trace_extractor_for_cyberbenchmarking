@@ -107,7 +107,7 @@ COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 3
+TASK_RUNTIME_SCHEMA = 4
 
 
 class RecoverableBuildError(RuntimeError):
@@ -269,6 +269,20 @@ def _adopt_resumable_stage(target_root, staged, identity):
     return True
 
 
+def prepared_setup_proof(item, cache_record):
+    """Bind the network-isolated warm result to its exact reusable setup cache.
+
+    This proves production of the cache, NOT a second offline replay. The
+    replay belongs to validation tests rather than the normal fetch path.
+    """
+    sha = cache_record.get('sha256')
+    if not isinstance(sha, str) or SHA.fullmatch(sha) is None:
+        raise RuntimeError('unverified task setup cache identity')
+    return {'schema': TASK_RUNTIME_SCHEMA, 'base_commit': item['base_commit'],
+            'env_hash': item['env_hash'], 'setup_cache_sha256': sha,
+            'network_isolated': True}
+
+
 def guest_resources():
     total_mib = (os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")) // (1024 * 1024)
     available = total_mib - MEMORY_RESERVE_MB
@@ -327,6 +341,34 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def copy_git_mirror(source, destination):
+    """Keep all pinned Git objects, including commits not reachable from refs.
+
+    Git clone would omit such objects. Copy mutable ref/configuration files but
+    hardlink immutable object data on the same filesystem. Refs can then be
+    updated privately without changing the verified dependency pool.
+    """
+    source, destination = Path(source), Path(destination)
+    if source.is_symlink() or not source.is_dir() or destination.exists():
+        raise RuntimeError('unsafe Git mirror clone request')
+
+    def copy_object_or_metadata(src, dst):
+        src = Path(src)
+        if src.is_symlink() or not src.is_file():
+            raise RuntimeError('unsafe Git mirror file: ' + str(src))
+        parts = src.relative_to(source).parts
+        if (len(parts) == 3 and parts[0] == 'objects'
+                and ((parts[1] == 'pack' and src.suffix in ('.pack', '.idx', '.rev', '.bitmap'))
+                     or (re.fullmatch(r'[0-9a-f]{2}', parts[1])
+                         and re.fullmatch(r'[0-9a-f]{38}|[0-9a-f]{62}', parts[2])))):
+            os.link(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    shutil.copytree(source, destination, symlinks=False,
+                    copy_function=copy_object_or_metadata)
 
 
 def atomic_json(path, value):
@@ -493,7 +535,7 @@ def verify_sources(inputs, mirrors):
 def firstboot(body, *, trim=True, shared_warm_cache=False):
     # Disposable configured swap inside the QCOW2 overlay prevents guest OOM.
     # Task scratch overlays are truncated/recreated between tasks, so fstrim on
-    # every warm/replay only burns HDD time; permanent common/repo images still trim.
+    # every warm task only burns HDD time; permanent common/repo images still trim.
     trim_step = r'''
         elif ! template_step filesystem-trim fstrim -av; then
             echo 'failed to reclaim temporary guest swap blocks'
@@ -632,7 +674,7 @@ def load_module(name, path):
 
 
 def generation_identity(resolved):
-    """Called only after package resolution, offline replay and disk validation."""
+    """Called only after package resolution, setup-cache preparation and disk validation."""
     return hashlib.sha256(json.dumps(resolved, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
@@ -959,7 +1001,7 @@ def build(args):
             if path.is_symlink() or (path.exists() and path.stat().st_uid != 0):
                 raise RuntimeError('untrusted host mirror')
             if not path.exists():
-                shutil.copytree(source, path, symlinks=False)
+                copy_git_mirror(source, path)
             else:
                 # Pull only from the immutable local pool, never from origin.
                 refs = capture("git", "--git-dir", str(source), "for-each-ref", "--format=%(refname)").decode().splitlines()
@@ -995,7 +1037,7 @@ def build(args):
             if destination.is_symlink():
                 raise RuntimeError("untrusted submodule cache path")
             if not destination.exists():
-                shutil.copytree(origin, destination, symlinks=False)
+                copy_git_mirror(origin, destination)
             cmd("git", "--git-dir", str(destination), "cat-file", "-e", commit + "^{commit}")
             return destination
 
@@ -1025,27 +1067,6 @@ def build(args):
                         "if reusable:",
                         "    proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')",
                         "    json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)",
-                        "    json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
-                    ]
-            elif mode in {"replay", "replay-recover"}:
-                delivered = {**cache, "path": "/opt/swe-gym-task/setup-cache.tar.gz"}
-                if cache.get("cache_format") == 2:
-                    delivered["wheel_store"] = "/opt/swe-gym-task/wheel-cas"
-                completion = {"schema": TASK_RUNTIME_SCHEMA, "kind": "task-replay",
-                              "logical_task_id": item["instance_id"],
-                              "cache_format": cache.get("cache_format", 1),
-                              "cache_sha256": cache["sha256"]}
-                lines.append("cache=" + repr(delivered))
-                if mode == "replay":
-                    lines += [
-                        "module['replay_task'](item,artifact,cache)",
-                        "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
-                    ]
-                else:
-                    lines += [
-                        "reusable=module['replay_task_ready'](item)",
-                        "json.dump({'reusable':bool(reusable)},open('/opt/swe-gym-task/recovery.json','w'),sort_keys=True)",
-                        "if reusable:",
                         "    json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
                     ]
             else:
@@ -1178,26 +1199,6 @@ def build(args):
                     finally: os.close(fd)
                 return wheels
 
-            def stage_task_wheels(incoming, cache_record):
-                cache_format = cache_record.get("cache_format", 1)
-                if type(cache_format) is not int:
-                    raise RuntimeError("unsupported persisted setup-cache format")
-                if cache_format != 2:
-                    return
-                wheels = checked_wheel_files(cache_record.get("wheel_files"))
-                folder = incoming / "wheel-cas"
-                folder.mkdir()
-                unique = {}
-                for record in wheels.values():
-                    sha, size = record["sha256"], record["size"]
-                    previous = unique.setdefault(sha, size)
-                    if previous != size:
-                        raise RuntimeError("wheel SHA-256 size collision")
-                for sha, size in unique.items():
-                    source = wheel_cas / sha
-                    if not verify_wheel_object(source, sha, size):
-                        raise RuntimeError("persisted wheel CAS object changed")
-                    os.link(source, folder / sha)
             for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
                 free_space(staged, margin)
                 key = tools.artifact_id("task_source", logical)
@@ -1350,7 +1351,7 @@ def build(args):
                 target = conda_root / sha / filename
                 target.parent.mkdir(parents=True)
                 os.link(source, target)
-            shutil.copytree(os_folder, payload / "os-artifacts")
+            shutil.copytree(os_folder, payload / "os-artifacts", copy_function=os.link)
             installer = payload / "miniconda.sh"
             cache_installer = cache_root / ("miniconda-" + MINICONDA_SHA256 + ".sh")
             if cache_installer.exists():
@@ -1366,7 +1367,7 @@ def build(args):
                 if downloaded.is_symlink() or not downloaded.is_file() or digest(downloaded) != MINICONDA_SHA256:
                     raise RuntimeError("Miniconda pool object missing or corrupted")
                 os.link(downloaded, cache_installer)
-            shutil.copyfile(cache_installer, installer)
+            os.link(cache_installer, installer)
 
             # Import verified wheel/sdist and npm bytes from the *same* pool
             # that the unprivileged resolver produced. Builders never refetch.
@@ -1542,7 +1543,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             # retries.  They live outside the staged generation, so a successful
             # publication never needs to delete a volume.  Migrate the historical
             # in-stage scratch pair once if an interrupted old builder left it there.
-            for scratch_name in ("task-warm.qcow2", "task-replay.qcow2"):
+            for scratch_name in ("task-warm.qcow2",):
                 legacy = staged / scratch_name
                 current_scratch = scratch_root / scratch_name
                 if legacy.exists() or legacy.is_symlink():
@@ -1646,8 +1647,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                                     cache_record.get("allowed_template_id") != item["template_id"] or
                                     cache_record.get("source_identity") != source_record["source_identity"] or
                                     Path(cache_record.get("path", "")) != expected_relative or
-                                    done.get("offline") != {"base_commit": item["base_commit"],
-                                                            "env_hash": item["env_hash"], "offline": True} or
+                                    done.get("prepared") != prepared_setup_proof(item, cache_record) or
                                     not isinstance(done.get("inventories"), dict) or
                                     not isinstance(done.get("vcs"), list)):
                                 continue
@@ -1716,7 +1716,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     target = incoming / 'vcs' / (key + '.git')
                     target.parent.mkdir(exist_ok=True)
                     if not target.exists():
-                        shutil.copytree(mirror, target, symlinks=False)
+                        copy_git_mirror(mirror, target)
                     cmd('git', '--git-dir', str(target), 'cat-file', '-e', commit + '^{commit}')
                     cmd('git', '--git-dir', str(target), 'update-ref', 'refs/heads/frozen', commit)
                     cmd('git', '--git-dir', str(target), 'symbolic-ref', 'HEAD', 'refs/heads/frozen')
@@ -1730,7 +1730,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     index.append({'url':base_url,'commit':commit,'archive':target.name})
                 (incoming / 'vcs-index.json').write_text(json.dumps(index, sort_keys=True))
 
-            offline_proofs, vcs_provenance, task_inventories = {}, {}, {}
+            prepared_proofs, vcs_provenance, task_inventories = {}, {}, {}
             incoming = scratch_root / "swe-gym-task"
             scratch_tasks_root = scratch_root / "tasks"
             scratch_tasks_root.mkdir(mode=0o700, exist_ok=True)
@@ -1739,27 +1739,18 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 task_scratch = scratch_tasks_root / ("task-" + quote(logical, safe="-_."))
                 task_scratch.mkdir(mode=0o700, exist_ok=True)
                 warm = task_scratch / "warm.qcow2"
-                replay = task_scratch / "replay.qcow2"
-                # Historical fixed scratch disks may still contain a valid,
-                # interrupted environment. Inspect them read-only and select
-                # the matching task; do not overwrite/move/rebase the image.
-                for kind, candidate in (("warm", scratch_root / "task-warm.qcow2"),
-                                        ("replay", scratch_root / "task-replay.qcow2")):
-                    current = warm if kind == "warm" else replay
-                    if (not current.exists() and candidate.exists() and
-                            scratch_uses_common(candidate) and
-                            guest_json_optional(candidate, "/opt/swe-gym-task/item.json") == item):
-                        if kind == "warm":
-                            warm = candidate
-                        else:
-                            replay = candidate
-                        print("found preserved historical " + kind + " scratch for " + logical, flush=True)
+                # An interrupted warm run can be reused without rebuilding it.
+                candidate = scratch_root / "task-warm.qcow2"
+                if (not warm.exists() and candidate.exists() and
+                        scratch_uses_common(candidate) and
+                        guest_json_optional(candidate, "/opt/swe-gym-task/item.json") == item):
+                    warm = candidate
+                    print("found preserved historical warm scratch for " + logical, flush=True)
                 source_record = artifacts[mapping[logical]["task_source"]]
                 ckpt_name = ("task-v" + str(TASK_RUNTIME_SCHEMA) + "-" +
                              tools.artifact_id("task_source", logical) + ".json")
-                # Older schema-2 builds used task-v2-<artifact>-<fingerprint>.json.
-                # Keep the old file and adopt its payload under the new stable
-                # name. The full artifact/offline checks below still apply.
+                # Adopt only matching-schema checkpoints; the isolated warm
+                # cache proof is checked before reuse.
                 if not (checkpoints / ckpt_name).exists():
                     prefix = ckpt_name.removesuffix(".json") + "-"
                     for previous in sorted(checkpoints.glob(prefix + "*.json")):
@@ -1783,21 +1774,20 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                             archive.is_symlink() or not archive.is_file() or
                             digest(archive) != cache_record["sha256"] or
                             archive.stat().st_size != cache_record["size"] or
-                            done["offline"] != {"base_commit": item["base_commit"],
-                                                "env_hash": item["env_hash"], "offline": True}):
+                            done.get("prepared") != prepared_setup_proof(item, cache_record)):
                         raise RuntimeError("verified task checkpoint changed; refusing unsafe reuse")
                     ensure_cache_wheels(cache_record, staged)
                     artifacts[mapping[logical]["setup_cache"]] = cache_record
                     vcs_provenance[logical] = done["vcs"]
                     task_inventories[logical] = done["inventories"]
-                    offline_proofs[logical] = done["offline"]
+                    prepared_proofs[logical] = done["prepared"]
                     print("reused verified task: " + logical, flush=True)
                     continue
 
                 _discard(incoming)
                 incoming.mkdir(mode=0o700)
                 (incoming / "item.json").write_text(json.dumps(item))
-                shutil.copyfile(staged / source_record["path"], incoming / "source.tar.gz")
+                os.link(staged / source_record["path"], incoming / "source.tar.gz")
                 stage_pinned_vcs(logical, incoming)
 
                 warm_boot, warm_completion = task_boot(item, source_record, mode="warm")
@@ -1851,45 +1841,18 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     "repo_setup": guest_json(warm, "/opt/swe-gym-lite/task-provenance/" + logical + ".setup.json"),
                     "eval_setup": guest_json(warm, "/opt/swe-gym-lite/task-provenance/" + logical + ".json")}
                 archive.chmod(0o444)
-                shutil.copyfile(archive, incoming / "setup-cache.tar.gz")
-                stage_task_wheels(incoming, cache_record)
-
-                replay_boot, replay_completion = task_boot(item, source_record, mode="replay", cache=cache_record)
-                expected_offline = {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}
-                replay_matches_item = (scratch_uses_common(replay) and
-                                       guest_json_optional(replay, "/opt/swe-gym-task/item.json") == item)
-                replay_ready = (replay_matches_item and
-                                completion_matches(replay, TASK_COMPLETION, replay_completion))
-                replay_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".replay.serial.log")
-                if replay_ready:
-                    print("reused completed task replay scratch: " + logical, flush=True)
-                else:
-                    if replay_matches_item:
-                        recovery_boot, _ = task_boot(item, source_record, mode="replay-recover", cache=cache_record)
-                        print("recovering completed work from interrupted task replay scratch: " + logical, flush=True)
-                        provision(replay, recovery_boot, incoming, network=False, trim=False,
-                                  serial_log=replay_serial, refresh_runtime=True)
-                        recovery = guest_json_optional(replay, "/opt/swe-gym-task/recovery.json")
-                        replay_ready = (recovery == {"reusable": True} and
-                                        completion_matches(replay, TASK_COMPLETION, replay_completion))
-                    if not replay_ready:
-                        replay = reset_scratch_overlay(replay, common)
-                        provision(replay, replay_boot, incoming, network=False,
-                                  completion=(TASK_COMPLETION, replay_completion),
-                                  trim=False, serial_log=replay_serial, refresh_runtime=True)
-                offline_proofs[logical] = guest_json(replay, "/opt/swe-gym-task/offline-proof.json")
-                if offline_proofs[logical] != {"base_commit": item["base_commit"], "env_hash": item["env_hash"], "offline": True}:
-                    raise RuntimeError("fresh task replay proof differs from exact base/environment")
+                prepared_proofs[logical] = prepared_setup_proof(item, cache_record)
                 write_checkpoint(ckpt_name, {"logical_task_id": logical,
                     "task_runtime_schema": TASK_RUNTIME_SCHEMA,
                     "cache_record": cache_record, "vcs": vcs_provenance[logical],
-                    "inventories": task_inventories[logical], "offline": offline_proofs[logical]})
+                    "inventories": task_inventories[logical],
+                    "prepared": prepared_proofs[logical]})
                 # Per-task scratch disks remain addressable and are never truncated.
                 # A later fetch can salvage interrupted setups without reinstallation.
                 shutil.rmtree(incoming)
             atomic_json(audit / "task-inventories.json", task_inventories)
             atomic_json(audit / "vcs-provenance.json", vcs_provenance)
-            atomic_json(audit / "offline-setups.json", offline_proofs)
+            atomic_json(audit / "prepared-setups.json", prepared_proofs)
 
             repos = staged / "repos"
             repos.mkdir(exist_ok=True)
@@ -1952,8 +1915,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 record = artifacts[mapping[logical]["task_source"]]
                 tools.validate_artifact(item, staged / record["path"], record)
             expected_tasks = len(inputs["tasks"]); expected_repos = len(repos_set); expected_envs = len(inputs["environments"])
-            if len(mapping) != expected_tasks or len(templates) != expected_repos or len(environments) != expected_envs or len(offline_proofs) != expected_tasks:
-                raise RuntimeError("final task/template/environment/replay coverage changed")
+            if len(mapping) != expected_tasks or len(templates) != expected_repos or len(environments) != expected_envs or len(prepared_proofs) != expected_tasks:
+                raise RuntimeError("final task/template/environment/setup-cache coverage changed")
 
             referenced_wheels = {}
             wheel_reference_bytes = 0
@@ -2001,7 +1964,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 "cache_provenance": {path.name: digest(path) for path in sorted(audit.glob('*.downloads.json'))},
                 "artifacts": artifacts, "task_artifacts": mapping, "wheel_cas": wheel_cas_manifest,
                 "templates": templates, "isolation_validation": isolations,
-                "offline_setups_sha256": digest(audit / 'offline-setups.json')}
+                "prepared_setups_sha256": digest(audit / 'prepared-setups.json')}
             # All resolved input bytes AND final QCOW2 hashes are now known. Disk
             # backings are relative, so the final directory name is not an input.
             generation = generation_identity(resolved)

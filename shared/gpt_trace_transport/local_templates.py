@@ -24,7 +24,7 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
-TASK_RUNTIME_SCHEMA = 3
+TASK_RUNTIME_SCHEMA = 4
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "scripts/verified_resolver_bridge.py",
@@ -425,7 +425,7 @@ def verify_local_validation(folder, manifest, *, expected, hasher=digest, comple
             or not compatible_template_identity(validation["compatibility"], expected)):
         raise ValueError("locally validated generation identity/compatibility differs")
     files = validation["files"]
-    if not isinstance(files, dict) or not {"manifest.json", "resolved-inputs.json", "common.qcow2", "audit/offline-setups.json"} <= set(files):
+    if not isinstance(files, dict) or not {"manifest.json", "resolved-inputs.json", "common.qcow2", "audit/prepared-setups.json"} <= set(files):
         raise ValueError("local generation byte inventory is incomplete")
     if len(files) > 50000: raise ValueError("oversized local generation inventory")
     for name, row in files.items():
@@ -446,7 +446,7 @@ def verify_local_validation(folder, manifest, *, expected, hasher=digest, comple
             raise ValueError("local generation file population differs")
         selected = files
     else:
-        selected = {name: files[name] for name in ("manifest.json", "resolved-inputs.json", "audit/offline-setups.json")}
+        selected = {name: files[name] for name in ("manifest.json", "resolved-inputs.json", "audit/prepared-setups.json")}
     for key, artifact in manifest.get("artifacts", {}).items():
         name = artifact.get("path")
         relative(name)
@@ -514,9 +514,10 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
     coverage = contract_coverage(source_root)
     if manifest.get("invariants") != coverage or len(manifest.get("templates", {})) != coverage["repos"] or len(manifest.get("task_artifacts", {})) != coverage["tasks"] or len(manifest.get("env_mapping", {})) != coverage["env_hashes"]:
         raise ValueError("local Lite coverage changed")
-    proof = json.loads((folder / "audit/offline-setups.json").read_bytes())
-    if digest(folder / "audit/offline-setups.json") != resolved.get("offline_setups_sha256") or set(proof) != set(manifest["task_artifacts"]) or any(not isinstance(x, dict) or x.get("offline") is not True for x in proof.values()):
-        raise ValueError("local fresh isolated replay proof differs")
+    proof = json.loads((folder / "audit/prepared-setups.json").read_bytes())
+    if (digest(folder / "audit/prepared-setups.json") != resolved.get("prepared_setups_sha256")
+            or not isinstance(proof, dict) or set(proof) != set(manifest["task_artifacts"])):
+        raise ValueError("local prepared setup proof differs")
     contract = json.loads((Path(source_root) / RUNTIME / "contract.json").read_bytes())
     if digest(Path(source_root) / RUNTIME / "contract.json") != expected["pins"]["contract_sha256"]:
         raise ValueError("installed native Lite contract differs")
@@ -541,8 +542,15 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
             row != clean for row in isolations.values()):
         raise ValueError("permanent template source-isolation proof differs")
     for logical, task in contract["tasks"].items():
-        if proof[logical] != {"base_commit": task["base_commit"], "env_hash": task["env_hash"], "offline": True}:
-            raise ValueError("local replay used a different task base/environment")
+        setup_key = manifest["task_artifacts"][logical].get("setup_cache")
+        setup_record = manifest["artifacts"].get(setup_key, {})
+        expected_proof = {"schema": TASK_RUNTIME_SCHEMA,
+                          "base_commit": task["base_commit"],
+                          "env_hash": task["env_hash"],
+                          "setup_cache_sha256": setup_record.get("sha256"),
+                          "network_isolated": True}
+        if proof[logical] != expected_proof:
+            raise ValueError("local prepared setup does not match the sealed cache/task")
         mapping = manifest["task_artifacts"][logical]
         if mapping.get("template_id") != task["template_id"]:
             raise ValueError("local task/repository template mapping differs")

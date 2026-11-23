@@ -55,7 +55,7 @@ def run(*args, cwd=None, env=None, input=None):
 
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 BUILDER_WHEEL_STORE = Path("/opt/swe-gym-task/wheel-cas")
-TASK_RUNTIME_SCHEMA = 3
+TASK_RUNTIME_SCHEMA = 4
 
 
 def _phase(item, phase, state, elapsed=None):

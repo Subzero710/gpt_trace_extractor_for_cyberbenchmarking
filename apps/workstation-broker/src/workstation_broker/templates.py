@@ -77,7 +77,7 @@ class TemplateRegistry:
         manifest_path = trusted(folder / "manifest.json", self.root)
         manifest = json.loads(manifest_path.read_bytes())
         if manifest.get("generation") != generation: raise ValueError("local generation identity differs")
-        files = [folder / n for n in ("manifest.json", "resolved-inputs.json", "local-validation.json", "audit/offline-setups.json")]
+        files = [folder / n for n in ("manifest.json", "resolved-inputs.json", "local-validation.json", "audit/prepared-setups.json")]
         expected = self.expected()
         signature = (tuple(file_signature(p) for p in files), self._golden_signature)
         first = self._generation_checks.get(generation) != signature

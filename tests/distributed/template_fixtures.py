@@ -171,7 +171,6 @@ def fixture(parent, *, activate=True, label="repo"):
                                                              "size": shared_wheel.stat().st_size}}
     for logical, task in contract["tasks"].items():
         mapping[logical] = {"template_id": task["template_id"]}
-        proofs[logical] = {"base_commit": task["base_commit"], "env_hash": task["env_hash"], "offline": True}
         for kind in ("task_source", "setup_cache"):
             key = tools.artifact_id(kind, logical)
             output = folder / ("sources" if kind == "task_source" else "setup-caches") / (key + ".tar.gz")
@@ -183,12 +182,16 @@ def fixture(parent, *, activate=True, label="repo"):
                 "path": output.relative_to(folder).as_posix(), "size": output.stat().st_size, "sha256": local.digest(output)}
             if kind == "setup_cache":
                 artifacts[key].update(cache_format=2, wheel_files=wheel_files)
+                proofs[logical] = {"schema": local.TASK_RUNTIME_SCHEMA,
+                    "base_commit": task["base_commit"], "env_hash": task["env_hash"],
+                    "setup_cache_sha256": artifacts[key]["sha256"],
+                    "network_isolated": True}
                 name = key + ".downloads.json"
                 local.atomic_json(folder / "audit" / name, {})
                 caches[name] = local.digest(folder / "audit" / name)
     environments = {key: {"conda": [], "pip": []} for key in contract["environments"]}
     inventories = {key: {"repo_setup": {}, "eval_setup": {}} for key in contract["tasks"]}
-    for name, value in (("offline-setups.json", proofs), ("environment-inventories.json", environments),
+    for name, value in (("prepared-setups.json", proofs), ("environment-inventories.json", environments),
                         ("environment-downloads.json", {}), ("task-inventories.json", inventories),
                         ("vcs-provenance.json", {key: {} for key in contract["tasks"]})):
         local.atomic_json(folder / "audit" / name, value)
@@ -208,7 +211,7 @@ def fixture(parent, *, activate=True, label="repo"):
         "golden": {"sha256": expected["golden_sha256"], "provenance": expected["golden_provenance"]},
         "builder_sources": {**{(local.RUNTIME / name).as_posix(): sha for name, sha in build_contract["runtime_sources"].items()},
             local.BUILDER.as_posix(): build_contract["builder_sha256"]}, "environments": environments, "resolved_os": os_manifest,
-        "cache_provenance": caches, "offline_setups_sha256": local.digest(folder / "audit/offline-setups.json"),
+        "cache_provenance": caches, "prepared_setups_sha256": local.digest(folder / "audit/prepared-setups.json"),
         **{key: local.digest(folder / "audit" / name) for name, key in (
             ("environment-downloads.json", "environment_downloads_sha256"),
             ("task-inventories.json", "task_inventories_sha256"), ("vcs-provenance.json", "vcs_provenance_sha256"))}}

@@ -437,12 +437,27 @@ def _pool_progress(stage, completed=None, total=None, unit='', details='', *, fo
 
 
 
+_STATIC_RECIPE_DEADLINE = contextvars.ContextVar('static_recipe_deadline', default=None)
+
+
+def _static_recipe_timeout(timeout):
+    """Honor one uninterrupted budget for each recipe, including lock waits."""
+    deadline = _STATIC_RECIPE_DEADLINE.get()
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('static recipe exceeded versioned total deadline')
+    return min(timeout, remaining)
+
+
 def invoke(argv, *, cwd=None, capture=False, env=None, timeout=None):
     command = [str(v) for v in argv]
     if timeout is None:
         timeout = _operation_timeout()
     if type(timeout) not in (int, float) or not 0 < timeout:
         raise ValueError('invalid subprocess timeout')
+    timeout = _static_recipe_timeout(timeout)
     if _POOL_PROGRESS is None:
         print('[pool]', ' '.join(command), flush=True)
         try:
@@ -708,7 +723,7 @@ def _shared_future_result(future):
 
 @contextlib.contextmanager
 def _bounded_lock(lock):
-    if not lock.acquire(timeout=_operation_timeout()):
+    if not lock.acquire(timeout=_static_recipe_timeout(_operation_timeout())):
         raise TimeoutError('versioned acquisition lock deadline reached')
     try:
         yield
@@ -1217,7 +1232,8 @@ class _StaticGitReadCache:
         if owner:
             try:
                 raw = subprocess.check_output(
-                    ['git', '--git-dir', str(mirror), 'cat-file', 'blob', oid], timeout=60)
+                    ['git', '--git-dir', str(mirror), 'cat-file', 'blob', oid],
+                    timeout=_static_recipe_timeout(_operation_timeout()))
                 if len(raw) > MAX_SOURCE:
                     raise RuntimeError('source metadata too large for Git object: ' + oid)
                 content = raw.decode('utf-8')
@@ -1251,17 +1267,22 @@ class _StaticGitReadCache:
 
 
 @contextlib.contextmanager
-def _static_task_completions(ordered_tasks, workers, analyze):
+def _static_task_completions(ordered_tasks, workers, analyze, *, stage='Static task analysis'):
     """Publish actual completions without changing deterministic merge order."""
     completed = 0
     progress_lock = threading.Lock()
 
     def tracked(item):
         nonlocal completed
-        result = analyze(item)
+        deadline = _STATIC_RECIPE_DEADLINE.set(time.monotonic() + _operation_timeout())
+        try:
+            result = analyze(item)
+            _static_recipe_timeout(_operation_timeout())
+        finally:
+            _STATIC_RECIPE_DEADLINE.reset(deadline)
         with progress_lock:
             completed += 1
-            _pool_progress('Static task analysis', completed, len(ordered_tasks), 'recipes')
+            _pool_progress(stage, completed, len(ordered_tasks), 'recipes')
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
@@ -1272,7 +1293,7 @@ def _static_task_completions(ordered_tasks, workers, analyze):
 def _merge_static_task_result(result, task_plan, groups, apt_requested, apt_upgrade_tasks,
                               vcs, issues):
     """Preserve the old sorted-task aggregation order, without shared worker writes."""
-    logical, plan, own_groups, own_apt, own_upgrades, own_vcs, own_issues = result
+    logical, plan, own_groups, own_apt, own_upgrades, own_vcs, own_issues = result[:7]
     if logical in task_plan:
         raise RuntimeError('duplicate static analysis task identity: ' + logical)
     task_plan[logical] = plan
@@ -5975,8 +5996,26 @@ def _native_acquired_archive(pool,runtime,url,sha,category,key):
     return pool.download(url,category,key,sha=sha)
 
 
-def _native_acquire_build_dependencies(pool,target,packages):
-    """Acquire the observed PEP 517 closure before publishing its parent plan."""
+
+def _merge_deferred_build_groups(pool, groups):
+    """Add verified native build roots to the single global Pip closure plan."""
+    for key,group in sorted(getattr(pool,'_deferred_build_groups',{}).items()):
+        previous=groups.get(key)
+        if previous is None:
+            groups[key]=group
+        else:
+            if (previous['target']!=group['target']
+                    or previous['requirements']!=group['requirements']
+                    or previous['constraints']!=group['constraints']
+                    or previous['preferred_versions']!=group['preferred_versions']
+                    or previous['no_deps'] is not group['no_deps']):
+                raise RuntimeError('inconsistent deferred PEP 517 closure identity: '+key)
+            previous['required']=True
+            previous['steps'].extend(group['steps'])
+
+
+def _native_acquire_build_dependencies(pool,target,packages,*,defer=False):
+    """Acquire PEP 517 build closures, or register them for the global planner."""
     plans = {}
     groups = set()
     for row in packages:
@@ -5991,10 +6030,23 @@ def _native_acquire_build_dependencies(pool,target,packages):
                 groups.add(tuple(sorted(set(requirements))))
     for requires in sorted(groups):
         key=pip_group_key(target,requires)
-        acquire_pip_group(pool,key,{
-            'target':target.as_dict(),'requirements':sorted(set(requires)),
-            'constraints':[],'no_deps':False,'required':True,
-            'tasks':[],'steps':['observed PEP517 build environment']})
+        group={'target':target.as_dict(),'requirements':sorted(set(requires)),
+               'constraints':[],'preferred_versions':{},'no_deps':False,'required':True,
+               'tasks':[],'steps':['observed PEP517 build environment']}
+        if defer:
+            # Native metadata discovery must not materialize Pip closures before
+            # all task roots are known and the global plan is constructed.
+            with _bounded_lock(pool._state_lock):
+                pending=getattr(pool,'_deferred_build_groups',None)
+                if pending is None:
+                    pending={}
+                    pool._deferred_build_groups=pending
+                previous=pending.setdefault(key,group)
+                if (previous['target']!=group['target']
+                        or previous['requirements']!=group['requirements']):
+                    raise RuntimeError('conflicting native PEP 517 build group')
+            continue
+        acquire_pip_group(pool,key,group)
         plans[key] = digest(pool.stage/'metadata'/('pip-plan-'+key+'.json'))
     return plans
 
@@ -6309,7 +6361,8 @@ def _native_populate_submodules(pool, runtime, mirror, commit, checkout, ancestr
             raise RuntimeError('materialized Git submodule differs from pinned gitlink: ' + path)
         _native_populate_submodules(pool, runtime, source, sha, destination, (*ancestry, node))
 
-def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, task_id=None):
+def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, task_id=None,
+                           defer_build_closures=False):
     """Evaluate exact pinned local build metadata, concurrently per source identity.
 
     Immutable checkouts, pip reports and PEP 517 TMPDIRs are identity-private.
@@ -6390,7 +6443,8 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
         observed = _native_metadata_command(
             argv, {**runtime, '_native_source_context': source_context}, report.parent)
         _native_acquire_build_dependencies(pool, target, [
-            {'kind': 'sdist', 'build_requirements': observed}])
+            {'kind': 'sdist', 'build_requirements': observed}],
+            defer=defer_build_closures)
         result = json.loads(report.read_text())
         installs = result.get('install') or []
         if len(installs) != 1:
@@ -8478,7 +8532,7 @@ def main(argv=None):
     source_cache=_StaticGitReadCache(static_workers)
     _pool_progress('Static task analysis',0,len(ordered_tasks),'recipes')
 
-    def analyze_static_task(item):
+    def analyze_static_task(item, native_metadata=None):
         logical,task=item
         # The existing recipe evaluator below is preserved verbatim except for
         # isolated mutable accumulators, Git cache access and native isolation.
@@ -8506,6 +8560,18 @@ def main(argv=None):
         env_pip_target=environment_pip_target.get(env_hash,task_target)
         env_requirements=set(requirements_by_env[env_hash]);env_vcs=set(vcs_by_env[env_hash])
         reqs=set();vcs_task=set();vcs_optional=set()
+        needs_native=False
+        def native_project_metadata():
+            nonlocal needs_native
+            needs_native=True
+            if native_metadata is None:
+                # The static pass only records an exact native-metadata request.
+                # No interpreter, backend or closure may run in this phase.
+                return set(),set()
+            if logical not in native_metadata:
+                raise RuntimeError('native metadata result missing for '+logical)
+            dependencies,remote=native_metadata[logical]
+            return set(dependencies),set(remote)
         explicit,reqfiles,_external,problems,extras,constraint_files,steps=pip_commands(commands)
         inline_constraints = set()
         for command in commands:
@@ -8518,9 +8584,7 @@ def main(argv=None):
         # Native metadata is authoritative for actual local installations,
         # including static projects and --no-deps build-time requirements.
         if any(step['local_project'] for step in steps):
-            reqs, vcs_task = _static_native_local_metadata(
-                pool, task_target, mirror, commit, commands, extras,
-                task_id=logical)
+            reqs, vcs_task = native_project_metadata()
         else:
             raw=get_file('pyproject.toml')
             if raw:
@@ -8529,9 +8593,7 @@ def main(argv=None):
                     reqs.update(dep);vcs_task.update(git)
                     dynamic={issue for issue in problem if issue.startswith('dynamic PEP621 ')}
                     if dynamic:
-                        native_deps,native_vcs=_static_native_local_metadata(
-                            pool,task_target,mirror,commit,commands,extras,
-                            task_id=logical)
+                        native_deps,native_vcs=native_project_metadata()
                         reqs.update(native_deps);vcs_task.update(native_vcs)
                     for ptext in problem:
                         if ptext not in dynamic:issue(logical,ptext)
@@ -8548,9 +8610,7 @@ def main(argv=None):
                 setup_deps.update(deps);setup_remote.update(remote);setup_problems.extend(problems)
             reqs.update(setup_deps);vcs_task.update(setup_remote)
             if setup_problems:
-                native_deps,native_vcs=_static_native_local_metadata(
-                    pool,task_target,mirror,commit,commands,extras,
-                    task_id=logical)
+                native_deps,native_vcs=native_project_metadata()
                 reqs.update(native_deps)
                 vcs_task.update(native_vcs)
 
@@ -8691,15 +8751,55 @@ def main(argv=None):
                             # apt-get install packages are still acquired below.
                             'apt_upgrade_suppressed':logical in apt_upgrade_tasks}
         vcs.update(required_vcs);vcs.update(normalized_optional)
+        request=(task_target,mirror,commit,commands,extras) if needs_native else None
         return (logical,task_plan[logical],groups,apt_requested,
-                apt_upgrade_tasks,vcs,own_issues)
+                apt_upgrade_tasks,vcs,own_issues,request)
 
-    # Completion counters advance as each worker finishes, not as the first
-    # sorted Future unblocks. Aggregation itself retains the original order.
-    with _static_task_completions(ordered_tasks, static_workers, analyze_static_task) as results:
+    # The first pass performs only local Git/file/recipe analysis. It cannot
+    # download Conda, install Python or invoke a PEP 517 backend. Reject known
+    # static errors before beginning any native metadata acquisition.
+    with _static_task_completions(ordered_tasks,static_workers,analyze_static_task) as results:
+        static_results=list(results)
+    static_issues=sorted({issue for result in static_results for issue in result[6]})
+    if static_issues:
+        write_new(stage/'metadata'/'static-errors.json',json.dumps(static_issues,indent=2))
+        for issue in static_issues:
+            print('[pool] static issue: '+issue,file=sys.stderr,flush=True)
+        raise RuntimeError('static dependency analysis rejected before native resolution: '
+                           +str(len(static_issues))+' issue(s); first: '+static_issues[0])
+
+    requests={result[0]:result[7] for result in static_results if result[7] is not None}
+    native_metadata={}
+    if requests:
+        _pool_progress('Native project metadata',0,len(requests),'projects')
+        def resolve_native(item):
+            logical,(target,mirror,commit,commands,extras)=item
+            requirements,remote=_static_native_local_metadata(
+                pool,target,mirror,commit,commands,extras,task_id=logical,
+                defer_build_closures=True)
+            return logical,(requirements,remote)
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(static_workers,len(requests)),
+                thread_name_prefix='native-project-metadata') as executor:
+            pending={executor.submit(resolve_native,item):item[0]
+                     for item in sorted(requests.items())}
+            for future in _bounded_completed(pending):
+                logical,value=_shared_future_result(future)
+                native_metadata[logical]=value
+                _pool_progress('Native project metadata',len(native_metadata),
+                               len(requests),'projects')
+
+    # Assemble the final task plans only after exact dynamic roots have been
+    # discovered. This local pass does no Conda/Pip network or backend work.
+    _pool_progress('Dependency plan assembly',0,len(ordered_tasks),'recipes')
+    with _static_task_completions(
+            ordered_tasks,static_workers,
+            lambda item:analyze_static_task(item,native_metadata),
+            stage='Dependency plan assembly') as results:
         for result in results:
             _merge_static_task_result(result,task_plan,groups,apt_requested,
                                       apt_upgrade_tasks,vcs,pool.issues)
+    _merge_deferred_build_groups(pool,groups)
 
     write_new(stage/'metadata'/'apt-policy.json',json.dumps({
         'schema':1,'upgrade_policy':'suppress-on-frozen-golden',
