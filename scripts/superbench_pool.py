@@ -5780,18 +5780,27 @@ import inspect
 import json
 import socket
 import sys
-from pip._internal.build_env import BuildEnvironment
+from pip._internal.build_env import BuildEnvironment, get_runnable_pip
 from pip._internal.cli.main import main
 from pip._internal.utils.subprocess import call_subprocess
 
-if tuple(inspect.signature(BuildEnvironment._install_requirements).parameters) != (
-        'pip_runnable', 'finder', 'requirements', 'prefix', 'kind'):
+signature = inspect.signature(BuildEnvironment.install_requirements)
+if not {'self', 'requirements', 'prefix_as_string', 'kind'} <= set(signature.parameters):
     raise RuntimeError('locked Pip build environment installer API differs')
 channel = socket.socket(fileno=int(sys.argv[1]))
 channel.set_inheritable(False)
 with channel, channel.makefile('rwb') as wire:
-    def install(pip_runnable, finder, requirements, prefix, *, kind):
-        wire.write(json.dumps({'requirements': sorted(set(requirements))}).encode() + b'\n')
+    def install(self, *args, **kwargs):
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        prefix = self._prefixes[arguments['prefix_as_string']]
+        if prefix.setup:
+            raise RuntimeError('Pip build prefix was already initialized')
+        prefix.setup = True
+        requirements = sorted(set(arguments['requirements']))
+        if not requirements:
+            return
+        pip_runnable = get_runnable_pip()
+        wire.write(json.dumps({'requirements': requirements}).encode() + b'\n')
         wire.flush()
         reply = wire.readline()
         if not reply:
@@ -5805,7 +5814,7 @@ with channel, channel.makefile('rwb') as wire:
                              '--no-index', '--no-deps', '--no-compile',
                              '--no-warn-script-location', '--disable-pip-version-check',
                              '--', path], command_desc='install verified build wheel ' + path)
-    BuildEnvironment._install_requirements = staticmethod(install)
+    BuildEnvironment.install_requirements = install
     sys.argv = ['pip', *sys.argv[2:]]
     raise SystemExit(main())
 """

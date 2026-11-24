@@ -171,3 +171,59 @@ def test_build_dependency_producer_uses_verified_cas_and_reuses_exact_selection(
         assert Path(first[0]).samefile(instance.objects / sha[:2] / sha)
     finally:
         instance._pip_cache_context.cleanup()
+
+
+@pytest.mark.parametrize('installer_api', ['finder', 'for_req'])
+def test_launcher_uses_common_build_environment_entrypoint(monkeypatch, installer_api):
+    import socket
+    from types import SimpleNamespace
+    from pip._internal import build_env
+    from pip._internal.cli import main as cli
+    from pip._internal.utils import subprocess as pip_subprocess
+
+    class LegacyEnvironment:
+        def install_requirements(self, finder, requirements, prefix_as_string, *, kind):
+            raise AssertionError('original installer must not execute')
+
+    class ModernEnvironment:
+        def install_requirements(self, requirements, prefix_as_string, *, kind, for_req=None):
+            raise AssertionError('original installer must not execute')
+
+    environment_type = LegacyEnvironment if installer_api == 'finder' else ModernEnvironment
+    environment = environment_type()
+    prefix = SimpleNamespace(path='/fixture/prefix', setup=False)
+    empty = SimpleNamespace(path='/fixture/empty', setup=False)
+    environment._prefixes = {'overlay': prefix, 'normal': empty}
+    calls = []
+    monkeypatch.setattr(build_env, 'BuildEnvironment', environment_type)
+    monkeypatch.setattr(build_env, 'get_runnable_pip', lambda: '/fixture/pip')
+    monkeypatch.setattr(pip_subprocess, 'call_subprocess',
+                        lambda argv, **kwargs: calls.append(argv))
+    parent, child = socket.socketpair()
+    with parent, child:
+        parent.sendall(b'["/fixture/one.whl", "/fixture/two.whl"]\n')
+        fd = child.detach()
+        monkeypatch.setattr(sys, 'argv', ['launcher', str(fd), 'install', '.'])
+
+        def main():
+            def invoke(requirements, layer):
+                if installer_api == 'finder':
+                    environment.install_requirements(object(), requirements, layer, kind='build')
+                else:
+                    environment.install_requirements(requirements, layer, kind='build', for_req=object())
+            invoke([], 'normal')
+            invoke(['one', 'two', 'one'], 'overlay')
+            return 0
+
+        monkeypatch.setattr(cli, 'main', main)
+        with pytest.raises(SystemExit) as error:
+            exec(pool._NATIVE_PIP_BUILD_LAUNCHER, {})
+        assert error.value.code == 0
+        assert json.loads(parent.makefile('rb').readline()) == {'requirements': ['one', 'two']}
+    assert prefix.setup and empty.setup
+    assert len(calls) == 2
+    for argv, wheel in zip(calls, ['one.whl', 'two.whl']):
+        assert argv[:3] == [sys.executable, '/fixture/pip', 'install']
+        assert argv[argv.index('--prefix') + 1] == prefix.path
+        assert {'--no-index', '--no-deps', '--no-compile'} <= set(argv)
+        assert argv[-1] == '/fixture/' + wheel
