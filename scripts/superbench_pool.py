@@ -6354,39 +6354,55 @@ def _native_conda_package_index(pool, runtime, sha, transaction_key):
     guessed ABI requirements or repository repodata is consulted.
     """
     with _bounded_lock(_NATIVE_POOL_LOCK):
-        cached = runtime.setdefault('conda_package_indices', {}).get(sha)
+        completed = runtime.setdefault('conda_package_indices', {})
+        cached = completed.get(sha)
         if cached is not None:
             return cached
-    item = pool.conda_lock['artifacts'][sha]
-    pool.download(item['url'], 'native-python-metadata', transaction_key, sha=sha)
-    filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
-    if (not filename or Path(filename).name != filename
-            or not filename.endswith(('.conda', '.tar.bz2'))):
-        raise RuntimeError('invalid pinned Conda package filename')
-    folder = runtime['root'] / 'package-indices' / sha
-    folder.mkdir(parents=True, exist_ok=True)
-    archive = pool.link_verified_object(sha, folder / filename)
-    # The Miniconda bootstrap is shared between concurrent metadata workers.
-    with runtime['conda_install_lock']:
-        conda = _native_bootstrap(pool, runtime)
-    script = ("import conda_package_handling.api as c, json, pathlib, sys\n"
-              "archive, destination = map(pathlib.Path, sys.argv[1:])\n"
-              "c.extract(str(archive), dest_dir=str(destination), components='info')\n"
-              "metadata = json.loads((destination / 'info/index.json').read_text())\n"
-              "print(json.dumps(metadata, sort_keys=True))\n")
-    extracted = folder / 'extracted-info'
-    result = _native_run([conda.parent / 'python', '-I', '-B', '-c', script,
-                          archive, extracted], runtime,
-                         interpreter=conda.parent / 'python')
-    metadata = json.loads(result)
-    if (not isinstance(metadata, dict)
-            or any(metadata.get(name) != item[name] for name in ('name', 'version', 'build'))
-            or not isinstance(metadata.get('depends', []), list)
-            or not all(isinstance(value, str) and value for value in metadata.get('depends', []))):
-        raise RuntimeError('locked Conda package metadata differs from its pinned identity')
-    with _bounded_lock(_NATIVE_POOL_LOCK):
-        runtime['conda_package_indices'][sha] = metadata
-    return metadata
+        inflight = runtime.setdefault('conda_package_indices_inflight', {})
+        pending = inflight.get(sha)
+        owner = pending is None
+        if owner:
+            pending = _OwnedFuture()
+            inflight[sha] = pending
+    if not owner:
+        return _shared_future_result(pending)
+    try:
+        item = pool.conda_lock['artifacts'][sha]
+        pool.download(item['url'], 'native-python-metadata', transaction_key, sha=sha)
+        filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
+        if (not filename or Path(filename).name != filename
+                or not filename.endswith(('.conda', '.tar.bz2'))):
+            raise RuntimeError('invalid pinned Conda package filename')
+        folder = runtime['root'] / 'package-indices' / sha
+        folder.mkdir(parents=True, exist_ok=True)
+        archive = pool.link_verified_object(sha, folder / filename)
+        # The Miniconda bootstrap is shared between concurrent metadata workers.
+        with runtime['conda_install_lock']:
+            conda = _native_bootstrap(pool, runtime)
+        script = ("import conda_package_handling.api as c, json, pathlib, sys\n"
+                  "archive, destination = map(pathlib.Path, sys.argv[1:])\n"
+                  "c.extract(str(archive), dest_dir=str(destination), components='info')\n"
+                  "metadata = json.loads((destination / 'info/index.json').read_text())\n"
+                  "print(json.dumps(metadata, sort_keys=True))\n")
+        extracted = folder / 'extracted-info'
+        result = _native_run([conda.parent / 'python', '-I', '-B', '-c', script,
+                              archive, extracted], runtime,
+                             interpreter=conda.parent / 'python')
+        metadata = json.loads(result)
+        if (not isinstance(metadata, dict)
+                or any(metadata.get(name) != item[name] for name in ('name', 'version', 'build'))
+                or not isinstance(metadata.get('depends', []), list)
+                or not all(isinstance(value, str) and value for value in metadata.get('depends', []))):
+            raise RuntimeError('locked Conda package metadata differs from its pinned identity')
+    except BaseException as error:
+        pending.set_exception(error)
+        raise
+    else:
+        with _bounded_lock(_NATIVE_POOL_LOCK):
+            completed[sha] = metadata
+            inflight.pop(sha)
+        pending.set_result(metadata)
+        return metadata
 
 
 def _native_minimal_python_packages(pool, runtime, sha):

@@ -267,3 +267,110 @@ def test_static_progress_tracks_actual_completion_without_reordering_results():
     assert observed == [
         ('Static task analysis', 1, 2, 'recipes'),
         ('Static task analysis', 2, 2, 'recipes')]
+
+
+@pytest.fixture
+def conda_index_inputs(tmp_path, monkeypatch):
+    import hashlib
+
+    candidate = pool.Pool(tmp_path / 'stage')
+    runtime = {'root': tmp_path / 'native', 'conda_install_lock': pool._OwnedLock()}
+    artifacts = {}
+    for name in ('generated-one', 'generated-two'):
+        content = name.encode()
+        sha = hashlib.sha256(content).hexdigest()
+        path = candidate.objects / sha[:2] / sha
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        artifacts[sha] = {'name': name, 'version': '1.0', 'build': 'generated',
+                          'url': 'https://example.invalid/' + name + '.conda'}
+    candidate.conda_lock = {'artifacts': artifacts}
+    downloads = []
+    def download(url, category, key, sha):
+        downloads.append(sha)
+        return candidate.reference(sha, category, key, candidate.verify_object(sha))
+    monkeypatch.setattr(candidate, 'download', download)
+    monkeypatch.setattr(pool, '_native_bootstrap', lambda *_: tmp_path / 'conda' / 'bin' / 'conda')
+    try:
+        yield candidate, runtime, artifacts, downloads
+    finally:
+        candidate._pip_cache_context.cleanup()
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_shared_conda_index_has_one_extractor_and_one_outcome(conda_index_inputs, monkeypatch, fail):
+    candidate, runtime, artifacts, downloads = conda_index_inputs
+    sha = next(iter(artifacts))
+    metadata = {key: artifacts[sha][key] for key in ('name', 'version', 'build')}
+    metadata['depends'] = []
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    extractions = []
+    error = RuntimeError('generated extraction failure')
+    original_wait = pool._shared_future_result
+
+    def wait(future):
+        waiting.set()
+        return original_wait(future)
+
+    def extract(argv, _runtime, **_kwargs):
+        archive, destination = map(Path, argv[-2:])
+        extractions.append(destination)
+        assert archive.samefile(candidate.objects / sha[:2] / sha)
+        destination.mkdir()
+        entered.set()
+        assert release.wait(timeout=5)
+        if fail:
+            raise error
+        return json.dumps(metadata).encode()
+
+    monkeypatch.setattr(pool, '_shared_future_result', wait)
+    monkeypatch.setattr(pool, '_native_run', extract)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+        first = workers.submit(pool._native_conda_package_index, candidate, runtime, sha, 'first')
+        assert entered.wait(timeout=5)
+        second = workers.submit(pool._native_conda_package_index, candidate, runtime, sha, 'second')
+        try:
+            assert waiting.wait(timeout=5)
+            assert not second.done()
+        finally:
+            release.set()
+        for future in (first, second):
+            if fail:
+                with pytest.raises(RuntimeError) as caught:
+                    future.result(timeout=5)
+                assert caught.value is error
+            else:
+                assert future.result(timeout=5) == metadata
+    if fail:
+        assert not runtime['conda_package_indices']
+        with pytest.raises(RuntimeError) as caught:
+            pool._native_conda_package_index(candidate, runtime, sha, 'third')
+        assert caught.value is error
+    else:
+        assert not runtime['conda_package_indices_inflight']
+        assert pool._native_conda_package_index(candidate, runtime, sha, 'third') == metadata
+    assert downloads == [sha]
+    assert len(extractions) == 1
+
+
+def test_distinct_conda_indices_extract_concurrently(conda_index_inputs, monkeypatch):
+    candidate, runtime, artifacts, downloads = conda_index_inputs
+    rendezvous = threading.Barrier(len(artifacts), timeout=5)
+
+    def extract(argv, _runtime, **_kwargs):
+        archive, destination = map(Path, argv[-2:])
+        sha = destination.parent.name
+        assert archive.samefile(candidate.objects / sha[:2] / sha)
+        destination.mkdir()
+        rendezvous.wait()
+        return json.dumps({key: artifacts[sha][key] for key in ('name', 'version', 'build')}
+                          | {'depends': []}).encode()
+
+    monkeypatch.setattr(pool, '_native_run', extract)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(artifacts)) as workers:
+        futures = {sha: workers.submit(pool._native_conda_package_index,
+                                       candidate, runtime, sha, sha) for sha in artifacts}
+        for sha, future in futures.items():
+            assert future.result(timeout=10)['name'] == artifacts[sha]['name']
+    assert sorted(downloads) == sorted(artifacts)
+    assert not runtime['conda_package_indices_inflight']
