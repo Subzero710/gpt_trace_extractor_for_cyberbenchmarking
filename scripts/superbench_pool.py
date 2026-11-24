@@ -2034,6 +2034,151 @@ def static_project(file, *, extra_groups=()):
             deps.remove(row);git.add(ref)
     return deps,git,issues
 
+def _declarative_local_metadata(get_file, target, extras, commands):
+    """Classify setuptools dependency declarations without running build code.
+
+    PEP 621 permits a dynamic version without making dependencies dynamic.
+    Legacy setuptools config may also own requirements while setup.py supplies
+    only the version, extension modules or other non-dependency arguments.
+    A non-declarative dependency source is a native metadata request, not a
+    partially evaluated dependency graph.
+    """
+    raw = get_file('pyproject.toml')
+    if not raw:
+        return None
+    data = tomllib.loads(raw)
+    build = data.get('build-system')
+    if (not isinstance(build, dict) or 'backend-path' in build
+            or build.get('build-backend', 'setuptools.build_meta:__legacy__')
+            not in {'setuptools.build_meta', 'setuptools.build_meta:__legacy__'}
+            or not isinstance(build.get('requires'), list)
+            or not all(isinstance(row, str) for row in build['requires'])):
+        return None
+    build_requirements = [_parse_registry_requirement(row) for row in build['requires']]
+    if ('build-backend' not in build and not any(
+            _normalized_package_name(row.name) == 'setuptools' and _marker_active(row, target)
+            for row in build_requirements)):
+        return None
+    roots = tuple(sorted({str(row) for row in build_requirements}))
+    setup = get_file('setup.py')
+    if setup:
+        # Reuse the existing bounded evaluator, including recipe-specific argv
+        # and pinned file reads. Do not infer missing dependencies from errors.
+        for argv in setup_script_invocations(commands):
+            rows, issues = setup_static(setup, extras=extras, get_file=get_file,
+                                        python_version=target.python_full_version,
+                                        setup_argv=argv, declarative_only=True)
+            if rows or issues:
+                return None
+    cfg = get_file('setup.cfg')
+    parsed = configparser.ConfigParser(interpolation=None)
+    if cfg:
+        parsed.read_string(cfg)
+        if parsed.defaults():
+            return None
+        if any(parsed.has_option('options', field) for field in
+               ('setup_requires', 'dependency_links')):
+            return None
+    project = data.get('project')
+    if project is not None:
+        if (not isinstance(project, dict) or not isinstance(project.get('name'), str)
+                or not isinstance(project.get('dynamic', []), list)
+                or not all(isinstance(field, str) for field in project.get('dynamic', []))
+                or {'dependencies', 'optional-dependencies', 'requires-python', 'name'}
+                   & set(project.get('dynamic', []))
+                or not isinstance(project.get('dependencies', []), list)
+                or not isinstance(project.get('optional-dependencies', {}), dict)):
+            return None
+        # A second dependency declaration is not part of this proof. Tool-only
+        # setup.cfg files, however, do not compete with a PEP 621 project table.
+        if (parsed.has_option('options', 'install_requires')
+                or parsed.has_option('options', 'python_requires')
+                or parsed.has_section('options.extras_require')):
+            return None
+        name = project['name']
+        requires_python = project.get('requires-python')
+        dependencies = project.get('dependencies', [])
+        optional = project.get('optional-dependencies', {})
+    else:
+        if (not cfg or not parsed.has_option('metadata', 'name')
+                or not parsed.has_option('options', 'install_requires')):
+            return None
+        name = parsed.get('metadata', 'name')
+        requires_python = parsed.get('options', 'python_requires', fallback=None)
+        def config_rows(section, key):
+            return [line.strip() for line in parsed.get(section, key).splitlines()
+                    if line.strip() and not line.lstrip().startswith('#')]
+        dependencies = config_rows('options', 'install_requires')
+        optional = ({group: config_rows('options.extras_require', group)
+                     for group in parsed.options('options.extras_require')}
+                    if parsed.has_section('options.extras_require') else {})
+    if not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?', name):
+        return None
+    Requirement, SpecifierSet, Version, _, _ = _packaging_symbols()
+    if requires_python is not None:
+        if not isinstance(requires_python, str):
+            return None
+        if not SpecifierSet(requires_python).contains(Version(target.python_full_version),
+                                                      prereleases=True):
+            raise RuntimeError('declared project Requires-Python rejects target')
+    if (not all(isinstance(row, str) for row in dependencies)
+            or not all(isinstance(group, str) and re.fullmatch(r'[A-Za-z0-9_.-]+', group)
+                       and isinstance(rows, list) and all(isinstance(row, str) for row in rows)
+                       for group, rows in optional.items())):
+        return None
+    # Reject conflicting normalized extra keys rather than combining distinct
+    # declarations. File/attribute directives and invalid requirements are not
+    # interpreted as dependency names.
+    if any(row.lstrip().lower().startswith(('file:', 'attr:'))
+           for row in itertools.chain(dependencies, *optional.values())):
+        return None
+    by_extra = {_normalized_package_name(group): rows for group, rows in optional.items()}
+    if len(by_extra) != len(optional):
+        return None
+    selected = (set(by_extra) if '*' in extras else
+                {_normalized_package_name(group) for group in extras})
+    required = set(); remote = set()
+    visited = set()
+    def consume(rows, contexts):
+        for row in rows:
+            requirement = Requirement(normalize_legacy_source_requirement(row))
+            if (requirement.marker is not None and not any(
+                    requirement.marker.evaluate({**target.markers, 'extra': group})
+                    for group in contexts)):
+                continue
+            if _normalized_package_name(requirement.name) == _normalized_package_name(name):
+                if requirement.url or requirement.specifier:
+                    # Resolving a versioned self-reference requires the actual
+                    # version; a dynamic version must not be guessed.
+                    return False
+                selected.update(_normalized_package_name(group) for group in requirement.extras)
+                continue
+            requirement.marker = None
+            if requirement.url:
+                reference = vcs_reference(str(requirement))
+                if reference is None:
+                    return False
+                remote.add(reference)
+            else:
+                required.add(str(requirement))
+        return True
+    try:
+        while True:
+            before = set(selected)
+            if not consume(dependencies, {'', *selected}):
+                return None
+            while selected - visited:
+                group = min(selected - visited)
+                visited.add(group)
+                if not consume(by_extra.get(group, []), {group}):
+                    return None
+            if selected == before:
+                break
+    except (ValueError, TypeError):
+        return None
+    return required, remote, roots
+
+
 def setup_cfg_static(source, *, extras=()):
     """Read declarative setuptools requirements (no package execution)."""
     if not source: return set(), []
@@ -2053,7 +2198,8 @@ def setup_cfg_static(source, *, extras=()):
     return specs, []
 
 
-def setup_static(source, *, extras=(), get_file=None, python_version=None, setup_argv=None):
+def setup_static(source, *, extras=(), get_file=None, python_version=None, setup_argv=None,
+                 declarative_only=False):
     """Evaluate a bounded subset of setuptools metadata without executing it.
 
     The evaluator models setup.py as a script (``__name__ == '__main__'``),
@@ -2470,6 +2616,10 @@ def setup_static(source, *, extras=(), get_file=None, python_version=None, setup
         saved=env;env=snapshot
         try:
             fields=fields_from_call(node)
+            if declarative_only and (node.args or
+                    {'install_requires', 'setup_requires', 'extras_require',
+                     'python_requires', 'dependency_links', 'requires', 'requires_dist', 'name'} & fields.keys()):
+                issues.append('setup.py supplies dependency metadata')
             for name in ('install_requires','setup_requires'):
                 if name not in fields:continue
                 try:values=evaluate(fields[name])
@@ -5621,6 +5771,123 @@ def _native_run_conda_elementary(command, runtime, environment):
 
 
 
+# Pip's locked target interpreter retains its own PEP 517 isolation and hook
+# ordering. Only the installer of each build layer is replaced: the host Rust
+# resolver supplies exact verified artifacts, and Pip installs one local wheel
+# per subprocess. The hook process never performs registry resolution itself.
+_NATIVE_PIP_BUILD_LAUNCHER = r"""
+import inspect
+import json
+import socket
+import sys
+from pip._internal.build_env import BuildEnvironment
+from pip._internal.cli.main import main
+from pip._internal.utils.subprocess import call_subprocess
+
+if tuple(inspect.signature(BuildEnvironment._install_requirements).parameters) != (
+        'pip_runnable', 'finder', 'requirements', 'prefix', 'kind'):
+    raise RuntimeError('locked Pip build environment installer API differs')
+channel = socket.socket(fileno=int(sys.argv[1]))
+channel.set_inheritable(False)
+with channel, channel.makefile('rwb') as wire:
+    def install(pip_runnable, finder, requirements, prefix, *, kind):
+        wire.write(json.dumps({'requirements': sorted(set(requirements))}).encode() + b'\n')
+        wire.flush()
+        reply = wire.readline()
+        if not reply:
+            raise RuntimeError('verified build dependency producer disconnected')
+        paths = json.loads(reply)
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise RuntimeError('invalid verified build dependency response')
+        for path in paths:
+            call_subprocess([sys.executable, pip_runnable, 'install',
+                             '--ignore-installed', '--no-user', '--prefix', prefix.path,
+                             '--no-index', '--no-deps', '--no-compile',
+                             '--no-warn-script-location', '--disable-pip-version-check',
+                             '--', path], command_desc='install verified build wheel ' + path)
+    BuildEnvironment._install_requirements = staticmethod(install)
+    sys.argv = ['pip', *sys.argv[2:]]
+    raise SystemExit(main())
+"""
+
+
+def _native_build_wheels(pool, target, runtime, requirements):
+    """Resolve a PEP 517 build layer with the same verified graph machinery.
+
+    Nested resolutions execute inline rather than occupying another worker of
+    the outer solver's metadata executor. Immutable metadata and acquisitions
+    are shared. Source-only distributions are built in their own isolated
+    environment, with the same exact build dependency producer.
+    """
+    target = _coerce_target(target)
+    if (not isinstance(requirements, list) or
+            not all(isinstance(row, str) for row in requirements)):
+        raise RuntimeError('invalid PEP 517 build requirements')
+    roots = tuple(sorted({str(_parse_registry_requirement(row)) for row in requirements}))
+    key = pip_group_key(target, roots)
+    shared = _native_solver_cache(pool)
+    # Reuse the same candidate/metadata single-flight caches, but do not wait
+    # on an executor whose threads may themselves be discovering build layers.
+    inline = {name: shared[name] for name in (
+        'release_metadata', 'artifact_metadata', 'releases',
+        'native_source_probe', 'sources_require_locked_python')}
+    with _bounded_lock(pool._state_lock):
+        selections = getattr(pool, '_native_build_selections', None)
+        if selections is None:
+            selections = pool._native_build_selections = _SingleFlightCache()
+        built_wheels = getattr(pool, '_native_built_wheels', None)
+        if built_wheels is None:
+            built_wheels = pool._native_built_wheels = _SingleFlightCache()
+    records = _memo_get_or_compute(selections, key, lambda: _resolve_registry_plan(
+        pool, target, roots, (), key, resolver_cache=inline)) if roots else []
+    paths = []
+    for record in records:
+        sha = record['sha256']
+        filename = record['filename']
+        if Path(filename).name != filename or not SHA.fullmatch(sha):
+            raise RuntimeError('invalid verified build artifact identity')
+        folder = runtime['root'] / 'build-wheels' / _target_fingerprint(target) / sha
+        folder.mkdir(parents=True, exist_ok=True)
+        if record['kind'] == 'wheel':
+            path = pool.link_verified_object(sha, folder / filename)
+        elif record['kind'] == 'sdist':
+            def build_wheel():
+                archive = pool.link_verified_object(sha, folder / filename)
+                output = folder / 'wheel'
+                output.mkdir()
+                python = _native_locked_python(pool, target)
+                context = {'kind': 'pypi-build-sdist', 'name': record['name'],
+                           'version': record['version'], 'sha256': sha,
+                           'target_python': target.python_full_version}
+                local = _native_metadata_runtime(pool, target, runtime, context)
+                observed = _native_metadata_command(
+                    [python, '-m', 'pip', 'wheel', '--use-pep517', '--no-deps',
+                     '--wheel-dir', output, archive], local, folder)
+                if observed != record['build_requirements']:
+                    raise RuntimeError('build wheel environment differs from verified source metadata')
+                wheels = list(output.glob('*.whl'))
+                if len(wheels) != 1 or wheels[0].is_symlink() or not wheels[0].is_file():
+                    raise RuntimeError('source build did not produce exactly one wheel')
+                wheel = wheels[0]
+                if _wheel_rank(wheel.name, target) is None:
+                    raise RuntimeError('built wheel is incompatible with locked target')
+                requires, extras = _wheel_core_metadata(wheel, expected_name=record['name'],
+                    expected_version=record['version'], target=target)
+                if (sorted({normalize_legacy_source_requirement(row) for row in requires})
+                        != sorted(set(record['requirements']))
+                        or sorted(set(extras)) != sorted(set(record['provides_extra']))):
+                    raise RuntimeError('built wheel dependencies differ from verified source metadata')
+                return wheel, digest(wheel)
+            path, expected = _memo_get_or_compute(built_wheels,
+                (_target_fingerprint(target), sha), build_wheel)
+            if digest(path) != expected:
+                raise RuntimeError('private build wheel changed after construction')
+        else:
+            raise RuntimeError('unknown verified build artifact type')
+        paths.append(str(path))
+    return paths
+
+
 def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=False):
     cadence = _conda_progress_interval()
     limit = _operation_timeout()
@@ -5640,11 +5907,26 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
     buffered = bytearray()
     process = None
     leaf_scopes = {}
+    channel = child_channel = None
+    requests = bytearray()
+    resolver = runtime.get('_native_build_resolver')
     try:
         environment = {**environment, 'PIP_DEFAULT_TIMEOUT': str(limit)}
-        process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
+        launch = command
+        options = {}
+        if resolver is not None:
+            if not metadata_build or command[1:3] != ['-m', 'pip']:
+                raise RuntimeError('build dependency producer attached to non-metadata Pip command')
+            channel, child_channel = socket.socketpair()
+            launch = [command[0], '-c', _NATIVE_PIP_BUILD_LAUNCHER,
+                      str(child_channel.fileno()), *command[3:]]
+            options['pass_fds'] = (child_channel.fileno(),)
+        process = subprocess.Popen(launch, cwd=runtime['root'], env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+                                   start_new_session=True, **options)
+        if child_channel is not None:
+            child_channel.close()
+            child_channel = None
 
         descriptor = process.stdout.fileno()
         os.set_blocking(descriptor, False)
@@ -5752,9 +6034,10 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
             next_check = min((born + limit for born in leaf_since.values()),
                              default=last_output + stall)
             delay = min(cadence, max(0, next_check - time.monotonic())) if status is None else 0
-            if pipe_open:
-                readable, _, _ = select.select([descriptor], [], [], delay)
-                if readable:
+            readers = ([descriptor] if pipe_open else []) + ([channel] if channel is not None else [])
+            if readers:
+                readable, _, _ = select.select(readers, [], [], delay)
+                if pipe_open and descriptor in readable:
                     block = os.read(descriptor, 65536)
                     if block:
                         buffered.extend(block)
@@ -5769,8 +6052,48 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
                         pipe_open = False
                         if buffered:
                             consume(buffered)
-                elif status is not None:
+                elif pipe_open and status is not None:
                     raise RuntimeError('Pip exited while a descendant still owns its output')
+                if channel is not None and channel in readable:
+                    block = channel.recv(65536)
+                    if not block:
+                        if requests:
+                            raise RuntimeError('truncated Pip build dependency request')
+                        channel.close()
+                        channel = None
+                    else:
+                        requests.extend(block)
+                        if len(requests) > MAX_SOURCE:
+                            raise RuntimeError('oversized Pip build dependency request')
+                        if b'\n' in requests:
+                            line, _, remainder = requests.partition(b'\n')
+                            if remainder:
+                                raise RuntimeError('concurrent Pip build dependency requests')
+                            requests.clear()
+                            request = json.loads(line)
+                            if not isinstance(request, dict) or set(request) != {'requirements'}:
+                                raise RuntimeError('invalid Pip build dependency request')
+                            # Pip invokes its installer synchronously. A request
+                            # cannot overlap a live backend/install subprocess.
+                            if any(row['pid'] != process.pid and row['state'] != 'Z'
+                                   for row in _native_process_tree_snapshot(process.pid)):
+                                raise RuntimeError('Pip requested build dependencies with live subprocesses')
+                            for marker in tuple(leaf_scopes):
+                                leaf_scopes.pop(marker).__exit__(None, None, None)
+                                leaf_since.pop(marker, None)
+                            # The outer Pip process is blocked on the socket.
+                            # Only the real producer's individually supervised
+                            # resolver, download and package operations run here.
+                            paths = resolver(request['requirements'])
+                            reply = json.dumps(paths).encode() + b'\n'
+                            if len(reply) > MAX_SOURCE:
+                                raise RuntimeError('oversized Pip build dependency response')
+                            with _registered_operation('Pip build dependency response',
+                                                       limit=limit, process=process.pid):
+                                channel.settimeout(limit)
+                                channel.sendall(reply)
+                                channel.settimeout(None)
+                            last_output = time.monotonic()
             else:
                 try:
                     process.wait(timeout=delay)
@@ -5791,6 +6114,10 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
     finally:
         if process is not None:
             process.stdout.close()
+        if channel is not None:
+            channel.close()
+        if child_channel is not None:
+            child_channel.close()
         for scope in leaf_scopes.values():
             scope.__exit__(None, None, None)
         meter.end(identity)
@@ -5838,7 +6165,8 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     # The raw pip progress protocol reports CURRENT and TOTAL in real bytes.
     # A global task percentage is intentionally never inferred from group counts.
     for index in range(len(command) - 2):
-        if command[index:index + 3] == ['-m', 'pip', 'install']:
+        if (command[index:index + 2] == ['-m', 'pip']
+                and command[index + 2] in {'install', 'wheel'}):
             command.insert(index + 3, '--progress-bar=raw')
             return _native_run_pip_elementary(
                 command, runtime, environment, metadata_build=metadata_build)
@@ -5935,20 +6263,28 @@ def _native_interpreter_has_stdlib_distutils(runtime, interpreter):
         return cache[identity]
 
 
+def _native_metadata_runtime(pool, target, runtime, source_context):
+    return {**runtime, '_native_source_context': source_context,
+            '_native_build_resolver': functools.partial(_native_build_wheels, pool, target, runtime)}
+
+
 def _native_metadata_command(argv, runtime, directory):
     """Execute the production pip command and capture its build-time closure."""
     # Scope the distutils selection to this isolated metadata subprocess only.
     # Do not modify the CAS, project build requirements, pip constraints or
     # other native commands. The build-isolation subprocess inherits the flag.
+    if not callable(runtime.get('_native_build_resolver')):
+        raise RuntimeError('native metadata requires a verified build dependency producer')
     use_stdlib = _native_interpreter_has_stdlib_distutils(runtime, argv[0])
     with tempfile.TemporaryDirectory(prefix='build-metadata-', dir=directory) as temporary:
         environment = {**runtime['env'], 'TMPDIR': temporary, 'PYTHONUNBUFFERED': '1'}
         if use_stdlib:
             environment['SETUPTOOLS_USE_DISTUTILS'] = 'stdlib'
+        environment['PIP_NO_INDEX'] = '1'
         local = {**runtime, 'env': environment}
         # Pip normally hides backend subprocess output below INFO. The
         # single verbose flag exposes PEP 517 work to our existing reader.
-        _native_run([*argv, '--verbose', '--no-clean'], local,
+        _native_run([*argv, '--no-index', '--no-cache-dir', '--verbose', '--no-clean'], local,
                     interpreter=argv[0], metadata_build=True)
         return _native_build_requirements(temporary)
 
@@ -6380,7 +6716,7 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
                       'version': candidate['version'], 'sha256': sha,
                       'target_python': target.python_full_version}
     observed_builds = _native_metadata_command(
-        command, {**runtime, '_native_source_context': source_context}, root)
+        command, _native_metadata_runtime(pool, target, runtime, source_context), root)
     data = json.loads(report.read_bytes())
     installs = data.get('install')
     if not isinstance(installs, list) or len(installs) != 1:
@@ -6627,7 +6963,7 @@ def _native_local_metadata(pool, target, mirror, commit, commands, extras, *, ta
         else:
             source_context['declared_backend'] = None
         observed = _native_metadata_command(
-            argv, {**runtime, '_native_source_context': source_context}, report.parent)
+            argv, _native_metadata_runtime(pool, target, runtime, source_context), report.parent)
         _native_acquire_build_dependencies(pool, target, [
             {'kind': 'sdist', 'build_requirements': observed}],
             defer=defer_build_closures)
@@ -8767,40 +9103,13 @@ def main(argv=None):
         for problem in problems:issue(logical,problem)
         # Project metadata is read at the pinned commit and after the recipe's
         # explicitly supported textual transformations.
-        # Native metadata is authoritative for actual local installations,
-        # including static projects and --no-deps build-time requirements.
         static_build_roots = None
         if any(step['local_project'] for step in steps):
-            # PEP 621 requirements are authoritative for a pure declarative
-            # setuptools project. Running PEP 517 just to rediscover the same
-            # dependencies would provision a Python and arbitrary build hooks.
-            project_source = get_file('pyproject.toml')
-            setup_source = get_file('setup.py')
-            setup_config = get_file('setup.cfg')
-            declarative = False
-            if project_source and not setup_source and not setup_config:
-                parsed_project = tomllib.loads(project_source)
-                project = parsed_project.get('project')
-                build_system = parsed_project.get('build-system')
-                if (isinstance(project, dict) and isinstance(project.get('name'), str)
-                        and isinstance(project.get('dependencies', []), list)
-                        and isinstance(project.get('optional-dependencies', {}), dict)
-                        and isinstance(project.get('dynamic', []), list)
-                        and not ({'dependencies', 'optional-dependencies'}
-                                 & set(project['dynamic'] if 'dynamic' in project else []))
-                        and isinstance(build_system, dict)
-                        and build_system.get('build-backend') == 'setuptools.build_meta'
-                        and 'backend-path' not in build_system
-                        and isinstance(build_system.get('requires'), list)
-                        and all(isinstance(item, str) for item in build_system['requires'])):
-                    deps, remote, problems = static_project(project_source, extra_groups=extras)
-                    if not problems:
-                        reqs.update(deps)
-                        vcs_task.update(remote)
-                        static_build_roots = tuple(sorted(set(build_system['requires'])))
-                        declarative = True
-            if not declarative:
+            declarative = _declarative_local_metadata(get_file, task_target, extras, commands)
+            if declarative is None:
                 reqs, vcs_task = native_project_metadata()
+            else:
+                reqs, vcs_task, static_build_roots = declarative
         else:
             raw=get_file('pyproject.toml')
             if raw:

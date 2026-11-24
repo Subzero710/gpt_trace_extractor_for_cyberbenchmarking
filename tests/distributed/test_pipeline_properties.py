@@ -280,13 +280,30 @@ def build_wheel(*args, **kwargs):
     return names, project, index
 
 
+def metadata_fixture_resolver(index):
+    """Resolve only the wheel fixtures explicitly generated for this test."""
+    wheels = {pool._normalized_package_name(pool._parse_wheel_filename(path.name)[0]): path
+              for path in index.glob('*.whl')}
+    def resolve(requirements):
+        result = []
+        for value in requirements:
+            requirement = pool._parse_registry_requirement(value)
+            path = wheels[pool._normalized_package_name(requirement.name)]
+            version = pool._parse_wheel_filename(path.name)[1]
+            assert requirement.specifier.contains(version)
+            result.append(str(path))
+        return result
+    return resolve
+
+
 def test_real_pip_captures_static_and_dynamic_build_requirements(tmp_path):
     names, project, index = metadata_project(tmp_path)
     report = tmp_path / 'report.json'
     runtime = {'root': tmp_path, 'env': {
         'PATH': os.environ['PATH'], 'HOME': str(tmp_path),
         'PIP_NO_INDEX': '1', 'PIP_FIND_LINKS': str(index),
-        'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1'}}
+        'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1'},
+        '_native_build_resolver': metadata_fixture_resolver(index)}
     observed = pool._native_metadata_command([
         sys.executable, '-m', 'pip', 'install', '--dry-run', '--ignore-installed',
         '--report', report, project], runtime, tmp_path)

@@ -18,6 +18,10 @@ import pytest
 import superbench_pool as pool
 
 
+def _unexpected_build_requirements(requirements):
+    raise AssertionError('unexpected build dependency request: ' + repr(requirements))
+
+
 def _fixture(root):
     root = Path(root)
     base = root / 'conda' / 'bin'
@@ -92,6 +96,7 @@ def test_metadata_subprocess_binds_its_explicit_interpreter():
         command = ('import pathlib,subprocess; '
                    + 'with_target = subprocess.check_output([' + repr(str(entry)) + ']); '
                    + 'pathlib.Path(' + repr(str(recorded)) + ').write_bytes(with_target)')
+        runtime['_native_build_resolver'] = _unexpected_build_requirements
         assert pool._native_metadata_command([python, '-c', command], runtime, root) == []
         assert recorded.read_text().strip() == str(python)
 

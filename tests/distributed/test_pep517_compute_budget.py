@@ -12,6 +12,10 @@ import pytest
 import superbench_pool as pool
 
 
+def _unexpected_build_requirements(requirements):
+    raise AssertionError('unexpected build dependency request: ' + repr(requirements))
+
+
 def _fixture(tmp_path, code):
     package = tmp_path / 'pip'
     package.mkdir()
@@ -85,6 +89,7 @@ def test_metadata_command_scopes_compute_grace_to_isolated_hook(tmp_path, monkey
         return b''
 
     monkeypatch.setattr(pool, '_native_run', run)
+    runtime['_native_build_resolver'] = _unexpected_build_requirements
     assert pool._native_metadata_command([sys.executable, '-m', 'pip', 'install', '.'],
                                          runtime, tmp_path) == []
     assert len(seen) == 1

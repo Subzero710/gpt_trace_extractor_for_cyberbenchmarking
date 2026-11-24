@@ -11,6 +11,10 @@ import pytest
 import superbench_pool as pool
 
 
+def _unexpected_build_requirements(requirements):
+    raise AssertionError('unexpected build dependency request: ' + repr(requirements))
+
+
 def test_vendored_distutils_export_gap_is_exact_nameerror():
     # This is the import pattern used by historical numpy.distutils.
     # The module's __all__ controls whether the CCompiler symbol is visible.
@@ -47,6 +51,7 @@ def test_native_metadata_uses_real_interpreter_capability_only(available, expect
              patch.object(pool, '_native_build_requirements', return_value=[]):
             python = Path(sys.executable)
             for _ in range(2):
+                runtime['_native_build_resolver'] = _unexpected_build_requirements
                 assert pool._native_metadata_command([python, '-m', 'pip', 'install', 'pkg'], runtime, root) == []
         assert len(seen) == 3  # Capability is checked only once per locked interpreter.
         assert seen[0][2] == python
@@ -128,6 +133,7 @@ def test_real_pep517_build_hook_output_is_visible_to_native_reader(tmp_path, mon
     monkeypatch.setattr(pool, '_native_run', inspect)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
+            runtime['_native_build_resolver'] = _unexpected_build_requirements
             assert pool._native_metadata_command(command, runtime, tmp_path) == []
         finally:
             if '_pip_byte_progress' in runtime:
@@ -175,6 +181,7 @@ def test_real_silent_buffered_pep517_hook_stays_observable(tmp_path, monkeypatch
     monkeypatch.setattr(pool, '_conda_progress_interval', lambda: 1)
     with contextlib.redirect_stdout(io.StringIO()):
         try:
+            runtime['_native_build_resolver'] = _unexpected_build_requirements
             assert pool._native_metadata_command(command, runtime, tmp_path) == []
         finally:
             runtime['_pip_byte_progress'].close()

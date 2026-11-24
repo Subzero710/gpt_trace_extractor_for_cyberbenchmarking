@@ -15,7 +15,7 @@ import subprocess
 import pytest
 
 import superbench_pool as pool
-from test_pipeline_properties import metadata_project
+from test_pipeline_properties import metadata_project, metadata_fixture_resolver
 
 
 pytestmark = pytest.mark.skipif(
@@ -81,7 +81,8 @@ def test_locked_interpreter_and_native_build_metadata(native_pool, tmp_path, min
     assert pool._native_bootstrap(native_pool, runtime).is_file()
     names, project, index = metadata_project(tmp_path)
     report = tmp_path/'metadata.json'
-    offline = {**runtime, 'env': {**runtime['env'], 'PIP_NO_INDEX': '1', 'PIP_FIND_LINKS': str(index)}}
+    offline = {**runtime, '_native_build_resolver': metadata_fixture_resolver(index),
+               'env': {**runtime['env'], 'PIP_NO_INDEX': '1'}}
     observed = pool._native_metadata_command([python, '-m', 'pip', 'install', '--use-pep517',
         '--dry-run', '--ignore-installed', '--report', report, project], offline, tmp_path)
     assert {item for group in observed for item in group} == {name + '==1.0' for name in names}
