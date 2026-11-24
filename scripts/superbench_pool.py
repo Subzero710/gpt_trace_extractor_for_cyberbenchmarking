@@ -5780,26 +5780,17 @@ import inspect
 import json
 import socket
 import sys
-from pip._internal.build_env import BuildEnvironment, get_runnable_pip
+from pip._internal import build_env
 from pip._internal.cli.main import main
 from pip._internal.utils.subprocess import call_subprocess
 
-signature = inspect.signature(BuildEnvironment.install_requirements)
-if not {'self', 'requirements', 'prefix_as_string', 'kind'} <= set(signature.parameters):
-    raise RuntimeError('locked Pip build environment installer API differs')
 channel = socket.socket(fileno=int(sys.argv[1]))
 channel.set_inheritable(False)
 with channel, channel.makefile('rwb') as wire:
-    def install(self, *args, **kwargs):
-        arguments = signature.bind(self, *args, **kwargs).arguments
-        prefix = self._prefixes[arguments['prefix_as_string']]
-        if prefix.setup:
-            raise RuntimeError('Pip build prefix was already initialized')
-        prefix.setup = True
-        requirements = sorted(set(arguments['requirements']))
+    def install_verified(requirements, prefix):
+        requirements = sorted(set(requirements))
         if not requirements:
             return
-        pip_runnable = get_runnable_pip()
         wire.write(json.dumps({'requirements': requirements}).encode() + b'\n')
         wire.flush()
         reply = wire.readline()
@@ -5808,13 +5799,41 @@ with channel, channel.makefile('rwb') as wire:
         paths = json.loads(reply)
         if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
             raise RuntimeError('invalid verified build dependency response')
+        command = [sys.executable, '-I', '-m', 'pip']
+        venv_python = getattr(prefix, 'venv_executable', None)
+        if venv_python is not None:
+            command.extend(['--python', venv_python])
         for path in paths:
-            call_subprocess([sys.executable, pip_runnable, 'install',
+            call_subprocess([*command, 'install',
                              '--ignore-installed', '--no-user', '--prefix', prefix.path,
                              '--no-index', '--no-deps', '--no-compile',
                              '--no-warn-script-location', '--disable-pip-version-check',
                              '--', path], command_desc='install verified build wheel ' + path)
-    BuildEnvironment.install_requirements = install
+
+    signature = inspect.signature(build_env.BuildEnvironment.install_requirements)
+    if not {'self', 'requirements', 'prefix_as_string', 'kind'} <= set(signature.parameters):
+        raise RuntimeError('locked Pip build environment installer API differs')
+    if 'finder' in signature.parameters:
+        def install(self, *args, **kwargs):
+            arguments = signature.bind(self, *args, **kwargs).arguments
+            prefix = self._prefixes[arguments['prefix_as_string']]
+            if prefix.setup:
+                raise RuntimeError('Pip build prefix was already initialized')
+            prefix.setup = True
+            install_verified(arguments['requirements'], prefix)
+        build_env.BuildEnvironment.install_requirements = install
+    else:
+        def bind_installer(installer):
+            api = inspect.signature(installer.install)
+            if not {'self', 'requirements', 'prefix', 'kind'} <= set(api.parameters):
+                raise RuntimeError('locked Pip build dependency installer API differs')
+            def install(self, *args, **kwargs):
+                arguments = api.bind(self, *args, **kwargs).arguments
+                install_verified(arguments['requirements'], arguments['prefix'])
+            installer.install = install
+        bind_installer(build_env.SubprocessBuildEnvironmentInstaller)
+        if hasattr(build_env, 'InprocessBuildEnvironmentInstaller'):
+            bind_installer(build_env.InprocessBuildEnvironmentInstaller)
     sys.argv = ['pip', *sys.argv[2:]]
     raise SystemExit(main())
 """

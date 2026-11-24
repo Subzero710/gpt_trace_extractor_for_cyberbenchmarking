@@ -28,7 +28,8 @@ def _wheel(folder, name):
     return path
 
 
-def test_actual_pip_static_and_dynamic_build_layers(tmp_path, monkeypatch):
+@pytest.mark.parametrize('interpreter_source', ['ci-pip', 'ensurepip'])
+def test_actual_pip_static_and_dynamic_build_layers(tmp_path, monkeypatch, interpreter_source):
     wheels = {name: _wheel(tmp_path, name) for name in ('fixture_static', 'fixture_dynamic')}
     source = tmp_path / 'source'
     source.mkdir()
@@ -64,9 +65,26 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     monkeypatch.setattr(pool, '_native_interpreter_has_stdlib_distutils', lambda *_: False)
     report = tmp_path / 'report.json'
     interpreter = tmp_path / 'interpreter'
-    subprocess.run([sys._base_executable, '-m', 'venv', str(interpreter)],
-                   check=True, timeout=pool._operation_timeout())
+    creation = [sys._base_executable, '-m', 'venv']
+    if interpreter_source == 'ci-pip':
+        creation.append('--without-pip')
+    subprocess.run([*creation, str(interpreter)], check=True, timeout=pool._operation_timeout())
     python = interpreter / 'bin' / 'python'
+    if interpreter_source == 'ci-pip':
+        import importlib.metadata
+        import shutil
+        import pip
+        destination = Path(subprocess.check_output([
+            python, '-I', '-c', 'import sysconfig; print(sysconfig.get_path("purelib"))'],
+            text=True, timeout=pool._operation_timeout()).strip())
+        distribution = importlib.metadata.distribution('pip')
+        metadata, = (distribution.locate_file(path).parent for path in distribution.files
+                     if path.name == 'METADATA' and path.parent.name.endswith('.dist-info'))
+        package = Path(pip.__file__).parent
+        shutil.copytree(package, destination / package.name)
+        shutil.copytree(metadata, destination / metadata.name)
+        assert subprocess.check_output([python, '-I', '-c', 'import pip; print(pip.__version__)'],
+                                       text=True, timeout=pool._operation_timeout()).strip() == pip.__version__
     try:
         observed = pool._native_metadata_command(
             [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
@@ -173,8 +191,9 @@ def test_build_dependency_producer_uses_verified_cas_and_reuses_exact_selection(
         instance._pip_cache_context.cleanup()
 
 
-@pytest.mark.parametrize('installer_api', ['finder', 'for_req'])
-def test_launcher_uses_common_build_environment_entrypoint(monkeypatch, installer_api):
+@pytest.mark.parametrize('installer_api', ['legacy', 'subprocess', 'inprocess', 'venv'])
+def test_launcher_uses_verified_build_environment_installer(monkeypatch, installer_api):
+    import abc
     import socket
     from types import SimpleNamespace
     from pip._internal import build_env
@@ -185,18 +204,43 @@ def test_launcher_uses_common_build_environment_entrypoint(monkeypatch, installe
         def install_requirements(self, finder, requirements, prefix_as_string, *, kind):
             raise AssertionError('original installer must not execute')
 
-    class ModernEnvironment:
+    class ModernEnvironment(abc.ABC):
+        @abc.abstractmethod
         def install_requirements(self, requirements, prefix_as_string, *, kind, for_req=None):
-            raise AssertionError('original installer must not execute')
+            raise AssertionError('abstract base is not an installer')
 
-    environment_type = LegacyEnvironment if installer_api == 'finder' else ModernEnvironment
-    environment = environment_type()
+    class SubprocessInstaller:
+        def install(self, requirements, prefix, *, kind, for_req):
+            raise AssertionError('original subprocess installer must not execute')
+
+    class InprocessInstaller:
+        def install(self, requirements, prefix, *, kind, for_req):
+            raise AssertionError('original inprocess installer must not execute')
+
+    class VirtualEnvironment(ModernEnvironment):
+        def install_requirements(self, requirements, prefix_as_string, *, kind, for_req=None):
+            prefix = self._prefixes[prefix_as_string]
+            assert not prefix.setup
+            prefix.setup = True
+            if requirements:
+                self.installer.install(requirements, prefix, kind=kind, for_req=for_req)
+
+    if installer_api == 'legacy':
+        monkeypatch.setattr(build_env, 'BuildEnvironment', LegacyEnvironment)
+        environment = LegacyEnvironment()
+    else:
+        monkeypatch.setattr(build_env, 'BuildEnvironment', ModernEnvironment)
+        monkeypatch.setattr(build_env, 'SubprocessBuildEnvironmentInstaller', SubprocessInstaller, raising=False)
+        monkeypatch.setattr(build_env, 'InprocessBuildEnvironmentInstaller', InprocessInstaller, raising=False)
+        environment = VirtualEnvironment()
+        environment.installer = InprocessInstaller() if installer_api == 'inprocess' else SubprocessInstaller()
     prefix = SimpleNamespace(path='/fixture/prefix', setup=False)
+    if installer_api == 'venv':
+        prefix.venv_executable = '/fixture/venv/bin/python'
     empty = SimpleNamespace(path='/fixture/empty', setup=False)
     environment._prefixes = {'overlay': prefix, 'normal': empty}
     calls = []
-    monkeypatch.setattr(build_env, 'BuildEnvironment', environment_type)
-    monkeypatch.setattr(build_env, 'get_runnable_pip', lambda: '/fixture/pip')
+    monkeypatch.delattr(build_env, 'get_runnable_pip', raising=False)
     monkeypatch.setattr(pip_subprocess, 'call_subprocess',
                         lambda argv, **kwargs: calls.append(argv))
     parent, child = socket.socketpair()
@@ -207,7 +251,7 @@ def test_launcher_uses_common_build_environment_entrypoint(monkeypatch, installe
 
         def main():
             def invoke(requirements, layer):
-                if installer_api == 'finder':
+                if installer_api == 'legacy':
                     environment.install_requirements(object(), requirements, layer, kind='build')
                 else:
                     environment.install_requirements(requirements, layer, kind='build', for_req=object())
@@ -219,11 +263,16 @@ def test_launcher_uses_common_build_environment_entrypoint(monkeypatch, installe
         with pytest.raises(SystemExit) as error:
             exec(pool._NATIVE_PIP_BUILD_LAUNCHER, {})
         assert error.value.code == 0
-        assert json.loads(parent.makefile('rb').readline()) == {'requirements': ['one', 'two']}
+        with parent.makefile('rb') as reply:
+            assert json.loads(reply.readline()) == {'requirements': ['one', 'two']}
+            assert reply.read() == b''
     assert prefix.setup and empty.setup
     assert len(calls) == 2
+    command = [sys.executable, '-I', '-m', 'pip']
+    if installer_api == 'venv':
+        command.extend(['--python', prefix.venv_executable])
     for argv, wheel in zip(calls, ['one.whl', 'two.whl']):
-        assert argv[:3] == [sys.executable, '/fixture/pip', 'install']
+        assert argv[:len(command) + 1] == [*command, 'install']
         assert argv[argv.index('--prefix') + 1] == prefix.path
         assert {'--no-index', '--no-deps', '--no-compile'} <= set(argv)
         assert argv[-1] == '/fixture/' + wheel
