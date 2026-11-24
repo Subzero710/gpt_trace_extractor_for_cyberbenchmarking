@@ -771,9 +771,11 @@ class _NetworkAttempt:
     def watch(self, sock):
         with self.lock:
             self.remaining()
-            # A TLS wrapper takes ownership of the original descriptor.
-            # The duplicate still refers to the same TCP connection.
-            self.sockets.append(sock.dup())
+            # Duplicate the transport descriptor, not the TLS session.
+            # A plain socket can interrupt both a fresh TCP connection and a
+            # reused SSLSocket without taking ownership of the live TLS object.
+            self.sockets.append(socket.fromfd(sock.fileno(), sock.family,
+                                              sock.type, sock.proto))
 
     def interrupt(self):
         with self.lock:
