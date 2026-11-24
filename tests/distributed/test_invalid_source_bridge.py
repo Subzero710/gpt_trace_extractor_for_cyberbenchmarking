@@ -1,4 +1,4 @@
-"""Offline Rust-wire bridge regression for a verified target syntax rejection."""
+"""Offline Rust-wire bridge regressions for verified source candidate rejections."""
 from __future__ import annotations
 import hashlib
 import importlib.util
@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from packaging.requirements import Requirement
 from packaging.version import Version, InvalidVersion
 
+import pytest
 import superbench_pool as pool
 
 spec = importlib.util.spec_from_file_location(
@@ -35,7 +36,11 @@ def test_syntax_rejection_is_distinct_from_metadata_infrastructure_error():
     assert child.stdin.getvalue()[0:1] == b'\x00'
 
 
-def test_bridge_rejects_bad_source_and_returns_verified_wheel(tmp_path,monkeypatch):
+@pytest.mark.parametrize('rejection', [
+    pool._IncompatibleSourceSyntax('source setup.py cannot compile on target Python'),
+    pool._IncompatibleSourceIdentity('source declares another distribution or release'),
+])
+def test_bridge_rejects_bad_source_and_returns_verified_wheel(tmp_path,monkeypatch,rejection):
     (tmp_path/'scripts').mkdir()
     (tmp_path/'config').mkdir()
     (tmp_path/'config/preparation.toml').write_text('''[acquisition]
@@ -80,7 +85,8 @@ assert (num(),num(),num())==(1,1,3)
 out.write(b'M');sendnum(1);sendnum(old);out.flush()
 status=read(1)
 assert status==b'\\x02', (status, string())
-assert 'setup.py' in string()
+assert string() == '''+repr(str(rejection))+'''
+
 out.write(b'M');sendnum(1);sendnum(new);out.flush()
 assert read(1)==b'\\x01'
 out.write(b'S');sendnum(1);sendnum(new);sendstr('solver decisions=2');out.flush()
@@ -96,7 +102,7 @@ out.write(b'S');sendnum(1);sendnum(new);sendstr('solver decisions=2');out.flush(
               'sha256':sha('1'),'url':new['item']['url'],'requirements':[],'provides_extra':[]}
     def probe(_pool,candidate,key,target):
         assert candidate is old
-        raise pool._IncompatibleSourceSyntax('source setup.py cannot compile on target Python')
+        raise rejection
     host={'_registered_operation':lambda *args, **kwargs:nullcontext(),
           '__file__':str(source), '_coerce_target':lambda target:target,
           '_packaging_symbols':lambda: (Requirement,None,Version,InvalidVersion,None),
@@ -114,7 +120,7 @@ out.write(b'S');sendnum(1);sendnum(new);sendstr('solver decisions=2');out.flush(
           '_candidate_satisfies':lambda c,reqs,cons:all(
                not r.specifier or r.specifier.contains(Version(c['version']),prereleases=True)
                for r in [*reqs,*cons]),
-          '_IncompatibleSourceSyntax':pool._IncompatibleSourceSyntax,
+          '_IncompatibleSourceCandidate':pool._IncompatibleSourceCandidate,
           '_POOL_PROGRESS':True}
     target=SimpleNamespace(python_artifact_sha256='b'*64)
     result=bridge.solve(host,None,target,{'demo>=0.5'},[], 'offline-test',no_deps=True,

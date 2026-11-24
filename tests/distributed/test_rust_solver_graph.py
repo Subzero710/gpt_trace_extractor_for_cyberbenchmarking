@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import superbench_pool as pool
 from test_superbench_pool import fixture_target
 
@@ -135,9 +136,13 @@ def test_compiled_rust_preserves_guards_of_skipped_learned_clauses():
             assert req.name in result and req.specifier.contains(str(result[req.name]))
 
 
-def test_compiled_rust_backtracks_after_proven_invalid_target_source():
-    # An old cached sdist with Python-2-only setup.py cannot be used by the
-    # locked target. Its exact syntax rejection must not abort the whole graph.
+@pytest.mark.parametrize('rejection', [
+    pool._IncompatibleSourceSyntax('verified setup.py is Python 2 syntax under target Python 3'),
+    pool._IncompatibleSourceIdentity('verified source metadata identifies a different release'),
+])
+def test_compiled_rust_backtracks_after_proven_invalid_target_source(rejection):
+    # A proven incompatible source cannot satisfy the active requirement.
+    # Reject only its exact candidate, not the whole graph.
     bad = _versioned('example', '0.5')
     bad['kind'] = 'sdist'
     bad['filename'] = 'example-0.5.tar.gz'
@@ -153,7 +158,7 @@ def test_compiled_rust_backtracks_after_proven_invalid_target_source():
 
     def source(_pool, candidate, key, target):
         probed.append(candidate['version'])
-        raise pool._IncompatibleSourceSyntax('verified setup.py is Python 2 syntax under target Python 3')
+        raise rejection
 
     def wheel(_pool, candidate, key, target, *_args, **_kwargs):
         assert candidate is good

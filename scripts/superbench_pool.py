@@ -6647,12 +6647,16 @@ def _native_acquire_build_dependencies(pool,target,packages,*,defer=False):
 
 
 
-class _IncompatibleSourceSyntax(RuntimeError):
-    """Verified sdist has a setuptools setup.py that cannot parse on target CPython.
+class _IncompatibleSourceCandidate(RuntimeError):
+    """Definitive incompatibility of a verified source candidate."""
 
-    Only this proven artifact-level incompatibility is a candidate rejection;
-    build failures, network errors, metadata-integrity errors remain fatal.
-    """
+
+class _IncompatibleSourceSyntax(_IncompatibleSourceCandidate):
+    """Verified sdist setup.py cannot parse on the locked target CPython."""
+
+
+class _IncompatibleSourceIdentity(_IncompatibleSourceCandidate):
+    """Verified sdist's target metadata names a different distribution or release."""
 
 
 @_supervised_operation
@@ -6807,20 +6811,33 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
         raise RuntimeError('native single-source report differs from verified CAS input')
     name = metadata.get('name')
     version = metadata.get('version')
-    requirements = metadata.get('requires_dist') or []
-    extras = metadata.get('provides_extra') or []
-    if (not isinstance(name, str) or not isinstance(version, str)
-            or _normalized_package_name(name) != _normalized_package_name(candidate['name'])
-            or _packaging_symbols()[2](version) != _packaging_symbols()[2](candidate['version'])
+    requirements = metadata.get('requires_dist', [])
+    extras = metadata.get('provides_extra', [])
+    if (not isinstance(name, str)
+            or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?', name)
+            or not isinstance(version, str)
             or not isinstance(requirements, list) or not all(isinstance(item, str) for item in requirements)
             or not isinstance(extras, list) or not all(isinstance(item, str) for item in extras)):
-        raise RuntimeError('native single-source package identity/requirements differ')
+        raise RuntimeError('invalid native single-source metadata fields: ' + filename)
+    _, _, Version, InvalidVersion, _ = _packaging_symbols()
+    try:
+        actual_version = Version(version)
+        expected_version = Version(candidate['version'])
+    except InvalidVersion as exc:
+        raise RuntimeError('invalid native single-source version identity: ' + filename) from exc
+    normalized_requirements = sorted({normalize_legacy_source_requirement(row)
+                                      for row in requirements})
+    if (_normalized_package_name(name) != _normalized_package_name(candidate['name'])
+            or actual_version != expected_version):
+        raise _IncompatibleSourceIdentity(
+            f'verified source {filename} (sha256={sha}, Python {target.python_full_version}) '
+            f'declares {name!r}=={version!r}, expected '
+            f"{candidate['name']!r}=={candidate['version']!r}")
     # The selected package's PEP 517 build environments were inspected before
     # TMPDIR cleanup. Their exact distributions are recursively acquired later.
     return {'kind': 'sdist', 'name': name, 'version': version,
             'filename': filename, 'url': url, 'sha256': sha,
-            'requirements': sorted(set(normalize_legacy_source_requirement(row)
-                                       for row in requirements)),
+            'requirements': normalized_requirements,
             'provides_extra': sorted(set(extras)),
             'build_requirements': observed_builds,
             **_candidate_yank_provenance(candidate)}

@@ -223,7 +223,7 @@ class _Wire:
             lambda: self.send_string(type(exc).__name__ + ': ' + str(exc))))
 
     def rejected_source(self, exc):
-        # A definitive source syntax rejection is a distinct protocol status.
+        # A definitive verified source rejection is a distinct protocol status.
         self._write(b'\x02' + self.encode(lambda: self.send_string(str(exc))))
 
 
@@ -838,9 +838,11 @@ def solve(host, pool, target, reqs, constraints, key, *, no_deps=False,
                                            sort_keys=True, ensure_ascii=False),
                               file=sys.stderr, flush=True)
                         traceback.print_exception(exc, file=sys.stderr)
-                    rejected = host.get('_IncompatibleSourceSyntax')
+                    rejected = host.get('_IncompatibleSourceCandidate')
                     if (op == b'M' and len(references) == 1
                             and isinstance(rejected, type) and isinstance(exc, rejected)):
+                        print('[pool] rejected source candidate: ' + str(exc),
+                              file=sys.stderr, flush=True)
                         wire.rejected_source(exc)
                     else:
                         wire.error(exc)
