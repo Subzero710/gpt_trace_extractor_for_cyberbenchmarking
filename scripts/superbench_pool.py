@@ -8435,9 +8435,8 @@ def acquire_pip_groups(pool, groups):
             edges = {}
             frontier = ordered
             all_groups = dict(ordered)
+            alternative_done = 0
             while frontier:
-                _pool_progress('Pip planning', len(planned), len(all_groups), 'closures',
-                               'verified Rust metadata')
                 def run(key, group, *, phase, choice=None, preference=None):
                     if _POOL_PROGRESS is not None:
                         _POOL_PROGRESS.closure_activity(1)
@@ -8447,7 +8446,9 @@ def acquire_pip_groups(pool, groups):
                     finally:
                         if _POOL_PROGRESS is not None:
                             _POOL_PROGRESS.closure_activity(-1)
-                def batch(inputs, *, phase, choices=None, preferences=None):
+                def batch(inputs, *, phase, stage, before, total, details,
+                          choices=None, preferences=None):
+                    _pool_progress(stage, before, total, 'closures', details)
                     completed = {}
                     failures = []
                     with concurrent.futures.ThreadPoolExecutor(
@@ -8461,9 +8462,8 @@ def acquire_pip_groups(pool, groups):
                             key = futures[future]
                             try:
                                 completed[key] = _shared_future_result(future)
-                                if phase == 'plan':
-                                    _pool_progress('Pip planning',len(planned)+len(completed),
-                                                   len(all_groups),'closures','verified Rust metadata')
+                                _pool_progress(stage, before + len(completed), total,
+                                               'closures', details)
                             except BaseException as exc:
                                 failures.append((key,exc))
                                 for other in futures:
@@ -8473,7 +8473,9 @@ def acquire_pip_groups(pool, groups):
                         raise RuntimeError('verified pip '+phase+' closure '+key+' failed: '+str(exc)) from exc
                     return completed
 
-                baseline = batch(frontier, phase='plan')
+                baseline = batch(frontier, phase='plan', stage='Pip planning',
+                                 before=len(planned), total=len(all_groups),
+                                 details='verified Rust metadata')
                 choices = {key:[result] for key,result in baseline.items()}
                 all_visible = {**planned, **baseline}
                 if variants > 1:
@@ -8483,7 +8485,11 @@ def acquire_pip_groups(pool, groups):
                         # Each additional solve is a complete, independent and
                         # audited Rust solution. A preference is never a pin.
                         for _ in range(1, variants):
-                            alternatives = batch(hints, phase='plan', preferences=hints)
+                            alternatives = batch(
+                                hints, phase='plan', stage='Pip alternatives',
+                                before=alternative_done, total=alternative_done + len(hints),
+                                details='verified Rust consolidation', preferences=hints)
+                            alternative_done += len(alternatives)
                             for key, result in alternatives.items():
                                 if (_global_pip_artifacts(result)
                                         != _global_pip_artifacts(choices[key][-1])):
@@ -8494,9 +8500,10 @@ def acquire_pip_groups(pool, groups):
                 options = {key:([planned[key]] if key in planned else choices[key])
                            for key in sorted(all_visible)}
                 selected = _global_pip_choose(pool, options, locked=planned)
-                _pool_progress('Pip source evidence',0,len(frontier),'closures',
-                               'selected source archives and PEP 517 metadata')
-                completed_sources = batch(frontier, phase='sources', choices=selected)
+                completed_sources = batch(
+                    frontier, phase='sources', stage='Pip source evidence',
+                    before=len(planned), total=len(all_groups),
+                    details='selected source archives and PEP 517 metadata', choices=selected)
                 for key in sorted(frontier):
                     planned[key] = completed_sources[key]
                 next_frontier = {}
@@ -8521,12 +8528,10 @@ def acquire_pip_groups(pool, groups):
             layers = _global_pip_levels(all_groups, edges)
             done = 0
             for layer in layers:
-                _pool_progress('Pip materialization',done,len(all_groups),'closures',
-                               'shared SHA-256 artifacts')
-                batch(layer, phase='publish', choices=planned)
+                batch(layer, phase='publish', stage='Pip materialization',
+                      before=done, total=len(all_groups),
+                      details='shared SHA-256 artifacts', choices=planned)
                 done += len(layer)
-                _pool_progress('Pip materialization',done,len(all_groups),'closures',
-                               'shared SHA-256 artifacts')
         finally:
             with _bounded_lock(pool._state_lock):
                 for key in ('metadata_executor','metadata_speculative_submit','metadata_promote',

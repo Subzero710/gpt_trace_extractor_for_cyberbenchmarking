@@ -61,3 +61,79 @@ def test_failed_subprocess_reports_tail(monkeypatch,capsys):
     with pytest.raises(Exception):
         pool.invoke([sys.executable,'-c','import sys; print("failure detail"); sys.exit(2)'])
     assert 'failure detail' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('variants', [1, 2])
+def test_global_pip_progress_tracks_distinct_passes_and_recursive_closures(tmp_path, monkeypatch, variants):
+    import hashlib
+    import json
+    import threading
+    from types import SimpleNamespace
+    import distributed as dispatcher
+
+    target = pool._target_environment_module().capture_current()
+    def group(requirements):
+        return {'target': target.as_dict(), 'requirements': requirements,
+                'constraints': [], 'preferred_versions': {}, 'no_deps': False,
+                'required': True, 'tasks': [], 'steps': []}
+
+    groups = {pool.pip_group_key(target, rows): group(rows)
+              for rows in (['demo>=1'], ['demo>=2'])}
+    child = pool.pip_group_key(target, ['build-helper>=1'])
+    candidate = SimpleNamespace(objects=tmp_path / 'objects', _state_lock=threading.RLock())
+    snapshots = []
+    path = tmp_path / 'fetch-progress.json'
+    view = pool._PoolProgress(io.StringIO(), tty=False, interval=3600,
+                              progress_path=path, operation_id='a' * 64)
+    monkeypatch.setattr(pool, '_POOL_PROGRESS', view)
+    report = pool._pool_progress
+    def observe(*args, **kwargs):
+        report(*args, **kwargs)
+        snapshots.append(json.loads(path.read_bytes()))
+    monkeypatch.setattr(pool, '_pool_progress', observe)
+    monkeypatch.setattr(pool, '_pip_worker_controls', lambda: (2, 2))
+    monkeypatch.setattr(pool, '_global_pip_policy', lambda: variants)
+    calls = []
+    lock = threading.Lock()
+
+    def acquire(_pool, key, info, *, phase, selection, preferences_override):
+        with lock:
+            calls.append((key, phase, preferences_override is not None))
+        if phase != 'plan':
+            return selection
+        name = 'build-helper' if key == child else 'demo'
+        version = '2' if info['requirements'] == ['demo>=2'] else '1'
+        kind = 'sdist' if info['requirements'] == ['demo>=1'] else 'wheel'
+        sha = hashlib.sha256(f'{name}/{version}/{kind}'.encode()).hexdigest()
+        return {'status': 'planned', 'packages': [
+            {'name': name, 'version': version, 'kind': kind, 'sha256': sha,
+             'build_requirements': [['build-helper>=1']] if kind == 'sdist' else []}]}
+
+    monkeypatch.setattr(pool, 'acquire_pip_group', acquire)
+    pool.acquire_pip_groups(candidate, groups)
+    expected = len(groups) + 1
+    by_stage = {}
+    terminal = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+    for snapshot in snapshots:
+        terminal.update('running', snapshot)
+        by_stage.setdefault(snapshot['stage'], []).append(snapshot)
+    # Polling can miss an entire short intervening stage. Even then a stage's
+    # completed-work count must never go backwards across recursive frontiers.
+    for stage, records in by_stage.items():
+        sampled = dispatcher._FetchBar(io.StringIO(), window_seconds=10)
+        for record in records:
+            sampled.update('running', record)
+        counts = [record['completed'] for record in records]
+        assert counts == sorted(counts), stage
+        assert all(record['completed'] <= record['total'] for record in records)
+        assert records[-1]['completed'] == records[-1]['total']
+    assert by_stage['Pip planning'][-1]['completed'] == expected
+    assert by_stage['Pip source evidence'][-1]['completed'] == expected
+    assert by_stage['Pip materialization'][-1]['completed'] == expected
+    assert ('Pip alternatives' in by_stage) == (variants > 1)
+    if variants > 1:
+        assert by_stage['Pip alternatives'][-1]['completed'] == len(groups)
+    assert sum(phase == 'plan' and not alternative for _, phase, alternative in calls) == expected
+    assert sum(alternative for _, _, alternative in calls) == (len(groups) if variants > 1 else 0)
+    assert sum(phase == 'sources' for _, phase, _ in calls) == expected
+    assert sum(phase == 'publish' for _, phase, _ in calls) == expected
