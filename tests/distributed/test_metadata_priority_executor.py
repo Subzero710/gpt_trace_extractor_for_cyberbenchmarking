@@ -275,8 +275,7 @@ def test_existing_queued_prefetch_is_promoted_when_rust_requires_it():
     assert seen == ['running', 'required', 'ancestor']
 
 
-def test_shared_closure_pool_installs_and_removes_priority_hooks(monkeypatch):
-    from types import SimpleNamespace
+def test_shared_closure_pool_installs_and_removes_priority_hooks(monkeypatch, tmp_path):
 
     module = _load('superbench_pool.py')
     cache = {}
@@ -305,8 +304,11 @@ def test_shared_closure_pool_installs_and_removes_priority_hooks(monkeypatch):
     monkeypatch.setattr(module, '_native_solver_cache', lambda _pool: cache)
     monkeypatch.setattr(module, '_pip_worker_controls', lambda: (2, 3))
     monkeypatch.setattr(module, 'acquire_pip_group', closure)
-    module.acquire_pip_groups(SimpleNamespace(_state_lock=threading.RLock()),
-                              {'first': {}, 'second': {}})
+    candidate = module.Pool(tmp_path)
+    try:
+        module.acquire_pip_groups(candidate, {key: {'tasks': []} for key in ('first', 'second')})
+    finally:
+        candidate._pip_cache_context.cleanup()
     assert set(checked) == {(phase, key)
                             for phase in ('plan', 'sources', 'publish')
                             for key in ('first', 'second')}

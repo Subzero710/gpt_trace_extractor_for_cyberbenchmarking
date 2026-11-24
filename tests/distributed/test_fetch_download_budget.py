@@ -37,3 +37,31 @@ def test_terminal_phase_progress_uses_gib_not_raw_byte_counts():
                 'pip_bytes': 0, 'pip_active': 4})
     assert '3.000/12.000 GiB (25.0%)' in view.previous
     assert 'bytes/min' not in view.previous
+
+
+def test_worker_budget_callback_uses_sealed_policy_and_live_rx(monkeypatch, capsys):
+    from pathlib import Path
+    import tomllib
+    import superbench_pool as pool
+    from gpt_trace_transport.local_templates import FETCH_BUDGET_EXIT_CODE
+
+    root = Path(pool.__file__).resolve().parents[1]
+    with (root / 'config/preparation.toml').open('rb') as stream:
+        limit = fetch_download_limit(tomllib.load(stream)['acquisition'])
+    original_read_text = Path.read_text
+    received = 20
+
+    def read_text(path, *args, **kwargs):
+        if path == Path('/proc/net/dev'):
+            return counters(received, 0)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    check = pool._fetch_download_budget(root, namespace_rx_bytes(counters(received, 0)))
+    check(limit)
+    received += 1
+    check(limit - 1)
+    with pytest.raises(SystemExit) as error:
+        check(limit)
+    assert error.value.code == FETCH_BUDGET_EXIT_CODE
+    assert 'planned Pip download exceeds fetch budget' in capsys.readouterr().err

@@ -1433,6 +1433,7 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
             with lock:active-=1
             return [{'kind':'wheel','name':'demo','version':'1.0','filename':key+'.whl',
                      'sha256':hashlib.sha256(key.encode()).hexdigest(),
+                     'download_size':len(key.encode()),
                      'url':'https://files.pythonhosted.org/'+key+'.whl',
                      'requirements':[],'provides_extra':[]}]
         def materialize(_pool,records,key,*args,**kwargs):

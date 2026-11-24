@@ -9223,6 +9223,25 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
     return summary
 
 
+def _fetch_download_budget(repo_root, network_rx_baseline):
+    transport = repo_root / 'shared/gpt_trace_transport/local_templates.py'
+    spec = importlib.util.spec_from_file_location('fetch_budget_policy', transport)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with (repo_root / 'config/preparation.toml').open('rb') as stream:
+        limit = module.fetch_download_limit(tomllib.load(stream)['acquisition'])
+    def check_budget(remaining):
+        received = module.namespace_rx_delta(network_rx_baseline,
+                        module.namespace_rx_bytes(Path('/proc/net/dev').read_text()))
+        if received + remaining > limit:
+            print('[pool] planned Pip download exceeds fetch budget: %.3f GiB received + '
+                  '%.3f GiB remaining > %.3f GiB limit' %
+                  (received / 1024**3, remaining / 1024**3, limit / 1024**3),
+                  file=sys.stderr, flush=True)
+            raise SystemExit(module.FETCH_BUDGET_EXIT_CODE)
+    return check_budget
+
+
 def main(argv=None):
     global _POOL_PROGRESS, _OPERATION_EVENT_FD
     p=argparse.ArgumentParser()
@@ -9270,22 +9289,7 @@ def main(argv=None):
     pool=Pool(stage)
     pool.operation_id = args.operation_id
     pool.resume_from = args.reuse_from
-    transport = repo_root / 'shared/gpt_trace_transport/local_templates.py'
-    spec = importlib.util.spec_from_file_location('fetch_budget_policy', transport)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    with (repo_root / 'config/preparation.toml').open('rb') as stream:
-        limit = module.fetch_download_limit(tomllib.load(stream)['acquisition'])
-    def check_budget(remaining):
-        received = module.namespace_rx_delta(args.network_rx_baseline,
-                        module.namespace_rx_bytes(Path('/proc/net/dev').read_text()))
-        if received + remaining > limit:
-            print('[pool] planned Pip download exceeds fetch budget: %.3f GiB received + '
-                  '%.3f GiB remaining > %.3f GiB limit' %
-                  (received / 1024**3, remaining / 1024**3, limit / 1024**3),
-                  file=sys.stderr, flush=True)
-            raise SystemExit(module.FETCH_BUDGET_EXIT_CODE)
-    pool.download_budget = check_budget
+    pool.download_budget = _fetch_download_budget(repo_root, args.network_rx_baseline)
     pool.conda_lock=conda_lock
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)
@@ -9364,7 +9368,6 @@ def main(argv=None):
     constants_file=adapter/'upstream'/'constants.py'
     if digest(constants_file)!=pins['upstream_files']['constants.py']:
         raise RuntimeError('untrusted evaluator setup constants')
-    import importlib.util
     spec=importlib.util.spec_from_file_location('swe_gym_fetch_specs',constants_file)
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
