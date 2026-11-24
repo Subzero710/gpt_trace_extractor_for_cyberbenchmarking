@@ -245,7 +245,9 @@ class _PoolProgress:
         self.pip_active = 0
         self._pip_transfer_active = 0
         self._pip_closure_active = 0
-        self.pip_file = None
+        self.phase_artifacts = {}
+        self.phase_byte_stage = None
+        self.phase_current = self.phase_total = 0
         self.last_time = time.monotonic()
         self.last_bytes = 0
         self.speed = 0.0
@@ -262,12 +264,31 @@ class _PoolProgress:
         # At most ten non-TTY records per known set, irrespective of its size.
         return min(10, completed * 10 // total)
 
+    def begin_artifact_phase(self, stage, artifacts):
+        with self.lock:
+            self.phase_byte_stage = stage
+            self.phase_artifacts = {sha: [row['retained_bytes'], row['size']]
+                                    for sha, row in artifacts.items() if not row['cached']}
+            self.phase_current = sum(row[0] for row in self.phase_artifacts.values())
+            self.phase_total = sum(row[1] for row in self.phase_artifacts.values())
+            self.update(stage, 0, len(artifacts), 'archives', force=True)
+
+    def phase_counts(self):
+        if self.stage == self.phase_byte_stage:
+            return self.phase_current, self.phase_total, 'bytes'
+        return self.completed, self.total, self.unit
+
     def _render(self):
         message = '[pool] ' + self.stage
-        if self.completed is not None and self.total is not None:
-            message += ' %s/%s %s' % (self.completed, self.total, self.unit)
-        elif self.completed is not None:
-            message += ' %s %s' % (self.completed, self.unit)
+        current, total, unit = self.phase_counts()
+        if unit == 'bytes':
+            percent = 100 * current / total if total else 100.0
+            message += ' %.3f/%.3f GiB (%.1f%% de la phase)' % (
+                current / 1024 ** 3, total / 1024 ** 3, percent)
+        elif current is not None and total is not None:
+            message += ' %s/%s %s' % (current, total, unit)
+        elif current is not None:
+            message += ' %s %s' % (current, unit)
         if self.details:
             message += ' | ' + self.details
         observed = self.network_bytes + self.pip_bytes
@@ -276,27 +297,13 @@ class _PoolProgress:
                 observed / 1048576, self.speed / 1048576)
         if self.pip_active:
             message += ' | %s pip actifs' % self.pip_active
-        known = [row for row in self.transfers.values()
-                 if row['total'] > 0 and row['current'] <= row['total']]
-        if self.pip_file is not None:
-            key, current, total = self.pip_file
-            if total > 0 and current <= total:
-                known.append({'name': 'pip-' + key, 'current': current, 'total': total})
-        if known:
-            selected = max(known, key=lambda row: (row['total'], row['current']))
-            current, total = selected['current'], selected['total']
-            filled = min(16, current * 16 // total)
-            message += ' | [%s%s] %.1f%% du fichier (%.1f/%.1f MiB)' % (
-                '#' * filled, '-' * (16 - filled), 100 * current / total,
-                current / 1048576, total / 1048576)
         return message
 
     def _publish_snapshot(self, now, *, force=False):
         """Atomic, durable stage counters for broker polling. No estimates."""
         if self.progress_path is None:
             return
-        current = self.completed
-        total = self.total
+        current, total, unit = self.phase_counts()
         if (current is not None and (type(current) is not int or current < 0)
                 or total is not None and (type(total) is not int or total < 0)
                 or current is not None and total is not None and current > total):
@@ -304,7 +311,7 @@ class _PoolProgress:
         payload = {
             'schema': 1, 'operation_id': self.operation_id,
             'stage': self.stage, 'completed': current, 'total': total,
-            'unit': self.unit, 'network_bytes': self.network_bytes,
+            'unit': unit, 'network_bytes': self.network_bytes,
             'pip_bytes': self.pip_bytes, 'pip_active': self.pip_active,
         }
         value = json.dumps(payload, sort_keys=True, separators=(',', ':'),
@@ -314,9 +321,10 @@ class _PoolProgress:
         # Publish every observed stage/count transition immediately; sample raw
         # byte changes no more often than the configured reporting interval.
         prior = self.last_snapshot_value
-        semantic = (payload['stage'], current, total, payload['unit'], payload['pip_active'])
+        semantic = (payload['stage'], current if unit != 'bytes' else None, total, unit, payload['pip_active'])
         old_semantic = None if prior is None else (
-            prior['stage'], prior['completed'], prior['total'], prior['unit'], prior['pip_active'])
+            prior['stage'], prior['completed'] if prior['unit'] != 'bytes' else None,
+            prior['total'], prior['unit'], prior['pip_active'])
         if not (force or prior is None or semantic != old_semantic
                 or now - self.last_snapshot >= self.interval):
             return
@@ -356,7 +364,8 @@ class _PoolProgress:
                 self.stream.write('\n')
             self.stream.flush()
         else:
-            bucket = self._count_bucket(self.completed, self.total)
+            current, total, _unit = self.phase_counts()
+            bucket = self._count_bucket(current, total)
             material_bytes = (total_bytes - self.last_report_bytes >= 64 * 1048576
                               and now - self.last_emit >= self.interval)
             milestone = (bucket is not None and bucket != self.last_count_bucket)
@@ -389,25 +398,58 @@ class _PoolProgress:
             self._emit(force=force, changed_stage=changed)
             self.last_stage = stage
 
-    def network_start(self, key, label, total):
+    def network_start(self, key, label, total, *, sha=None, offset=0):
         with self.lock:
             if key in self.transfers:
                 raise RuntimeError('duplicate transfer identity')
-            self.transfers[key] = {'name': label, 'current': 0, 'total': total}
+            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
+                expected = self.phase_artifacts[sha][1]
+                if total != expected or not 0 <= offset <= expected:
+                    raise RuntimeError('HTTPS size differs from planned phase artifact')
+                self.phase_current += offset - self.phase_artifacts[sha][0]
+                self.phase_artifacts[sha][0] = offset
+            self.transfers[key] = {'name': label, 'current': offset, 'total': total, 'sha': sha}
             self._emit()
 
     def network_resume(self, key, previous_bytes):
         # Previously persisted bytes belong in the transfer bar but are not
         # new network traffic; never count them again on Range retries.
         with self.lock:
-            self.transfers[key]['current'] = previous_bytes
+            transfer = self.transfers[key]
+            transfer['current'] = previous_bytes
+            sha = transfer['sha']
+            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
+                self.phase_current += previous_bytes - self.phase_artifacts[sha][0]
+                self.phase_artifacts[sha][0] = previous_bytes
             self._emit()
 
     def network_advance(self, key, amount):
         with self.lock:
-            self.transfers[key]['current'] += amount
+            transfer = self.transfers[key]
+            transfer['current'] += amount
+            sha = transfer['sha']
+            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
+                self.phase_current += transfer['current'] - self.phase_artifacts[sha][0]
+                self.phase_artifacts[sha][0] = transfer['current']
             self.network_bytes += amount
             self._emit()
+
+    def artifact_verified(self, sha, size):
+        with self.lock:
+            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
+                current, expected = self.phase_artifacts[sha]
+                if size != expected:
+                    raise RuntimeError('verified CAS size differs from phase plan')
+                self.phase_current += size - current
+                self.phase_artifacts[sha][0] = size
+                self._emit()
+
+    def artifact_discarded(self, sha):
+        with self.lock:
+            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
+                self.phase_current -= self.phase_artifacts[sha][0]
+                self.phase_artifacts[sha][0] = 0
+                self._emit()
 
     def network_end(self, key):
         with self.lock:
@@ -419,7 +461,6 @@ class _PoolProgress:
             self.pip_bytes = snapshot['bytes']
             self._pip_transfer_active = snapshot['jobs']
             self.pip_active = self._pip_transfer_active + self._pip_closure_active
-            self.pip_file = snapshot['file']
             self._emit()
 
     def closure_activity(self, delta):
@@ -1183,9 +1224,7 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
             view = _POOL_PROGRESS
             transfer_key = object()
             if view is not None:
-                view.network_start(transfer_key, path.name, total or 0)
-                if offset:
-                    view.network_resume(transfer_key, offset)
+                view.network_start(transfer_key, path.name, total or 0, sha=sha, offset=offset)
             try:
                 mode = 'ab' if offset else 'wb' if path.exists() else 'xb'
                 with path.open(mode) as stream:
@@ -1229,6 +1268,8 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
         actual = hashes['sha256'].hexdigest()
         if sha is not None and actual != sha:
             path.unlink()
+            if view is not None:
+                view.artifact_discarded(sha)
             raise DownloadIntegrityError('HTTPS artifact sha256 mismatch: ' + str(path))
         checks = sri_parts(sri) or ()
         if checks and not any(hashes[algorithm].digest() == expected
@@ -3560,6 +3601,8 @@ class Pool:
             refs = self.provenance.setdefault(category, {}).setdefault(identity, [])
             if sha not in refs:
                 refs.append(sha)
+            if _POOL_PROGRESS is not None:
+                _POOL_PROGRESS.artifact_verified(sha, size)
             return sha
 
     def put(self, path, category, identity, *, verified_sha=None, durable=False):
@@ -5478,15 +5521,7 @@ class _NativePipByteProgress:
         state = self.snapshot()
         prefix = ('[pool] Pip transfers: %.1f MiB observed | %.2f MiB/s | %d pip active | '
                   % (state['bytes'] / 1048576, speed / 1048576, state['jobs']))
-        selected = state['file']
-        if selected is None:
-            return prefix + 'resolving / download size unknown (no global percent)'
-        identity, current, total = selected
-        width = 20
-        filled = min(width, current * width // total)
-        return (prefix + '%s [%s%s] %.1f%% (%.1f/%.1f MiB, this file only)' % (
-            identity, '#' * filled, '-' * (width - filled),
-            100 * current / total, current / 1048576, total / 1048576))
+        return prefix + 'download size unknown (no global percent)'
 
     def _monitor(self):
         while not self.stop_event.wait(self.interval):
@@ -8402,6 +8437,172 @@ def _global_pip_levels(groups, edges):
     return [layers[level] for level in sorted(layers)]
 
 
+def _pip_materialization_manifest(pool, groups, planned, edges):
+    """One size and one progress identity per selected immutable archive."""
+    artifacts = {}
+    tasks = {key: set(group['tasks']) for key, group in groups.items()}
+    for layer in reversed(_global_pip_levels(groups, edges)):
+        for key in layer:
+            for child in edges.get(key, ()):
+                tasks[child].update(tasks[key])
+    for key, choice in sorted(planned.items()):
+        for package in choice.get('packages', ()):
+            sha = package['sha256']
+            if not SHA.fullmatch(sha):
+                raise RuntimeError('invalid planned Pip artifact identity')
+            url = package['url']
+            _validate_https_endpoint(url, 'files.pythonhosted.org')
+            size = package.get('download_size')
+            if size is not None and (type(size) is not int or size < 0):
+                raise RuntimeError('invalid planned Pip archive size')
+            row = artifacts.setdefault(sha, {'filename': package['filename'], 'size': size,
+                                              'urls': set(), 'closures': set(), 'tasks': set()})
+            if size is not None:
+                if row['size'] is not None and row['size'] != size:
+                    raise RuntimeError('conflicting planned Pip archive sizes')
+                row['size'] = size
+            row['urls'].add(url)
+            row['closures'].add(key)
+            row['tasks'].update(tasks[key])
+    for sha, row in artifacts.items():
+        path = pool.objects / sha[:2] / sha
+        row['cached'] = path.is_file()
+        if path.is_symlink():
+            raise RuntimeError('unsafe planned Pip object')
+        if row['cached']:
+            size = pool.verify_object(sha)
+            if row['size'] is not None and row['size'] != size:
+                raise RuntimeError('cached Pip archive size differs from plan')
+            row['size'] = size
+        row['retained_bytes'] = 0
+        for field in ('urls', 'closures', 'tasks'):
+            row[field] = sorted(row[field])
+        if row['cached'] or row['size'] is None or len(row['urls']) != 1:
+            continue
+        name = hashlib.sha256(row['urls'][0].encode()).hexdigest()
+        raw = pool.stage / 'downloads' / name
+        retained = getattr(pool, 'resume_from', None)
+        if not raw.exists() and retained is not None:
+            previous = retained / 'downloads' / name
+            if previous.is_symlink():
+                raise RuntimeError('unsafe retained Pip archive')
+            if previous.is_file() and 0 < previous.stat().st_size <= row['size']:
+                with _registered_operation('restore interrupted Pip transfer'):
+                    raw.parent.mkdir(exist_ok=True)
+                    shutil.copyfile(previous, raw)
+                    if raw.stat().st_size != previous.stat().st_size:
+                        raise RuntimeError('retained Pip transfer changed')
+        if raw.is_symlink():
+            raise RuntimeError('unsafe partial Pip archive')
+        if raw.is_file():
+            size = raw.stat().st_size
+            if size > row['size']:
+                raise RuntimeError('retained Pip transfer exceeds planned size')
+            if size == row['size']:
+                if digest(raw) != sha:
+                    raise RuntimeError('complete retained Pip transfer has invalid digest')
+                pool.put(raw, 'python', sorted(row['closures'])[0], verified_sha=sha)
+                row['cached'] = True
+            else:
+                row['retained_bytes'] = size
+    return artifacts
+
+
+def _pip_plan_checkpoint(pool, initial):
+    identity = hashlib.sha256(json.dumps(initial, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return pool.stage / 'metadata' / ('pip-materialization-' + identity + '.json')
+
+
+def _read_global_pip_checkpoint(pool, initial, checkpoint):
+    retained = getattr(pool, 'resume_from', None)
+    if retained is None:
+        return None
+    path = retained / 'metadata' / checkpoint.name
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('unsafe retained Pip materialization plan')
+    record = json.loads(path.read_bytes())
+    if record['operation_id'] != pool.operation_id:
+        return None
+    if record['schema'] != 1 or record['initial'] != initial:
+        raise RuntimeError('retained Pip materialization plan identity differs')
+    planned = record['planned']
+    groups = dict(initial)
+    edges = {}
+    frontier = set(initial)
+    while frontier:
+        key = min(frontier)
+        frontier.remove(key)
+        group = groups[key]
+        choice = planned[key]
+        status = choice['status']
+        if status == 'optional-failed':
+            if group['required'] or not isinstance(choice['error'], str):
+                raise RuntimeError('invalid retained optional Pip result')
+        else:
+            target = _coerce_target(group['target'])
+            if status not in ('planned', 'reused'):
+                raise RuntimeError('invalid retained Pip result')
+            completed_path = _pip_plan_path(pool.stage, key)
+            if status == 'reused' or completed_path.is_file():
+                if not reuse_pip_plan(pool, target, group['requirements'], key,
+                        constraints=group['constraints'], no_deps=group['no_deps'],
+                        preferred_versions=group.get('preferred_versions')):
+                    raise RuntimeError('retained completed Pip closure is unavailable')
+                completed = json.loads(completed_path.read_bytes())
+                if set(_pip_plan_artifact_shas(completed)) != _global_pip_artifacts(choice):
+                    raise RuntimeError('retained completed Pip closure differs from selection')
+            _validate_pip_plan_graph({'target': group['target'], 'requested': group['requirements'],
+                'constraints': group['constraints'], 'no_deps': group['no_deps'], 'packages': choice['packages'],
+                'resolver_policy': {'schema': PIP_PLAN_SCHEMA, 'name': PIP_RESOLVER_POLICY,
+                    'target_fingerprint': _target_fingerprint(target), 'runtime': _resolver_runtime_identity()}})
+        children = _global_pip_child_groups(key, group, choice)
+        edges[key] = set(children)
+        for child, info in children.items():
+            if child not in groups:
+                groups[child] = info
+                frontier.add(child)
+            elif any(groups[child].get(field) != info.get(field) for field in
+                     ('target', 'requirements', 'constraints', 'no_deps', 'required')):
+                raise RuntimeError('retained Pip build group identity differs')
+    if set(planned) != set(groups):
+        raise RuntimeError('retained Pip plan coverage differs')
+    _global_pip_levels(groups, edges)
+    return planned, groups, edges
+
+
+def _publish_pip_materialization_plan(pool, initial, planned, groups, edges, checkpoint):
+    if getattr(pool, 'operation_id', None) is not None:
+        write_new(checkpoint, json.dumps({'schema': 1, 'operation_id': pool.operation_id,
+                   'initial': initial, 'planned': planned}, sort_keys=True, separators=(',', ':')))
+    artifacts = _pip_materialization_manifest(pool, groups, planned, edges)
+    unknown = [sha for sha, row in artifacts.items() if row['size'] is None]
+    if unknown:
+        write_new(checkpoint.with_name(checkpoint.stem + '-volume.json'),
+                  json.dumps({'unknown_size_sha256': unknown, 'artifacts': artifacts}, sort_keys=True))
+        raise RuntimeError('Pip materialization size unavailable for: ' + ', '.join(unknown))
+    total = sum(row['size'] for row in artifacts.values())
+    cached = sum(row['size'] for row in artifacts.values() if row['cached'])
+    retained = sum(row['retained_bytes'] for row in artifacts.values())
+    remaining = total - cached - retained
+    report = {'unique_archives': len(artifacts), 'total_bytes': total, 'cached_bytes': cached,
+              'retained_bytes': retained, 'remaining_bytes': remaining, 'artifacts': artifacts}
+    write_new(checkpoint.with_name(checkpoint.stem + '-volume.json'),
+              json.dumps(report, sort_keys=True, separators=(',', ':')))
+    print('[pool] Pip materialization plan: %d archives | %.3f GiB total | %.3f GiB cached | '
+          '%.3f GiB partial | %.3f GiB remaining' % (len(artifacts), total / 1024**3,
+              cached / 1024**3, retained / 1024**3, remaining / 1024**3), flush=True)
+    for row in sorted(artifacts.values(), key=lambda item: item['size'], reverse=True)[:20]:
+        print('[pool] Pip artifact: %.1f MiB %s | %s' % (row['size'] / 1048576,
+              row['filename'], ', '.join(row['tasks'])), flush=True)
+    if _POOL_PROGRESS is not None:
+        _POOL_PROGRESS.begin_artifact_phase('Pip materialization', artifacts)
+    if getattr(pool, 'download_budget', None) is not None:
+        pool.download_budget(remaining)
+    return report
+
+
 def acquire_pip_groups(pool, groups):
     """Plan all validated closure graphs, consolidate, then fetch winning CAS.
 
@@ -8436,43 +8637,48 @@ def acquire_pip_groups(pool, groups):
             frontier = ordered
             all_groups = dict(ordered)
             alternative_done = 0
-            while frontier:
-                def run(key, group, *, phase, choice=None, preference=None):
+            def run(key, group, *, phase, choice=None, preference=None):
+                if _POOL_PROGRESS is not None:
+                    _POOL_PROGRESS.closure_activity(1)
+                try:
+                    return acquire_pip_group(pool, key, group, phase=phase,
+                                             selection=choice, preferences_override=preference)
+                finally:
                     if _POOL_PROGRESS is not None:
-                        _POOL_PROGRESS.closure_activity(1)
-                    try:
-                        return acquire_pip_group(pool, key, group, phase=phase,
-                                                 selection=choice, preferences_override=preference)
-                    finally:
-                        if _POOL_PROGRESS is not None:
-                            _POOL_PROGRESS.closure_activity(-1)
-                def batch(inputs, *, phase, stage, before, total, details,
-                          choices=None, preferences=None):
-                    _pool_progress(stage, before, total, 'closures', details)
-                    completed = {}
-                    failures = []
-                    with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(workers, len(inputs)),
-                            thread_name_prefix='verified-pip-'+phase) as executor:
-                        futures = {executor.submit(run, key, all_groups[key], phase=phase,
-                                                   choice=(choices or {}).get(key),
-                                                   preference=(preferences or {}).get(key)):key
-                                   for key in sorted(inputs)}
-                        for future in _bounded_completed(futures):
-                            key = futures[future]
-                            try:
-                                completed[key] = _shared_future_result(future)
-                                _pool_progress(stage, before + len(completed), total,
-                                               'closures', details)
-                            except BaseException as exc:
-                                failures.append((key,exc))
-                                for other in futures:
-                                    if not other.done():other.cancel()
-                    if failures:
-                        key, exc = min(failures, key=lambda row:row[0])
-                        raise RuntimeError('verified pip '+phase+' closure '+key+' failed: '+str(exc)) from exc
-                    return completed
+                        _POOL_PROGRESS.closure_activity(-1)
+            def batch(inputs, *, phase, stage, before, total, details,
+                      choices=None, preferences=None):
+                _pool_progress(stage, before, total, 'closures', details)
+                completed = {}
+                failures = []
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(workers, len(inputs)),
+                        thread_name_prefix='verified-pip-'+phase) as executor:
+                    futures = {executor.submit(run, key, all_groups[key], phase=phase,
+                                               choice=(choices or {}).get(key),
+                                               preference=(preferences or {}).get(key)):key
+                               for key in sorted(inputs)}
+                    for future in _bounded_completed(futures):
+                        key = futures[future]
+                        try:
+                            completed[key] = _shared_future_result(future)
+                            _pool_progress(stage, before + len(completed), total,
+                                           'closures', details)
+                        except BaseException as exc:
+                            failures.append((key,exc))
+                            for other in futures:
+                                if not other.done():other.cancel()
+                if failures:
+                    key, exc = min(failures, key=lambda row:row[0])
+                    raise RuntimeError('verified pip '+phase+' closure '+key+' failed: '+str(exc)) from exc
+                return completed
 
+            checkpoint = _pip_plan_checkpoint(pool, ordered)
+            resumed = _read_global_pip_checkpoint(pool, ordered, checkpoint)
+            if resumed is not None:
+                planned, all_groups, edges = resumed
+                frontier = {}
+            while frontier:
                 baseline = batch(frontier, phase='plan', stage='Pip planning',
                                  before=len(planned), total=len(all_groups),
                                  details='verified Rust metadata')
@@ -8526,12 +8732,15 @@ def acquire_pip_groups(pool, groups):
                             next_frontier[child] = info
                 frontier = next_frontier
             layers = _global_pip_levels(all_groups, edges)
+            _publish_pip_materialization_plan(pool, ordered, planned, all_groups, edges, checkpoint)
             done = 0
             for layer in layers:
                 batch(layer, phase='publish', stage='Pip materialization',
                       before=done, total=len(all_groups),
                       details='shared SHA-256 artifacts', choices=planned)
                 done += len(layer)
+            if _POOL_PROGRESS is not None:
+                _POOL_PROGRESS.finish()
         finally:
             with _bounded_lock(pool._state_lock):
                 for key in ('metadata_executor','metadata_speculative_submit','metadata_promote',
@@ -9022,6 +9231,7 @@ def main(argv=None):
     p.add_argument('--operation-id',required=True)
     p.add_argument('--operation-events-fd', required=True, type=int)
     p.add_argument('--reuse-from',type=Path)
+    p.add_argument('--network-rx-baseline',required=True,type=json.loads)
     args=p.parse_args(argv)
     if os.geteuid()==0:raise RuntimeError('refusing privileged fetch account')
     if not SHA.fullmatch(args.operation_id):raise RuntimeError('invalid operation ID')
@@ -9058,6 +9268,24 @@ def main(argv=None):
     if args.reuse_from is not None:
         verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
     pool=Pool(stage)
+    pool.operation_id = args.operation_id
+    pool.resume_from = args.reuse_from
+    transport = repo_root / 'shared/gpt_trace_transport/local_templates.py'
+    spec = importlib.util.spec_from_file_location('fetch_budget_policy', transport)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with (repo_root / 'config/preparation.toml').open('rb') as stream:
+        limit = module.fetch_download_limit(tomllib.load(stream)['acquisition'])
+    def check_budget(remaining):
+        received = module.namespace_rx_delta(args.network_rx_baseline,
+                        module.namespace_rx_bytes(Path('/proc/net/dev').read_text()))
+        if received + remaining > limit:
+            print('[pool] planned Pip download exceeds fetch budget: %.3f GiB received + '
+                  '%.3f GiB remaining > %.3f GiB limit' %
+                  (received / 1024**3, remaining / 1024**3, limit / 1024**3),
+                  file=sys.stderr, flush=True)
+            raise SystemExit(module.FETCH_BUDGET_EXIT_CODE)
+    pool.download_budget = check_budget
     pool.conda_lock=conda_lock
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)

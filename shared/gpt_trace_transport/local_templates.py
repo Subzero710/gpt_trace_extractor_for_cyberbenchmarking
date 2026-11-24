@@ -42,6 +42,42 @@ FETCH_SOURCE_FILES = (
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
 )
+FETCH_BUDGET_EXIT_CODE = 75
+
+
+def namespace_rx_bytes(contents):
+    interfaces = {}
+    for line in contents.splitlines()[2:]:
+        name, separator, fields = line.partition(':')
+        if not separator or len(fields.split()) != 16:
+            raise RuntimeError('invalid Linux network interface counters')
+        name = name.strip()
+        if name == 'lo':
+            continue
+        if name in interfaces or not name:
+            raise RuntimeError('duplicate or empty network interface')
+        value = int(fields.split()[0])
+        if value < 0:
+            raise RuntimeError('negative network byte counter')
+        interfaces[name] = value
+    if not interfaces:
+        raise RuntimeError('fetch namespace has no non-loopback network interface')
+    return interfaces
+
+
+def namespace_rx_delta(baseline, current):
+    if baseline.keys() != current.keys() or any(current[key] < baseline[key] for key in baseline):
+        raise RuntimeError('fetch namespace network counters changed identity or reset')
+    return sum(current[key] - baseline[key] for key in baseline)
+
+
+def fetch_download_limit(acquisition):
+    gib = acquisition['max_download_gib']
+    if type(gib) is not int or gib <= 0:
+        raise RuntimeError('invalid acquisition download budget')
+    return gib * 1024 ** 3
+
+
 def fetch_runtime_executables(source_root=ROOT):
     """Derive Fossil-only executables from the versioned Rust crate manifest.
 

@@ -38,7 +38,7 @@ def record(name,version,requires=()):
     return {'kind':'wheel','name':name,'version':str(version),
             'filename':f'{name}-{version}-py3-none-any.whl',
             'sha256':sha,'url':f'https://files.pythonhosted.org/{name}-{version}-py3-none-any.whl',
-            'requirements':list(requires),'provides_extra':[]}
+            'requirements':list(requires),'provides_extra':[], 'download_size':len(raw)}
 
 
 def group(env,name):
@@ -206,3 +206,66 @@ def test_total_bytes_precede_number_of_archives_when_sizes_verified(candidate):
     alternatives={'one':[{'status':'planned','packages':[huge]},
                          {'status':'planned','packages':[little1,little2]}]}
     assert len(pool._global_pip_choose(candidate,alternatives)['one']['packages'])==2
+
+
+def test_phase_budget_rejects_before_any_materialization(tmp_path, candidate):
+    env = target()
+    groups = {'left': group(env, 'left'), 'right': group(env, 'right')}
+    planned = {key: {'status': 'planned', 'packages': [record('shared', '1'), record(key, '1')]}
+               for key in groups}
+    candidate.operation_id = 'a' * 64
+    observed = []
+    def reject(remaining):
+        observed.append(remaining)
+        raise RuntimeError('budget exhausted')
+    candidate.download_budget = reject
+    checkpoint = pool._pip_plan_checkpoint(candidate, groups)
+    with pytest.raises(RuntimeError, match='budget exhausted'):
+        pool._publish_pip_materialization_plan(candidate, groups, planned, groups, {}, checkpoint)
+    report = json.loads(checkpoint.with_name(checkpoint.stem + '-volume.json').read_text())
+    assert report['unique_archives'] == 3
+    assert observed == [sum(len(f'{name}==1'.encode()) for name in ('shared', 'left', 'right'))]
+    assert report['remaining_bytes'] == observed[0]
+    assert checkpoint.is_file()
+    assert not list(candidate.objects.glob('*/*'))
+
+
+def test_selected_checkpoint_and_partial_download_reused(tmp_path):
+    env = target()
+    initial = {'demo': group(env, 'demo')}
+    selected = {'demo': {'status': 'planned', 'packages': [record('demo', '1')]}}
+    old = pool.Pool(tmp_path / 'old')
+    new = pool.Pool(tmp_path / 'new')
+    try:
+        old.operation_id = new.operation_id = 'b' * 64
+        new.resume_from = old.stage
+        checkpoint = pool._pip_plan_checkpoint(old, initial)
+        pool._publish_pip_materialization_plan(old, initial, selected, initial, {}, checkpoint)
+        artifact = selected['demo']['packages'][0]
+        raw_name = hashlib.sha256(artifact['url'].encode()).hexdigest()
+        (old.stage / 'downloads').mkdir()
+        (old.stage / 'downloads' / raw_name).write_bytes(b'demo')
+        with patch.object(pool, '_resolver_runtime_identity', return_value={'test': 'sealed'}):
+            restored, groups, edges = pool._read_global_pip_checkpoint(new, initial,
+                                pool._pip_plan_checkpoint(new, initial))
+        assert restored == selected
+        report = pool._publish_pip_materialization_plan(new, initial, restored, groups, edges,
+                                 pool._pip_plan_checkpoint(new, initial))
+        assert report['retained_bytes'] == 4
+        assert report['remaining_bytes'] == artifact['download_size'] - 4
+        assert (new.stage / 'downloads' / raw_name).read_bytes() == b'demo'
+        assert (old.stage / 'downloads' / raw_name).read_bytes() == b'demo'
+    finally:
+        old._pip_cache_context.cleanup()
+        new._pip_cache_context.cleanup()
+
+
+def test_missing_pypi_size_refuses_materialization(tmp_path, candidate):
+    env = target()
+    initial = {'demo': group(env, 'demo')}
+    row = record('demo', '1')
+    del row['download_size']
+    selected = {'demo': {'status': 'planned', 'packages': [row]}}
+    with pytest.raises(RuntimeError, match='size unavailable'):
+        pool._publish_pip_materialization_plan(candidate, initial, selected, initial, {},
+                                              pool._pip_plan_checkpoint(candidate, initial))

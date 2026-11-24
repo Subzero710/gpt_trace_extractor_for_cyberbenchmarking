@@ -34,7 +34,7 @@ from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonic
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
     verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, fetch_runtime_build_identity_path,
     verify_fetch_runtime_build_identity, pool_contract, seal,
-    sync_directory)
+    sync_directory, namespace_rx_bytes, namespace_rx_delta, fetch_download_limit, FETCH_BUDGET_EXIT_CODE)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
 
@@ -835,7 +835,7 @@ class PreparationManager:
                 # verified the previous worker and all descendants are absent.
                 pending_integration = (isinstance(previous.get('publication_verified'), dict)
                     and previous['publication_verified'].get('runtime_integrated') != True)
-                if not (payload['retry'] and previous['phase'] in {'failed','interrupted'}
+                if not (payload['retry'] and previous['phase'] in {'failed','interrupted','canceled'}
                         and previous.get('result') is None
                         and (previous.get('publication_verified') is None or pending_integration)
                         and (pending_integration or not (self.base.parent/'dependency-pool'/'ready').exists())):
@@ -1083,18 +1083,27 @@ def retained_dependency_stage(manager, pool_root, state, account):
     for entry in manager.root.iterdir():
         if not entry.is_dir() or entry.is_symlink() or SHA.fullmatch(entry.name) is None:
             continue
-        previous=manager._read(entry.name)
-        if (previous is None or previous['phase'] not in TERMINAL or
-                previous.get('result') is not None or previous.get('publication_verified') or
-                _salvage_identity(previous['compatibility'])!=wanted):
-            continue
-        # No process/cgroup/source container from a past operation may write
-        # into the stage while it is read for recovery.
-        if JobScope.members(previous) or manager._containers(previous):
-            raise RuntimeError('retained dependency stage has active owners')
-        candidates.append((previous,pool_root/'incoming'))
-        for attempt in range(1,previous['attempt']+1):
-            candidates.append((previous,pool_root/('incoming-'+entry.name+'-'+str(attempt))))
+        latest = manager._read(entry.name)
+        if latest is None:
+            raise RuntimeError('missing retained preparation state')
+        histories = [latest]
+        for attempt in range(1, latest['attempt']):
+            journal = safe(entry / f'attempt-{attempt:04d}.json')
+            previous = json.loads(journal.read_bytes())
+            if (previous.get('schema') != 1 or previous.get('operation_id') != entry.name
+                    or previous.get('attempt') != attempt or previous.get('deployment') != manager.deployment
+                    or hashlib.sha256(canonical(previous.get('compatibility'))).hexdigest() != entry.name):
+                raise RuntimeError('invalid retained preparation attempt journal')
+            histories.append(previous)
+        for previous in histories:
+            if (previous['phase'] not in TERMINAL or previous.get('result') is not None
+                    or previous.get('publication_verified') or
+                    _salvage_identity(previous['compatibility']) != wanted):
+                continue
+            if JobScope.members(previous) or manager._containers(previous):
+                raise RuntimeError('retained dependency stage has active owners')
+            candidates.append((previous, pool_root / 'incoming'))
+            candidates.append((previous, pool_root / ('incoming-' + entry.name + '-' + str(previous['attempt']))))
     matches=[]
     for previous,path in candidates:
         if path.is_symlink():raise RuntimeError('unsafe retained dependency stage symlink')
@@ -1358,13 +1367,26 @@ def _prepare(manager, state):
     if (type(cadence) is not int or type(idle_limit) is not int or not 1 <= cadence < idle_limit <= 180
             or type(elementary_limit) is not int or not 1 <= elementary_limit <= 180):
         raise RuntimeError('invalid versioned preparation watchdog controls')
+    from workstation_broker.fetch_egress import FETCH_WORKER_UMASK, fetch_worker_command, source_network
+    download_limit = fetch_download_limit(acquisition)
+    def received():
+        with host_operation('read-fetch-namespace-rx'):
+            result = subprocess.run(['ip', 'netns', 'exec', source_network(), 'cat', '/proc/net/dev'],
+                                    capture_output=True, text=True, check=True, timeout=cleanup_timeout)
+        return namespace_rx_bytes(result.stdout)
+    baseline = received()
+    def enforce_download_limit():
+        amount = namespace_rx_delta(baseline, received())
+        if amount >= download_limit:
+            raise RuntimeError('fetch download budget reached: %.3f/%.3f GiB received in fetch namespace' %
+                               (amount / 1024 ** 3, download_limit / 1024 ** 3))
     read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     try:
         try:
-            from workstation_broker.fetch_egress import FETCH_WORKER_UMASK, fetch_worker_command
             child = subprocess.Popen(fetch_worker_command(account, interpreter,
                             [str(program), "--repo-root", str(source_root), "--stage", str(stage),
                              "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
+                             "--network-rx-baseline", json.dumps(baseline, sort_keys=True),
                              *(["--reuse-from", str(reuse)] if reuse is not None else [])]),
                            cwd=source_root, env=env, pass_fds=(write_fd,),
                            stdin=subprocess.DEVNULL, start_new_session=True,
@@ -1384,11 +1406,13 @@ def _prepare(manager, state):
                         watch.feed(chunk)
                     else:
                         exitcode = child.wait(timeout=cleanup_timeout)
+                        enforce_download_limit()
                         if exitcode == 0 and (watch.active or watch.pending):
                             raise RuntimeError('acquisition worker exited with unresolved operation records')
                         break
                 if time.monotonic() < watch.next_deadline(next_check):
                     continue
+                enforce_download_limit()
                 progress = manager._progress(state)
                 if progress is not None:
                     observation = (progress['stage'], progress['completed'],
@@ -1415,6 +1439,17 @@ def _prepare(manager, state):
         os.close(read_fd)
     if exitcode != 0:
         _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
+        if exitcode == FETCH_BUDGET_EXIT_CODE:
+            progress = manager._progress(state)
+            if (progress is None or progress['stage'] != 'Pip materialization'
+                    or progress['unit'] != 'bytes' or progress['total'] is None
+                    or progress['completed'] is None):
+                raise RuntimeError('download budget refusal lacks measured Pip volume')
+            remaining = progress['total'] - progress['completed']
+            amount = namespace_rx_delta(baseline, received())
+            raise RuntimeError('planned Pip download exceeds fetch budget: %.3f GiB received + '
+                               '%.3f GiB remaining > %.3f GiB limit' %
+                               (amount / 1024**3, remaining / 1024**3, download_limit / 1024**3))
         raise subprocess.CalledProcessError(exitcode, child.args)
     # Package build backends may spawn children. A successful downloader exit
     # cannot authorize publication while any descendant can still write bytes.

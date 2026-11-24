@@ -941,7 +941,9 @@ class _FetchBar:
         self.byte_samples.append((now, received))
         if done is not None:
             if self.work_samples and done < self.work_samples[-1][1]:
-                raise RuntimeError('fetch completed-work counter went backwards')
+                if progress['unit'] != 'bytes':
+                    raise RuntimeError('fetch completed-work counter went backwards')
+                self.work_samples.clear()
             self.work_samples.append((now, done))
         while self.byte_samples and now - self.byte_samples[0][0] > self.window_seconds:
             self.byte_samples.popleft()
@@ -975,10 +977,11 @@ class _FetchBar:
             stage, completed, total, unit = 'Préparation', None, None, ''
         if type(completed) is int and type(total) is int and total > 0:
             proportion = min(1.0, completed / total)
-            label = f'{completed}/{total} {unit} ({100 * proportion:.1f}%)'
+            label = (f'{completed / 1024**3:.3f}/{total / 1024**3:.3f} GiB ({100 * proportion:.1f}%)'
+                     if unit == 'bytes' else f'{completed}/{total} {unit} ({100 * proportion:.1f}%)')
             filled = int(24 * proportion)
         elif type(completed) is int and total == 0:
-            label = f'{completed}/0 {unit}'
+            label = '0/0 GiB (100%)' if unit == 'bytes' else f'{completed}/0 {unit}'
             filled = 24
         else:
             label = 'phase active — total non mesuré'
@@ -995,7 +998,7 @@ class _FetchBar:
             # Show both independently when a stage produces work AND downloads.
             if self.stage_has_transfer:
                 metric += f' | {bytes_per_second / 1048576:.2f} MiB/s'
-            if completed is not None and unit:
+            if completed is not None and unit and unit != 'bytes':
                 metric += f' | {units_per_minute:.1f} {unit}/min'
             if self.last['pip_active']:
                 activity = f" | {self.last['pip_active']} pip actifs"
@@ -1015,14 +1018,14 @@ class _FetchBar:
                 return available - len(f'fetch | {stage} [] {label}{metric}{suffix}{activity}')
             if bar_capacity() < 2:
                 activity = ''
-            if bar_capacity() < 2 and type(completed) is int and type(total) is int and total > 0 and unit:
+            if bar_capacity() < 2 and type(completed) is int and type(total) is int and total > 0 and unit and unit != 'bytes':
                 # The work-rate metric already identifies the unit.
                 label = f'{completed}/{total} ({100 * min(1.0, completed / total):.1f}%)'
             if bar_capacity() < 2:
                 suffix = suffix.removesuffix(' reçus')
             if bar_capacity() < 2:
                 suffix = ''
-            if bar_capacity() < 2 and type(completed) is int and type(total) is int:
+            if bar_capacity() < 2 and type(completed) is int and type(total) is int and unit != 'bytes':
                 label = f'{completed}/{total}'
             width = min(24, max(2, bar_capacity()))
             if type(total) is int and total > 0 and type(completed) is int:
@@ -1148,12 +1151,20 @@ def preparation_fetch(cfg, *, fetch_source=None):
                             " start remains unconfirmed; rerun make superbench-fetch "
                             "ADAPTER=swe-gym-lite to rediscover it; "
                             "no mutation was blindly retried")
-                    raise RuntimeError("preparation " + operation_id + " failed: " + str(status.get("error")))
+                    error = str(status.get('error'))
+                    for pattern in (
+                            r'RuntimeError: fetch download budget reached: ([0-9.]+/[0-9.]+ GiB) received in fetch namespace',
+                            r'RuntimeError: planned Pip download exceeds fetch budget: ([0-9.]+ GiB received \+ [0-9.]+ GiB remaining > [0-9.]+ GiB limit)'):
+                        matched = re.fullmatch(pattern, error)
+                        if matched:
+                            print('\nfetch | LIMITE DE TÉLÉCHARGEMENT | ' + matched.group(1), flush=True)
+                            break
+                    raise RuntimeError("preparation " + operation_id + " failed: " + error)
                 error = status.get("error")
                 # Only an explicit new make superbench-fetch invocation retries
                 # a terminal failed job; the broker verifies process/cgroup
                 # absence and preserves all old bytes before admitting it.
-                retryable_preflight_failure = phase in {"failed", "interrupted"}
+                retryable_preflight_failure = phase in {"failed", "interrupted", "canceled"}
                 if phase != "not_started" and not retryable_preflight_failure:
                     raise RuntimeError("fetch zombie preserved (" + str(phase) + "): " +
                                        str(error) + "; administrative cleanup required")

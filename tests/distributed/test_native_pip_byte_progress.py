@@ -1,4 +1,4 @@
-"""Regression tests: reported pip percentages are exclusively real file bytes."""
+"""Regression tests: Pip byte counters remain accurate without displaying individual file percentages."""
 import contextlib
 import importlib.util
 import io
@@ -23,7 +23,7 @@ def test_real_file_byte_percentage_and_restart_accounting():
         meter.begin('job')
         assert meter.observe('job', b'Progress 1048576 of 4194304\n')
         assert meter.snapshot()['file'] == ('job', 1048576, 4194304)
-        assert '[#####---------------] 25.0%' in meter._render()
+        assert '%' not in meter._render()
         assert meter.observe('job', b'Progress 3145728 of 4194304\n')
         assert meter.snapshot()['bytes'] == 3145728
         assert meter.observe('job', b'Progress 0 of 1048576\n')

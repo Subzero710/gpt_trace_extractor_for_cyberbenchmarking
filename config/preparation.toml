@@ -16,6 +16,7 @@ template_payload_batch_mib = 1024
 template_payload_batch_members = 512
 
 [acquisition]
+max_download_gib = 200
 # QEMU's restricted user network forwards only this explicit proxy endpoint.
 network = "10.0.2.0/24"
 service_address = "10.0.2.100"
