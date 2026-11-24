@@ -2037,7 +2037,7 @@ def static_project(file, *, extra_groups=()):
     return deps,git,issues
 
 def _declarative_local_metadata(get_file, target, extras, commands):
-    """Classify setuptools dependency declarations without running build code.
+    """Classify local dependency declarations without running build code.
 
     PEP 621 permits a dynamic version without making dependencies dynamic.
     Legacy setuptools config may also own requirements while setup.py supplies
@@ -2051,36 +2051,52 @@ def _declarative_local_metadata(get_file, target, extras, commands):
     data = tomllib.loads(raw)
     build = data.get('build-system')
     if (not isinstance(build, dict) or 'backend-path' in build
-            or build.get('build-backend', 'setuptools.build_meta:__legacy__')
-            not in {'setuptools.build_meta', 'setuptools.build_meta:__legacy__'}
             or not isinstance(build.get('requires'), list)
             or not all(isinstance(row, str) for row in build['requires'])):
         return None
-    build_requirements = [_parse_registry_requirement(row) for row in build['requires']]
-    if ('build-backend' not in build and not any(
-            _normalized_package_name(row.name) == 'setuptools' and _marker_active(row, target)
-            for row in build_requirements)):
+    backend = build.get('build-backend', 'setuptools.build_meta:__legacy__')
+    if backend not in ('setuptools.build_meta', 'setuptools.build_meta:__legacy__', 'mesonpy'):
         return None
-    roots = tuple(sorted({str(row) for row in build_requirements}))
-    setup = get_file('setup.py')
-    if setup:
-        # Reuse the existing bounded evaluator, including recipe-specific argv
-        # and pinned file reads. Do not infer missing dependencies from errors.
-        for argv in setup_script_invocations(commands):
-            rows, issues = setup_static(setup, extras=extras, get_file=get_file,
-                                        python_version=target.python_full_version,
-                                        setup_argv=argv, declarative_only=True)
-            if rows or issues:
-                return None
-    cfg = get_file('setup.cfg')
+    build_requirements = [_parse_registry_requirement(row) for row in build['requires']]
     parsed = configparser.ConfigParser(interpolation=None)
-    if cfg:
-        parsed.read_string(cfg)
-        if parsed.defaults():
+    cfg = None
+    if backend == 'mesonpy':
+        # Meson-python reads PEP 621 metadata, not setuptools configuration.
+        # An explicit non-isolated install uses the recipe's environment and
+        # does not invoke the isolated build-requirements hooks. Do not create
+        # an extra isolated build closure or build a wheel to read these fields.
+        _, _, _, issues, _, _, steps = pip_commands(commands)
+        local = [step for step in steps if step['local_project']]
+        if (issues or not local or any(not step['no_build_isolation']
+                                      or step['no_use_pep517'] for step in local)
+                or setup_script_invocations(commands, implicit=False)
+                or not isinstance(data.get('project'), dict)):
             return None
-        if any(parsed.has_option('options', field) for field in
-               ('setup_requires', 'dependency_links')):
+        roots = ()
+    elif backend in {'setuptools.build_meta', 'setuptools.build_meta:__legacy__'}:
+        if ('build-backend' not in build and not any(
+                _normalized_package_name(row.name) == 'setuptools' and _marker_active(row, target)
+                for row in build_requirements)):
             return None
+        roots = tuple(sorted({str(row) for row in build_requirements}))
+        setup = get_file('setup.py')
+        if setup:
+            # Reuse the existing bounded evaluator, including recipe-specific
+            # argv and pinned file reads.
+            for argv in setup_script_invocations(commands):
+                rows, issues = setup_static(setup, extras=extras, get_file=get_file,
+                                            python_version=target.python_full_version,
+                                            setup_argv=argv, declarative_only=True)
+                if rows or issues:
+                    return None
+        cfg = get_file('setup.cfg')
+        if cfg:
+            parsed.read_string(cfg)
+            if parsed.defaults():
+                return None
+            if any(parsed.has_option('options', field) for field in
+                   ('setup_requires', 'dependency_links')):
+                return None
     project = data.get('project')
     if project is not None:
         if (not isinstance(project, dict) or not isinstance(project.get('name'), str)
@@ -2090,6 +2106,10 @@ def _declarative_local_metadata(get_file, target, extras, commands):
                    & set(project.get('dynamic', []))
                 or not isinstance(project.get('dependencies', []), list)
                 or not isinstance(project.get('optional-dependencies', {}), dict)):
+            return None
+        if backend == 'mesonpy' and (set(project.get('dynamic', [])) - {'version'}
+                or ('version' not in project and 'version' not in project.get('dynamic', []))
+                or ('version' in project and 'version' in project.get('dynamic', []))):
             return None
         # A second dependency declaration is not part of this proof. Tool-only
         # setup.cfg files, however, do not compete with a PEP 621 project table.
@@ -2829,7 +2849,7 @@ def shell_segments(line):
     return segments
 
 
-def setup_script_invocations(commands):
+def setup_script_invocations(commands, *, implicit=True):
     """Derive setup.py argv identities from the pinned official install stream."""
     invocations=[];local_pip=False
     for line in commands:
@@ -2854,8 +2874,7 @@ def setup_script_invocations(commands):
                 if item in ('-e','--editable','-ve','-ev') and index+1<len(parts):
                     target=parts[index+1]
                     if target in ('.','./') or target.startswith('.['):local_pip=True
-    if local_pip:invocations.append(('setup.py','egg_info'))
-    if not invocations:invocations.append(('setup.py','egg_info'))
+    if implicit and (local_pip or not invocations):invocations.append(('setup.py','egg_info'))
     return tuple(dict.fromkeys(invocations))
 
 
@@ -2900,6 +2919,8 @@ def pip_commands(commands):
                 optional = follower in (['true'], [':'])
             ss, ff, vv, cc, ee = set(), set(), set(), set(), set()
             no_deps = False
+            no_build_isolation = False
+            no_use_pep517 = False
             local_project = False
             i = 0
             while i < len(parts):
@@ -2924,7 +2945,11 @@ def pip_commands(commands):
                             if match: ee.update(t.strip() for t in match[0].split(',') if t.strip())
                     else: issues.append('unknown editable target ' + target)
                     i += 2; continue
-                if arg in ('--no-build-isolation', '--no-use-pep517', '--upgrade',
+                if arg == '--no-build-isolation':
+                    no_build_isolation = True; i += 1; continue
+                if arg == '--no-use-pep517':
+                    no_use_pep517 = True; i += 1; continue
+                if arg in ('--upgrade',
                            '-U', '-q', '--quiet', '-v', '--verbose', '--prefer-binary',
                            '--no-warn-script-location', '--no-input'):
                     i += 1; continue
@@ -2958,6 +2983,8 @@ def pip_commands(commands):
             steps.append({'requirements': ss, 'files': ff, 'constraints': cc,
                            'vcs': vv, 'local_extras': ee, 'no_deps': no_deps,
                            'local_project': local_project,
+                           'no_build_isolation': no_build_isolation,
+                           'no_use_pep517': no_use_pep517,
                            'optional': optional, 'command': command})
     return specs, files, vcs, issues, local_extras, constraints, steps
 

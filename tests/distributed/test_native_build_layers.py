@@ -97,13 +97,13 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     assert json.loads(report.read_bytes())['install'][0]['metadata']['requires_dist'] == ['fixture_dynamic==1.0']
 
 
-def _declared(project, setup, config='', *, extras=(), python='3.8.20'):
+def _declared(project, setup, config='', *, extras=(), python='3.8.20', commands=None):
     from types import SimpleNamespace
     target = SimpleNamespace(python_full_version=python, markers={
         'python_version': '.'.join(python.split('.')[:2]), 'python_full_version': python})
     files = {'pyproject.toml': project, 'setup.py': setup, 'setup.cfg': config}
     return pool._declarative_local_metadata(lambda name, required=False: files.get(name),
-        target, extras, ['python -m pip install -e .'])
+        target, extras, ['python -m pip install -e .'] if commands is None else commands)
 
 
 _BUILD_SYSTEM = '''[build-system]
@@ -163,6 +163,81 @@ def test_dynamic_dependencies_and_competing_metadata_remain_native():
     assert _declared(_BUILD_SYSTEM + _PROJECT, _SETUP, '[options]\ninstall_requires=other') is None
     assert _declared(_BUILD_SYSTEM + 'build-backend="custom_backend"\n' + _PROJECT, _SETUP) is None
     assert _declared(_BUILD_SYSTEM, _SETUP, '[metadata]\nname=generated\n[options]\ninstall_requires=file: reqs.txt') is None
+
+
+_MESON_BUILD_SYSTEM = """[build-system]
+requires = ["meson-python", "meson", "Cython", "numpy"]
+build-backend = "mesonpy"
+"""
+
+
+def test_meson_nonisolated_install_reads_only_pinned_pep621_dependencies():
+    commands = ['python -m pip install "numpy<2"; '
+                'python -m pip install -ve .[outer] --no-build-isolation -Ceditable-verbose=true']
+    result = _declared(_MESON_BUILD_SYSTEM + _PROJECT,
+                       'raise AssertionError("setup.py is not a Meson metadata source")',
+                       '[options]\ninstall_requires=unrelated',
+                       extras={'outer'}, python='3.10.14', commands=commands)
+    assert result == ({'base>=1', 'modern', 'outer-only', 'extra-lib>=1'}, set(), ())
+    _, _, _, issues, _, _, steps = pool.pip_commands(commands)
+    assert not issues
+    assert not steps[0]['no_build_isolation'] and not steps[0]['local_project']
+    assert steps[1]['no_build_isolation'] and steps[1]['local_project']
+
+
+
+def test_meson_declarative_analysis_never_reads_setuptools_files():
+    from types import SimpleNamespace
+    target = SimpleNamespace(python_full_version='3.10.15', markers={
+        'python_version': '3.10', 'python_full_version': '3.10.15'})
+    def read(name):
+        assert name == 'pyproject.toml'
+        return _MESON_BUILD_SYSTEM + _PROJECT
+    assert pool._declarative_local_metadata(read, target, (), [
+        'pip install . --no-build-isolation']) == ({'base>=1', 'modern'}, set(), ())
+
+
+def test_meson_static_version_and_target_python_validation():
+    project = _PROJECT.replace('dynamic = ["version"]', 'version = "1.0"')
+    commands = ['pip install . --no-build-isolation']
+    assert _declared(_MESON_BUILD_SYSTEM + project, '', commands=commands) == (
+        {'base>=1', 'legacy'}, set(), ())
+    with pytest.raises(RuntimeError, match='Requires-Python rejects target'):
+        _declared(_MESON_BUILD_SYSTEM + project, '', python='3.7.17', commands=commands)
+
+
+@pytest.mark.parametrize('commands', [
+    ['pip install -e .'],
+    ['pip install --no-build-isolation compiler; pip install -e .'],
+    ['pip install -e . --config-settings --no-build-isolation'],
+    ['pip install -e . --no-build-isolation; pip install .'],
+    ['pip install -e . --no-build-isolation --no-use-pep517'],
+    ['python setup.py develop; pip install -e . --no-build-isolation'],
+    ['python setup.py egg_info; pip install -e . --no-build-isolation'],
+    ['echo "--no-build-isolation"; pip install .'],
+])
+def test_meson_requires_explicit_nonisolated_pep517_recipe(commands):
+    assert _declared(_MESON_BUILD_SYSTEM + _PROJECT, '', commands=commands) is None
+
+
+@pytest.mark.parametrize('project', [
+    _PROJECT.replace('"version"', '"dependencies"'),
+    _PROJECT.replace('"version"', '"version", "optional-dependencies"'),
+    _PROJECT.replace('"version"', '"version", "requires-python"'),
+    _PROJECT.replace('dynamic = ["version"]', ''),
+    _PROJECT.replace('dynamic = ["version"]', 'version = "1.0"\ndynamic = ["version"]'),
+    _PROJECT.replace('"generated[inner]"', '"generated[inner]==1.0"'),
+])
+def test_meson_requires_complete_declarative_dependency_metadata(project):
+    assert _declared(_MESON_BUILD_SYSTEM + project, '', extras={'outer'},
+                     commands=['pip install -e .[outer] --no-build-isolation']) is None
+
+
+def test_meson_with_backend_path_or_missing_project_is_not_declarative():
+    commands = ['pip install -e . --no-build-isolation']
+    assert _declared(_MESON_BUILD_SYSTEM, '', commands=commands) is None
+    assert _declared(_MESON_BUILD_SYSTEM + 'backend-path = ["."]\n' + _PROJECT,
+                     '', commands=commands) is None
 
 
 def test_build_dependency_producer_uses_verified_cas_and_reuses_exact_selection(tmp_path, monkeypatch):
