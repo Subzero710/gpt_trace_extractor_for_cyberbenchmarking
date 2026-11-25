@@ -152,15 +152,15 @@ def test_global_pip_progress_tracks_distinct_passes_and_recursive_closures(tmp_p
 def test_phase_bytes_are_deduplicated_and_resumed_without_counting_old_traffic():
     view = pool._PoolProgress(io.StringIO(), tty=False, interval=3600)
     view.begin_artifact_phase('Pip materialization', {
-        'a': {'size': 400, 'retained_bytes': 100, 'cached': False},
-        'b': {'size': 600, 'retained_bytes': 0, 'cached': False},
-        'c': {'size': 1000, 'retained_bytes': 0, 'cached': True}})
+        'a'*64: {'size': 400, 'retained_bytes': 100, 'cached': False},
+        'b'*64: {'size': 600, 'retained_bytes': 0, 'cached': False},
+        'c'*64: {'size': 1000, 'retained_bytes': 0, 'cached': True}})
     assert view.phase_counts() == (100, 1000, 'bytes')
-    view.network_start('first', 'a', 400, sha='a', offset=100)
+    view.network_start('first', 'a', 400, sha='a'*64, offset=100)
     view.network_advance('first', 100)
     view.network_end('first')
-    view.network_start('retry', 'a', 400, sha='a', offset=200)
-    view.network_start('other', 'b', 600, sha='b')
+    view.network_start('retry', 'a', 400, sha='a'*64, offset=200)
+    view.network_start('other', 'b', 600, sha='b'*64)
     view.network_advance('retry', 200)
     view.network_advance('other', 100)
     assert view.phase_counts() == (500, 1000, 'bytes')
@@ -168,4 +168,77 @@ def test_phase_bytes_are_deduplicated_and_resumed_without_counting_old_traffic()
     assert '50.0% de la phase' in view._render()
     assert 'du fichier' not in view._render()
     with pytest.raises(RuntimeError, match='size differs'):
-        view.network_start('invalid', 'b', 601, sha='b')
+        view.network_start('invalid', 'b', 601, sha='b'*64)
+
+
+def test_global_volume_deduplicates_sha_across_phases_and_resolves_unknown_sizes():
+    view = pool._PoolProgress(io.StringIO(), tty=False, interval=3600)
+    a, b = 'a'*64, 'b'*64
+    view.begin_artifact_phase('Pip materialization', {
+        a: {'size': 400, 'retained_bytes': 100, 'cached': False}})
+    view.network_start('pip', 'a', 400, sha=a, offset=100)
+    view.network_advance('pip', 300)
+    view.network_end('pip')
+    view.artifact_verified(a,400)
+    view.begin_artifact_phase('Conda archives', {
+        a: {'size': 400, 'retained_bytes': 0, 'cached': True},
+        b: {'size': None, 'retained_bytes': 0, 'cached': False}})
+    assert view._volume()['identified_bytes'] == 400
+    assert view.phase_counts()[2] == 'archives'
+    assert '1 tailles à découvrir' in view._phase_details()
+    view.network_start('conda','b',600,sha=b)
+    view.network_advance('conda',200)
+    assert view.phase_counts() == (200,600,'bytes')
+    assert view._volume() == {'identified_bytes':1000,'acquired_bytes':600,'artifacts':2,'complete':False}
+    view.network_advance('conda',400)
+    view.network_end('conda')
+    view.artifact_verified(b,600)
+    view.close_volume({a:{'size':400},b:{'size':600}})
+    assert view._volume() == {'identified_bytes':1000,'acquired_bytes':1000,'artifacts':2,'complete':True}
+    assert view.network_bytes == 900
+
+
+def test_inventory_freezes_progress_snapshot_before_hashing(tmp_path, monkeypatch):
+    import json
+    (tmp_path/'metadata').mkdir()
+    candidate=pool.Pool(tmp_path)
+    progress=tmp_path/'metadata'/'fetch-progress.json'
+    view=pool._PoolProgress(io.StringIO(),tty=False,progress_path=progress,operation_id='a'*64)
+    monkeypatch.setattr(pool,'_POOL_PROGRESS',view)
+    view.update('Pip planning',0,1,'closures')
+    with pytest.raises(RuntimeError,match='incomplete dependency closure'):
+        pool.audit_inventory(candidate,{},{},{},'a'*64)
+    inventory=json.loads((tmp_path/'inventory.json').read_bytes())
+    row=next(row for row in inventory['files'] if row['path']=='metadata/fetch-progress.json')
+    view.finish()
+    assert row['sha256']==pool.digest(progress)
+    assert row['size']==progress.stat().st_size
+
+
+def test_apt_print_uris_volume_tracks_native_partial_and_completed_files(tmp_path, monkeypatch):
+    import hashlib
+    (tmp_path/'apt'/'archives'/'partial').mkdir(parents=True)
+    view=pool._PoolProgress(io.StringIO(),tty=False,interval=3600)
+    monkeypatch.setattr(pool,'_POOL_PROGRESS',view)
+    candidate=pool.Pool(tmp_path)
+    sha=hashlib.sha256(b'abcdef').hexdigest()
+    archive='example_1_all.deb'
+    def output(command, **kwargs):
+        assert '--print-uris' in command and 'Acquire::ForceHash=SHA256' in command
+        assert '--no-remove' in command
+        return f"'https://example.invalid/{archive}' {archive} 6 SHA256:{sha}\n"
+    monkeypatch.setattr(pool.subprocess,'check_output',output)
+    apt=tmp_path/'apt'
+    partial=apt/'archives'/'partial'/archive
+    partial.write_bytes(b'ab')
+    budget=[]
+    candidate.download_budget=budget.append
+    expected=pool._apt_archive_volume(candidate,[],{'example'},apt)
+    assert expected=={archive:sha}
+    assert view.phase_counts()==(2,6,'bytes')
+    assert budget==[4]
+    partial.write_bytes(b'abcdef')
+    partial.rename(apt/'archives'/archive)
+    pool._observe_apt_archives(apt,expected)
+    assert view.phase_counts()==(6,6,'bytes')
+    assert view.network_bytes==0  # Native APT network bytes come from namespace RX.

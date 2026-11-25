@@ -89,7 +89,8 @@ def test_unknown_total_has_no_fake_global_percent():
                  completed=123, total=None)
     view.update('running', value)
     view.finish(True)
-    assert 'total non mesuré' in output.getvalue()
+    assert '123 closures' in output.getvalue()
+    assert 'total non mesuré' not in output.getvalue()
     assert '%' not in output.getvalue()
     assert 'TERMINÉ' in output.getvalue()
 
@@ -305,3 +306,44 @@ def test_received_volume_and_both_units_fit_100_columns(monkeypatch):
     assert '0.00 MiB/s' in view.previous
     assert '0.0 recipes/min' in view.previous
     assert len(view.previous) <= 99
+
+
+def test_schema2_volume_actual_rx_and_repeated_stage_epoch(tmp_path,monkeypatch):
+    operation_id='a'*64
+    stage=tmp_path/'dependency-pool'/f'incoming-{operation_id}-1'/'metadata'
+    stage.mkdir(parents=True)
+    manager=object.__new__(preparation.PreparationManager)
+    manager.base=tmp_path/'golden.qcow2'
+    manager.root=tmp_path/'preparations'
+    amount=[2*1048576]
+    clock=[10.0]
+    monkeypatch.setattr(dispatcher.time,'monotonic',lambda:clock[0])
+    progress=pool._PoolProgress(io.StringIO(),tty=False,progress_path=stage/'fetch-progress.json',
+                               operation_id=operation_id,rx_counter=lambda:amount[0])
+    progress.begin_artifact_phase('Conda archives',{'a'*64:{'size':1024**3,'cached':False,'retained_bytes':0}})
+    state={'operation_id':operation_id,'attempt':1,'phase':'running'}
+    view=dispatcher._FetchBar(io.StringIO(),window_seconds=10)
+    first=manager._progress(state)
+    assert first['schema']==2 and first['rx_bytes']==amount[0]
+    view.update('running',first)
+    clock[0]+=5;amount[0]+=5*1048576
+    progress.finish()
+    view.update('running',manager._progress(state))
+    assert '1.00 MiB/s' in view.previous
+    assert '1.000 GiB' in view.volume_line
+    assert 'restant 1.000' in view.volume_line
+    view.update('running',dict(first,stage='Pip planning',unit='closures',total=10,completed=8,stage_epoch=2))
+    view.update('running',dict(first,stage='Pip planning',unit='closures',total=2,completed=0,stage_epoch=4))
+    assert '0/2 closures' in view.previous
+
+
+def test_remote_failure_diagnostic_uses_actual_worker_error():
+    import base64
+    raw=b"[pool] FAILED; data retained, no automatic cleanup: incompatible closure\nE: Unmet dependencies\nE: Unmet dependencies\n"
+    status={'error':'CalledProcessError: worker failed','phase':'failed',
+            'progress':{'stage':'APT archives'},'live_log':{'content_b64':base64.b64encode(raw).decode()}}
+    message=dispatcher._fetch_failure_detail(status)
+    assert 'APT archives: incompatible closure' in message
+    assert message.count('E: Unmet dependencies')==1
+    status['error']='TimeoutError: watchdog expired'
+    assert 'watchdog expired' in dispatcher._fetch_failure_detail(status)

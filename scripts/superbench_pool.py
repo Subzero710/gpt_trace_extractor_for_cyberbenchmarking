@@ -223,7 +223,7 @@ class _PoolProgress:
     only stage changes, meaningful count milestones and material byte progress.
     No timer generates an unchanged log record.
     """
-    def __init__(self, stream=None, *, tty=None, interval=None, progress_path=None, operation_id=None):
+    def __init__(self, stream=None, *, tty=None, interval=None, progress_path=None, operation_id=None, rx_counter=None):
         if (progress_path is None) != (operation_id is None):
             raise ValueError("progress snapshot requires both its path and operation identity")
         self.progress_path = None if progress_path is None else Path(progress_path)
@@ -248,6 +248,12 @@ class _PoolProgress:
         self.phase_artifacts = {}
         self.phase_byte_stage = None
         self.phase_current = self.phase_total = 0
+        self.phase_unknown = set()
+        self.artifact_volume = {}
+        self.volume_closed = False
+        self.phase_aliases = {}
+        self.stage_epoch = 0
+        self.rx_counter = rx_counter
         self.last_time = time.monotonic()
         self.last_bytes = 0
         self.speed = 0.0
@@ -257,6 +263,26 @@ class _PoolProgress:
         self.last_report_bytes = 0
         self.last_output = ''
 
+    def _volume_record(self, sha, size, acquired):
+        if not SHA.fullmatch(sha) or not 0 <= acquired <= size:
+            raise RuntimeError('invalid global artifact volume')
+        previous = self.artifact_volume.get(sha)
+        if previous is not None and previous[1] != size:
+            raise RuntimeError('conflicting size for identical SHA-256 artifact')
+        self.artifact_volume[sha] = [acquired, size]
+
+    def _volume(self):
+        return {'identified_bytes': sum(row[1] for row in self.artifact_volume.values()),
+                'acquired_bytes': sum(row[0] for row in self.artifact_volume.values()),
+                'artifacts': len(self.artifact_volume), 'complete': self.volume_closed}
+
+    def close_volume(self, links):
+        with self.lock:
+            # Only the actually referenced, verified CAS constitutes the final total.
+            self.artifact_volume = {sha: [row['size'], row['size']] for sha, row in links.items()}
+            self.volume_closed = True
+            self._emit(force=True)
+
     @staticmethod
     def _count_bucket(completed, total):
         if completed is None or total is None or total == 0:
@@ -264,19 +290,42 @@ class _PoolProgress:
         # At most ten non-TTY records per known set, irrespective of its size.
         return min(10, completed * 10 // total)
 
-    def begin_artifact_phase(self, stage, artifacts):
+    def begin_artifact_phase(self, stage, artifacts, *, aliases=None, sha256=True):
         with self.lock:
+            if self.stage == stage:
+                self.stage_epoch += 1
+            self.phase_aliases = {} if aliases is None else dict(aliases)
+            if sha256:
+                for sha, row in artifacts.items():
+                    if row['size'] is not None:
+                        self._volume_record(sha, row['size'], row['size'] if row['cached'] else row['retained_bytes'])
             self.phase_byte_stage = stage
             self.phase_artifacts = {sha: [row['retained_bytes'], row['size']]
                                     for sha, row in artifacts.items() if not row['cached']}
             self.phase_current = sum(row[0] for row in self.phase_artifacts.values())
-            self.phase_total = sum(row[1] for row in self.phase_artifacts.values())
+            self.phase_total = sum(row[1] for row in self.phase_artifacts.values() if row[1] is not None)
+            self.phase_unknown = {key for key,row in self.phase_artifacts.items() if row[1] is None}
             self.update(stage, 0, len(artifacts), 'archives', force=True)
 
     def phase_counts(self):
-        if self.stage == self.phase_byte_stage:
+        if self.stage == self.phase_byte_stage and not self.phase_unknown:
             return self.phase_current, self.phase_total, 'bytes'
         return self.completed, self.total, self.unit
+
+    def _phase_size(self, key, size):
+        row=self.phase_artifacts[key]
+        if row[1] is None:
+            self.phase_unknown.remove(key)
+            self.phase_total += size
+            row[1]=size
+        elif row[1]!=size:
+            raise RuntimeError('archive size differs from planned phase artifact')
+
+    def _phase_details(self):
+        if self.stage == self.phase_byte_stage and self.phase_unknown:
+            known_acquired=sum(row[0] for row in self.phase_artifacts.values() if row[1] is not None)
+            return f'{known_acquired/1024**3:.3f}/{self.phase_total/1024**3:.3f} GiB identifiés | {len(self.phase_unknown)} tailles à découvrir'
+        return self.details
 
     def _render(self):
         message = '[pool] ' + self.stage
@@ -289,8 +338,8 @@ class _PoolProgress:
             message += ' %s/%s %s' % (current, total, unit)
         elif current is not None:
             message += ' %s %s' % (current, unit)
-        if self.details:
-            message += ' | ' + self.details
+        if self._phase_details():
+            message += ' | ' + self._phase_details()
         observed = self.network_bytes + self.pip_bytes
         if observed or self.transfers or self.pip_active:
             message += ' | %.1f MiB reçus | %.2f MiB/s' % (
@@ -309,10 +358,13 @@ class _PoolProgress:
                 or current is not None and total is not None and current > total):
             raise RuntimeError('invalid verified progress counters')
         payload = {
-            'schema': 1, 'operation_id': self.operation_id,
+            'schema': 2, 'operation_id': self.operation_id,
             'stage': self.stage, 'completed': current, 'total': total,
             'unit': unit, 'network_bytes': self.network_bytes,
             'pip_bytes': self.pip_bytes, 'pip_active': self.pip_active,
+            'details': self._phase_details(), 'stage_epoch': self.stage_epoch,
+            'volume': self._volume(),
+            'rx_bytes': self.rx_counter() if self.rx_counter is not None else self.network_bytes+self.pip_bytes,
         }
         value = json.dumps(payload, sort_keys=True, separators=(',', ':'),
                            ensure_ascii=False).encode('utf-8') + b'\n'
@@ -321,10 +373,10 @@ class _PoolProgress:
         # Publish every observed stage/count transition immediately; sample raw
         # byte changes no more often than the configured reporting interval.
         prior = self.last_snapshot_value
-        semantic = (payload['stage'], current if unit != 'bytes' else None, total, unit, payload['pip_active'])
+        semantic = (payload['stage'], self.stage_epoch, current if unit != 'bytes' else None, total, unit, payload['pip_active'], payload['details'] if unit!='bytes' and not self.phase_unknown else '')
         old_semantic = None if prior is None else (
-            prior['stage'], prior['completed'] if prior['unit'] != 'bytes' else None,
-            prior['total'], prior['unit'], prior['pip_active'])
+            prior['stage'], prior['stage_epoch'], prior['completed'] if prior['unit'] != 'bytes' else None,
+            prior['total'], prior['unit'], prior['pip_active'], prior['details'] if prior['unit']!='bytes' and not self.phase_unknown else '')
         if not (force or prior is None or semantic != old_semantic
                 or now - self.last_snapshot >= self.interval):
             return
@@ -391,6 +443,7 @@ class _PoolProgress:
             if changed and self.tty and self.last_stage is not None:
                 self.stream.write('\n')
             if changed:
+                self.stage_epoch += 1
                 self.last_count_bucket = None
             self.stage = stage
             self.completed, self.total = completed, total
@@ -402,13 +455,19 @@ class _PoolProgress:
         with self.lock:
             if key in self.transfers:
                 raise RuntimeError('duplicate transfer identity')
-            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
-                expected = self.phase_artifacts[sha][1]
-                if total != expected or not 0 <= offset <= expected:
-                    raise RuntimeError('HTTPS size differs from planned phase artifact')
-                self.phase_current += offset - self.phase_artifacts[sha][0]
-                self.phase_artifacts[sha][0] = offset
-            self.transfers[key] = {'name': label, 'current': offset, 'total': total, 'sha': sha}
+            phase_key = self.phase_aliases.get(label, sha)
+            if self.stage == self.phase_byte_stage and phase_key in self.phase_artifacts:
+                if total:
+                    self._phase_size(phase_key,total)
+                expected = self.phase_artifacts[phase_key][1]
+                if offset < 0 or expected is not None and offset > expected:
+                    raise RuntimeError('HTTPS offset exceeds planned phase artifact')
+                self.phase_current += offset - self.phase_artifacts[phase_key][0]
+                self.phase_artifacts[phase_key][0] = offset
+            if sha is not None and total:
+                self._volume_record(sha, total, offset)
+            self.transfers[key] = {'name': label, 'current': offset, 'total': total, 'sha': sha,
+                                   'phase_key': phase_key, 'epoch': self.stage_epoch}
             self._emit()
 
     def network_resume(self, key, previous_bytes):
@@ -417,35 +476,50 @@ class _PoolProgress:
         with self.lock:
             transfer = self.transfers[key]
             transfer['current'] = previous_bytes
-            sha = transfer['sha']
-            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
-                self.phase_current += previous_bytes - self.phase_artifacts[sha][0]
-                self.phase_artifacts[sha][0] = previous_bytes
+            sha, phase_key = transfer['sha'], transfer['phase_key']
+            if transfer['epoch'] == self.stage_epoch and self.stage == self.phase_byte_stage and phase_key in self.phase_artifacts:
+                self.phase_current += previous_bytes - self.phase_artifacts[phase_key][0]
+                self.phase_artifacts[phase_key][0] = previous_bytes
+            if sha in self.artifact_volume:
+                self._volume_record(sha, self.artifact_volume[sha][1], previous_bytes)
             self._emit()
 
     def network_advance(self, key, amount):
         with self.lock:
             transfer = self.transfers[key]
             transfer['current'] += amount
-            sha = transfer['sha']
-            if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
-                self.phase_current += transfer['current'] - self.phase_artifacts[sha][0]
-                self.phase_artifacts[sha][0] = transfer['current']
+            sha, phase_key = transfer['sha'], transfer['phase_key']
+            if transfer['epoch'] == self.stage_epoch and self.stage == self.phase_byte_stage and phase_key in self.phase_artifacts:
+                self.phase_current += transfer['current'] - self.phase_artifacts[phase_key][0]
+                self.phase_artifacts[phase_key][0] = transfer['current']
+            if sha in self.artifact_volume:
+                self._volume_record(sha, self.artifact_volume[sha][1], transfer['current'])
             self.network_bytes += amount
             self._emit()
 
     def artifact_verified(self, sha, size):
         with self.lock:
+            self._volume_record(sha, size, size)
             if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
                 current, expected = self.phase_artifacts[sha]
-                if size != expected:
-                    raise RuntimeError('verified CAS size differs from phase plan')
+                self._phase_size(sha,size)
                 self.phase_current += size - current
                 self.phase_artifacts[sha][0] = size
+            self._emit()
+
+    def phase_artifact_verified(self, identity, size):
+        with self.lock:
+            if self.stage == self.phase_byte_stage and identity in self.phase_artifacts:
+                current, expected = self.phase_artifacts[identity]
+                self._phase_size(identity,size)
+                self.phase_current += size - current
+                self.phase_artifacts[identity][0] = size
                 self._emit()
 
     def artifact_discarded(self, sha):
         with self.lock:
+            if sha in self.artifact_volume:
+                self._volume_record(sha, self.artifact_volume[sha][1], 0)
             if self.stage == self.phase_byte_stage and sha in self.phase_artifacts:
                 self.phase_current -= self.phase_artifacts[sha][0]
                 self.phase_artifacts[sha][0] = 0
@@ -1022,7 +1096,10 @@ class _ValidatedHTTPSRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self,req,fp,code,msg,headers,newurl):
         _validate_https_endpoint(newurl,self.expected_host)
-        return super().redirect_request(req,fp,code,msg,headers,newurl)
+        redirected = super().redirect_request(req,fp,code,msg,headers,newurl)
+        if redirected is not None and req.get_method() == 'HEAD':
+            redirected.method = 'HEAD'
+        return redirected
 
 
 _RESOLVE_HTTPS_ADDRESS = """
@@ -1275,6 +1352,8 @@ def fetch(url, path, *, sha=None, sri=None, limit=2**37, integrity_digests=None,
         if checks and not any(hashes[algorithm].digest() == expected
                               for algorithm, expected in checks):
             path.unlink()
+            if view is not None:
+                view.artifact_discarded(view.phase_aliases.get(path.name))
             raise DownloadIntegrityError('HTTPS artifact SRI mismatch: ' + str(path))
         if integrity_digests is not None:
             integrity_digests.update({algorithm: hashes[algorithm].digest()
@@ -4130,6 +4209,93 @@ class _CondaTransferProgress:
             self.last_bytes=self.network_bytes
 
 
+def _begin_download_phase(pool, phase, volume, **kwargs):
+    _POOL_PROGRESS.begin_artifact_phase(phase,volume,**kwargs)
+    if getattr(pool,'download_budget',None) is not None and all(row['size'] is not None for row in volume.values()):
+        remaining = sum(row['size']-row['retained_bytes'] for row in volume.values() if not row['cached'])
+        pool.download_budget(remaining)
+
+
+def _archive_content_length(url):
+    """Read only headers; never transfer an archive to discover its length."""
+    _validate_https_endpoint(url)
+    def measure():
+        request = urllib.request.Request(url, method='HEAD', headers={'Accept-Encoding': 'identity'})
+        try:
+            with _open_https(request, timeout=_operation_timeout()) as response:
+                _validate_https_endpoint(response.url)
+                length = response.headers.get('Content-Length', '')
+                if response.status != 200:
+                    raise RuntimeError('unexpected archive measurement HTTP status: '+url)
+                if not length.isdigit() or response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                    return None
+                return int(length)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (405,501):
+                raise
+            exc.close()
+            return None
+    return _network_retry('archive size '+url, measure)
+
+
+def _sha_archive_plan(pool, entries, phase, *, measured=None):
+    """Resolve sizes in parallel from verified CAS or immutable URL headers."""
+    if not entries:
+        return {}
+    _pool_progress(phase+' size discovery',0,len(entries),'archives')
+    def measure(item):
+        sha, (url, raw) = item
+        cached = (pool.objects/sha[:2]/sha).is_file()
+        size = (pool.verify_object(sha) if cached else measured[sha]['size'] if measured is not None
+                else _archive_content_length(url))
+        if measured is not None and measured[sha]['size'] is not None and measured[sha]['size'] != size:
+            raise RuntimeError('verified archive differs from previously measured size: '+url)
+        prior = getattr(pool,'resume_from',None)
+        if not cached and not raw.exists() and prior is not None:
+            previous=prior/'downloads'/raw.name
+            if previous.is_symlink():
+                raise RuntimeError('unsafe retained archive')
+            if previous.is_file() and previous.stat().st_size>0 and (size is None or previous.stat().st_size<=size):
+                with _registered_operation('restore pinned archive prefix'):
+                    shutil.copyfile(previous,raw)
+                    if raw.stat().st_size!=previous.stat().st_size:
+                        raise RuntimeError('retained archive changed during copy')
+        retained = raw.stat().st_size if not cached and raw.is_file() else 0
+        if raw.is_symlink() or retained<0 or size is not None and retained>size:
+            raise RuntimeError('invalid retained archive length: '+url)
+        return sha, {'size': size, 'cached': cached, 'retained_bytes': retained}
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_acquisition_workers(),len(entries))) as executor:
+        futures = [executor.submit(measure,item) for item in sorted(entries.items())]
+        for future in _bounded_completed(futures):
+            sha, row = _shared_future_result(future)
+            result[sha] = row
+            if _POOL_PROGRESS is not None and row['size'] is not None:
+                with _POOL_PROGRESS.lock:
+                    _POOL_PROGRESS._volume_record(sha,row['size'],row['size'] if row['cached'] else row['retained_bytes'])
+            _pool_progress(phase+' size discovery',len(result),len(entries),'archives')
+    return result
+
+
+def _locked_conda_volume(pool, entries):
+    path=pool.stage/'metadata'/'conda-volume.json'
+    source=getattr(pool,'resume_from',None)
+    urls={sha:url for sha,(url,_) in entries.items()}
+    measured=None
+    if source is not None:
+        prior=source/'metadata'/path.name
+        if prior.is_file() and not prior.is_symlink():
+            previous=json.loads(prior.read_bytes())
+            if previous.get('urls')==urls:
+                sizes=previous['sizes']
+                if set(sizes)!=set(entries) or any(size is not None and (type(size) is not int or size<0) for size in sizes.values()):
+                    raise RuntimeError('invalid retained Conda size manifest')
+                measured={sha:{'size':size} for sha,size in sizes.items()}
+    volume=_sha_archive_plan(pool,entries,'Conda archives',measured=measured)
+    write_new(path,json.dumps({'urls':urls,'sizes':{sha:row['size'] for sha,row in volume.items()}},sort_keys=True,separators=(',',':')))
+    return volume
+
+
 def acquire_locked_conda(pool,lock):
     """Download and DURABLY publish each verified Conda artifact immediately."""
     artifacts=lock['artifacts'];references=defaultdict(set)
@@ -4141,6 +4307,10 @@ def acquire_locked_conda(pool,lock):
     print('[pool] Conda lock: '+str(len(lock['environments']))+' environments, '
           +str(sum(len(row['transactions']) for row in lock['environments'].values()))
           +' transactions, '+str(len(references))+' unique archives',flush=True)
+    if _POOL_PROGRESS is not None:
+        entries = {sha: (artifacts[sha]['url'],pool.stage/'downloads'/('conda-'+sha)) for sha in references}
+        volume = _sha_archive_plan(pool, entries, 'Conda archives',measured=getattr(pool,'conda_volume',None))
+        _begin_download_phase(pool,'Conda archives',volume)
     progress=_CondaTransferProgress(len(references),len(references)-len(missing),
                                     _conda_progress_interval())
     progress.report(force=True)
@@ -4233,12 +4403,13 @@ def _apt_download_module():
     return module
 
 
-def _run_apt_downloads(arguments):
+def _run_apt_downloads(arguments, *, progress=None):
     limit = _operation_timeout()
     cadence = _conda_progress_interval()
     _apt_download_module().run_downloads(
         arguments, limit=limit, cadence=cadence, observe=_registered_operation,
         terminate=lambda process: _stop_native_process_group(process, cleanup_limit=limit, cadence=cadence),
+        progress=progress,
     )
 
 
@@ -4267,7 +4438,9 @@ def _apt_simulate(opts, packages):
                                 env={**os.environ, 'LC_ALL': 'C'}, timeout=_operation_timeout())
     output = result.stdout + '\n' + result.stderr
     if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, command, output=output)
+        error = subprocess.CalledProcessError(result.returncode, command, output=output)
+        error.add_note(output)
+        raise error
     if ('The following packages will be DOWNGRADED:' in output
             or any(line.startswith(('Remv ', 'Purg ')) for line in output.splitlines())):
         raise RuntimeError('APT resolution would downgrade or remove installed packages')
@@ -4341,6 +4514,57 @@ def _apt_historical_sources(pool, apt, architecture):
         pins.append('Package: *\nPin: release n=' + suite + '\nPin-Priority: 1\n\n')
         identities.append(suite)
     return ''.join(sources), ''.join(pins), identities
+
+
+def _apt_archive_volume(pool, opts, packages, apt):
+    command=['apt-get',*opts,'-o','Acquire::ForceHash=SHA256','--print-uris',
+             '--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
+    with _registered_operation('APT signed archive volume'):
+        output=subprocess.check_output(command,text=True,env={**os.environ,'LC_ALL':'C'},timeout=_operation_timeout())
+    volume, filenames = {}, {}
+    for line in output.splitlines():
+        if not line.startswith("'"):
+            continue
+        parts=shlex.split(line)
+        if (len(parts)!=4 or not re.fullmatch(r'[A-Za-z0-9+._:%~\-]+\.deb',parts[1])
+                or not parts[2].isdigit() or not re.fullmatch(r'SHA256:[0-9a-f]{64}',parts[3])):
+            raise RuntimeError('invalid signed APT archive measurement: '+line)
+        url,name,length,checksum=parts
+        _validate_https_endpoint(url)
+        sha,size=checksum.split(':',1)[1],int(length)
+        if name in filenames or sha in volume:
+            raise RuntimeError('duplicate signed APT archive measurement: '+name)
+        filenames[name]=sha
+        partial=apt/'archives'/'partial'/name
+        retained=partial.stat().st_size if partial.is_file() else 0
+        if partial.is_symlink() or not 0 <= retained <= size:
+            raise RuntimeError('invalid retained APT archive length: '+name)
+        # APT omitted already cached archives from --print-uris. Every URI
+        # here still needs bytes in APT's own isolated archive directory.
+        volume[sha]={'size':size,'cached':False,'retained_bytes':retained}
+    _begin_download_phase(pool,'APT archives',volume)
+    return filenames
+
+
+def _observe_apt_archives(apt, filenames):
+    with _POOL_PROGRESS.lock:
+        for name,sha in filenames.items():
+            final=apt/'archives'/name
+            partial=apt/'archives'/'partial'/name
+            try:
+                size=partial.stat().st_size
+            except FileNotFoundError:
+                try:
+                    size=final.stat().st_size
+                except FileNotFoundError:
+                    size=0
+            current,total=_POOL_PROGRESS.phase_artifacts[sha]
+            if not 0 <= size <= total:
+                raise RuntimeError('APT archive size exceeds signed index: '+name)
+            _POOL_PROGRESS.phase_current += size-current
+            _POOL_PROGRESS.phase_artifacts[sha][0]=size
+            _POOL_PROGRESS._volume_record(sha,total,size)
+        _POOL_PROGRESS._emit()
 
 
 def apt_closure(pool,packages):
@@ -4423,14 +4647,21 @@ def apt_closure(pool,packages):
                else value) for value in opts]
         _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
         # Resolve one combined transaction: never install two independent closures.
-        # Existing native selections must survive the additional historical roots.
+        # Compare for diagnostics, not equality: dependencies may be recalculated.
         plan=_apt_simulate(opts,packages)
         if not {name.split(':')[0] for name in missing} <= {name.split(':')[0] for name in plan}:
             raise RuntimeError('historical APT resolution did not select every missing package by name')
-        if any(plan.get(name)!=version for name,version in native_plan.items()):
-            raise RuntimeError('historical APT resolution changed the native Kali plan')
+        for name in sorted(native_plan.keys() | plan.keys()):
+            before, after = native_plan.get(name), plan.get(name)
+            if before != after:
+                print('[pool] APT plan change: '+name+' | '+str(before)+' -> '+str(after),flush=True)
         print('[pool] APT historical resolution: '+', '.join(historical),flush=True)
-    _run_apt_downloads(['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)])
+    command=['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
+    expected_archives = _apt_archive_volume(pool,opts,packages,apt) if _POOL_PROGRESS is not None else None
+    if expected_archives is None:
+        _run_apt_downloads(command)
+    else:
+        _run_apt_downloads(command,progress=lambda: _observe_apt_archives(apt,expected_archives))
     debs=sorted((apt/'archives').glob('*.deb'))
     if not debs:
         raise RuntimeError('signed Kali resolution lacks any required new Debian archives')
@@ -4456,8 +4687,12 @@ def apt_closure(pool,packages):
             raise RuntimeError('duplicate or foreign APT archive: '+path.name)
         received.add(identity)
         sha=pool.put(path,'apt','signed-historical-closure' if historical else 'kali-last-snapshot')
+        if expected_archives is not None and path.name in expected_archives and sha != expected_archives[path.name]:
+            raise RuntimeError('APT archive SHA-256 differs from signed index: '+path.name)
         meta.append({'sha256':sha,'package':fields['Package'],
                      'version':fields['Version'],'architecture':fields['Architecture']})
+    if expected_archives is not None and not set(expected_archives)<= {path.name for path in debs if path.is_file()}:
+        raise RuntimeError('APT did not materialize every signed archive URI')
     if received!=selected or not meta:
         raise RuntimeError('downloaded APT archives differ from the simulated closure')
     write_new(stage/'metadata'/'apt-closure.json',json.dumps({
@@ -9065,6 +9300,53 @@ def _run_pinned_npm(pool, args, *, cwd, env, timeout=1800):
         return invoke([node,str(cli),*args],cwd=cwd,env=isolated,timeout=timeout)
 
 
+def _sri_archive_plan(pool, ordered, phase, category, owner):
+    groups = defaultdict(list)
+    for url, sri in ordered:
+        identity = tuple(sorted((algorithm,value.hex()) for algorithm,value in sri_parts(sri)))
+        groups[identity].append((url,sri))
+    aliases = {hashlib.sha256(url.encode()).hexdigest(): identity
+               for identity, rows in groups.items() for url, _ in rows}
+    _pool_progress(phase+' size discovery',0,len(groups),'archives')
+    def measure(item):
+        identity, rows = item
+        for url, sri in rows:
+            with _bounded_lock(pool._state_lock):
+                cached=next((pool.by_sri[token] for token in sri_parts(sri) if token in pool.by_sri),None)
+            if cached is not None:
+                return identity, {'size':pool.verify_object(cached),'cached':True,'retained_bytes':0}
+            raw = pool.stage/'downloads'/hashlib.sha256(url.encode()).hexdigest()
+            if raw.is_file():
+                try:
+                    matched=verify_sri(raw,sri)
+                except RuntimeError:
+                    continue
+                sha=digest(raw)
+                pool.put(raw,category,url if owner is None else owner,verified_sha=sha)
+                with _bounded_lock(pool._state_lock):
+                    pool.by_url[url]=sha
+                    for token in matched:
+                        previous=pool.by_sri.setdefault(token,sha)
+                        if previous!=sha:
+                            raise RuntimeError('conflicting retained SRI identity')
+                return identity, {'size':raw.stat().st_size,'cached':True,'retained_bytes':0}
+        url, _ = rows[0]
+        size = _archive_content_length(url)
+        raw = pool.stage/'downloads'/hashlib.sha256(url.encode()).hexdigest()
+        retained = raw.stat().st_size if raw.is_file() else 0
+        if retained<0 or size is not None and retained>size:
+            raise RuntimeError('invalid retained SRI archive length: '+url)
+        return identity, {'size':size,'cached':False,'retained_bytes':retained}
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(_acquisition_workers(),len(groups))) as executor:
+        futures = [executor.submit(measure,item) for item in groups.items()]
+        for future in _bounded_completed(futures):
+            identity,row = _shared_future_result(future)
+            result[identity]=row
+            _pool_progress(phase+' size discovery',len(result),len(groups),'archives')
+    return result,aliases
+
+
 def _download_sri_closure(pool, urls, category, identity=None):
     """Acquire one immutable SRI URL set concurrently within the global I/O budget."""
     ordered=sorted(urls.items())
@@ -9074,6 +9356,10 @@ def _download_sri_closure(pool, urls, category, identity=None):
     if _POOL_PROGRESS is None:
         print(f'[pool] {category} closure: {len(ordered)} unique archives with {workers} workers',flush=True)
     _pool_progress(phase,0,len(ordered),'archives',f'{workers} workers')
+    aliases = {}
+    if _POOL_PROGRESS is not None:
+        volume,aliases = _sri_archive_plan(pool,ordered,phase,category,identity)
+        _begin_download_phase(pool,phase,volume,aliases=aliases,sha256=False)
     def transfer(url,sri):
         return url,pool.download(url,category,url if identity is None else identity,sri=sri)
     results={}
@@ -9083,6 +9369,8 @@ def _download_sri_closure(pool, urls, category, identity=None):
         try:
             for future in _bounded_completed(futures):
                 url,sha=_shared_future_result(future);results[url]=sha
+                if _POOL_PROGRESS is not None:
+                    _POOL_PROGRESS.phase_artifact_verified(aliases[hashlib.sha256(url.encode()).hexdigest()],pool.verify_object(sha))
                 _pool_progress(phase,len(results),len(ordered),'archives',f'{workers} workers')
         except BaseException:
             for future in futures:future.cancel()
@@ -9148,7 +9436,11 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
                     conda_transactions=None,conda_lock_sha256=None):
     stage=pool.stage
     files=[];seen_inodes={}
-    for path in sorted(stage.rglob('*')):
+    progress_path = _POOL_PROGRESS.progress_path if _POOL_PROGRESS is not None else None
+    paths = [path for path in sorted(stage.rglob('*')) if path != progress_path]
+    file_count = sum(path.is_file() for path in paths)
+    _pool_progress('Verifying final pool inventory',0,file_count,'files')
+    for path in paths:
         if path.is_symlink():
             raise RuntimeError('symlink in dependency pool: '+str(path))
         if not path.is_file():continue
@@ -9160,6 +9452,7 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
             row={'path':rel,'size':info.st_size,'sha256':digest(path)}
             seen_inodes[identity]=row['sha256']
         files.append(row)
+        _pool_progress('Verifying final pool inventory',len(files),file_count,'files')
 
     file_digests={entry['path']:entry['sha256'] for entry in files}
 
@@ -9364,6 +9657,13 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         if not isinstance(url,str) or not SHA.fullmatch(sha) or sha not in pool.links:
             reject('URL-index','unregistered URL-to-CAS artifact')
     issues=sorted(set(pool.issues))
+    if progress_path is not None:
+        _pool_progress('Dependency acquisition complete' if not issues else 'Dependency acquisition rejected',force=True)
+        # The broker verifies this file like every other pool entry. Freeze it
+        # before hashing; further console messages must not rewrite the inode.
+        _POOL_PROGRESS.progress_path = None
+        files.append({'path':progress_path.relative_to(stage).as_posix(),
+                      'size':progress_path.stat().st_size,'sha256':digest(progress_path)})
     summary={'schema':2,'kind':'download-only-pool','complete':not issues,
              'operation_id':operation_id,'tasks':len(task_plan),'repos':len(gitplan),
              'conda_recipes':len(envplan),'python_versions':list(PYTHONS),
@@ -9386,15 +9686,18 @@ def _fetch_download_budget(repo_root, network_rx_baseline):
     spec.loader.exec_module(module)
     with (repo_root / 'config/preparation.toml').open('rb') as stream:
         limit = module.fetch_download_limit(tomllib.load(stream)['acquisition'])
-    def check_budget(remaining):
-        received = module.namespace_rx_delta(network_rx_baseline,
+    def received_bytes():
+        return module.namespace_rx_delta(network_rx_baseline,
                         module.namespace_rx_bytes(Path('/proc/net/dev').read_text()))
+    def check_budget(remaining):
+        received = received_bytes()
         if received + remaining > limit:
-            print('[pool] planned Pip download exceeds fetch budget: %.3f GiB received + '
+            print('[pool] planned archive download exceeds fetch budget: %.3f GiB received + '
                   '%.3f GiB remaining > %.3f GiB limit' %
                   (received / 1024**3, remaining / 1024**3, limit / 1024**3),
                   file=sys.stderr, flush=True)
             raise SystemExit(module.FETCH_BUDGET_EXIT_CODE)
+    check_budget.received_bytes = received_bytes
     return check_budget
 
 
@@ -9436,8 +9739,10 @@ def main(argv=None):
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
     write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
+    budget = _fetch_download_budget(repo_root,args.network_rx_baseline)
     _POOL_PROGRESS = _PoolProgress(
-        progress_path=stage/'metadata'/'fetch-progress.json', operation_id=args.operation_id)
+        progress_path=stage/'metadata'/'fetch-progress.json', operation_id=args.operation_id,
+        rx_counter=budget.received_bytes)
     _pool_progress('Verified recovery')
     verified=set()
     if args.reuse_from is not None:
@@ -9445,7 +9750,7 @@ def main(argv=None):
     pool=Pool(stage)
     pool.operation_id = args.operation_id
     pool.resume_from = args.reuse_from
-    pool.download_budget = _fetch_download_budget(repo_root, args.network_rx_baseline)
+    pool.download_budget = budget
     pool.conda_lock=conda_lock
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)
@@ -9830,6 +10135,23 @@ def main(argv=None):
             print('[pool] static issue: '+issue,file=sys.stderr,flush=True)
         raise RuntimeError('static dependency closure rejected before network resolution: '
                            +str(len(static_issues))+' issue(s); first: '+static_issues[0])
+    # Signed APT download-only resolution against Kali, never the Ubuntu host.
+    os_source=adapter/'os_packages.py'
+    import ast
+    tree=ast.parse(os_source.read_text())
+    rows=[node.value for node in tree.body if isinstance(node,ast.Assign) and any(
+          isinstance(target,ast.Name) and target.id=='PACKAGES' for target in node.targets)]
+    if len(rows)!=1:raise RuntimeError('missing pinned APT manifest')
+    apt_requested.update(ast.literal_eval(rows[0]))
+    _pool_progress('Signed Kali APT resolution',details=f'{len(apt_requested)} requested packages')
+    try:apt_closure(pool,apt_requested)
+    except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
+        raise RuntimeError('required signed APT closure unavailable: '+str(exc)) from exc
+    # Every locked Conda archive has an immutable SHA and URL, so its volume
+    # can be measured independently of Pip/VCS discovery and without downloading it.
+    conda_entries={sha:(item['url'],stage/'downloads'/('conda-'+sha))
+                   for sha,item in conda_lock['artifacts'].items()}
+    pool.conda_volume=_locked_conda_volume(pool,conda_entries)
     acquire_pip_groups(pool,groups)
     # Pin VCS inputs, resolve metadata from pyproject/setup.cfg/setup.py, and
     # propagate nested VCS references only to tasks that depend on them.
@@ -9957,6 +10279,7 @@ def main(argv=None):
             # as the upstream recipe permits.
             vcs_frozen.pop(value,None)
             vcs_failure('VCS fetch/closure failed: '+str(exc))
+    _pool_progress('VCS dependency resolution',visited_vcs,visited_vcs,'sources visited','0 queued')
     write_new(stage/'metadata'/'vcs-optional-failures.json',
               json.dumps(vcs_optional_failures,sort_keys=True,indent=2)+'\n')
     write_new(stage/'metadata'/'vcs-npm-required.json',json.dumps(sorted(vcs_npm_required),indent=2)+'\n')
@@ -10003,18 +10326,6 @@ def main(argv=None):
         try: npm_global_bootstrap(pool)
         except (RuntimeError,OSError,ValueError) as exc:
             raise RuntimeError('required npm CLI acquisition failed: '+str(exc)) from exc
-    # Signed APT download-only resolution against Kali, never the Ubuntu host.
-    os_source=adapter/'os_packages.py'
-    import ast
-    tree=ast.parse(os_source.read_text())
-    rows=[node.value for node in tree.body if isinstance(node,ast.Assign) and any(
-          isinstance(target,ast.Name) and target.id=='PACKAGES' for target in node.targets)]
-    if len(rows)!=1:raise RuntimeError('missing pinned APT manifest')
-    apt_requested.update(ast.literal_eval(rows[0]))
-    _pool_progress('Signed Kali APT resolution',details=f'{len(apt_requested)} requested packages')
-    try:apt_closure(pool,apt_requested)
-    except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
-        raise RuntimeError('required signed APT closure unavailable: '+str(exc)) from exc
     _pool_progress('Conda archive acquisition')
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
@@ -10022,14 +10333,19 @@ def main(argv=None):
     _native_close(pool)
     with (Path(__file__).resolve().parents[1] / 'config/preparation.toml').open('rb') as stream:
         bootstrap=tomllib.load(stream)['bootstrap']
-    _pool_progress('Miniconda bootstrap archive')
-    pool.download('https://repo.anaconda.com/miniconda/' + bootstrap['miniconda_archive'],
-                  'bootstrap', 'miniconda-installer', sha=bootstrap['miniconda_sha256'])
+    bootstrap_url='https://repo.anaconda.com/miniconda/' + bootstrap['miniconda_archive']
+    bootstrap_sha=bootstrap['miniconda_sha256']
+    bootstrap_raw=pool.stage/'downloads'/hashlib.sha256(bootstrap_url.encode()).hexdigest()
+    if _POOL_PROGRESS is not None:
+        volume=_sha_archive_plan(pool,{bootstrap_sha:(bootstrap_url,bootstrap_raw)},'Miniconda bootstrap archive')
+        _begin_download_phase(pool,'Miniconda bootstrap archive',volume)
+    pool.download(bootstrap_url,'bootstrap','miniconda-installer',sha=bootstrap_sha)
+    if _POOL_PROGRESS is not None:
+        _POOL_PROGRESS.close_volume(pool.links)
     _pool_progress('Verifying final pool inventory')
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
                     conda_lock_sha256=conda_lock_sha256)
-    _pool_progress('Dependency acquisition complete',force=True)
 
 
 def _pool_cli_entry():

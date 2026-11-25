@@ -751,7 +751,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                      patch.object(pool, '_golden_dependency', return_value={
                          'apt_package_manifest_sha256': hashlib.sha256(golden).hexdigest()}), \
                      patch.object(pool, '__file__', str(stage / 'scripts' / 'superbench_pool.py')):
-                    if mode == 'success':
+                    if mode in ('success','changed-native'):
                         pool.apt_closure(candidate, requested)
                     else:
                         with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
@@ -759,7 +759,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 if mode in ('other-error', 'update-error'):
                     self.assertFalse(any(call[0] == 'key' and call[1] in {row['key_url'] for row in historical}
                                          for call in calls))
-                if mode != 'success':
+                if mode not in ('success','changed-native'):
                     self.assertFalse(any(call[0] == 'transfer' and call[2] == 'install' for call in calls))
                     self.assertFalse((stage / 'metadata/apt-closure.json').exists())
                     continue

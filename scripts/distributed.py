@@ -897,9 +897,16 @@ class _FetchBar:
         self.reset()
 
     def reset(self):
+        if getattr(self,'_rendered_volume',None) is not None and self.tty:
+            self.stream.write('\r\x1b[2K\x1b[1A\r\x1b[2K')
+            self.stream.flush()
+        self._rendered_volume = None
         self.last = None
         self.previous = None
         self.observed_stage = None
+        self.observed_epoch = None
+        self.observed_unit = None
+        self.volume_line = None
         self.observed_operation = None
         self.stage_started = None
         self.byte_samples = deque()
@@ -923,14 +930,17 @@ class _FetchBar:
             raise RuntimeError('invalid fetch transfer or work counters')
         if self.observed_operation is not None and operation != self.observed_operation:
             raise RuntimeError('fetch progress changed operation without an attempt reset')
-        if stage != self.observed_stage:
+        epoch = progress.get('stage_epoch')
+        if (stage,epoch,progress['unit']) != (self.observed_stage,self.observed_epoch,self.observed_unit):
             self.observed_stage = stage
+            self.observed_epoch = epoch
+            self.observed_unit = progress['unit']
             self.stage_started = now
             self.byte_samples.clear()
             self.work_samples.clear()
             self.stage_has_transfer = False
         self.observed_operation = operation
-        received = network + pip
+        received = progress['rx_bytes'] if progress['schema']==2 else network+pip
         # Once a stage has displayed download throughput, keep that metric
         # visible even when a burst finishes or pip_active returns to zero.
         self.stage_has_transfer |= received > 0 or progress['pip_active'] > 0
@@ -956,7 +966,7 @@ class _FetchBar:
     def update(self, phase, progress=None):
         now = time.monotonic()
         if progress is not None:
-            if (not isinstance(progress, dict) or progress.get('schema') != 1
+            if (not isinstance(progress, dict) or progress.get('schema') not in (1,2)
                     or not isinstance(progress.get('stage'), str)):
                 raise RuntimeError('invalid broker progress record')
             if phase not in ('validating', 'failed', 'interrupted', 'canceled'):
@@ -980,18 +990,23 @@ class _FetchBar:
             label = (f'{completed / 1024**3:.3f}/{total / 1024**3:.3f} GiB ({100 * proportion:.1f}%)'
                      if unit == 'bytes' else f'{completed}/{total} {unit} ({100 * proportion:.1f}%)')
             filled = int(24 * proportion)
+            if self.last is not None and 'tailles à découvrir' in self.last.get('details',''):
+                label += ' | '+self.last['details']
         elif type(completed) is int and total == 0:
             label = '0/0 GiB (100%)' if unit == 'bytes' else f'{completed}/0 {unit}'
             filled = 24
         else:
-            label = 'phase active — total non mesuré'
+            label = f'{completed} {unit}' if completed is not None else ''
+            details = self.last.get('details','') if self.last and phase not in ('validating','failed','interrupted','canceled') else ''
+            label = ' | '.join(part for part in (label,details) if part)
             filled = 0
 
         metric = ''
         suffix = ''
         activity = ''
         if self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
-            transferred = self.last['network_bytes'] + self.last['pip_bytes']
+            transferred = (self.last['rx_bytes'] if self.last['schema']==2 else
+                           self.last['network_bytes'] + self.last['pip_bytes'])
             bytes_per_second = max(0.0, self._rate(self.byte_samples))
             units_per_minute = max(0.0, self._rate(self.work_samples) * 60)
             # These are different quantities, never interchangeable rates.
@@ -1032,11 +1047,25 @@ class _FetchBar:
                 filled = min(width, int(width * min(1.0, completed / total)))
             else:
                 filled = width if total == 0 and type(completed) is int else 0
-        bar = '[' + '#' * filled + '-' * (width - filled) + ']'
-        text = f'fetch | {stage} {bar} {label}{metric}{suffix}{activity}'
+        bar = '[' + '#' * filled + '-' * (width - filled) + ']' if total is not None and completed is not None else ''
+        text = f'fetch | {stage} ' + ' '.join(part for part in (bar,label) if part) + metric + suffix + activity
+        text = text.rstrip()
+        if self.last is not None and 'volume' in self.last:
+            volume = self.last['volume']
+            known,acquired = volume['identified_bytes'],volume['acquired_bytes']
+            scope = 'total' if volume['complete'] else 'identifié (SHA-256)'
+            self.volume_line = f'fetch | {scope}: {known/1024**3:.3f} GiB | acquis {acquired/1024**3:.3f} | restant {(known-acquired)/1024**3:.3f} GiB'
+
         if self.tty:
             text = text[:max(1, columns - 1)]
-            if text != self.previous:
+            if self.volume_line is not None:
+                volume_line = self.volume_line[:max(1,columns-1)]
+                if (text,volume_line) != (self.previous,getattr(self,'_rendered_volume',None)):
+                    prefix = '\x1b[1A' if getattr(self,'_rendered_volume',None) is not None else ''
+                    self.stream.write(prefix+'\r\x1b[2K'+volume_line+'\n\r\x1b[2K'+text)
+                    self.stream.flush()
+                    self._rendered_volume=volume_line
+            elif text != self.previous:
                 self.stream.write('\r\x1b[2K' + text)
                 self.stream.flush()
         self.previous = text
@@ -1050,12 +1079,14 @@ class _FetchBar:
                 text = 'fetch | ' + label
             self.stream.write('\r\x1b[2K' + text + '\n')
         else:
+            if self.volume_line is not None:
+                self.stream.write(self.volume_line+'\n')
             self.stream.write(text + '\n')
         self.stream.flush()
 
 
 def _record_fetch_failure(exc):
-    """Full local failure record, never print the exception in fetch terminal."""
+    """Retain the complete local traceback alongside the terminal diagnostic."""
     import traceback
     directory = ROOT/'state'/'distributed'
     if directory.is_symlink():
@@ -1069,6 +1100,26 @@ def _record_fetch_failure(exc):
             out.write('\n')
     except BaseException:
         raise
+
+def _fetch_failure_detail(status):
+    import base64
+    record=status.get('live_log')
+    lines=[]
+    if isinstance(record,dict) and isinstance(record.get('content_b64'),str):
+        raw=base64.b64decode(record['content_b64'],validate=True).decode('utf-8','replace')
+        lines=[''.join(ch for ch in line if ch.isprintable()) for line in raw.splitlines()]
+    failures=[line for line in lines if line.startswith('[pool] FAILED;')]
+    errors=[line for line in lines if line.startswith(('E: ','Error: '))]
+    stage=status.get('progress')
+    phase=stage.get('stage') if isinstance(stage,dict) else status.get('phase')
+    cause=str(status.get('error'))
+    if failures and cause.startswith('CalledProcessError:'):
+        cause=failures[-1].split('automatic cleanup:',1)[-1].strip()
+    # APT stderr often carries the only package-specific reason. Retain the
+    # latest unique diagnostic lines without dumping command arguments/tracebacks.
+    detail='\n'.join(dict.fromkeys(errors[-12:])) if 'APT' in str(phase) else ''
+    return str(phase)+': '+cause+('\n'+detail if detail else '')
+
 
 def preparation_fetch(cfg, *, fetch_source=None):
     """Only explicit Lite fetch triggers a job; reads rediscover lost responses."""
@@ -1127,9 +1178,9 @@ def preparation_fetch(cfg, *, fetch_source=None):
             if attempt != last_attempt:
                 view.reset()
                 last_attempt = attempt
-            # The broker reports atomic worker counters. Its raw process log
-            # remains on Fossil and is never forwarded to the Acer terminal.
-            view.update(phase, status.get('progress'))
+            # Do not draw a new empty bar for a retained failed attempt before retrying.
+            if phase not in {'not_started','failed','interrupted','canceled'}:
+                view.update(phase, status.get('progress'))
             if phase == "ready":
                 result = status.get("result")
                 coverage=recipe.get("coverage") or {}
@@ -1154,12 +1205,12 @@ def preparation_fetch(cfg, *, fetch_source=None):
                     error = str(status.get('error'))
                     for pattern in (
                             r'RuntimeError: fetch download budget reached: ([0-9.]+/[0-9.]+ GiB) received in fetch namespace',
-                            r'RuntimeError: planned Pip download exceeds fetch budget: ([0-9.]+ GiB received \+ [0-9.]+ GiB remaining > [0-9.]+ GiB limit)'):
+                            r'RuntimeError: planned archive download exceeds fetch budget: ([0-9.]+ GiB received \+ [0-9.]+ GiB remaining > [0-9.]+ GiB limit)'):
                         matched = re.fullmatch(pattern, error)
                         if matched:
                             print('\nfetch | LIMITE DE TÉLÉCHARGEMENT | ' + matched.group(1), flush=True)
                             break
-                    raise RuntimeError("preparation " + operation_id + " failed: " + error)
+                    raise RuntimeError(_fetch_failure_detail(status))
                 error = status.get("error")
                 # Only an explicit new make superbench-fetch invocation retries
                 # a terminal failed job; the broker verifies process/cgroup
@@ -1715,6 +1766,7 @@ if __name__ == "__main__":
         if len(sys.argv) > 1 and sys.argv[1] == 'superbench-fetch':
             _record_fetch_failure(exc)
             _FetchBar().finish(False)
+            print('fetch | '+str(exc),file=sys.stderr,flush=True)
         else:
             print("distributed operation failed: " + str(exc), file=sys.stderr)
         raise SystemExit(1)

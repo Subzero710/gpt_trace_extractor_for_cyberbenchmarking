@@ -642,8 +642,20 @@ class PreparationManager:
             'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
             'network_bytes', 'pip_bytes', 'pip_active'
         }
+        if isinstance(data,dict) and data.get('schema') == 2:
+            required |= {'details','stage_epoch','volume','rx_bytes'}
+            volume=data.get('volume')
+            if (not isinstance(volume,dict) or set(volume)!={'identified_bytes','acquired_bytes','artifacts','complete'}
+                    or any(type(volume[key]) is not int or volume[key]<0 for key in ('identified_bytes','acquired_bytes','artifacts'))
+                    or type(volume['complete']) is not bool or volume['acquired_bytes']>volume['identified_bytes']
+                    or volume['complete'] and volume['acquired_bytes']!=volume['identified_bytes']
+                    or type(data.get('stage_epoch')) is not int or data['stage_epoch']<0
+                    or type(data.get('rx_bytes')) is not int or data['rx_bytes']<0
+                    or not isinstance(data.get('details'),str) or len(data['details'])>1024
+                    or any(ord(ch)<32 for ch in data['details'])):
+                reject('invalid fetch volume or phase identity','volume_validation',rejected_payload=data)
         if (not isinstance(data, dict) or set(data) != required
-                or data['schema'] != 1 or data['operation_id'] != operation_id
+                or data['schema'] not in (1,2) or data['operation_id'] != operation_id
                 or not isinstance(data['stage'], str) or not 0 < len(data['stage']) <= 160
                 or not isinstance(data['unit'], str) or len(data['unit']) > 64
                 or any(ord(ch) < 32 for ch in data['stage'] + data['unit'])
@@ -1441,13 +1453,12 @@ def _prepare(manager, state):
         _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
         if exitcode == FETCH_BUDGET_EXIT_CODE:
             progress = manager._progress(state)
-            if (progress is None or progress['stage'] != 'Pip materialization'
-                    or progress['unit'] != 'bytes' or progress['total'] is None
+            if (progress is None or progress['unit'] != 'bytes' or progress['total'] is None
                     or progress['completed'] is None):
-                raise RuntimeError('download budget refusal lacks measured Pip volume')
+                raise RuntimeError('download budget refusal lacks measured archive volume')
             remaining = progress['total'] - progress['completed']
             amount = namespace_rx_delta(baseline, received())
-            raise RuntimeError('planned Pip download exceeds fetch budget: %.3f GiB received + '
+            raise RuntimeError('planned archive download exceeds fetch budget: %.3f GiB received + '
                                '%.3f GiB remaining > %.3f GiB limit' %
                                (amount / 1024**3, remaining / 1024**3, download_limit / 1024**3))
         raise subprocess.CalledProcessError(exitcode, child.args)
