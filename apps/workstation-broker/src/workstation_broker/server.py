@@ -1508,7 +1508,10 @@ def main():
     if uds.exists(): uds.unlink()
     stamp = process_identity(os.getpid())
     if stamp is None: raise RuntimeError("execution host native process identity is unavailable")
-    atomic_json(record_path, {"schema": 1, "broker_identity": stamp,
+    source_identity = os.environ["GPT_TRACE_BROKER_SOURCE_SHA256"]
+    if re.fullmatch(r"[0-9a-f]{64}", source_identity) is None:
+        raise RuntimeError("invalid native broker source identity")
+    atomic_json(record_path, {"schema": 1, "broker_identity": stamp, "source_sha256": source_identity,
         "deployment": {"control_id": os.environ["WORKSTATION_BROKER_CONTROL_ID"],
         "execution_id": os.environ["WORKSTATION_BROKER_EXECUTION_ID"]}}, 0o600)
     from gpt_trace_transport.gateway import start_from_env

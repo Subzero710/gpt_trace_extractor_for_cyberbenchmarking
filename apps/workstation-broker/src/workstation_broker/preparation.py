@@ -456,6 +456,40 @@ class _PreparationSnapshotEvents:
                                     self._DELETE | self._ATTRIB)):
                     return True
 
+def _validate_fetch_progress(data, operation_id, reject, observed=None):
+    required = {
+        'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
+        'network_bytes', 'pip_bytes', 'pip_active'
+    }
+    if isinstance(data,dict) and data.get('schema') == 2:
+        required |= {'details','stage_epoch','volume','rx_bytes'}
+        volume=data.get('volume')
+        if (not isinstance(volume,dict) or set(volume)!={'identified_bytes','acquired_bytes','artifacts','complete'}
+                or any(type(volume[key]) is not int or volume[key]<0 for key in ('identified_bytes','acquired_bytes','artifacts'))
+                or type(volume['complete']) is not bool or volume['acquired_bytes']>volume['identified_bytes']
+                or volume['complete'] and volume['acquired_bytes']!=volume['identified_bytes']
+                or type(data.get('stage_epoch')) is not int or data['stage_epoch']<0
+                or type(data.get('rx_bytes')) is not int or data['rx_bytes']<0
+                or not isinstance(data.get('details'),str) or len(data['details'])>1024
+                or any(ord(ch)<32 for ch in data['details'])):
+            reject('invalid fetch volume or phase identity','volume_validation',rejected_payload=data)
+    if (not isinstance(data, dict) or set(data) != required
+            or data['schema'] not in (1,2) or data['operation_id'] != operation_id
+            or not isinstance(data['stage'], str) or not 0 < len(data['stage']) <= 160
+            or not isinstance(data['unit'], str) or len(data['unit']) > 64
+            or any(ord(ch) < 32 for ch in data['stage'] + data['unit'])
+            or any(type(data[key]) is not int or data[key] < 0
+                   for key in ('network_bytes', 'pip_bytes', 'pip_active'))
+            or any(data[key] is not None and (type(data[key]) is not int or data[key] < 0)
+                   for key in ('completed', 'total'))
+            or (data['completed'] is not None and data['total'] is not None
+                and data['completed'] > data['total'])):
+        reject('invalid verified fetch progress data', 'payload_validation',
+               rejected_payload=data, expected_keys=sorted(required),
+               expected_operation_id=operation_id, opened=observed)
+    return data
+
+
 class PreparationManager:
     def __init__(self, base, template_root, templates, *, source_root=ROOT, deployment=None):
         self.base, self.template_root, self.templates = Path(base), Path(template_root), templates
@@ -537,6 +571,16 @@ class PreparationManager:
         operation_id = state.get('operation_id')
         if type(attempt) is not int or attempt < 1 or not isinstance(operation_id, str):
             return None
+        logger = logging.getLogger(__name__)
+
+        def reject(message, reason, **values):
+            logger.error('fetch progress snapshot rejected: operation_id=%s '
+                         'attempt=%s reason=%s rejected_values=%r',
+                         operation_id, attempt, reason, values)
+            raise RuntimeError(message)
+
+        if 'integration_progress' in state:
+            return _validate_fetch_progress(state['integration_progress'], operation_id, reject)
         stage = self.base.parent/'dependency-pool'/('incoming-'+identifier(operation_id)+'-'+str(attempt))
         metadata = stage/'metadata'
         if (not stage.is_dir() or stage.is_symlink()
@@ -544,20 +588,12 @@ class PreparationManager:
             return None
         path = metadata/'fetch-progress.json'
         owner = stage.stat().st_uid
-        logger = logging.getLogger(__name__)
-
         def attributes(info):
             return {'device': info.st_dev, 'inode': info.st_ino,
                     'uid': info.st_uid, 'gid': info.st_gid,
                     'mode': oct(stat.S_IMODE(info.st_mode)),
                     'regular': stat.S_ISREG(info.st_mode),
                     'links': info.st_nlink, 'size': info.st_size}
-
-        def reject(message, reason, **values):
-            logger.error('fetch progress snapshot rejected: operation_id=%s '
-                         'attempt=%s reason=%s rejected_values=%r',
-                         operation_id, attempt, reason, values)
-            raise RuntimeError(message)
 
         try:
             named = path.lstat()
@@ -638,37 +674,7 @@ class PreparationManager:
         except (ValueError, UnicodeError) as exc:
             reject('invalid verified fetch progress data', 'json_decode',
                    error_type=type(exc).__name__, error=str(exc), payload=value)
-        required = {
-            'schema', 'operation_id', 'stage', 'completed', 'total', 'unit',
-            'network_bytes', 'pip_bytes', 'pip_active'
-        }
-        if isinstance(data,dict) and data.get('schema') == 2:
-            required |= {'details','stage_epoch','volume','rx_bytes'}
-            volume=data.get('volume')
-            if (not isinstance(volume,dict) or set(volume)!={'identified_bytes','acquired_bytes','artifacts','complete'}
-                    or any(type(volume[key]) is not int or volume[key]<0 for key in ('identified_bytes','acquired_bytes','artifacts'))
-                    or type(volume['complete']) is not bool or volume['acquired_bytes']>volume['identified_bytes']
-                    or volume['complete'] and volume['acquired_bytes']!=volume['identified_bytes']
-                    or type(data.get('stage_epoch')) is not int or data['stage_epoch']<0
-                    or type(data.get('rx_bytes')) is not int or data['rx_bytes']<0
-                    or not isinstance(data.get('details'),str) or len(data['details'])>1024
-                    or any(ord(ch)<32 for ch in data['details'])):
-                reject('invalid fetch volume or phase identity','volume_validation',rejected_payload=data)
-        if (not isinstance(data, dict) or set(data) != required
-                or data['schema'] not in (1,2) or data['operation_id'] != operation_id
-                or not isinstance(data['stage'], str) or not 0 < len(data['stage']) <= 160
-                or not isinstance(data['unit'], str) or len(data['unit']) > 64
-                or any(ord(ch) < 32 for ch in data['stage'] + data['unit'])
-                or any(type(data[key]) is not int or data[key] < 0
-                       for key in ('network_bytes', 'pip_bytes', 'pip_active'))
-                or any(data[key] is not None and (type(data[key]) is not int or data[key] < 0)
-                       for key in ('completed', 'total'))
-                or (data['completed'] is not None and data['total'] is not None
-                    and data['completed'] > data['total'])):
-            reject('invalid verified fetch progress data', 'payload_validation',
-                   rejected_payload=data, expected_keys=sorted(required),
-                   expected_operation_id=operation_id, opened=observed)
-        return data
+        return _validate_fetch_progress(data, operation_id, reject, observed)
 
     def _public(self, state):
         if state['phase'] == 'ready' and (JobScope.members(state) or self._containers(state)):
@@ -1151,8 +1157,55 @@ def verify_published_inventory(folder, state, proof):
     return inventory
 
 
+def _published_progress(ready, state, proof):
+    inventory = verify_published_inventory(ready, state, proof)
+    relative = 'metadata/fetch-progress.json'
+    entries = [row for row in inventory['files'] if row['path'] == relative]
+    if len(entries) != 1:
+        raise RuntimeError('published pool lacks its final progress inventory entry')
+    raw = safe(Path(ready) / relative, immutable=True).read_bytes()
+    if len(raw) != entries[0]['size'] or hashlib.sha256(raw).hexdigest() != entries[0]['sha256']:
+        raise RuntimeError('published pool progress differs from its verified inventory')
+    def reject(message, _reason, **_values):
+        raise RuntimeError(message)
+    progress = _validate_fetch_progress(json.loads(raw), state['operation_id'], reject)
+    if (progress.get('operation_id') != state['operation_id'] or progress.get('schema') != 2
+            or progress.get('volume', {}).get('complete') is not True):
+        raise RuntimeError('published pool lacks final measured acquisition progress')
+    return progress
+
+
+def _integration_progress(prior, stage, completed=None, total=None, unit='', details=''):
+    if (completed is not None and (type(completed) is not int or completed < 0)
+            or total is not None and (type(total) is not int or total < 0)
+            or completed is not None and total is not None and completed > total):
+        raise RuntimeError('invalid integration progress counters')
+    return {**prior, 'stage': stage, 'completed': completed, 'total': total, 'unit': unit,
+            'details': ''.join(ch for ch in details if ch.isprintable())[:1024],
+            'stage_epoch': prior['stage_epoch'] + int((stage, unit) != (prior['stage'], prior['unit'])),
+            'pip_active': 0}
+
+
 def _integrate_published_pool(manager, state, ready, result):
     """Build/validate templates from an already sealed pool after a crash."""
+    operation_id = state['operation_id']
+    with manager.lock():
+        state = manager._read(operation_id)
+        progress = _published_progress(ready, state, result)
+        state = {**state, 'phase': 'validating', 'integration_progress':
+                 _integration_progress(progress, 'Construction des templates')}
+        manager._write(state)
+
+    def report(stage, completed=None, total=None, unit='', details=''):
+        with manager.lock():
+            current = manager._read(operation_id)
+            if current['attempt'] != state['attempt'] or current['phase'] not in {'running', 'validating'}:
+                raise RuntimeError('template progress no longer belongs to the active preparation')
+            prior = current['integration_progress']
+            updated = _integration_progress(prior, stage, completed, total, unit, details)
+            if updated != prior:
+                manager._write({**current, 'integration_progress': updated})
+
     builder_path = manager.source_root / "scripts/build_local_templates.py"
     spec = importlib.util.spec_from_file_location("swegym_integrated_builder", builder_path)
     if spec is None or spec.loader is None:
@@ -1161,15 +1214,18 @@ def _integrate_published_pool(manager, state, ready, result):
     sys.modules[spec.name] = builder
     spec.loader.exec_module(builder)
     args = types.SimpleNamespace(
-        operation_id=state["operation_id"], virtual_gib=builder.VIRTUAL_GIB,
+        operation_id=operation_id, virtual_gib=builder.VIRTUAL_GIB,
         free_space_gib=builder.FREE_SPACE_GIB,
     )
-    final = builder.build(args)
+    final = builder.build(args, progress=report)
     generation = Path(final).name
     integrated = {**result, "runtime_integrated": True, "generation": generation,
                   "prepared_setups": True, "pool_directory": str(ready)}
-    manager._write({**state, "phase": "validating", "publication_verified": integrated,
-                    "built_generation": generation})
+    with manager.lock():
+        current = manager._read(operation_id)
+        manager._write({**current, "phase": "validating", "publication_verified": integrated,
+                        "built_generation": generation, 'integration_progress':
+                        _integration_progress(current['integration_progress'], 'Templates intégrés')})
     return integrated
 
 
@@ -1523,6 +1579,17 @@ def _prepare(manager, state):
     if actual_files != expected | {"inventory.json"}:
         raise RuntimeError("unlisted/missing pool artifacts: " +
                            str(sorted(actual_files ^ (expected | {"inventory.json"}))[:12]))
+    # Status reads hold the same lock. Stop reading worker-owned metadata before
+    # any ownership, mode or inode changes during deduplication and sealing.
+    with manager.lock():
+        state = manager._read(state['operation_id'])
+        final_progress = manager._progress(state)
+        if (final_progress is None or final_progress.get('schema') != 2
+                or final_progress.get('volume', {}).get('complete') is not True):
+            raise RuntimeError('completed fetch lacks its final measured progress')
+        state = {**state, 'integration_progress':
+                 _integration_progress(final_progress, 'Publication du pool')}
+        manager._write(state)
     # Canonicalize equal bytes into one inode while this stage is still new.
     # Only this uncommitted candidate is touched; no prior ready/zombie data.
     import secrets

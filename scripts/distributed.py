@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 import hashlib
 import json
@@ -504,7 +505,102 @@ def _buildkit_controls():
     return budget, probe, interval
 
 
-def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
+def _builder_dns_config(content, nameservers):
+    import ipaddress
+    addresses = list(dict.fromkeys(str(ipaddress.ip_address(value)) for value in nameservers))
+    if not addresses or any(ipaddress.ip_address(value).is_loopback or ipaddress.ip_address(value).is_unspecified
+                            for value in addresses):
+        raise RuntimeError('fetch namespace does not expose usable DNS servers')
+    original = tomllib.loads(content)
+    previous = original.get('dns', {})
+    if not isinstance(previous, dict):
+        raise RuntimeError('invalid BuildKit DNS configuration')
+    if previous.get('nameservers') == addresses:
+        return content
+    wanted = {**previous, 'nameservers': addresses}
+    if any(not isinstance(value, list) or any(not isinstance(item, str) for item in value)
+           for value in wanted.values()):
+        raise RuntimeError('unsupported BuildKit DNS configuration')
+    section = '[dns]\n' + ''.join(f'{key} = {json.dumps(value)}\n' for key, value in wanted.items())
+    if 'dns' in original:
+        # Replace only the DNS table; verify all unrelated TOML values survived.
+        pattern = r'(?ms)^\s*\[dns\][ \t]*(?:#.*)?\n.*?(?=^[ \t]*\[|\Z)'
+        updated, count = re.subn(pattern, lambda _match: '\n' + section, content)
+        if count != 1:
+            raise RuntimeError('BuildKit DNS table is not an explicit standalone table')
+    else:
+        updated = content.rstrip() + '\n\n' + section
+    if tomllib.loads(updated) != {**original, 'dns': wanted}:
+        raise RuntimeError('BuildKit DNS update would modify unrelated configuration')
+    return updated
+
+
+def configure_fetch_builder_dns(*, allow_change=True):
+    # The builder and its network are provisioned externally. Reconcile only DNS
+    # on that exact builder, including after a container recreation.
+    sys.path.insert(0, str(ROOT / 'apps/workstation-broker/src'))
+    from workstation_broker.fetch_egress import source_builder, source_network
+    network, builder = source_network(), source_builder()
+    limit = _distributed_operation_timeout()
+    resolv = run(['ip', 'netns', 'exec', network, 'cat', '/etc/resolv.conf'], capture=True, timeout=limit)
+    nameservers = [fields[1] for line in resolv.splitlines() if (fields := line.split())
+                   and fields[0] == 'nameserver' and len(fields) >= 2]
+    # Inspect the external builder's actual node rather than constructing a fixed node ID.
+    description = run(['docker', 'buildx', 'inspect', '--bootstrap', builder], capture=True, timeout=limit)
+    header, separator, nodes = description.partition('Nodes:')
+    if not separator or not re.search(r'(?m)^Driver:\s*docker-container\s*$', header):
+        raise RuntimeError('fetch builder must use the dedicated docker-container driver')
+    node_names = re.findall(r'(?m)^Name:[ \t]+([^\s]+)', nodes)
+    if len(node_names) != 1:
+        raise RuntimeError('fetch builder must have exactly one local node')
+    container = 'buildx_buildkit_' + node_names[0]
+    info, = json.loads(run(['docker', 'inspect', container], capture=True, timeout=limit))
+    if (info['Name'] != '/' + container or info['HostConfig']['NetworkMode'] != network
+            or not info['State']['Running']):
+        raise RuntimeError('fetch builder is not running on its dedicated network')
+    argv = info['Args']
+    config = '/etc/buildkit/buildkitd.toml'
+    for i, arg in enumerate(argv):
+        if arg == '--config':
+            config = argv[i+1]
+        elif arg.startswith('--config='):
+            config = arg.partition('=')[2]
+    if not config.startswith('/') or '..' in Path(config).parts:
+        raise RuntimeError('invalid BuildKit daemon config path')
+    target = info['Id']
+    content = run(['docker', 'exec', target, 'sh', '-ec',
+                   'if [ -e "$1" ]; then cat "$1"; fi', 'sh', config], capture=True, timeout=limit)
+    updated = _builder_dns_config(content, nameservers)
+    if updated == content:
+        return nameservers
+    if not allow_change:
+        raise RuntimeError('fetch builder DNS changed while a preparation owns the build slot')
+    subprocess.run(['docker', 'exec', '-i', target, 'sh', '-ec',
+                    'mkdir -p "$(dirname "$1")"; tmp=$(mktemp "${1}.XXXXXX"); '
+                    "trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" \"$1\"",
+                    'sh', config], input=updated, text=True, check=True, timeout=limit)
+    run(['docker', 'restart', target], timeout=limit)
+    run(['docker', 'buildx', 'inspect', '--bootstrap', builder], capture=True, timeout=limit)
+    return nameservers
+
+
+def _buildkit_progress(update, completed_steps):
+    # Dockerfile counts are reported by BuildKit itself, never inferred from
+    # elapsed time or the number of internal BuildKit vertices.
+    observed = None
+    for row in update.get('vertexes', []):
+        match = re.match(r'^\[\s*(\d+)/(\d+)\]\s*(.*)', row.get('name', ''))
+        if match and row.get('started'):
+            index, total = map(int, match.groups()[:2])
+            if not 1 <= index <= total:
+                raise RuntimeError('invalid BuildKit Dockerfile step count')
+            if row.get('completed') and not row.get('error'):
+                completed_steps.add(index)
+            observed = len(completed_steps), total, match[3]
+    return observed
+
+
+def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None, progress=None):
     budget, probe, interval = _buildkit_controls()
     with tempfile.NamedTemporaryFile(prefix="gpttrace-buildkit-", suffix=".log", delete=False) as raw:
         succeeded = False
@@ -512,6 +608,11 @@ def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
         process = subprocess.Popen(command, cwd=ROOT, stdin=stdin, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         pending = b""
+        diagnostic = {}
+        failed_vertices = {}
+        plain_tail = bytearray()
+        last_progress = None
+        completed_steps = set()
         try:
             while True:
                 readable, _, _ = select.select([process.stdout], [], [], min(interval, watch.remaining()))
@@ -529,12 +630,40 @@ def _run_buildkit(command, *, stdin=subprocess.DEVNULL, monitor=None):
                     raise RuntimeError("BuildKit progress frame exceeds size limit")
                 for line in lines:
                     if line.startswith(b"{"):
-                        watch.feed(json.loads(line))
+                        update = json.loads(line)
+                        watch.feed(update)
+                        for row in update.get('logs', []):
+                            tail = diagnostic.setdefault(row['vertex'], bytearray())
+                            tail.extend(base64.b64decode(row['data'], validate=True))
+                            del tail[:-4096]
+                        for row in update.get('vertexes', []):
+                            if row.get('error'):
+                                failed_vertices[row['digest']] = row['error']
+                            elif row.get('completed'):
+                                diagnostic.pop(row['digest'], None)
+                        if progress is not None:
+                            observed = _buildkit_progress(update, completed_steps)
+                            if observed is not None and observed != last_progress:
+                                # A repeated extraction event can arrive after its
+                                # vertex completed; never regress completed steps.
+                                if last_progress is None or observed[0] >= last_progress[0]:
+                                    progress(*observed)
+                                    last_progress = observed
                     else:
+                        plain_tail.extend(line + b'\n')
+                        del plain_tail[:-4096]
                         print(line.decode(errors="replace"), flush=True)
             status = process.wait(timeout=min(probe, watch.remaining()))
             if status != 0:
-                raise subprocess.CalledProcessError(status, command)
+                details = []
+                for vertex, error in failed_vertices.items():
+                    log = diagnostic.get(vertex, b'').decode('utf-8', 'replace')
+                    details.extend(line.strip() for line in log.splitlines() if line.strip())
+                    details.append(error)
+                if not details:
+                    details = plain_tail.decode('utf-8', 'replace').splitlines()
+                detail = '\n'.join(dict.fromkeys(details))[-2200:]
+                raise RuntimeError(f'BuildKit exit {status}: {detail}' if detail else f'BuildKit exit {status}')
             if pending or not watch.observed_vertex or watch.vertices or watch.statuses:
                 raise RuntimeError("BuildKit exited without settling its build operations")
             succeeded = True
@@ -969,13 +1098,13 @@ class _FetchBar:
             if (not isinstance(progress, dict) or progress.get('schema') not in (1,2)
                     or not isinstance(progress.get('stage'), str)):
                 raise RuntimeError('invalid broker progress record')
-            if phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+            if phase not in ('failed', 'interrupted', 'canceled'):
                 self._observe(progress, now)
             self.last = progress
         elif self.last is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
             # A missed broker snapshot is still an observation of no new bytes.
             self._observe(self.last, now)
-        if phase == 'validating':
+        if phase == 'validating' and progress is None:
             stage, completed, total, unit = 'Validation finale', None, None, ''
         elif phase in ('failed', 'interrupted', 'canceled'):
             stage, completed, total, unit = 'Préparation interrompue', None, None, ''
@@ -990,14 +1119,14 @@ class _FetchBar:
             label = (f'{completed / 1024**3:.3f}/{total / 1024**3:.3f} GiB ({100 * proportion:.1f}%)'
                      if unit == 'bytes' else f'{completed}/{total} {unit} ({100 * proportion:.1f}%)')
             filled = int(24 * proportion)
-            if self.last is not None and 'tailles à découvrir' in self.last.get('details',''):
+            if self.last is not None and self.last.get('details') and (phase == 'validating' or 'tailles à découvrir' in self.last['details']):
                 label += ' | '+self.last['details']
         elif type(completed) is int and total == 0:
             label = '0/0 GiB (100%)' if unit == 'bytes' else f'{completed}/0 {unit}'
             filled = 24
         else:
             label = f'{completed} {unit}' if completed is not None else ''
-            details = self.last.get('details','') if self.last and phase not in ('validating','failed','interrupted','canceled') else ''
+            details = self.last.get('details','') if self.last and phase not in ('failed','interrupted','canceled') else ''
             label = ' | '.join(part for part in (label,details) if part)
             filled = 0
 
@@ -1019,7 +1148,7 @@ class _FetchBar:
                 activity = f" | {self.last['pip_active']} pip actifs"
             if transferred:
                 suffix = f' | {transferred / 1048576:.1f} MiB reçus'
-        if not metric and self.stage_started is not None and phase not in ('validating', 'failed', 'interrupted', 'canceled'):
+        if not metric and self.stage_started is not None and phase not in ('failed', 'interrupted', 'canceled') and (phase != 'validating' or progress is not None):
             elapsed = max(0, int(now - self.stage_started))
             metric = f' | {elapsed // 60}m{elapsed % 60:02d}s écoulées'
 
@@ -1622,6 +1751,63 @@ def control(cfg, action, args):
 
 
 
+def _broker_source_identity():
+    paths = [ROOT / 'scripts/distributed.py', ROOT / 'config/runner.toml',
+             ROOT / 'config/distributed.toml', ROOT / 'infra/workstation/systemd/gpt-trace-distributed-broker.service.in']
+    for directory in (ROOT / 'apps/workstation-broker/src', ROOT / 'shared/gpt_trace_transport'):
+        paths.extend(directory.rglob('*.py'))
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(path.relative_to(ROOT).as_posix().encode() + b'\0')
+        digest.update(bytes.fromhex(file_sha(path)))
+    return digest.hexdigest()
+
+
+def _start_current_broker(cfg):
+    from gpt_trace_transport.local_templates import safe
+    service = 'gpt-trace-distributed-broker.service'
+    run(['systemctl', 'enable', '--now', service])
+    _wait_local_broker(cfg)
+    expected = _broker_source_identity()
+    record_path = cfg['paths']['broker_runtime_directory'] / 'broker-process.json'
+
+    def matches():
+        record = json.loads(safe(record_path).read_bytes())
+        pid = run(['systemctl', 'show', '--property=MainPID', '--value', service], capture=True)
+        return (record['broker_identity']['pid'] == int(pid)
+                and record.get('deployment') == {key: cfg['deployment'][key] for key in ('control_id', 'execution_id')}
+                and record.get('source_sha256') == expected)
+
+    if not matches():
+        run(['systemctl', 'restart', service])
+        _wait_local_broker(cfg)
+        if not matches():
+            raise RuntimeError('broker did not load the current source identity')
+
+
+def _configure_idle_fetch_builder(cfg):
+    import fcntl
+    # The preparation worker holds this slot for its entire lifetime. Do not
+    # restart its builder on a concurrent make up if the DNS has changed.
+    directory = cfg['paths']['base_image'].parent / 'preparations'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    from gpt_trace_transport.local_templates import safe
+    safe(directory, directory=True)
+    fd = os.open(directory / 'build-slot.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != 0 or info.st_mode & 0o077:
+            raise RuntimeError('untrusted preparation slot')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            configure_fetch_builder_dns(allow_change=False)
+        else:
+            configure_fetch_builder_dns()
+    finally:
+        os.close(fd)
+
+
 def _wait_local_broker(cfg):
     policy = tomllib.loads((ROOT / "config/preparation.toml").read_text())["acquisition"]
     budget = _distributed_operation_timeout()
@@ -1695,6 +1881,7 @@ def execution(cfg, action, args):
         limits = tomllib.loads((ROOT / "config/runner.toml").read_text())["workstation"]
         if limits["provider"] != "libvirt": raise ValueError("libvirt provider required")
         execution_environment(cfg)
+        os.environ["GPT_TRACE_BROKER_SOURCE_SHA256"] = _broker_source_identity()
         python = ROOT / ".venv-workstation-broker/bin/python"
         os.execv(str(python), [str(python), "-m", "workstation_broker.server"])
     if action in {"up", "kali_control", "doctor"}:
@@ -1705,8 +1892,8 @@ def execution(cfg, action, args):
                 _run_execution_helper("workstation_broker.admission")
             except subprocess.CalledProcessError as exc:
                 raise RuntimeError("execution admission failed: " + (exc.stderr or str(exc)).strip()) from exc
-        run(["systemctl", "enable", "--now", "gpt-trace-distributed-broker.service"])
-        _wait_local_broker(cfg)
+        _configure_idle_fetch_builder(cfg)
+        _start_current_broker(cfg)
         execution_tunnel(cfg, 'up')
         if action != "doctor": return
     if action in {"status", "doctor"}:

@@ -751,7 +751,10 @@ def install_generation(staged, target_root, manifest, validate):
     return final
 
 
-def build(args):
+def build(args, *, progress=None):
+    def report(stage, completed=None, total=None, unit="", details=""):
+        if progress is not None:
+            progress(stage, completed, total, unit, details)
     if os.geteuid() != 0:
         raise RuntimeError("local preparation requires the execution host root execution broker")
     from workstation_broker.preparation import verify_worker_claim
@@ -1088,14 +1091,20 @@ def build(args):
             if not (inputs_root / "inputs.json").is_file():
                 from workstation_broker.fetch_egress import source_network, source_builder
                 build_steps = load_module("swegym_host_build_steps", ROOT / "scripts/distributed.py")
+                report("Image de collecte des sources")
+                dns = build_steps.configure_fetch_builder_dns()
                 build_steps._run_buildkit(
                     ["docker", "buildx", "build", "--builder", source_builder(), "--progress", "rawjson", "--load",
                      "--label", "io.gpttrace.local-preparation=source-fetch", "-t", image,
                      "-f", "apps/runner/Dockerfile", "."],
-                    monitor=lambda: free_space(staged, margin))
+                    monitor=lambda: free_space(staged, margin),
+                    progress=lambda done, total, detail: report(
+                        "Image de collecte des sources", done, total, "étapes", detail))
                 source_cache = cache_root / "dataset"
                 source_cache.mkdir(mode=0o700, exist_ok=True)
+                report("Collecte des métadonnées sources")
                 cmd("docker", "run", "--rm", *source_container_arguments(job), "--network", source_network(),
+                    *(flag for address in dns for flag in ("--dns", address)),
                     "--pull", "never", "--cap-drop", "ALL",
                     "--security-opt", "no-new-privileges:true", "--entrypoint", "python",
                     "--mount", "type=bind,source=" + str(inputs_root) + ",target=/build-inputs",
@@ -1107,7 +1116,8 @@ def build(args):
             if inputs["pins"] != pins or pins["recipe_version"] != 2 or pins["schema_version"] != 2:
                 raise RuntimeError("host/fetch container recipe differs; rebuild the runner image")
             repos_set = sorted({item["repo"] for item in inputs["tasks"].values()})
-            for repo in repos_set:
+            for repo_index, repo in enumerate(repos_set):
+                report("Import des dépôts", repo_index, len(repos_set), "dépôts", repo)
                 mirror = cache_root / (repo.replace("/", "_") + ".git")
                 bases = [row["base_commit"] for row in inputs["tasks"].values() if row["repo"] == repo]
                 if mirror.is_dir() and not mirror.is_symlink() and mirror.stat().st_uid == 0 and all(
@@ -1115,6 +1125,7 @@ def build(args):
                             capture_output=True, timeout=60).returncode == 0 for sha in bases):
                     continue
                 mirror_for("https://github.com/" + repo + ".git", repo.replace("/", "_") + ".git")
+            report("Import des dépôts", len(repos_set), len(repos_set), "dépôts")
             verify_sources(inputs, cache_root)
             source_folder, cache_folder, wheel_cas, audit = (staged / "sources", staged / "setup-caches",
                                                                staged / "wheel-cas", staged / "audit")
@@ -1199,7 +1210,8 @@ def build(args):
                     finally: os.close(fd)
                 return wheels
 
-            for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
+            for task_index, (logical, item) in enumerate(sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0]))):
+                report("Archives des tâches", task_index, len(inputs["tasks"]), "tâches", logical)
                 free_space(staged, margin)
                 key = tools.artifact_id("task_source", logical)
                 output = source_folder / (key + ".tar.gz")
@@ -1257,6 +1269,8 @@ def build(args):
                 mapping[logical] = {"template_id": item["template_id"], "task_source": key,
                                     "setup_cache": tools.artifact_id("setup_cache", logical)}
 
+            report("Archives des tâches", len(inputs["tasks"]), len(inputs["tasks"]), "tâches")
+            report("Préparation des paquets système")
             # Golden provenance exposes kali-last-snapshot, a mutable alias,
             # not an immutable snapshot ID. Resolve in one persistent resumable
             # resolver volume; never recreate it merely because a host copy-out
@@ -1412,6 +1426,7 @@ def build(args):
                 raise RuntimeError('npm dependency has no recorded download URL')
             (payload / 'npm-pool.json').write_text(json.dumps(npm_urls,sort_keys=True))
 
+            report("Construction du template commun")
             common = staged / "common.qcow2"
             initial_common = not common.exists()
             if initial_common:
@@ -1734,7 +1749,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             incoming = scratch_root / "swe-gym-task"
             scratch_tasks_root = scratch_root / "tasks"
             scratch_tasks_root.mkdir(mode=0o700, exist_ok=True)
-            for logical, item in sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0])):
+            for task_index, (logical, item) in enumerate(sorted(inputs["tasks"].items(), key=lambda row: (row[1]["repo"], row[1]["env_hash"], row[0]))):
+                report("Préparation des tâches", task_index, len(inputs["tasks"]), "tâches", logical)
                 free_space(staged, margin)
                 task_scratch = scratch_tasks_root / ("task-" + quote(logical, safe="-_."))
                 task_scratch.mkdir(mode=0o700, exist_ok=True)
@@ -1850,6 +1866,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 # Per-task scratch disks remain addressable and are never truncated.
                 # A later fetch can salvage interrupted setups without reinstallation.
                 shutil.rmtree(incoming)
+            report("Préparation des tâches", len(inputs["tasks"]), len(inputs["tasks"]), "tâches")
             atomic_json(audit / "task-inventories.json", task_inventories)
             atomic_json(audit / "vcs-provenance.json", vcs_provenance)
             atomic_json(audit / "prepared-setups.json", prepared_proofs)
@@ -1859,7 +1876,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             templates, isolations = {}, {"common": common_validation}
             base_record = {"path": str(BASE), "sha256": digest(BASE)}
             common_record = {"path": "common.qcow2", "sha256": digest(common)}
-            for repo in repos_set:
+            for repo_index, repo in enumerate(repos_set):
+                report("Templates des dépôts", repo_index, len(repos_set), "dépôts", repo)
                 image = repos / (repo.replace("/", "_") + ".qcow2")
                 repo_completion = {"schema": 1, "kind": "repository", "repo": repo,
                     "template_abi": job["compatibility"]["template_abi"],
@@ -1902,6 +1920,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                     raise RuntimeError("repository template leaked source or mirror state")
                 templates["swe-gym-lite/" + repo.replace("/", "_")] = {"chain": [
                     {"path": image.relative_to(staged).as_posix(), "sha256": digest(image)}, common_record, base_record]}
+            report("Templates des dépôts", len(repos_set), len(repos_set), "dépôts")
+            report("Validation des templates")
             sizes = {}
             for image in [common, *sorted(repos.glob("*.qcow2"))]:
                 chain = json.loads(capture("qemu-img", "info", "--backing-chain", "--output=json", str(image)))
