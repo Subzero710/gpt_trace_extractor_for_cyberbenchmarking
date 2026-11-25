@@ -371,6 +371,28 @@ def copy_git_mirror(source, destination):
                     copy_function=copy_object_or_metadata)
 
 
+def local_submodule_mirror(url, commit, dependency_pool, cache_root, *, repository_from_url, command):
+    """Resolve only exact Git objects already acquired in the sealed pool."""
+    try:
+        normalized = repository_from_url(url)
+    except ValueError as exc:
+        raise RuntimeError("invalid pinned Git submodule URL: " + str(exc)) from exc
+    if not re.fullmatch(r"[a-f0-9]{40}", commit):
+        raise RuntimeError("untrusted Git submodule commit: " + normalized)
+    origin = dependency_pool / "git-extra" / (normalized.replace("/", "_") + ".git")
+    if not origin.is_dir() or origin.is_symlink():
+        raise RuntimeError("submodule was not acquired: " + normalized)
+    command("git", "--git-dir", str(origin), "cat-file", "-e", commit + "^{commit}")
+    key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
+    destination = cache_root / key
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise RuntimeError("untrusted submodule cache path: " + normalized)
+    if not destination.exists():
+        copy_git_mirror(origin, destination)
+    command("git", "--git-dir", str(destination), "cat-file", "-e", commit + "^{commit}")
+    return destination
+
+
 def atomic_json(path, value):
     path = Path(path)
     temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
@@ -788,6 +810,7 @@ def build(args, *, progress=None):
             pool_compatibility.get("pool_schema") != pool_contract(ROOT)["pool_schema"]):
         raise RuntimeError("preparation job lacks the verified dependency-pool contract")
     job = {**job, "compatibility": installed, "pool_compatibility": pool_compatibility}
+    repository_from_url = load_module("swe_gym_pool_repository", ROOT / "scripts/superbench_pool.py").github_repository
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
     os_tools = load_module("swe_gym_os_packages", GUEST.with_name("os_packages.py"))
     target_root = TEMPLATES / "swe-gym-lite"
@@ -987,13 +1010,7 @@ def build(args, *, progress=None):
 
         def mirror_for(url, name):
             """Reuse the verified host Git pool: no external Git operations here."""
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            if parsed.scheme != 'https' or parsed.hostname != 'github.com' or parsed.username or parsed.password:
-                raise RuntimeError('unsupported pinned Git source URL')
-            canonical = parsed.path.strip('/').removesuffix('.git')
-            if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', canonical):
-                raise RuntimeError('invalid Git pool repository')
+            canonical = repository_from_url(url)
             source_name = canonical.replace('/', '_') + '.git'
             source = dependency_pool / 'git' / source_name
             if not source.is_dir():
@@ -1022,27 +1039,8 @@ def build(args, *, progress=None):
             return path
 
         def submodule_mirror(url, commit):
-            """Use the exact submodule commit already acquired in the dependency pool."""
-            parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.username or parsed.password:
-                raise RuntimeError("unsupported Git submodule URL")
-            normalized = parsed.path.lstrip("/").removesuffix(".git")
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
-                raise RuntimeError("untrusted Git submodule repository")
-            if not re.fullmatch(r"[a-f0-9]{40}", commit):
-                raise RuntimeError("untrusted Git submodule commit")
-            origin = dependency_pool / "git-extra" / (normalized.replace("/", "_") + ".git")
-            if not origin.is_dir() or origin.is_symlink():
-                raise RuntimeError("submodule was not acquired: " + normalized)
-            cmd("git", "--git-dir", str(origin), "cat-file", "-e", commit + "^{commit}")
-            key = "submodule-" + hashlib.sha256(url.encode()).hexdigest() + ".git"
-            destination = cache_root / key
-            if destination.is_symlink():
-                raise RuntimeError("untrusted submodule cache path")
-            if not destination.exists():
-                copy_git_mirror(origin, destination)
-            cmd("git", "--git-dir", str(destination), "cat-file", "-e", commit + "^{commit}")
-            return destination
+            return local_submodule_mirror(url, commit, dependency_pool, cache_root,
+                                          repository_from_url=repository_from_url, command=cmd)
 
         def task_boot(item, artifact, *, mode, cache=None):
             # Only this item/source/cache ever enters this scratch disk.
@@ -1260,8 +1258,11 @@ def build(args, *, progress=None):
                         write_checkpoint("source-" + key + ".json", record)
                         print("recovered orphan verified source: " + logical, flush=True)
                     if record is None:
-                        record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
-                                                      submodule_mirror=submodule_mirror)
+                        try:
+                            record = tools.build_artifact(item, cache_root / (item["repo"].replace("/", "_") + ".git"), output,
+                                                          submodule_mirror=submodule_mirror)
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                            raise RuntimeError("task source " + logical + ": " + str(exc)) from exc
                         output.chmod(0o444)
                         tools.validate_artifact(item, output, record)
                         write_checkpoint("source-" + key + ".json", record)

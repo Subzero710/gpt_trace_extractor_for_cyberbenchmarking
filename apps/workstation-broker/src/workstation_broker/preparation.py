@@ -731,24 +731,24 @@ class PreparationManager:
             ready = self.base.parent / 'dependency-pool' / 'ready'
             if ready.exists() or ready.is_symlink():
                 inventory = verify_published_inventory(ready, state, proof)
-                pending_integration = proof.get('runtime_integrated') != True
                 if (proof.get('kind') != 'download-only-pool' or proof.get('complete') is not True
                         or proof.get('pool_directory') != str(ready)
                         or inventory.get('operation_id') != state['operation_id']
                         or inventory.get('complete') is not True
                         or inventory.get('tasks') != proof.get('tasks')
                         or inventory.get('repos') != proof.get('repos')
-                        or inventory.get('conda_recipes') != proof.get('conda_recipes')
-                        or (not pending_integration and proof.get('runtime_integrated') is not True)
-                        or proof.get('prepared_setups') is not True
-                        or not isinstance(proof.get('generation'), str)):
-                    if not pending_integration:
+                        or inventory.get('conda_recipes') != proof.get('conda_recipes')):
+                    raise RuntimeError('published pool does not match the durable verified publication record')
+                if proof.get('runtime_integrated') is not True:
+                    if state['phase'] not in TERMINAL:
+                        state = {**state, 'phase': 'interrupted',
+                                 'error': state.get('error') or 'runtime integration remains incomplete; sealed pool retained'}
+                        self._write(state)
+                else:
+                    if proof.get('prepared_setups') is not True or not isinstance(proof.get('generation'), str):
                         raise RuntimeError('published pool does not match the durable verified publication record')
-                    state = {**state, 'phase': 'interrupted', 'error': 'runtime integration remains incomplete; sealed pool retained'}
+                    state = {**state, 'phase': 'ready', 'result': proof, 'error': None}
                     self._write(state)
-                    return state
-                state = {**state, 'phase': 'ready', 'result': proof, 'error': None}
-                self._write(state)
         if state['phase'] not in TERMINAL:
             if self.slot_busy(): raise RuntimeError('unidentified active build slot; outcome unconfirmed')
             state = {**state, 'phase': 'interrupted', 'error': 'worker/descendants absent; interrupted preparation retained'}
