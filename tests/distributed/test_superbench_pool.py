@@ -611,6 +611,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             candidate = pool.Pool(stage)
             golden_package_list = b'testpkg 1\n'
             (stage / 'golden-packages.txt').write_bytes(golden_package_list)
+            (stage / 'golden-dpkg-status').write_bytes(b'Package: testpkg\nVersion: 1\nArchitecture: all\nStatus: install ok installed\n\n')
             (stage / 'config').mkdir()
             (stage / 'config/preparation.toml').write_bytes((ROOT / 'config/preparation.toml').read_bytes())
             golden_identity = {'apt_package_manifest_sha256': hashlib.sha256(golden_package_list).hexdigest()}
@@ -634,7 +635,9 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 else:
                     self.assertEqual(args[-1], 'update')
                     self.assertIn('APT::Update::Error-Mode=any', args)
-            def dpkg(args, **kwargs): return 'Package: testpkg\nVersion: 1\nArchitecture: all\n'
+            def dpkg(args, **kwargs):
+                if args[0]=='dpkg-query':return golden_package_list
+                return 'Package: testpkg\nVersion: 1\nArchitecture: all\n'
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
                  patch.object(pool, '_run_apt_downloads', side_effect=apt_commands), \
@@ -685,6 +688,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 candidate = pool.Pool(stage)
                 golden = b'native 2\n'
                 (stage / 'golden-packages.txt').write_bytes(golden)
+                (stage / 'golden-dpkg-status').write_bytes(b'Package: native\nVersion: 2\nArchitecture: all\nStatus: install ok installed\n\n')
                 (stage / 'config').mkdir()
                 policy = ROOT / 'config/preparation.toml'
                 (stage / 'config/preparation.toml').write_bytes(policy.read_bytes())
@@ -717,6 +721,8 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                     del combined['old-runtime']
                     combined['substitute-runtime'] = '1'
                 def simulate(opts, packages):
+                    if any('offline-lists' in arg for arg in opts):
+                        return combined
                     extra = any('sources-historical.list' in arg for arg in opts)
                     calls.append(('simulate', extra, set(packages)))
                     if extra and mode != 'still-missing':
@@ -739,6 +745,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                         for name, version in combined.items():
                             (stage / 'apt/archives' / (name + '.deb')).write_bytes((name+'='+version).encode())
                 def dpkg(args, **kwargs):
+                    if args[0]=='dpkg-query':return golden
                     name = Path(args[-1]).stem
                     return 'Package: '+name+'\nVersion: '+combined[name]+'\nArchitecture: all\n'
                 with patch.object(candidate, 'download', side_effect=download), \

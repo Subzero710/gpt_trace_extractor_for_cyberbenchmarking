@@ -69,20 +69,31 @@ def test_known_pre_download_failures_retry_only_before_any_pool_bytes(tmp_path, 
     assert not jobs.pre_download_fetch_retryable(state, base)
 
 
-def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
+def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path, monkeypatch):
     if os.geteuid() != 0:
         pytest.skip("root ownership is required for fetch source sealing")
     private = tmp_path / "private-repo"
     private.mkdir(mode=0o700)
     _source_tree(private)
+    (private / "config/preparation.toml").write_text("[acquisition]\ntimeout_seconds = 180\n")
     pool = tmp_path / "dependency-pool"
     pool.mkdir()
     dependency = {"schema": 1, "target_environment": {"schema": 2}, "npm_version": "10.9.9"}
     packages = tmp_path / "kali-packages.txt"
-    packages.write_bytes(b"fixture-package\t1\tall\n")
+    packages.write_bytes(b"fixture-package 1\n")
     packages.chmod(0o444)
     dependency["apt_package_manifest_sha256"] = hashlib.sha256(packages.read_bytes()).hexdigest()
     manager = SimpleNamespace(source_root=private, base=tmp_path / "golden.qcow2")
+    manager.base.write_bytes(b"fixture image")
+    manager.base.chmod(0o444)
+    status = b"Package: fixture-package\nVersion: 1\nArchitecture: all\nStatus: install ok installed\nProvides: fixture-virtual\n\n"
+    original_check_output = jobs.subprocess.check_output
+    def read_status(command, **kwargs):
+        if command[0] == "virt-cat":
+            assert command == ["virt-cat", "-a", str(manager.base), "/var/lib/dpkg/status"]
+            return status
+        return original_check_output(command, **kwargs)
+    monkeypatch.setattr(jobs.subprocess, "check_output", read_status)
     original_identity = jobs.golden_dependency_identity
     jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
     try:
@@ -118,6 +129,8 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path):
     assert staged_dependency.stat().st_uid == 0
     assert (source_root / "golden-packages.txt").read_bytes() == packages.read_bytes()
     assert stat.S_IMODE(staged_dependency.stat().st_mode) == 0o444
+    assert (source_root / "golden-dpkg-status").read_bytes() == status
+    assert stat.S_IMODE((source_root / "golden-dpkg-status").stat().st_mode) == 0o444
     assert stat.S_IMODE(source_root.stat().st_mode) == 0o555
 
 

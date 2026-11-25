@@ -4517,7 +4517,10 @@ def _apt_historical_sources(pool, apt, architecture):
 
 
 def _apt_archive_volume(pool, opts, packages, apt):
-    command=['apt-get',*opts,'-o','Acquire::ForceHash=SHA256','--print-uris',
+    measurement_cache=apt/'measurement-archives'
+    measurement_cache.mkdir()
+    command=['apt-get',*opts,'-o','Dir::Cache::Archives='+str(measurement_cache),
+             '-o','Acquire::ForceHash=SHA256','--print-uris',
              '--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
     with _registered_operation('APT signed archive volume'):
         output=subprocess.check_output(command,text=True,env={**os.environ,'LC_ALL':'C'},timeout=_operation_timeout())
@@ -4539,8 +4542,24 @@ def _apt_archive_volume(pool, opts, packages, apt):
         retained=partial.stat().st_size if partial.is_file() else 0
         if partial.is_symlink() or not 0 <= retained <= size:
             raise RuntimeError('invalid retained APT archive length: '+name)
-        # APT omitted already cached archives from --print-uris. Every URI
-        # here still needs bytes in APT's own isolated archive directory.
+        # Measure against an empty archive cache so even retained bytes must
+        # match the signed current SHA-256 before they may be reused.
+        destination=apt/'archives'/name
+        if destination.is_symlink():raise RuntimeError('unsafe retained APT archive')
+        if destination.exists():
+            if destination.stat().st_size==size and digest(destination)==sha:
+                retained=size
+            else:
+                prior=apt/'retained'/digest(destination)
+                prior.mkdir(parents=True,exist_ok=True)
+                destination.rename(prior/name)
+        donor=getattr(pool,'apt_repair_source',None)
+        if retained!=size and donor is not None:
+            cached=donor/'objects'/'sha256'/sha[:2]/sha
+            if cached.is_file() and not cached.is_symlink() and cached.stat().st_size==size and digest(cached)==sha:
+                with _registered_operation('reuse signed APT archive'):
+                    shutil.copyfile(cached,destination)
+                retained=size
         volume[sha]={'size':size,'cached':False,'retained_bytes':retained}
     _begin_download_phase(pool,'APT archives',volume)
     return filenames
@@ -4565,6 +4584,16 @@ def _observe_apt_archives(apt, filenames):
             _POOL_PROGRESS.phase_artifacts[sha][0]=size
             _POOL_PROGRESS._volume_record(sha,total,size)
         _POOL_PROGRESS._emit()
+
+
+def _verify_golden_dpkg_inventory(directory, inventory):
+    # Use the exact query that produced the sealed golden manifest, including
+    # residual package records and multiple architectures, not a synthetic status.
+    with _registered_operation('verify golden dpkg status'):
+        result=subprocess.check_output(['dpkg-query','--admindir='+str(directory),'-W',
+            '-f=${Package} ${Version}\n'],timeout=_operation_timeout())
+    if not inventory or sorted(result.splitlines())!=sorted(inventory.splitlines()):
+        raise RuntimeError('golden dpkg status differs from authenticated package inventory')
 
 
 def apt_closure(pool,packages):
@@ -4596,23 +4625,13 @@ def apt_closure(pool,packages):
     expected=_golden_dependency()['apt_package_manifest_sha256']
     if hashlib.sha256(contents).hexdigest()!=expected:
         raise RuntimeError('golden package inventory SHA-256 differs')
-    status_rows=[]
-    for line in contents.decode('utf-8').splitlines():
-        fields=line.strip().split()
-        if len(fields)!=2:
-            raise RuntimeError('golden package inventory line is malformed')
-        name,version=fields
-        if (not re.fullmatch(r'[A-Za-z0-9+._:-]+',name) or
-                not re.fullmatch(r'[A-Za-z0-9+._:~+-]+',version)):
-            raise RuntimeError('unsafe installed Debian identity')
-        name,separator,qualified=name.partition(':')
-        architecture=qualified if separator else deb_arch
-        if architecture not in (deb_arch,'all'):
-            raise RuntimeError('golden package is foreign-architecture: '+name)
-        status_rows.append('Package: '+name+'\nVersion: '+version+'\nArchitecture: '
-                           +architecture+'\nStatus: install ok installed\n')
+    status_source=golden.with_name('golden-dpkg-status')
+    if status_source.is_symlink() or not status_source.is_file():
+        raise RuntimeError('authenticated golden dpkg status is missing')
+    status_bytes=status_source.read_bytes()
     status=apt/'status'
-    write_new(status,'\n'.join(status_rows)+'\n')
+    write_new(status,status_bytes)
+    _verify_golden_dpkg_inventory(apt,contents)
     preferences=apt/'preferences'
     write_new(preferences,'')
     opts=['-o','Dir::Etc::sourcelist='+str(sources),'-o','Dir::Etc::sourceparts=-',
@@ -4622,7 +4641,7 @@ def apt_closure(pool,packages):
           '-o','Dir::Cache::Archives='+str(apt/'archives'),
           '-o','APT::Get::AllowUnauthenticated=false',
           '-o','Acquire::AllowInsecureRepositories=false',
-          '-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
+          '-o','APT::Architecture='+deb_arch,'-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
     opts.extend(('-o', 'Acquire::Retries=' + str(_network_retries()[0] - 1)))
     _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
     missing=set()
@@ -4695,10 +4714,20 @@ def apt_closure(pool,packages):
         raise RuntimeError('APT did not materialize every signed archive URI')
     if received!=selected or not meta:
         raise RuntimeError('downloaded APT archives differ from the simulated closure')
+    # Simulate the same explicit local archives as the network-disabled guest.
+    # The signed online plan alone does not prove that this replay is solvable.
+    offline_lists=apt/'offline-lists'
+    offline_lists.mkdir()
+    offline_opts=[value for value in opts if not value.startswith(('Dir::State::Lists=', 'Dir::Etc::sourcelist='))]
+    offline_opts+=['-o','Dir::State::Lists='+str(offline_lists),'-o','Dir::Etc::sourcelist=/dev/null']
+    replay=_apt_simulate(offline_opts,{str(path.absolute()) for path in debs if path.is_file()})
+    if {(name.split(':')[0],version) for name,version in replay.items()}!=selected:
+        raise RuntimeError('offline APT replay differs from signed transaction')
     write_new(stage/'metadata'/'apt-closure.json',json.dumps({
         'requested':sorted(packages),'resolved':meta,
         'missing_in_kali':sorted(missing),'historical_suites':historical,
-        'golden_package_inventory_sha256':expected},sort_keys=True))
+        'golden_package_inventory_sha256':expected,
+        'golden_dpkg_status_sha256':hashlib.sha256(status_bytes).hexdigest()},sort_keys=True))
 
 
 def _packaging_symbols():
@@ -9701,6 +9730,39 @@ def _fetch_download_budget(repo_root, network_rx_baseline):
     return check_budget
 
 
+def _apt_repair_inventory(pool, previous, operation_id):
+    stage=pool.stage
+    retained_provenance={key:value for key,value in previous['provenance'].items() if key!='apt'}
+    retained_shas={sha for groups in retained_provenance.values() for hashes in groups.values() for sha in hashes}
+    objects={sha:previous['objects'][sha] for sha in retained_shas}
+    for sha,row in pool.links.items():
+        if sha in objects and objects[sha]!=row:
+            raise RuntimeError('APT repair object identity conflict')
+        objects[sha]=row
+    provenance={**retained_provenance,**pool.provenance}
+    urls={url:sha for url,sha in previous['url_index'].items() if sha in retained_shas}
+    urls.update(pool.by_url)
+    _POOL_PROGRESS.close_volume(objects)
+    _pool_progress('Dependency acquisition complete',force=True)
+    _POOL_PROGRESS.progress_path=None
+    files={}
+    for path in sorted(stage.rglob('*')):
+        if path.is_symlink():raise RuntimeError('unsafe APT repair output')
+        if path.is_file():
+            relative=path.relative_to(stage).as_posix()
+            files[relative]={'path':relative,'size':path.stat().st_size,'sha256':digest(path)}
+    for row in previous['files']:
+        relative=row['path']
+        if (relative in files or relative.startswith('apt/') or relative=='metadata/apt-closure.json'
+                or relative.startswith('objects/sha256/') and row['sha256'] not in retained_shas
+                or relative.startswith('downloads/') and row['sha256'] not in retained_shas):
+            continue
+        files[relative]=row
+    summary={**previous,'operation_id':operation_id,'objects':objects,'provenance':provenance,
+             'url_index':urls,'files':sorted(files.values(),key=lambda row:row['path'])}
+    write_new(stage/'inventory.json',json.dumps(summary,sort_keys=True,indent=2)+'\n')
+
+
 def main(argv=None):
     global _POOL_PROGRESS, _OPERATION_EVENT_FD
     p=argparse.ArgumentParser()
@@ -9709,6 +9771,7 @@ def main(argv=None):
     p.add_argument('--operation-id',required=True)
     p.add_argument('--operation-events-fd', required=True, type=int)
     p.add_argument('--reuse-from',type=Path)
+    p.add_argument('--repair-apt-from',type=Path)
     p.add_argument('--network-rx-baseline',required=True,type=json.loads)
     args=p.parse_args(argv)
     if os.geteuid()==0:raise RuntimeError('refusing privileged fetch account')
@@ -9744,6 +9807,31 @@ def main(argv=None):
         progress_path=stage/'metadata'/'fetch-progress.json', operation_id=args.operation_id,
         rx_counter=budget.received_bytes)
     _pool_progress('Verified recovery')
+    if args.repair_apt_from is not None:
+        if args.reuse_from is not None:
+            raise RuntimeError('APT repair cannot combine two recovery sources')
+        previous=json.loads((args.repair_apt_from/'inventory.json').read_bytes())
+        prior_apt=json.loads((args.repair_apt_from/'metadata'/'apt-closure.json').read_bytes())
+        if (previous['complete'] is not True or previous['issues']
+                or previous['conda_lock_sha256']!=conda_lock_sha256
+                or prior_apt['golden_package_inventory_sha256']!=_golden_dependency()['apt_package_manifest_sha256']
+                or 'golden_dpkg_status_sha256' in prior_apt):
+            raise RuntimeError('incompatible prior APT publication')
+        pool=Pool(stage)
+        pool.download_budget=budget
+        pool.apt_repair_source=args.repair_apt_from
+        retained_shas={sha for category,groups in previous['provenance'].items() if category!='apt'
+                       for hashes in groups.values() for sha in hashes}
+        for sha in retained_shas:
+            size=previous['objects'][sha]['size']
+            _POOL_PROGRESS._volume_record(sha,size,size)
+        _pool_progress('Signed Kali APT resolution',details='Repairing published APT closure')
+        try:
+            apt_closure(pool,set(prior_apt['requested']))
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError('required signed APT closure unavailable: '+(exc.output or str(exc))[-3000:]) from exc
+        _apt_repair_inventory(pool,previous,args.operation_id)
+        return
     verified=set()
     if args.reuse_from is not None:
         verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
@@ -10146,7 +10234,8 @@ def main(argv=None):
     _pool_progress('Signed Kali APT resolution',details=f'{len(apt_requested)} requested packages')
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
-        raise RuntimeError('required signed APT closure unavailable: '+str(exc)) from exc
+        raise RuntimeError('required signed APT closure unavailable: '+
+            (exc.output.strip()[-3000:] if isinstance(exc,subprocess.CalledProcessError) and exc.output else str(exc))) from exc
     # Every locked Conda archive has an immutable SHA and URL, so its volume
     # can be measured independently of Pip/VCS discovery and without downloading it.
     conda_entries={sha:(item['url'],stage/'downloads'/('conda-'+sha))

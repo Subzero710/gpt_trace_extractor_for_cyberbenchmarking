@@ -177,6 +177,20 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
     inventory.write_bytes(packages.read_bytes())
     os.chown(inventory, 0, 0)
     inventory.chmod(0o444)
+    # Read the complete dpkg database from the authenticated immutable image.
+    # The unprivileged fetcher never opens a host QCOW2 or the host dpkg database.
+    controls = tomllib.loads((manager.source_root / 'config/preparation.toml').read_text())['acquisition']
+    limit = controls['timeout_seconds']
+    if type(limit) is not int or not 1 <= limit <= 180:
+        raise RuntimeError('invalid golden dpkg status extraction deadline')
+    status = subprocess.check_output(['virt-cat', '-a', str(safe(manager.base, immutable=True)),
+                                      '/var/lib/dpkg/status'], timeout=limit)
+    if not status:
+        raise RuntimeError('golden dpkg database is empty')
+    status_path = snapshot / 'golden-dpkg-status'
+    status_path.write_bytes(status)
+    os.chown(status_path, 0, 0)
+    status_path.chmod(0o444)
     for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
                             key=lambda p: len(p.parts), reverse=True):
         os.chown(directory, 0, 0)
@@ -729,8 +743,10 @@ class PreparationManager:
         proof = state.get('publication_verified')
         if state['phase'] in {'running', 'validating', 'interrupted', 'canceled'} and isinstance(proof, dict):
             ready = self.base.parent / 'dependency-pool' / 'ready'
-            if ready.exists() or ready.is_symlink():
-                inventory = verify_published_inventory(ready, state, proof)
+            retired = _retired_pool(ready.parent,state['operation_id'])
+            publication = retired if retired.exists() or retired.is_symlink() else ready
+            if publication.exists() or publication.is_symlink():
+                inventory = verify_published_inventory(publication, state, proof)
                 if (proof.get('kind') != 'download-only-pool' or proof.get('complete') is not True
                         or proof.get('pool_directory') != str(ready)
                         or inventory.get('operation_id') != state['operation_id']
@@ -856,7 +872,8 @@ class PreparationManager:
                 if not (payload['retry'] and previous['phase'] in {'failed','interrupted','canceled'}
                         and previous.get('result') is None
                         and (previous.get('publication_verified') is None or pending_integration)
-                        and (pending_integration or not (self.base.parent/'dependency-pool'/'ready').exists())):
+                        and (pending_integration or not (self.base.parent/'dependency-pool'/'ready').exists()
+                             or _apt_repair_source(self,self.base.parent/'dependency-pool',previous) is not None)):
                     raise RuntimeError('explicit retry of failed/unpublished preparation required')
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")
@@ -1157,6 +1174,104 @@ def verify_published_inventory(folder, state, proof):
     return inventory
 
 
+# This migration is authorized only from the exact fetcher whose synthetic
+# dpkg status was repaired. No future fetcher change inherits this authorization.
+_APT_REPAIR_PREDECESSOR = "af2f0b605323326ab5a48ffda7aabfca550e1e82adc6f39217d25051a32a64f2"
+_APT_REPAIR_SUCCESSOR = "c3b0c9e722f4eaf75970ca5c314633fa9122421ed3cfb56e6459f63e022b4c08"
+
+
+def _apt_repair_compatible(previous, current):
+    if not isinstance(previous,dict) or not isinstance(current,dict):
+        return False
+    key='scripts/superbench_pool.py'
+    old=dict(previous);new=dict(current)
+    old_sources=dict(old.pop('fetch_sources',{}));new_sources=dict(new.pop('fetch_sources',{}))
+    old_fetcher=old.pop('fetcher_sha256',None);new_fetcher=new.pop('fetcher_sha256',None)
+    return (old_fetcher==old_sources.pop(key,None)==_APT_REPAIR_PREDECESSOR
+            and new_fetcher==new_sources.pop(key,None)==_APT_REPAIR_SUCCESSOR
+            and old==new and old_sources==new_sources)
+
+
+def _retired_pool(root, operation_id):
+    return root / ('retired-'+identifier(operation_id))
+
+
+def _apt_repair_source(manager, root, state):
+    candidates=[]
+    ready=root/'ready'
+    for directory in manager.root.iterdir():
+        if not directory.is_dir() or directory.is_symlink() or SHA.fullmatch(directory.name) is None:
+            continue
+        prior=manager._read(directory.name)
+        if prior is None or not _apt_repair_compatible(prior['compatibility'],state['compatibility']):
+            continue
+        proof=prior.get('publication_verified')
+        if (prior['phase'] not in TERMINAL or prior.get('result') is not None
+                or not isinstance(proof,dict) or proof.get('runtime_integrated') != 'pending'):
+            continue
+        if JobScope.members(prior) or manager._containers(prior):
+            raise RuntimeError('APT repair predecessor still has active owners')
+        retired=_retired_pool(root,prior['operation_id'])
+        candidate=retired if retired.exists() or retired.is_symlink() else ready
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        inventory=verify_published_inventory(candidate,prior,proof)
+        path=safe(candidate/'metadata/apt-closure.json',immutable=True)
+        raw=path.read_bytes()
+        rows=[row for row in inventory['files'] if row['path']=='metadata/apt-closure.json']
+        if (len(rows)!=1 or rows[0]['sha256']!=hashlib.sha256(raw).hexdigest()
+                or rows[0]['size']!=len(raw) or 'golden_dpkg_status_sha256' in json.loads(raw)):
+            raise RuntimeError('prior APT closure does not match repair contract')
+        candidates.append((candidate,prior,inventory))
+    if len(candidates)>1:
+        raise RuntimeError('ambiguous sealed APT repair predecessor')
+    return candidates[0] if candidates else None
+
+
+def _link_apt_repair_files(stage, inventory, migration):
+    donor,prior,previous=migration
+    # The worker cannot make hardlinks to protected root-owned inodes. Only
+    # the broker links the exact immutable entries authorized by the old proof.
+    original={row['path']:row for row in previous['files']}
+    for item in stage.rglob('*'):
+        if item.is_symlink() or item.is_mount() or not (item.is_file() or item.is_dir()):
+            raise RuntimeError('unsafe APT repair candidate entry: '+str(item))
+    verified_inodes={}
+    for row in inventory['files']:
+        relative=row['path']
+        if (not isinstance(relative,str) or not relative or Path(relative).is_absolute()
+                or '..' in Path(relative).parts):
+            raise RuntimeError('unsafe APT repair inventory path')
+        target=stage/relative
+        if target.exists() or target.is_symlink():
+            continue
+        if (row!=original.get(relative) or relative.startswith('apt/')
+                or relative in ('metadata/apt-closure.json','metadata/fetch-progress.json')):
+            raise RuntimeError('APT repair attempted to import an unapproved file')
+        source=safe(donor/relative,immutable=True)
+        if source.stat().st_size!=row['size']:
+            raise RuntimeError('retained APT repair input size differs')
+        # Candidate paths are exclusively broker-owned after the downloader exits.
+        for ancestor in (target.parent,*target.parent.parents):
+            if ancestor.is_symlink():raise RuntimeError('unsafe APT repair destination')
+            if ancestor==stage:break
+        target.parent.mkdir(parents=True,exist_ok=True)
+        os.link(source,target)
+        info=target.stat()
+        verified_inodes[(info.st_dev,info.st_ino)]=row['sha256']
+    # All old non-APT logical decisions must remain byte-for-byte identical.
+    for key in ('task_plan','environment_plan','git_plan','conda_transactions','conda_lock_sha256'):
+        if inventory[key]!=previous[key]:raise RuntimeError('APT repair changed non-APT plan: '+key)
+    if {k:v for k,v in inventory['provenance'].items() if k!='apt'}!={k:v for k,v in previous['provenance'].items() if k!='apt'}:
+        raise RuntimeError('APT repair changed non-APT provenance')
+    retained={sha for category,groups in previous['provenance'].items() if category!='apt'
+              for hashes in groups.values() for sha in hashes}
+    for sha in retained:
+        if inventory['objects'].get(sha)!=previous['objects'][sha]:
+            raise RuntimeError('APT repair changed non-APT CAS identity')
+    return verified_inodes
+
+
 def _published_progress(ready, state, proof):
     inventory = verify_published_inventory(ready, state, proof)
     relative = 'metadata/fetch-progress.json'
@@ -1386,11 +1501,12 @@ def _prepare(manager, state):
             sync_directory(root)
         verify_published_inventory(ready, state, pending)
         return _integrate_published_pool(manager, state, ready, pending)
-    if ready.exists() or ready.is_symlink():
+    migration = _apt_repair_source(manager,root,state)
+    if (ready.exists() or ready.is_symlink()) and (migration is None or migration[0]!=ready):
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
         raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
-    reuse = retained_dependency_stage(manager,root,state,account)
+    reuse = retained_dependency_stage(manager,root,state,account) if migration is None else None
     source_program = manager.source_root / "scripts/superbench_pool.py"
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
@@ -1455,7 +1571,8 @@ def _prepare(manager, state):
                             [str(program), "--repo-root", str(source_root), "--stage", str(stage),
                              "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
                              "--network-rx-baseline", json.dumps(baseline, sort_keys=True),
-                             *(["--reuse-from", str(reuse)] if reuse is not None else [])]),
+                             *(["--reuse-from", str(reuse)] if reuse is not None else []),
+                             *(["--repair-apt-from", str(migration[0])] if migration is not None else [])]),
                            cwd=source_root, env=env, pass_fds=(write_fd,),
                            stdin=subprocess.DEVNULL, start_new_session=True,
                            umask=FETCH_WORKER_UMASK)
@@ -1541,8 +1658,8 @@ def _prepare(manager, state):
              or len(inventory["task_plan"]) != task_count
              or not isinstance(inventory.get("objects"),dict)):
         raise RuntimeError("incomplete/unverified downloaded dependency pool")
+    checked_inodes = _link_apt_repair_files(stage,inventory,migration) if migration is not None else {}
     expected = set()
-    checked_inodes = {}
     for entry in inventory["files"]:
         relative = entry["path"]
         if (not isinstance(relative,str) or not relative or Path(relative).is_absolute()
@@ -1615,8 +1732,12 @@ def _prepare(manager, state):
                 raise RuntimeError("escaping pool symlink: " + str(item))
             os.chown(item, 0, 0, follow_symlinks=False)
             continue
-        os.chown(item, 0, 0)
-        item.chmod(0o555 if item.is_dir() else 0o444)
+        mode=0o555 if item.is_dir() else 0o444
+        info=item.stat()
+        if (info.st_uid,info.st_gid)!=(0,0):
+            os.chown(item,0,0)
+        if stat.S_IMODE(info.st_mode)!=mode:
+            item.chmod(mode)
     os.chown(stage, 0, 0)
     stage.chmod(0o555)
     # File contents, directory entries and permission changes must all be
@@ -1632,8 +1753,15 @@ def _prepare(manager, state):
               "manifest_sha256": hashlib.sha256(raw).hexdigest(),
               "pool_directory": str(ready), "runtime_integrated": "pending"}
     state = {**state, "publication_attempt": state['attempt']}
-    manager._write({**state, "phase": "validating", "publication_verified": result})
-    os.rename(stage, ready)
+    with manager.lock():
+        if migration is not None and migration[0]==ready:
+            retired=_retired_pool(root,migration[1]['operation_id'])
+            if retired.exists() or retired.is_symlink():
+                raise RuntimeError('APT repair predecessor archive already exists')
+            os.rename(ready,retired)
+            sync_directory(root)
+        manager._write({**state, "phase": "validating", "publication_verified": result})
+        os.rename(stage, ready)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try: os.fsync(descriptor)
     finally: os.close(descriptor)

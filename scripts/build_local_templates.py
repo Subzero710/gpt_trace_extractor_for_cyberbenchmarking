@@ -304,6 +304,19 @@ def warm_cache_gib(virtual_gib):
 def guest_failure_diagnostics(image):
     """Read-only recovery of the guest's firstboot failure, including kernel OOM."""
     messages = []
+    # APT's native diagnostic is in a separate file; its exception embeds
+    # every .deb argument and can otherwise consume the broker error budget.
+    for path in ("/opt/swe-gym-os/install.log", "/opt/swe-gym-build/os-artifacts/install.log"):
+        try:
+            result=subprocess.run(["virt-cat", "-a", str(image), path], capture_output=True,
+                                  timeout=_versioned_host_subprocess_timeout(),check=False)
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            messages.append(path+": diagnostic unavailable: "+str(exc))
+            continue
+        if result.returncode==0:
+            detail=result.stdout.decode(errors="replace").strip()
+            if detail:
+                messages.append(path+":\n"+detail[-1800:])
     for path in ("/etc/gpt-trace-image-build-failed", "/var/log/swe-gym-lite-builder.log"):
         try:
             result = subprocess.run(
@@ -332,7 +345,7 @@ def guest_failure_diagnostics(image):
                         messages.append("guest system journal:\n" + "\n".join(relevant[-60:]))
     except (OSError, subprocess.TimeoutExpired) as exc:
         messages.append(f"guest journal unavailable: {exc}")
-    return "\n".join(messages)[-12000:] or "no readable guest diagnostics"
+    return "\n".join(messages)[:12000] or "no readable guest diagnostics"
 
 
 def digest(path):
@@ -1319,22 +1332,43 @@ def build(args, *, progress=None):
             # not an immutable snapshot ID. Resolve in one persistent resumable
             # resolver volume; never recreate it merely because a host copy-out
             # was interrupted.
-            resolver = cache_root / "os-resolver.qcow2"
+            closure_path = dependency_pool / "metadata/apt-closure.json"
+            rows = json.loads(closure_path.read_bytes())
+            closure_sha = digest(closure_path)
+            status_sha = rows["golden_dpkg_status_sha256"]
+            if SHA.fullmatch(status_sha) is None:
+                raise RuntimeError("invalid golden dpkg status identity in APT closure")
+            resolver = cache_root / ("os-resolver-" + closure_sha + ".qcow2")
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
             resolver_completion = {"schema": 2, "kind": "os-resolver",
-                "source_fingerprint": inputs["source_fingerprint"]}
+                "source_fingerprint": inputs["source_fingerprint"], "apt_closure_sha256": closure_sha}
             if (os_folder / "manifest.json").is_file():
                 os_manifest = json.loads((os_folder / "manifest.json").read_text())
                 os_tools.verify_artifacts(os_folder, os_manifest)
+                actual = {entry["sha256"] for entry in os_manifest["artifacts"].values()}
+                if actual != {entry["sha256"] for entry in rows["resolved"]}:
+                    raise RuntimeError("existing completed OS closure differs from current signed plan; preserved")
                 print("reused verified OS package closure", flush=True)
             else:
                 _purge_apt_partial(staged)
-                if not resolver.exists():
-                    overlay(resolver, BASE)
-                elif resolver.is_symlink() or not resolver.is_file():
-                    raise RuntimeError("unsafe persistent OS resolver volume; preserved")
-                resolver_ready = completion_matches(resolver, RESOLVER_COMPLETION, resolver_completion)
+                # Failed dpkg transactions are not resumable by deleting their
+                # logs: a modified package database is no longer the golden.
+                candidates = [resolver, *sorted(cache_root.glob(resolver.stem + ".retry-*" + resolver.suffix))]
+                resolver_ready = False
+                pristine = None
+                for candidate in candidates:
+                    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+                        raise RuntimeError("unsafe persistent OS resolver volume; preserved")
+                    if not candidate.exists():
+                        continue
+                    if completion_matches(candidate, RESOLVER_COMPLETION, resolver_completion):
+                        resolver, resolver_ready = candidate, True
+                        break
+                    if hashlib.sha256(capture("virt-cat", "-a", str(candidate), "/var/lib/dpkg/status")).hexdigest() == status_sha:
+                        pristine = candidate
+                if not resolver_ready:
+                    resolver = pristine if pristine is not None else reset_scratch_overlay(resolver, BASE)
                 if not resolver_ready:
                     # resolve() is intentionally not idempotent.  Keep the QCOW2
                     # volume itself and clear only its incomplete guest scratch.
@@ -1347,7 +1381,6 @@ def build(args, *, progress=None):
                     shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
                     artifact_root = os_payload / "artifacts"
                     artifact_root.mkdir()
-                    rows = json.loads((dependency_pool / "metadata/apt-closure.json").read_bytes())
                     expected = {entry["sha256"]:entry for entry in rows["resolved"]}
                     received = {}
                     for archive in sorted((dependency_pool / "apt/archives").glob("*.deb")):
