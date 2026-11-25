@@ -142,15 +142,20 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
     if os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1":
         commands = _template_script(commands)
     script = "set -eo pipefail\n" + "\n".join(commands) + "\n"
-    argv = ["/bin/bash", "-c", script]
     if offline:
-        argv = ["unshare", "--net", "/bin/bash", "-c", "ip link set lo up\n" + script]
-    with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
-        result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
-        if result.returncode:
-            output.seek(0, os.SEEK_END)
-            output.seek(max(0, output.tell()-4000))
-            raise RuntimeError(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}")
+        script = "ip link set lo up\n" + script
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="swegym-recipe-", suffix=".sh") as recipe:
+        recipe.write(script)
+        recipe.flush()
+        argv = ["/bin/bash", recipe.name]
+        if offline:
+            argv = ["unshare", "--net", *argv]
+        with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
+            result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
+            if result.returncode:
+                output.seek(0, os.SEEK_END)
+                output.seek(max(0, output.tell()-4000))
+                raise RuntimeError(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}")
 
 
 def stream_digest(path):
