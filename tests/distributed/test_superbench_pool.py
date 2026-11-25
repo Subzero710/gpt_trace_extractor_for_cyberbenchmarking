@@ -638,13 +638,144 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
                  patch.object(pool, '_run_apt_downloads', side_effect=apt_commands), \
+                 patch.object(pool, '_apt_simulate', return_value={'testpkg': '1'}), \
+                 patch.object(pool, '_apt_historical_sources') as historical, \
                  patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(['gpg'], 0)), \
                  patch.object(pool.subprocess, 'check_output', side_effect=dpkg), \
                  patch.object(pool, '_target_debian_architecture', return_value='amd64'), \
                  patch.object(pool, '_golden_dependency', return_value=golden_identity), \
                  patch.object(pool, '__file__', str(stage / 'scripts' / 'superbench_pool.py')):
                 pool.apt_closure(candidate, {'testpkg'})
+                historical.assert_not_called()
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
+
+
+    def test_apt_missing_classification(self):
+        requested = {'native', 'old-dev', 'old-runtime'}
+        absent = ("Reading package lists...\nE: Unable to locate package old-dev\n"
+                  "E: Package 'old-runtime' has no installation candidate\n")
+        self.assertEqual(pool._apt_missing_packages(absent, requested), {'old-dev', 'old-runtime'})
+        self.assertEqual(pool._apt_missing_packages('Error: Unable to locate package old-dev', requested),
+                         {'old-dev'})
+        for diagnostic in ('E: Failed to fetch archive', 'E: Unmet dependencies',
+                           'E: Unable to locate package not-requested'):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(pool._apt_missing_packages(absent + diagnostic, requested), set())
+        self.assertEqual(pool._apt_missing_packages('no diagnostics', requested), set())
+
+    def test_apt_simulation_rejects_downgrades_and_removals(self):
+        for output in ('The following packages will be DOWNGRADED:', 'Remv native [2]', 'Purg native [2]'):
+            with self.subTest(output=output), patch.object(pool.subprocess, 'run', return_value=
+                    subprocess.CompletedProcess([], 0, stdout=output, stderr='')):
+                with self.assertRaisesRegex(RuntimeError, 'downgrade or remove'):
+                    pool._apt_simulate([], {'native'})
+        with patch.object(pool.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, stdout='Inst native [2] (1 archive [amd64])', stderr=''),
+                subprocess.CompletedProcess([], 0)]):
+            with self.assertRaisesRegex(RuntimeError, 'downgrade native'):
+                pool._apt_simulate([], {'native'})
+        with patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, stdout='Inst old-dev (1:2-3 archive [amd64])\nInst native [2] (2 archive [amd64])', stderr='')):
+            self.assertEqual(pool._apt_simulate([], {'native', 'old-dev'}), {'native': '2', 'old-dev': '1:2-3'})
+
+    def test_apt_historical_retry_only_for_missing_roots(self):
+        for mode in ('success', 'other-error', 'changed-native', 'still-missing', 'update-error', 'wrong-key', 'provider-only'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                stage = Path(tmp)
+                candidate = pool.Pool(stage)
+                golden = b'native 2\n'
+                (stage / 'golden-packages.txt').write_bytes(golden)
+                (stage / 'config').mkdir()
+                policy = ROOT / 'config/preparation.toml'
+                (stage / 'config/preparation.toml').write_bytes(policy.read_bytes())
+                historical = tomllib.loads(policy.read_text())['apt_historical']['sources']
+                keys = {row['key_url']: row['fingerprint'] for row in historical}
+                keys['https://archive.kali.org/archive-key.asc'] = pool.KALI_SIGNING_FPR
+                by_path = {}
+                calls = []
+                def download(url, category, identity, **kwargs):
+                    self.assertEqual(category, 'apt')
+                    raw = url.encode()
+                    sha = hashlib.sha256(raw).hexdigest()
+                    path = candidate.objects / sha[:2] / sha
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(raw)
+                    by_path[path] = keys[url]
+                    calls.append(('key', url))
+                    return sha
+                def gpg(args, **kwargs):
+                    fingerprint = by_path[args[-1]]
+                    if mode == 'wrong-key' and fingerprint != pool.KALI_SIGNING_FPR:
+                        fingerprint = '0' * 40
+                    return 'pub:::::::::\nfpr:::::::::' + fingerprint + ':\n'
+                requested = {'native', 'old-dev', 'old-runtime'}
+                native = {'native': '2'}
+                combined = {**native, 'old-dev': '1', 'old-runtime': '1', 'old-transitive': '1'}
+                if mode == 'changed-native':
+                    combined['native'] = '3'
+                if mode == 'provider-only':
+                    del combined['old-runtime']
+                    combined['substitute-runtime'] = '1'
+                def simulate(opts, packages):
+                    extra = any('sources-historical.list' in arg for arg in opts)
+                    calls.append(('simulate', extra, set(packages)))
+                    if extra and mode != 'still-missing':
+                        return combined
+                    if packages == {'native'}:
+                        return native
+                    output = ("E: Unable to locate package old-dev\n"
+                              "E: Package 'old-runtime' has no installation candidate\n")
+                    if mode == 'other-error':
+                        output += 'E: Unmet dependencies\n'
+                    raise subprocess.CalledProcessError(100, ['apt-get'], output=output)
+                def transfer(args):
+                    extra = any('sources-historical.list' in arg for arg in args)
+                    calls.append(('transfer', extra, 'update' if 'update' in args else 'install'))
+                    if mode == 'update-error' and not extra:
+                        raise subprocess.CalledProcessError(100, args, output='E: Failed to fetch archive')
+                    if 'install' in args:
+                        self.assertTrue(extra)
+                        self.assertIn('--no-remove', args)
+                        for name, version in combined.items():
+                            (stage / 'apt/archives' / (name + '.deb')).write_bytes((name+'='+version).encode())
+                def dpkg(args, **kwargs):
+                    name = Path(args[-1]).stem
+                    return 'Package: '+name+'\nVersion: '+combined[name]+'\nArchitecture: all\n'
+                with patch.object(candidate, 'download', side_effect=download), \
+                     patch.object(pool, 'invoke', side_effect=gpg), \
+                     patch.object(pool, '_run_apt_downloads', side_effect=transfer), \
+                     patch.object(pool, '_apt_simulate', side_effect=simulate), \
+                     patch.object(pool.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                     patch.object(pool.subprocess, 'check_output', side_effect=dpkg), \
+                     patch.object(pool, '_target_debian_architecture', return_value='amd64'), \
+                     patch.object(pool, '_golden_dependency', return_value={
+                         'apt_package_manifest_sha256': hashlib.sha256(golden).hexdigest()}), \
+                     patch.object(pool, '__file__', str(stage / 'scripts' / 'superbench_pool.py')):
+                    if mode == 'success':
+                        pool.apt_closure(candidate, requested)
+                    else:
+                        with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                            pool.apt_closure(candidate, requested)
+                if mode in ('other-error', 'update-error'):
+                    self.assertFalse(any(call[0] == 'key' and call[1] in {row['key_url'] for row in historical}
+                                         for call in calls))
+                if mode != 'success':
+                    self.assertFalse(any(call[0] == 'transfer' and call[2] == 'install' for call in calls))
+                    self.assertFalse((stage / 'metadata/apt-closure.json').exists())
+                    continue
+                self.assertIn(('simulate', False, {'native'}), calls)
+                self.assertIn(('simulate', True, requested), calls)
+                self.assertEqual([call for call in calls if call[0] == 'transfer'],
+                                 [('transfer', False, 'update'), ('transfer', True, 'update'),
+                                  ('transfer', True, 'install')])
+                preferences = (stage / 'apt/preferences-historical').read_text()
+                for row in historical:
+                    self.assertIn('Pin: release n='+row['suite']+'\nPin-Priority: 1', preferences)
+                    self.assertIn(row['fingerprint'], (stage / 'apt/sources-historical.list').read_text())
+                manifest = json.loads((stage / 'metadata/apt-closure.json').read_text())
+                self.assertEqual(manifest['missing_in_kali'], ['old-dev', 'old-runtime'])
+                self.assertEqual(manifest['historical_suites'], [row['suite'] for row in historical])
+                self.assertEqual({row['package']: row['version'] for row in manifest['resolved']}, combined)
 
 
 # GPT_TRACE_SWEGYM_GLOBAL_ARTIFACT_POOL_V1

@@ -3928,7 +3928,7 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
             except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError,RuntimeError):
                 continue
 
-    # APT will verify these archives again against signed Kali indexes.
+    # APT will verify these archives again against the signed repository indexes.
     # They are writable APT cache entries, so COPY instead of hardlinking them.
     old_debs=old/'apt'/'archives'
     if old_debs.is_dir():
@@ -4242,8 +4242,109 @@ def _run_apt_downloads(arguments):
     )
 
 
+def _apt_missing_packages(output, requested):
+    """Classify only explicit missing roots; all other APT failures remain fatal."""
+    missing = set()
+    errors = [line for line in output.splitlines() if re.match(r'^(?:E:|Error:)', line)]
+    for line in errors:
+        match = re.fullmatch(
+            r"(?:E:|Error:) (?:Unable to locate package ([A-Za-z0-9+._:-]+)|"
+            r"Package '([A-Za-z0-9+._:-]+)' has no installation candidate)", line)
+        if match is None:
+            return set()
+        name = match.group(1) or match.group(2)
+        if name not in requested:
+            return set()
+        missing.add(name)
+    return missing
+
+
+def _apt_simulate(opts, packages):
+    command = ['apt-get', *opts, '--simulate', '--reinstall', '-y', '--no-remove',
+               'install', *sorted(packages)]
+    with _registered_operation('APT dependency simulation'):
+        result = subprocess.run(command, capture_output=True, text=True,
+                                env={**os.environ, 'LC_ALL': 'C'}, timeout=_operation_timeout())
+    output = result.stdout + '\n' + result.stderr
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, command, output=output)
+    if ('The following packages will be DOWNGRADED:' in output
+            or any(line.startswith(('Remv ', 'Purg ')) for line in output.splitlines())):
+        raise RuntimeError('APT resolution would downgrade or remove installed packages')
+    plan = {}
+    for line in output.splitlines():
+        if not line.startswith('Inst '):
+            continue
+        match = re.match(r'^Inst ([A-Za-z0-9+._:-]+)(?: \[([^\]]+)\])? \(([^ ]+) ', line)
+        if match is None:
+            raise RuntimeError('unrecognized APT installation plan: ' + line)
+        name, old, version = match.groups()
+        if name in plan:
+            raise RuntimeError('duplicate package in APT installation plan: ' + name)
+        if old and old != version:
+            with _registered_operation('APT version comparison'):
+                comparison = subprocess.run(['dpkg', '--compare-versions', version, 'lt', old],
+                                            timeout=_operation_timeout(), check=False)
+            if comparison.returncode not in (0, 1):
+                raise RuntimeError('invalid APT package version comparison: ' + name)
+            if comparison.returncode == 0:
+                raise RuntimeError('APT resolution would downgrade ' + name)
+        plan[name] = version
+    return plan
+
+
+def _apt_historical_sources(pool, apt, architecture):
+    path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('missing versioned APT source policy')
+    with path.open('rb') as stream:
+        rows = tomllib.load(stream)['apt_historical']['sources']
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError('no configured historical APT repositories')
+    sources, pins, identities = [], [], []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {'uri', 'suite', 'components', 'key_url', 'fingerprint'}:
+            raise RuntimeError('invalid historical APT source policy')
+        uri, suite, components, key_url, fingerprint = (row[key] for key in
+            ('uri', 'suite', 'components', 'key_url', 'fingerprint'))
+        _validate_https_endpoint(uri)
+        _validate_https_endpoint(key_url)
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', suite)
+                or not isinstance(components, list) or not components
+                or any(not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', value)
+                       for value in components)
+                or not re.fullmatch(r'[A-F0-9]{40}', fingerprint)
+                or suite in identities):
+            raise RuntimeError('invalid or duplicate historical APT repository identity')
+        sha = pool.download(key_url, 'apt', 'historical-signing-key:' + suite)
+        key = pool.objects / sha[:2] / sha
+        imported = invoke(['gpg', '--show-keys', '--with-colons', key], capture=True)
+        primary = []
+        waiting = False
+        for line in imported.splitlines():
+            fields = line.split(':')
+            if fields[0] == 'pub':
+                waiting = True
+            elif fields[0] == 'fpr' and waiting:
+                primary.append(fields[9])
+                waiting = False
+        if primary != [fingerprint]:
+            raise RuntimeError('historical APT signing key fingerprint differs: ' + suite)
+        ring = apt / ('historical-' + suite + '.gpg')
+        with ring.open('xb') as output:
+            subprocess.run(['gpg', '--dearmor'], input=key.read_bytes(), stdout=output,
+                           check=True, timeout=_operation_timeout())
+        sources.append('deb [arch=' + architecture + ' signed-by=' + str(ring) + ',' + fingerprint
+                       + '] ' + uri + ' ' + suite + ' ' + ' '.join(components) + '\n')
+        # A priority below the installed (100) and native (500) candidates
+        # admits missing dependencies without making Debian an upgrade source.
+        pins.append('Package: *\nPin: release n=' + suite + '\nPin-Priority: 1\n\n')
+        identities.append(suite)
+    return ''.join(sources), ''.join(pins), identities
+
+
 def apt_closure(pool,packages):
-    """Signed Kali APT resolution from the golden's real installed inventory.
+    """Native Kali APT resolution, with a restricted historical retry for missing roots.
 
     Uses an isolated APT state/list/archive directory and only download-only
     operations. Ubuntu's installed status and package lists never participate.
@@ -4288,7 +4389,11 @@ def apt_closure(pool,packages):
                            +architecture+'\nStatus: install ok installed\n')
     status=apt/'status'
     write_new(status,'\n'.join(status_rows)+'\n')
+    preferences=apt/'preferences'
+    write_new(preferences,'')
     opts=['-o','Dir::Etc::sourcelist='+str(sources),'-o','Dir::Etc::sourceparts=-',
+          '-o','Dir::Etc::preferences='+str(preferences),'-o','Dir::Etc::preferencesparts=-',
+          '-o','APT::Get::allow-Downgrades=false',
           '-o','Dir::State::Lists='+str(apt/'lists'),'-o','Dir::State::status='+str(status),
           '-o','Dir::Cache::Archives='+str(apt/'archives'),
           '-o','APT::Get::AllowUnauthenticated=false',
@@ -4296,11 +4401,42 @@ def apt_closure(pool,packages):
           '-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
     opts.extend(('-o', 'Acquire::Retries=' + str(_network_retries()[0] - 1)))
     _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
+    missing=set()
+    historical=[]
+    try:
+        plan=_apt_simulate(opts,packages)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode != 100:
+            raise
+        missing=_apt_missing_packages(exc.output,packages)
+        if not missing:
+            raise
+        print('[pool] APT missing in Kali: '+', '.join(sorted(missing)),flush=True)
+        native_plan=_apt_simulate(opts,packages-missing) if packages-missing else {}
+        extra_sources,extra_pins,historical=_apt_historical_sources(pool,apt,deb_arch)
+        combined=apt/'sources-historical.list'
+        combined_preferences=apt/'preferences-historical'
+        write_new(combined,sources.read_text()+extra_sources)
+        write_new(combined_preferences,extra_pins)
+        opts=[('Dir::Etc::sourcelist='+str(combined) if value.startswith('Dir::Etc::sourcelist=')
+               else 'Dir::Etc::preferences='+str(combined_preferences) if value.startswith('Dir::Etc::preferences=')
+               else value) for value in opts]
+        _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
+        # Resolve one combined transaction: never install two independent closures.
+        # Existing native selections must survive the additional historical roots.
+        plan=_apt_simulate(opts,packages)
+        if not {name.split(':')[0] for name in missing} <= {name.split(':')[0] for name in plan}:
+            raise RuntimeError('historical APT resolution did not select every missing package by name')
+        if any(plan.get(name)!=version for name,version in native_plan.items()):
+            raise RuntimeError('historical APT resolution changed the native Kali plan')
+        print('[pool] APT historical resolution: '+', '.join(historical),flush=True)
     _run_apt_downloads(['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)])
     debs=sorted((apt/'archives').glob('*.deb'))
     if not debs:
         raise RuntimeError('signed Kali resolution lacks any required new Debian archives')
     meta=[]
+    selected={(name.split(':')[0],version) for name,version in plan.items()}
+    received=set()
     for path in debs:
         control=subprocess.check_output(['dpkg-deb','-f',str(path)],text=True,timeout=90)
         fields={}
@@ -4308,11 +4444,25 @@ def apt_closure(pool,packages):
             found=re.search(r'^'+field+r':\s*(\S+)\s*$',control,flags=re.M)
             if not found:raise RuntimeError('APT archive missing '+field+': '+path.name)
             fields[field]=found.group(1)
-        sha=pool.put(path,'apt','kali-last-snapshot')
+        identity=(fields['Package'],fields['Version'])
+        if identity not in selected:
+            # A prior attempt may have retained a different archive version.
+            # Preserve its bytes, but never publish it as part of the new closure.
+            retained=apt/'retained'/digest(path)
+            retained.mkdir(parents=True,exist_ok=True)
+            path.rename(retained/path.name)
+            continue
+        if identity in received or fields['Architecture'] not in ('all',deb_arch):
+            raise RuntimeError('duplicate or foreign APT archive: '+path.name)
+        received.add(identity)
+        sha=pool.put(path,'apt','signed-historical-closure' if historical else 'kali-last-snapshot')
         meta.append({'sha256':sha,'package':fields['Package'],
                      'version':fields['Version'],'architecture':fields['Architecture']})
+    if received!=selected or not meta:
+        raise RuntimeError('downloaded APT archives differ from the simulated closure')
     write_new(stage/'metadata'/'apt-closure.json',json.dumps({
         'requested':sorted(packages),'resolved':meta,
+        'missing_in_kali':sorted(missing),'historical_suites':historical,
         'golden_package_inventory_sha256':expected},sort_keys=True))
 
 
@@ -9864,7 +10014,7 @@ def main(argv=None):
     _pool_progress('Signed Kali APT resolution',details=f'{len(apt_requested)} requested packages')
     try:apt_closure(pool,apt_requested)
     except (RuntimeError,subprocess.CalledProcessError,OSError) as exc:
-        raise RuntimeError('required signed Kali closure unavailable: '+str(exc)) from exc
+        raise RuntimeError('required signed APT closure unavailable: '+str(exc)) from exc
     _pool_progress('Conda archive acquisition')
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
