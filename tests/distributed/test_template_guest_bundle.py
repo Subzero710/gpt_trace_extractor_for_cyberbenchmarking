@@ -81,3 +81,58 @@ def test_actual_offline_installer_consumes_updated_contract(tmp_path, monkeypatc
     assert kwargs['limit'] == builder._versioned_host_subprocess_timeout()
     assert kwargs['cadence'] == controls()['progress_interval_seconds']
     assert kwargs['env']['DEBIAN_FRONTEND'] == 'noninteractive'
+
+
+def test_golden_constructor_is_masked_offline_even_without_completion_marker(tmp_path):
+    import shutil
+    import subprocess
+
+    root = tmp_path / 'guest'
+    units = root / 'etc/systemd/system'
+    wants = units / 'multi-user.target.wants'
+    wants.mkdir(parents=True)
+    source = ROOT / 'infra/workstation/systemd/gpt-trace-golden-build.service'
+    unit = units / source.name
+    shutil.copyfile(source, unit)
+    enabled = wants / source.name
+    enabled.symlink_to(Path('..') / source.name)
+    marker = root / 'etc/gpt-trace-image-build-complete'
+    marker.write_text('ok\n')
+    original = source.read_bytes()
+    flag, command = builder.template_golden_isolation_arguments(root)
+    assert flag == '--run-command'
+    for _ in range(2):
+        subprocess.run(['sh', '-ec', command], check=True, capture_output=True)
+        assert unit.is_symlink() and unit.readlink() == Path('/dev/null')
+        assert not enabled.is_symlink()
+        status = subprocess.run(['systemctl', '--root=' + str(root), 'is-enabled', source.name],
+                                capture_output=True, text=True)
+        assert status.stdout.strip() == 'masked'
+        marker.unlink(missing_ok=True)
+    assert source.read_bytes() == original
+
+
+def test_template_boot_does_not_append_previous_attempt_log():
+    script = builder.firstboot('true')
+    assert 'exec > /var/log/swe-gym-lite-builder.log 2>&1' in script
+    assert 'exec >> /var/log/swe-gym-lite-builder.log' not in script
+    assert 'template_step reset-completion rm -f' in script
+
+
+def test_golden_mask_precedes_firstboot_registration_and_repo_runtime_refresh():
+    import ast
+
+    tree = ast.parse((ROOT / 'scripts/build_local_templates.py').read_text())
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    calls = [node for node in ast.walk(functions['provision']) if isinstance(node, ast.Call)
+             and any(isinstance(arg, ast.Constant) and arg.value == '--firstboot' for arg in node.args)]
+    assert len(calls) == 1
+    arguments = calls[0].args
+    mask = next(i for i, arg in enumerate(arguments) if isinstance(arg, ast.Starred)
+                and isinstance(arg.value, ast.Call) and isinstance(arg.value.func, ast.Name)
+                and arg.value.func.id == 'template_golden_isolation_arguments')
+    boot = next(i for i, arg in enumerate(arguments) if isinstance(arg, ast.Constant) and arg.value == '--firstboot')
+    assert mask < boot
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == 'template_golden_isolation_arguments'
+               for node in ast.walk(functions['refresh_overlay_runtime']))

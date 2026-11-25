@@ -322,7 +322,7 @@ def guest_failure_diagnostics(image):
             if extracted.returncode == 0:
                 journal = subprocess.run(
                     ["journalctl", "--directory", str(Path(directory) / "journal"),
-                     "--no-pager", "-o", "short-iso", "-n", "2000"],
+                     "--boot=0", "--no-pager", "-o", "short-iso", "-n", "2000"],
                     capture_output=True, timeout=60, check=False)
                 if journal.returncode == 0:
                     lines = journal.stdout.decode(errors="replace").splitlines()
@@ -405,6 +405,17 @@ def atomic_json(path, value):
     fd = os.open(path.parent, os.O_DIRECTORY)
     try: os.fsync(fd)
     finally: os.close(fd)
+
+
+def template_golden_isolation_arguments(guest_root=Path("/")):
+    """Mask the inherited golden constructor before starting a template guest."""
+    import shlex
+    unit = "gpt-trace-golden-build.service"
+    guest_root = Path(guest_root)
+    unit_path = guest_root / "etc/systemd/system" / unit
+    disable = shlex.join(["systemctl", "--root=" + str(guest_root), "disable", unit])
+    mask = shlex.join(["ln", "-sfnT", "/dev/null", str(unit_path)])
+    return ["--run-command", disable + " && " + mask]
 
 
 def template_bundle_upload_arguments(directory, installed_contract, current_contract, source_root=ROOT):
@@ -611,7 +622,7 @@ export GPT_TRACE_SHARED_WARM_CACHE="$WARM_CACHE_MOUNT"
 ''' if shared_warm_cache else ""
     script = """#!/bin/bash
 set -eo pipefail
-exec >> /var/log/swe-gym-lite-builder.log 2>&1
+exec > /var/log/swe-gym-lite-builder.log 2>&1
 export GPTTRACE_TEMPLATE_TRACE=1
 export GPTTRACE_TEMPLATE_TIMEOUT=__TEMPLATE_SECONDS__
 template_event() {
@@ -991,7 +1002,8 @@ def build(args, *, progress=None):
                 _inject_payload(image, payload, scratch_root, cmd)
             if refresh_runtime:
                 argv += runtime_upload_arguments()
-            cmd(*argv, *template_bundle_uploads, "--firstboot", str(boot_file))
+            cmd(*argv, *template_bundle_uploads, *template_golden_isolation_arguments(),
+                "--firstboot", str(boot_file))
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
             argv = [qemu_system_binary(), "-machine", "accel=kvm", "-cpu", "host",
@@ -1025,7 +1037,7 @@ def build(args, *, progress=None):
             image.chmod(0o600)
             try:
                 cmd("virt-customize", "--no-network", "-a", str(image),
-                    *runtime_upload_arguments())
+                    *runtime_upload_arguments(), *template_golden_isolation_arguments())
             finally:
                 image.chmod(original_mode)
 
