@@ -7241,8 +7241,9 @@ def _requires_python_compatible(raw, target_python):
     """Check the target against PyPI's declared Requires-Python without guessing.
 
     Historical registries contain versions quoted as strings, e.g. >= '2.7',
-    and inclusive lower-bound wildcards such as >=3.5.*. Only these precise
-    *syntactic* anomalies are normalized. The full original conjunction is
+    inclusive lower-bound wildcards such as >=3.5.*, and numeric prefix
+    equality/exclusion wildcards missing the separator before the asterisk.
+    Only these precise syntactic anomalies are normalized. The full conjunction is
     then parsed and evaluated by packaging; any other invalidity is fatal.
     """
     _, SpecifierSet, _, _, _ = _packaging_symbols()
@@ -7269,13 +7270,18 @@ def _requires_python_compatible(raw, target_python):
                     # inclusive wildcard exception is checked separately.
                     SpecifierSet(normalized)
                 except ValueError:
-                    if re.fullmatch(r'>=\s*\d+(?:\.\d+)*\.\*', normalized) is None:
+                    if (re.fullmatch(r'>=\s*\d+(?:\.\d+)*\.\*', normalized) is None
+                            and re.fullmatch(r'(?:==|!=)\s*\d+(?:\.\d+)*\*', normalized) is None):
                         raise RuntimeError('invalid Requires-Python metadata: ' + repr(value)) from exc
                 token = normalized
                 changed = True
             inclusive_lower = re.fullmatch(r'>=\s*(\d+(?:\.\d+)*)\.\*', token)
             if inclusive_lower is not None:
                 token = '>=' + inclusive_lower.group(1)
+                changed = True
+            prefix = re.fullmatch(r'(==|!=)\s*(\d+(?:\.\d+)*)\*', token)
+            if prefix is not None:
+                token = prefix.group(1) + prefix.group(2) + '.*'
                 changed = True
             pieces.append(token)
         if not changed:

@@ -779,10 +779,33 @@ class TestGlobalPipArtifactPool(unittest.TestCase):
         self.assertFalse(check('==3.10.*',Version('3.11.0')))
         self.assertTrue(check('>=3.8,<3.12',Version('3.10.14')))
 
+    def test_historical_requires_python_missing_wildcard_separator(self):
+        from packaging.version import Version
+        check=pool._requires_python_compatible
+        legacy='>=2.7,!=3.0*,!=3.1*,!=3.2*'
+        for version, expected in [('2.6.9',False),('2.7.18',True),('3.0.0',False),
+                                  ('3.1.9',False),('3.2.6',False),('3.3.0',True),
+                                  ('3.10.14',True),('3.11.10',True),('3.12.0',True)]:
+            with self.subTest(version=version):
+                self.assertEqual(check(legacy,Version(version)),expected)
+        self.assertTrue(check('==3.11*',Version('3.11.10')))
+        self.assertFalse(check('==3.11*',Version('3.12.0')))
+        self.assertFalse(check("!= '3.11*'",Version('3.11.10')))
+        self.assertFalse(check('>=2.7,!=3.0*,<3.11',Version('3.11.10')))
+
+    def test_historical_requires_python_missing_separator_registry_admission(self):
+        sha=hashlib.sha256(b'wheel').hexdigest()
+        item={'packagetype':'bdist_wheel','filename':'jupyter_console-5.0.0-py3-none-any.whl',
+              'url':'https://files.pythonhosted.org/packages/jupyter_console-5.0.0-py3-none-any.whl',
+              'digests':{'sha256':sha},'requires_python':'>=2.7,!=3.0*,!=3.1*,!=3.2*'}
+        rows=pool._release_artifacts('jupyter-console','5.0.0',[item],fixture_target('3.11.10'))
+        self.assertEqual([row['filename'] for row in rows],[item['filename']])
+
     def test_historical_requires_python_other_invalid_forms_fail_closed(self):
         from packaging.version import Version
         for bad in ('>3.5.*','<=3.5.*','>=3.5.*,not-a-version',
-                    '>=3.5.*; python_version<"4"', '>=bad', 12, False, ''):
+                    '>=3.5.*; python_version<"4"', '>=bad', '!=3.1**', '!=3.1*garbage',
+                    '!=3.1*,not-a-version', '>3.1*', 12, False, ''):
             with self.subTest(value=bad):
                 with self.assertRaisesRegex(RuntimeError,'invalid Requires-Python'):
                     pool._requires_python_compatible(bad,Version('3.10.14'))
