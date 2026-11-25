@@ -407,6 +407,30 @@ def atomic_json(path, value):
     finally: os.close(fd)
 
 
+def template_bundle_upload_arguments(directory, installed_contract, current_contract, source_root=ROOT):
+    """Refresh build-only controls and native supervisors in mutable overlays."""
+    if not isinstance(installed_contract, dict):
+        raise RuntimeError("invalid installed golden guest contract")
+    cadence = current_contract["progress_interval_seconds"]
+    cleanup = current_contract["cleanup_timeout_seconds"]
+    limit = _versioned_host_subprocess_timeout()
+    if not (type(cleanup) is type(cadence) is int and 1 <= cadence <= limit <= 180
+            and 1 <= cleanup <= limit):
+        raise RuntimeError("invalid template guest operation controls")
+    contract = {**installed_contract, "progress_interval_seconds": cadence,
+                "cleanup_timeout_seconds": cleanup}
+    destination = Path(directory) / "guest-contract.json"
+    atomic_json(destination, contract)
+    source = Path(source_root) / "infra/workstation/image"
+    files = (destination, source / "apt_downloads.py", source / "conda_trace.py")
+    arguments = []
+    for path in files:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("missing versioned template guest bundle input: " + str(path))
+        arguments.extend(("--upload", str(path) + ":/opt/gpt-trace/bundle/" + path.name))
+    return arguments
+
+
 def free_space(path, margin):
     free = shutil.disk_usage(path).free
     if free < margin:
@@ -951,8 +975,15 @@ def build(args, *, progress=None):
                 "--upload", str(GUEST.with_name("target_environment.py")) + ":/opt/swe-gym-lite/target_environment.py",
             ]
 
+        template_bundle_uploads = None
+
         def provision(image, boot, payload=None, *, network, completion=None,
                       cache_disk=None, trim=True, serial_log=None, refresh_runtime=False):
+            nonlocal template_bundle_uploads
+            if template_bundle_uploads is None:
+                template_bundle_uploads = template_bundle_upload_arguments(
+                    scratch_root, guest_json(BASE, "/opt/gpt-trace/bundle/guest-contract.json"),
+                    golden.guest_contract())
             boot_file = staged / "firstboot.sh"
             boot_file.write_text(firstboot(boot, trim=trim, shared_warm_cache=cache_disk is not None))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
@@ -960,7 +991,7 @@ def build(args, *, progress=None):
                 _inject_payload(image, payload, scratch_root, cmd)
             if refresh_runtime:
                 argv += runtime_upload_arguments()
-            cmd(*argv, "--firstboot", str(boot_file))
+            cmd(*argv, *template_bundle_uploads, "--firstboot", str(boot_file))
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
             argv = [qemu_system_binary(), "-machine", "accel=kvm", "-cpu", "host",
