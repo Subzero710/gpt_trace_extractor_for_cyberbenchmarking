@@ -1177,7 +1177,7 @@ def verify_published_inventory(folder, state, proof):
 # This migration is authorized only from the exact fetcher whose synthetic
 # dpkg status was repaired. No future fetcher change inherits this authorization.
 _APT_REPAIR_PREDECESSOR = "af2f0b605323326ab5a48ffda7aabfca550e1e82adc6f39217d25051a32a64f2"
-_APT_REPAIR_SUCCESSOR = "c3b0c9e722f4eaf75970ca5c314633fa9122421ed3cfb56e6459f63e022b4c08"
+_APT_REPAIR_SUCCESSOR = "d78f6388c036abffa17e37fa3db43c09e13f9ec235cd9c9288cded477331eaab"
 
 
 def _apt_repair_compatible(previous, current):

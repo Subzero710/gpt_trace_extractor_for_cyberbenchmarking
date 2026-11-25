@@ -4586,6 +4586,12 @@ def _observe_apt_archives(apt, filenames):
         _POOL_PROGRESS._emit()
 
 
+def _apt_offline_options(opts, lists):
+    # Override complete APT assignments without dropping their preceding -o.
+    return [*opts, '-o', 'Dir::State::Lists='+str(lists),
+            '-o', 'Dir::Etc::sourcelist=/dev/null']
+
+
 def _verify_golden_dpkg_inventory(directory, inventory):
     # Use the exact query that produced the sealed golden manifest, including
     # residual package records and multiple architectures, not a synthetic status.
@@ -4718,8 +4724,7 @@ def apt_closure(pool,packages):
     # The signed online plan alone does not prove that this replay is solvable.
     offline_lists=apt/'offline-lists'
     offline_lists.mkdir()
-    offline_opts=[value for value in opts if not value.startswith(('Dir::State::Lists=', 'Dir::Etc::sourcelist='))]
-    offline_opts+=['-o','Dir::State::Lists='+str(offline_lists),'-o','Dir::Etc::sourcelist=/dev/null']
+    offline_opts=_apt_offline_options(opts,offline_lists)
     replay=_apt_simulate(offline_opts,{str(path.absolute()) for path in debs if path.is_file()})
     if {(name.split(':')[0],version) for name,version in replay.items()}!=selected:
         raise RuntimeError('offline APT replay differs from signed transaction')

@@ -66,6 +66,32 @@ def test_real_apt_preserves_provides_breaks_and_rejects_historical_conflict(tmp_
     assert pool._apt_simulate(opts, {java, old}) == {'fixture-java': '1', 'fixture-ssl': '3'}
 
 
+def test_offline_options_override_signed_sources_and_lists_with_real_apt(tmp_path):
+    status = tmp_path / 'status'
+    status.write_text(stanza('fixture-provider', '4', Status='install ok installed',
+                             Provides='fixture-lib (= 4)') + '\n')
+    java = deb(tmp_path, 'fixture-java', '1', Depends='fixture-lib (>= 3)')
+    online_lists = tmp_path / 'online-lists'
+    online_lists.mkdir()
+    offline_lists = tmp_path / 'offline-lists'
+    offline_lists.mkdir()
+    online_sources = tmp_path / 'signed.list'
+    online_sources.write_text('invalid source entry\n')
+    opts = ['-o', 'Dir::State::status=' + str(status),
+            '-o', 'Dir::State::Lists=' + str(online_lists),
+            '-o', 'Dir::Etc::sourcelist=' + str(online_sources),
+            '-o', 'Dir::Etc::sourceparts=-', '-o', 'Dir::Etc::preferences=/dev/null',
+            '-o', 'Dir::Etc::preferencesparts=-']
+    broken = [value for value in opts if not value.startswith(
+        ('Dir::State::Lists=', 'Dir::Etc::sourcelist='))]
+    broken += ['-o', 'Dir::State::Lists=' + str(offline_lists),
+               '-o', 'Dir::Etc::sourcelist=/dev/null']
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        pool._apt_simulate(broken, {java})
+    assert 'Option -o requires an argument' in exc.value.output
+    assert pool._apt_simulate(pool._apt_offline_options(opts, offline_lists), {java}) == {'fixture-java': '1'}
+
+
 def compatibility(old):
     digest = broker._APT_REPAIR_PREDECESSOR if old else broker._APT_REPAIR_SUCCESSOR
     return {'fetcher_sha256': digest, 'fetch_sources': {'scripts/superbench_pool.py': digest,
