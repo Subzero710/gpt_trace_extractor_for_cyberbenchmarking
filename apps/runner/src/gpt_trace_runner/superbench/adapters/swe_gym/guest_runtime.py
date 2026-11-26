@@ -406,13 +406,19 @@ const path = require('path');
 const cacache = require('cacache');
 const root = process.argv[1];
 const entries = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const crypto = require('crypto');
+const byDigest = new Map();
+for (const entry of entries) {
+  if (!byDigest.has(entry.sha256)) byDigest.set(entry.sha256, []);
+  byDigest.get(entry.sha256).push(entry.url);
+}
 (async () => {
-  for (const entry of entries) {
-    const data = fs.readFileSync(path.join(root, entry.sha256));
-    const crypto = require('crypto');
-    if (crypto.createHash('sha256').update(data).digest('hex') !== entry.sha256)
+  for (const [sha, urls] of byDigest) {
+    const data = fs.readFileSync(path.join(root, sha));
+    if (crypto.createHash('sha256').update(data).digest('hex') !== sha)
       throw Error('npm pool integrity mismatch');
-    await cacache.put(path.join(process.argv[3], '_cacache'), entry.url, data);
+    for (const url of urls)
+      await cacache.put(path.join(process.argv[3], '_cacache'), url, data);
   }
 })().catch(err => { console.error(err); process.exitCode = 1; });
 '''
@@ -940,12 +946,20 @@ def build_common(inputs):
     lock_path = ROOT / "conda-lock.json"
     if lock_path.is_symlink() or not lock_path.is_file():
         raise RuntimeError("pinned Conda lock is missing from the common build payload")
-    lock = json.loads(lock_path.read_bytes())
+    lock_bytes = lock_path.read_bytes()
+    lock = json.loads(lock_bytes)
+    lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
     if lock.get("schema") != 1 or lock.get("kind") != "swe-gym-lite-conda-image-lock":
         raise RuntimeError("unsupported pinned Conda lock")
+    provenance_path = ROOT / "environment-cache-provenance.json"
+    if provenance_path.is_symlink() or not provenance_path.is_file():
+        raise RuntimeError("verified common archive provenance is missing")
+    provenance = json.loads(provenance_path.read_bytes())
+    if provenance.get("schema") != 1 or provenance.get("kind") != "verified-input-archives":
+        raise RuntimeError("invalid common archive provenance")
     for env_hash, record in sorted(inputs["environments"].items()):
         commands = locked_environment_script(env_hash, record, lock)
-        recipe_proof = {"lock_sha256": stream_digest(lock_path), "transactions": len(lock["environments"][env_hash]["transactions"])}
+        recipe_proof = {"lock_sha256": lock_sha256, "transactions": len(lock["environments"][env_hash]["transactions"])}
         prefix = CONDA.parent.parent / "envs" / record["stored_name"]
         inventory_file = ROOT / "environments" / (env_hash + ".json")
         recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
@@ -990,9 +1004,6 @@ def build_common(inputs):
         os.replace(temporary, recipe_file)
     # Task setup is performed only in disposable builder overlays. The common
     # image has never contained benchmark checkouts or source archives.
-    caches = {"conda": file_inventory(Path("/opt/miniconda3/pkgs")),
-              "pip": file_inventory(Path("/root/.cache/pip")), "recipe_caches": file_inventory(ROOT / "caches")}
-    (ROOT / "environment-cache-provenance.json").write_text(json.dumps(caches, sort_keys=True))
     validate_isolation()
     shell(["chmod -R a+rX " + shlex.quote(str(ROOT)), "chmod -R a+rX /opt/miniconda3"], cwd=ROOT)
 
@@ -1022,12 +1033,20 @@ def verify_os_packages():
 
 
 def file_inventory(folder):
-    records = {}
+    records, digests = {}, {}
     for path in sorted(folder.rglob("*")):
         if path.is_symlink():
             records[path.relative_to(folder).as_posix()] = {"link": os.readlink(path)}
         elif path.is_file():
-            records[path.relative_to(folder).as_posix()] = {"sha256": stream_digest(path), "size": path.stat().st_size}
+            info = path.stat()
+            identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            if identity not in digests:
+                sha = stream_digest(path)
+                after = path.stat()
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != identity:
+                    raise RuntimeError("file changed during inventory: " + str(path))
+                digests[identity] = sha
+            records[path.relative_to(folder).as_posix()] = {"sha256": digests[identity], "size": info.st_size}
     return records
 
 

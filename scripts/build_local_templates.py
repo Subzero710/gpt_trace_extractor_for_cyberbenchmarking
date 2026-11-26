@@ -356,6 +356,19 @@ def digest(path):
     return h.hexdigest()
 
 
+def common_archive_provenance(lock, filenames, npm_urls, verified, bootstrap_sha):
+    return {
+        "schema": 1,
+        "kind": "verified-input-archives",
+        "miniconda": {"sha256": bootstrap_sha, "size": verified[bootstrap_sha]},
+        "conda": {sha: {"url": artifact["url"], "size": verified[sha]}
+                  for sha, artifact in sorted(lock["artifacts"].items())},
+        "pip": {name: {"sha256": sha, "size": verified[sha]}
+                for name, sha in sorted(filenames.items())},
+        "npm": [{**row, "size": verified[row["sha256"]]} for row in npm_urls],
+    }
+
+
 def copy_git_mirror(source, destination):
     """Keep all pinned Git objects, including commits not reachable from refs.
 
@@ -1433,34 +1446,33 @@ def build(args, *, progress=None):
             shutil.copyfile(lock_source, payload / "conda-lock.json")
             locked_pool = BASE.parent / "dependency-pool" / "ready" / "objects" / "sha256"
             lock_payload = json.loads(lock_source.read_bytes())
+            verified_archives = {}
+
+            def verified_archive(sha):
+                if not isinstance(sha, str) or not SHA.fullmatch(sha):
+                    raise RuntimeError("invalid dependency pool archive identity")
+                source = safe(locked_pool / sha[:2] / sha, immutable=True)
+                if sha not in verified_archives:
+                    if digest(source) != sha:
+                        raise RuntimeError("dependency pool archive digest mismatch: " + sha)
+                    verified_archives[sha] = source.stat().st_size
+                return source
+
             conda_root = payload / "conda-artifacts"
             conda_root.mkdir()
             for sha, artifact in sorted(lock_payload.get("artifacts", {}).items()):
-                source = locked_pool / sha[:2] / sha
                 filename = Path(str(artifact.get("url", ""))).name
-                if (not SHA.fullmatch(sha) or source.is_symlink() or not source.is_file()
-                        or digest(source) != sha or not filename or "/" in filename):
-                    raise RuntimeError("locked Conda archive is missing from the verified dependency pool")
+                if not filename or "/" in filename:
+                    raise RuntimeError("invalid locked Conda archive filename")
+                source = verified_archive(sha)
                 target = conda_root / sha / filename
                 target.parent.mkdir(parents=True)
                 os.link(source, target)
             shutil.copytree(os_folder, payload / "os-artifacts", copy_function=os.link)
-            installer = payload / "miniconda.sh"
-            cache_installer = cache_root / ("miniconda-" + MINICONDA_SHA256 + ".sh")
-            if cache_installer.exists():
-                from gpt_trace_transport.local_templates import safe
-                safe(cache_installer)
-                if digest(cache_installer) != MINICONDA_SHA256:
-                    raise RuntimeError("cached Miniconda digest mismatch")
-            else:
-                bootstrap = pool_record.get("provenance", {}).get("bootstrap", {}).get("miniconda-installer", [])
-                if MINICONDA_SHA256 not in bootstrap:
-                    raise RuntimeError("Miniconda bootstrap absent from dependency pool")
-                downloaded = locked_pool / MINICONDA_SHA256[:2] / MINICONDA_SHA256
-                if downloaded.is_symlink() or not downloaded.is_file() or digest(downloaded) != MINICONDA_SHA256:
-                    raise RuntimeError("Miniconda pool object missing or corrupted")
-                os.link(downloaded, cache_installer)
-            os.link(cache_installer, installer)
+            bootstrap = pool_record.get("provenance", {}).get("bootstrap", {}).get("miniconda-installer", [])
+            if MINICONDA_SHA256 not in bootstrap:
+                raise RuntimeError("Miniconda bootstrap absent from dependency pool")
+            os.link(verified_archive(MINICONDA_SHA256), payload / "miniconda.sh")
 
             # Import verified wheel/sdist and npm bytes from the *same* pool
             # that the unprivileged resolver produced. Builders never refetch.
@@ -1479,10 +1491,7 @@ def build(args, *, progress=None):
                     if old != sha:
                         raise RuntimeError('different Python artifacts share one immutable filename: '+name)
             for name, sha in sorted(filenames.items()):
-                source = locked_pool / sha[:2] / sha
-                if source.is_symlink() or not source.is_file() or digest(source) != sha:
-                    raise RuntimeError('PyPI pool object missing or modified: '+sha)
-                os.link(source, package_root / name)
+                os.link(verified_archive(sha), package_root / name)
             npm_root = payload / 'npm-artifacts'
             npm_root.mkdir()
             npm_shas = set()
@@ -1494,16 +1503,16 @@ def build(args, *, progress=None):
             for url, sha in sorted(pool_record.get('url_index', {}).items()):
                 if sha not in npm_shas or urlparse(url).scheme != 'https':
                     continue
-                source = locked_pool / sha[:2] / sha
-                if source.is_symlink() or not source.is_file() or digest(source) != sha:
-                    raise RuntimeError('npm pool object missing or modified')
                 dest = npm_root / sha
                 if not dest.exists():
-                    os.link(source,dest)
+                    os.link(verified_archive(sha), dest)
                 npm_urls.append({'url':url,'sha256':sha})
             if npm_shas - {row['sha256'] for row in npm_urls}:
                 raise RuntimeError('npm dependency has no recorded download URL')
             (payload / 'npm-pool.json').write_text(json.dumps(npm_urls,sort_keys=True))
+            archive_provenance = common_archive_provenance(
+                lock_payload, filenames, npm_urls, verified_archives, MINICONDA_SHA256)
+            atomic_json(payload / "environment-cache-provenance.json", archive_provenance)
 
             report("Construction du template commun")
             common = staged / "common.qcow2"
@@ -1538,6 +1547,7 @@ template_step miniconda-bootstrap bash /opt/swe-gym-build/miniconda.sh -b -p /op
 import runpy
 runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
 PY_NPM
+cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
 template_step remove-build-payload rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
@@ -1555,6 +1565,7 @@ cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 import runpy
 runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
 PY_NPM
+cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
 template_step remove-build-payload rm -rf /opt/swe-gym-build
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
@@ -1563,19 +1574,6 @@ module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json
 json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
 ''' + marker_line + r'''PY_GUEST
 '''
-            clean_isolation = {"builder_mirrors": 0, "repo_mirrors": 0, "task_sources": 0, "checkouts": 0}
-            legacy_common_complete = False
-            if not initial_common and generic_guest_complete(common):
-                try:
-                    legacy_common_complete = (
-                        guest_json(common, "/opt/swe-gym-lite/build-environments.json") ==
-                            {"environments": inputs["environments"]}
-                        and guest_json(common, "/opt/swe-gym-lite/isolation-validation.json") == clean_isolation
-                        and isinstance(guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json"), dict)
-                        and all(isinstance(guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json"), dict)
-                                for key in inputs["environments"]))
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    legacy_common_complete = False
             common_ready = completion_matches(common, COMMON_COMPLETION, common_completion)
 
             def refresh_incomplete_common_runtime():
@@ -1627,6 +1625,8 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
             common.chmod(0o444)
             environments = {key: guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json") for key in inputs["environments"]}
             common_cache = guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json")
+            if not common_ready and common_cache != archive_provenance:
+                raise RuntimeError("common archive provenance differs from verified inputs")
             atomic_json(audit / "environment-inventories.json", environments)
             atomic_json(audit / "environment-downloads.json", common_cache)
             common_validation = guest_json(common, "/opt/swe-gym-lite/isolation-validation.json")
