@@ -237,24 +237,11 @@ def test_shared_capture_invalidates_on_environment_and_context(tmp_path):
     assert first != runtime._capture_cache_identity('a'*64, req, {'pip_freeze':'a'}, {'CFLAGS':'-O0'})
 
 
-def test_exact_v1_to_v2_apt_repair_transition():
+def test_native_repair_has_no_revision_allowlist():
     import ast
     path = ROOT/'apps/workstation-broker/src/workstation_broker/preparation.py'
     tree = ast.parse(path.read_text())
-    names = {'_APT_REPAIR_SUCCESSOR', '_NATIVE_APT_REPAIR_V1', '_NATIVE_APT_REPAIR_SUCCESSOR'}
-    nodes = [node for node in tree.body if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)) or (isinstance(node, ast.FunctionDef) and node.name == '_native_apt_repair_compatible')]
-    ns = {}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), ns)
-    source = 'scripts/superbench_pool.py'
-    common = {'pool_schema': 4, 'golden_dependency': {'same': True}}
-    unchanged = 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py'
-    def record(version, native_hash, shared_hash):
-        return {**common, 'fetcher_sha256': version, 'fetch_sources': {source: version,
-            'scripts/native_requirements.py': native_hash,
-            'shared/gpt_trace_transport/local_templates.py': shared_hash,
-            unchanged: 'same', 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py': 'same'}}
-    old = record(ns['_NATIVE_APT_REPAIR_V1'], 'before', 'before')
-    new = record(hashlib.sha256((ROOT/source).read_bytes()).hexdigest(), 'after', 'after')
-    assert ns['_native_apt_repair_compatible'](old, new)
-    assert not ns['_native_apt_repair_compatible'](new, old)
-    assert not ns['_native_apt_repair_compatible'](old, {**new, 'pool_schema': 5})
+    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_native_apt_repair_compatible')
+    assert not any(isinstance(item, ast.Constant) and isinstance(item.value, str)
+                   and len(item.value) == 64 and all(char in '0123456789abcdef' for char in item.value)
+                   for item in ast.walk(node))

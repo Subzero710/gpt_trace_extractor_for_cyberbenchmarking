@@ -1182,38 +1182,51 @@ def verify_published_inventory(folder, state, proof):
     return inventory
 
 
-# Only the audited real-status predecessor can reuse non-APT plans.
-_APT_REPAIR_SUCCESSOR = "d78f6388c036abffa17e37fa3db43c09e13f9ec235cd9c9288cded477331eaab"
-_NATIVE_APT_REPAIR_V1 = "1277aa7ebf0a7eba7ee9667b55a3bf6358ca7ff1a986408b298a266b254a43c0"
-_NATIVE_APT_REPAIR_SUCCESSOR = "0a5e0bcbab7cce209ac396e71ea8c17f0182a7b96d5c5c47e985ba450b5c3f89"
-
-
 def _native_apt_repair_compatible(previous, current):
-    if not isinstance(previous, dict) or not isinstance(current, dict):
+    """Reuse sealed non-APT plans within the same semantic pool contract.
+
+    Code hashes authorize an acquisition, not its reusable data format. Changes
+    to non-APT plan semantics require a new pool schema; changing a fetcher
+    implementation alone does not invalidate a verified publication.
+    """
+    if not isinstance(previous, dict) or not isinstance(current, dict) or previous == current:
         return False
-    old, new = dict(previous), dict(current)
-    old_sources, new_sources = dict(old.pop('fetch_sources', {})), dict(new.pop('fetch_sources', {}))
-    key = 'scripts/superbench_pool.py'
-    old_fetcher = old.pop('fetcher_sha256', None)
-    if old_fetcher != old_sources.get(key) or old_fetcher not in (_APT_REPAIR_SUCCESSOR, _NATIVE_APT_REPAIR_V1):
+    required = {'fetch_kind', 'pool_schema', 'pins', 'platform', 'coverage',
+                'conda_lock_sha256', 'golden_dependency', 'fetcher_sha256', 'fetch_sources'}
+    if set(previous) != required or set(current) != required:
         return False
-    if new.pop('fetcher_sha256', None) != new_sources.get(key) or new_sources.get(key)!=_NATIVE_APT_REPAIR_SUCCESSOR:
+    if any(previous[key] != current[key] for key in required - {'fetcher_sha256', 'fetch_sources'}):
         return False
-    # The schema change affects only task warm/cache replay, never acquired
-    # archive identities. All other compatibility fields must stay identical.
-    if 'task_runtime_schema' in old or 'task_runtime_schema' in new:
-        if old.pop('task_runtime_schema', None) != 4 or new.pop('task_runtime_schema', None) != 5:
+    if current['fetch_kind'] != 'download-only-pool-v4' or current['pool_schema'] != 4:
+        return False
+    if not isinstance(current['golden_dependency'], dict) or not isinstance(current['pins'], dict):
+        return False
+    if not isinstance(current['coverage'], dict) or set(current['coverage']) != {'tasks', 'repos', 'conda_recipes'}:
+        return False
+    if any(type(value) is not int or value <= 0 for value in current['coverage'].values()):
+        return False
+    if not isinstance(current['platform'], str) or not current['platform'] or not SHA.fullmatch(str(current['conda_lock_sha256'])):
+        return False
+    old_sources, new_sources = previous['fetch_sources'], current['fetch_sources']
+    fetcher = 'scripts/superbench_pool.py'
+    for record, sources in ((previous, old_sources), (current, new_sources)):
+        if (not isinstance(sources, dict) or record['fetcher_sha256'] != sources.get(fetcher)
+                or any(not isinstance(name, str) or not isinstance(sha, str) or SHA.fullmatch(sha) is None
+                       for name, sha in sources.items())):
             return False
-    if old_fetcher == _APT_REPAIR_SUCCESSOR:
-        added = {'scripts/native_requirements.py',
-                  'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py'}
-        changed = {key, 'shared/gpt_trace_transport/local_templates.py',
-                    'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py'}
-    else:
-        added = set()
-        changed = {key, 'scripts/native_requirements.py', 'shared/gpt_trace_transport/local_templates.py'}
-    return (old == new and set(new_sources)-set(old_sources)==added and not set(old_sources)-set(new_sources)
-            and {name for name in old_sources if old_sources[name]!=new_sources[name]}==changed)
+    adapter = 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/'
+    apt_inputs = {'infra/workstation/image/apt_downloads.py', 'scripts/native_requirements.py',
+                  adapter + 'upstream/dockerfiles.py', adapter + 'os_packages.py'}
+    implementation = {fetcher, 'shared/gpt_trace_transport/local_templates.py'}
+    # Non-APT solver inputs and policies must still match exactly. A historical
+    # schema-4 publication predating native discovery lacks the two added files.
+    if set(new_sources) != set(FETCH_SOURCE_FILES):
+        return False
+    if set(old_sources) not in (set(new_sources), set(new_sources) - {
+            'scripts/native_requirements.py', adapter + 'upstream/dockerfiles.py'}):
+        return False
+    stable = set(new_sources) - apt_inputs - implementation
+    return all(old_sources[name] == new_sources[name] for name in stable)
 
 
 def _retired_pool(root, operation_id):
@@ -1221,37 +1234,48 @@ def _retired_pool(root, operation_id):
 
 
 def _apt_repair_source(manager, root, state):
-    candidates=[]
-    ready=root/'ready'
-    for directory in manager.root.iterdir():
-        if not directory.is_dir() or directory.is_symlink() or SHA.fullmatch(directory.name) is None:
+    ready = root/'ready'
+    candidates = []
+    if ready.exists() or ready.is_symlink():
+        safe(ready, immutable=True, directory=True)
+        published = json.loads(safe(ready/'inventory.json', immutable=True).read_bytes())
+        prior_id = identifier(published['operation_id'])
+        # The inventory names its actual owner. Never pair ready with an unrelated journal.
+        directories = [(prior_id, ready)]
+    else:
+        directories = [(entry.name, _retired_pool(root, entry.name))
+                       for entry in manager.root.iterdir()
+                       if entry.is_dir() and not entry.is_symlink() and SHA.fullmatch(entry.name)]
+    for prior_id, candidate in directories:
+        if not candidate.exists() and not candidate.is_symlink():
             continue
-        prior=manager._read(directory.name)
-        if prior is None or not _native_apt_repair_compatible(prior['compatibility'],state['compatibility']):
+        prior = manager._read(prior_id)
+        if prior is None or prior['operation_id'] != prior_id:
+            raise RuntimeError('published pool has no authenticated preparation owner')
+        if not _native_apt_repair_compatible(prior['compatibility'], state['compatibility']):
             continue
-        proof=prior.get('publication_verified')
+        proof = prior.get('publication_verified')
         if (prior['phase'] not in TERMINAL or prior.get('result') is not None
-                or not isinstance(proof,dict) or proof.get('runtime_integrated') != 'pending'):
+                or not isinstance(proof, dict) or proof.get('runtime_integrated') != 'pending'):
             continue
         if JobScope.members(prior) or manager._containers(prior):
             raise RuntimeError('APT repair predecessor still has active owners')
-        retired=_retired_pool(root,prior['operation_id'])
-        candidate=retired if retired.exists() or retired.is_symlink() else ready
-        if not candidate.exists() and not candidate.is_symlink():
-            continue
-        inventory=verify_published_inventory(candidate,prior,proof)
-        path=safe(candidate/'metadata/apt-closure.json',immutable=True)
-        raw=path.read_bytes()
-        rows=[row for row in inventory['files'] if row['path']=='metadata/apt-closure.json']
-        if (len(rows)!=1 or rows[0]['sha256']!=hashlib.sha256(raw).hexdigest()
-                or rows[0]['size']!=len(raw) or 'golden_dpkg_status_sha256' not in json.loads(raw)
-                or (candidate/'metadata/native-pip-inspection.json').exists()):
+        inventory = verify_published_inventory(candidate, prior, proof)
+        current = state['compatibility']
+        if (inventory.get('schema') != 2 or inventory.get('kind') != 'download-only-pool'
+                or inventory.get('conda_lock_sha256') != current['conda_lock_sha256']
+                or any(inventory.get(key) != value for key, value in current['coverage'].items())):
+            raise RuntimeError('prior inventory differs from the current pool contract')
+        raw = safe(candidate/'metadata/apt-closure.json', immutable=True).read_bytes()
+        rows = [row for row in inventory['files'] if row['path'] == 'metadata/apt-closure.json']
+        closure = json.loads(raw)
+        if (len(rows) != 1 or rows[0]['sha256'] != hashlib.sha256(raw).hexdigest()
+                or rows[0]['size'] != len(raw)
+                or not SHA.fullmatch(str(closure.get('golden_dpkg_status_sha256', '')))
+                or closure.get('golden_package_inventory_sha256') != current['golden_dependency']['apt_package_manifest_sha256']):
             raise RuntimeError('prior APT closure does not match repair contract')
-        candidates.append((candidate,prior,inventory))
-    if len(candidates)>1:
-        immediate = [row for row in candidates if row[1]['compatibility']['fetcher_sha256'] == _NATIVE_APT_REPAIR_V1]
-        if len(immediate) == 1:
-            return immediate[0]
+        candidates.append((candidate, prior, inventory))
+    if len(candidates) > 1:
         raise RuntimeError('ambiguous sealed APT repair predecessor')
     return candidates[0] if candidates else None
 
@@ -1274,7 +1298,7 @@ def _link_apt_repair_files(stage, inventory, migration):
         if target.exists() or target.is_symlink():
             continue
         if (row!=original.get(relative) or relative.startswith('apt/')
-                or relative in ('metadata/apt-closure.json','metadata/apt-policy.json','metadata/fetch-progress.json')):
+                or relative in ('metadata/apt-closure.json','metadata/apt-policy.json','metadata/native-pip-inspection.json','metadata/fetch-progress.json')):
             raise RuntimeError('APT repair attempted to import an unapproved file')
         source=safe(donor/relative,immutable=True)
         if source.stat().st_size!=row['size']:

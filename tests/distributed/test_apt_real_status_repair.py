@@ -94,24 +94,34 @@ def test_offline_options_override_signed_sources_and_lists_with_real_apt(tmp_pat
 
 def compatibility(old):
     key = 'scripts/superbench_pool.py'
-    changed = ('shared/gpt_trace_transport/local_templates.py',
-               'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py')
-    digest = broker._APT_REPAIR_SUCCESSOR if old else hashlib.sha256((ROOT / key).read_bytes()).hexdigest()
-    sources = {key: digest, 'other': 'unchanged', **{name: 'old' if old else 'new' for name in changed}}
-    if not old:
-        sources.update({'scripts/native_requirements.py': 'native',
-                        'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py': 'upstream'})
-    return {'fetcher_sha256': digest, 'fetch_sources': sources,
-            'golden_dependency': {'same': True}, 'pool_schema': 4}
+    sha = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    sources = {name: sha(name) for name in broker.FETCH_SOURCE_FILES}
+    adapter = 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/'
+    if old:
+        sources.pop('scripts/native_requirements.py')
+        sources.pop(adapter + 'upstream/dockerfiles.py')
+    sources[key] = sha('old fetcher' if old else 'current fetcher')
+    sources['infra/workstation/image/apt_downloads.py'] = sha('old helper' if old else 'restored helper')
+    return {'fetch_kind': 'download-only-pool-v4', 'pool_schema': 4,
+            'pins': {'contract_sha256': sha('contract')}, 'platform': 'linux-64',
+            'coverage': {'tasks': 1, 'repos': 1, 'conda_recipes': 1},
+            'conda_lock_sha256': sha('lock'),
+            'fetcher_sha256': sources[key], 'fetch_sources': sources,
+            'golden_dependency': {'apt_package_manifest_sha256': sha('golden')}}
 
 
-def test_repair_is_bound_to_exact_transition():
+def test_repair_uses_semantic_contract_not_fetcher_revision():
     old, new = compatibility(True), compatibility(False)
     assert broker._native_apt_repair_compatible(old, new)
-    assert not broker._native_apt_repair_compatible(new, old)
+    assert not broker._native_apt_repair_compatible(new, new)
     assert not broker._native_apt_repair_compatible(old, {**new, 'pool_schema': 5})
-    assert not broker._native_apt_repair_compatible(old, {**new, 'fetch_sources': {**new['fetch_sources'], 'other': 'changed'}})
+    assert not broker._native_apt_repair_compatible(old, {**new, 'pins': {'different': True}})
+    assert not broker._native_apt_repair_compatible(old, {**new, 'golden_dependency': {}})
+    assert not broker._native_apt_repair_compatible(old, {**new, 'fetch_sources': {**new['fetch_sources'], 'config/preparation.toml': 'e' * 64}})
     assert not broker._native_apt_repair_compatible(old, {**new, 'fetcher_sha256': 'f' * 64})
+    later = {**new, 'fetcher_sha256': 'f' * 64, 'fetch_sources': {**new['fetch_sources'], 'scripts/superbench_pool.py': 'f' * 64}}
+    assert broker._native_apt_repair_compatible(new, later)
+    assert broker._native_apt_repair_compatible(old, later)
 
 
 def put(folder, relative, data):
@@ -133,6 +143,7 @@ def test_apt_repair_reuses_exact_nonapt_inodes_and_replaces_closure(tmp_path, mo
     old_data_path = donor / path
     old_data_path.chmod(0o444)
     old_apt = put(donor, 'metadata/apt-closure.json', b'old closure')
+    old_native = put(donor, 'metadata/native-pip-inspection.json', b'old report')
     old_deb = put(donor, 'apt/archives/old.deb', b'old archive')
     old_sha = old_deb['sha256']
     old_cas = put(donor, 'objects/sha256/' + old_sha[:2] + '/' + old_sha, b'old archive')
@@ -140,7 +151,7 @@ def test_apt_repair_reuses_exact_nonapt_inodes_and_replaces_closure(tmp_path, mo
            'objects': {sha: old_data, old_sha: old_cas},
            'provenance': {'pip': {'x': [sha]}, 'apt': {'old': [old_sha]}},
            'url_index': {'https://example.invalid/pip': sha, 'https://example.invalid/apt': old_sha},
-           'files': [old_data, old_apt, old_deb, old_cas],
+           'files': [old_data, old_apt, old_deb, old_cas, old_native],
            'task_plan': {'task': {}}, 'environment_plan': {}, 'git_plan': {},
            'conda_transactions': {}, 'conda_lock_sha256': 'b'*64}
     candidate = pool.Pool(stage)
@@ -149,12 +160,15 @@ def test_apt_repair_reuses_exact_nonapt_inodes_and_replaces_closure(tmp_path, mo
     new_archive.write_bytes(b'new archive')
     new_sha = candidate.put(new_archive, 'apt', 'new')
     put(stage, 'metadata/apt-closure.json', b'new closure')
+    put(stage, 'metadata/native-pip-inspection.json', b'new report')
     progress = pool._PoolProgress(io.StringIO(), tty=False, progress_path=stage/'metadata/fetch-progress.json', operation_id='c'*64)
     monkeypatch.setattr(pool, '_POOL_PROGRESS', progress)
     pool._apt_repair_inventory(candidate, old, 'c'*64)
     inventory = json.loads((stage/'inventory.json').read_bytes())
     broker._link_apt_repair_files(stage, inventory, (donor, {}, old))
     assert (stage/path).samefile(old_data_path)
+    assert (stage/'metadata/native-pip-inspection.json').read_bytes() == b'new report'
+    assert (donor/'metadata/native-pip-inspection.json').read_bytes() == b'old report'
     assert set(inventory['objects']) == {sha, new_sha}
     assert not (stage/'apt/archives/old.deb').exists()
     assert inventory['task_plan'] == old['task_plan']
@@ -167,18 +181,24 @@ def test_apt_repair_reuses_exact_nonapt_inodes_and_replaces_closure(tmp_path, mo
         assert hashlib.sha256((stage/record['path']).read_bytes()).hexdigest() == record['sha256']
 
 
-def test_prior_publication_is_recoverable_before_and_after_retirement(tmp_path, monkeypatch):
+@pytest.mark.parametrize('native', [False, True])
+def test_prior_publication_is_recoverable_before_and_after_retirement(tmp_path, monkeypatch, native):
     if os.geteuid() != 0:
         pytest.skip('root-owned sealed publication required')
     root = tmp_path / 'pool'
     ready = root / 'ready'
     ready.mkdir(parents=True)
     journals = tmp_path / 'preparations'
-    old_id = hashlib.sha256(broker.canonical(compatibility(True))).hexdigest()
+    donor_contract = compatibility(not native)
+    old_id = hashlib.sha256(broker.canonical(donor_contract)).hexdigest()
     (journals / old_id).mkdir(parents=True)
-    raw = json.dumps({'requested': ['fixture-java'], 'resolved': [], 'golden_dpkg_status_sha256': 'd'*64}).encode()
+    raw = json.dumps({'requested': ['fixture-java'], 'resolved': [], 'golden_dpkg_status_sha256': 'd'*64,
+                      'golden_package_inventory_sha256': compatibility(True)['golden_dependency']['apt_package_manifest_sha256']}).encode()
     closure = put(ready, 'metadata/apt-closure.json', raw)
-    old_inventory = {'operation_id': old_id, 'complete': True, 'issues': [], 'files': [closure],
+    if native:
+        put(ready, 'metadata/native-pip-inspection.json', b'prior native report')
+    old_inventory = {'schema': 2, 'conda_lock_sha256': compatibility(True)['conda_lock_sha256'],
+                     'operation_id': old_id, 'complete': True, 'issues': [], 'files': [closure],
                      'kind': 'download-only-pool', 'tasks': 1, 'repos': 1, 'conda_recipes': 1,
                      'python_versions': ['3.11']}
     proof = {key: old_inventory[key] for key in ('kind','tasks','repos','conda_recipes','python_versions')}
@@ -187,15 +207,24 @@ def test_prior_publication_is_recoverable_before_and_after_retirement(tmp_path, 
     proof.update(manifest_sha256=hashlib.sha256(inventory_raw).hexdigest(), runtime_integrated='pending')
     for item in (*ready.rglob('*'), ready):
         item.chmod(0o555 if item.is_dir() else 0o444)
-    prior = {'operation_id': old_id, 'compatibility': compatibility(True),
+    prior = {'operation_id': old_id, 'compatibility': donor_contract,
              'phase': 'interrupted', 'result': None, 'publication_verified': proof}
-    state = {'compatibility': compatibility(False)}
-    manager = SimpleNamespace(root=journals, _read=lambda operation_id: prior,
+    current = compatibility(False)
+    current['fetch_sources']['scripts/superbench_pool.py'] = hashlib.sha256(b'next fetcher').hexdigest()
+    current['fetcher_sha256'] = current['fetch_sources']['scripts/superbench_pool.py']
+    state = {'compatibility': current}
+    def read(operation_id):
+        assert operation_id == old_id
+        return prior
+    manager = SimpleNamespace(root=journals, _read=read,
                               _containers=lambda state: [])
     monkeypatch.setattr(broker.JobScope, 'members', lambda state: [])
+    unrelated = journals / hashlib.sha256(b'unrelated').hexdigest()
+    unrelated.mkdir()
     assert broker._apt_repair_source(manager, root, state) == (ready, prior, old_inventory)
+    unrelated.rmdir()
     retired = broker._retired_pool(root, old_id)
     ready.rename(retired)
     assert broker._apt_repair_source(manager, root, state) == (retired, prior, old_inventory)
     assert (retired/'metadata/apt-closure.json').read_bytes() == raw
-    assert broker._apt_repair_source(manager, root, {'compatibility': compatibility(True)}) is None
+    assert broker._apt_repair_source(manager, root, {'compatibility': donor_contract}) is None

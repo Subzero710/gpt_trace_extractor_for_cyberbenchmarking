@@ -4403,14 +4403,57 @@ def _apt_download_module():
     return module
 
 
+@contextlib.contextmanager
+def _apt_progress_observation(progress, *, cadence, limit):
+    if progress is None:
+        yield
+        return
+    stopped = threading.Event()
+    errors = []
+
+    def sample():
+        with _registered_operation('APT archive progress observation', limit=limit):
+            progress()
+
+    def monitor():
+        try:
+            while not stopped.wait(cadence):
+                sample()
+        except BaseException as exc:
+            errors.append(exc)
+
+    sample()
+    thread = threading.Thread(target=monitor, name='apt-archive-progress', daemon=True)
+    thread.start()
+    failure = None
+    try:
+        yield
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        stopped.set()
+        thread.join(timeout=limit)
+        if thread.is_alive():
+            error = TimeoutError('APT progress observation did not terminate')
+        else:
+            error = errors[0] if errors else None
+        if error is not None:
+            if failure is not None:
+                failure.add_note('APT progress observation failed: ' + repr(error))
+            else:
+                raise error
+    sample()
+
+
 def _run_apt_downloads(arguments, *, progress=None):
     limit = _operation_timeout()
     cadence = _conda_progress_interval()
-    _apt_download_module().run_downloads(
-        arguments, limit=limit, cadence=cadence, observe=_registered_operation,
-        terminate=lambda process: _stop_native_process_group(process, cleanup_limit=limit, cadence=cadence),
-        progress=progress,
-    )
+    with _apt_progress_observation(progress, cadence=cadence, limit=limit):
+        _apt_download_module().run_downloads(
+            arguments, limit=limit, cadence=cadence, observe=_registered_operation,
+            terminate=lambda process: _stop_native_process_group(process, cleanup_limit=limit, cadence=cadence),
+        )
 
 
 def _apt_missing_packages(output, requested):
@@ -10059,7 +10102,8 @@ def _apt_repair_inventory(pool, previous, operation_id):
             files[relative]={'path':relative,'size':path.stat().st_size,'sha256':digest(path)}
     for row in previous['files']:
         relative=row['path']
-        if (relative in files or relative.startswith('apt/') or relative=='metadata/apt-closure.json'
+        if (relative in files or relative.startswith('apt/') or relative in ('metadata/apt-closure.json', 'metadata/apt-policy.json',
+                                 'metadata/native-pip-inspection.json', 'metadata/fetch-progress.json')
                 or relative.startswith('objects/sha256/') and row['sha256'] not in retained_shas
                 or relative.startswith('downloads/') and row['sha256'] not in retained_shas):
             continue
@@ -10118,11 +10162,23 @@ def main(argv=None):
             raise RuntimeError('APT repair cannot combine two recovery sources')
         previous=json.loads((args.repair_apt_from/'inventory.json').read_bytes())
         prior_apt=json.loads((args.repair_apt_from/'metadata'/'apt-closure.json').read_bytes())
-        if (previous['complete'] is not True or previous['issues']
-                or previous['conda_lock_sha256']!=conda_lock_sha256
-                or prior_apt['golden_package_inventory_sha256']!=_golden_dependency()['apt_package_manifest_sha256']
-                or (args.repair_apt_from/'metadata'/'native-pip-inspection.json').exists()):
+        if (previous.get('schema') != 2 or previous.get('kind') != 'download-only-pool'
+                or previous['complete'] is not True or previous['issues']
+                or previous['conda_lock_sha256'] != conda_lock_sha256
+                or prior_apt['golden_package_inventory_sha256'] != _golden_dependency()['apt_package_manifest_sha256']
+                or prior_apt.get('golden_dpkg_status_sha256') != digest(repo_root/'golden-dpkg-status')
+                or set(previous['task_plan']) != set(tasks)
+                or set(previous['environment_plan']) != set(environments)
+                or set(previous['git_plan']) != {row['repo'] for row in tasks.values()}):
             raise RuntimeError('incompatible prior APT publication')
+        for logical, row in previous['task_plan'].items():
+            if any(row.get(key) != tasks[logical][key] for key in ('repo', 'base_commit', 'env_hash')):
+                raise RuntimeError('retained task differs from pinned contract: ' + logical)
+        for env, transactions in previous['conda_transactions'].items():
+            if env not in conda_lock['environments'] or transactions != [row['key'] for row in conda_lock['environments'][env]['transactions']]:
+                raise RuntimeError('retained Conda transactions differ from lock: ' + env)
+        if set(previous['conda_transactions']) != set(environments):
+            raise RuntimeError('retained Conda transactions do not cover the contract')
         pool=Pool(stage)
         pool.download_budget=budget
         pool.apt_repair_source=args.repair_apt_from

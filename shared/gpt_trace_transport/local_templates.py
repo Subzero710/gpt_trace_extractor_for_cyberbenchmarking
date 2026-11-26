@@ -670,7 +670,11 @@ def verify_manifest(folder, expected, *, source_root=ROOT):
 
 
 def pool_contract(source_root=ROOT):
-    """Content identity for dependency acquisition; independent of KVM/golden/runtime."""
+    """Acquisition identity, separate from the immutable artifact identity.
+
+    The pool schema versions non-APT plan semantics as well as the stored layout.
+    Bump it for incompatible changes to either; source hashes authorize execution.
+    """
     source_root = Path(source_root)
     pins = json.loads((source_root / PINS).read_bytes())
     if pins.get("schema_version") != 2 or pins.get("recipe_version") != 2:

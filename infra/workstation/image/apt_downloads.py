@@ -83,7 +83,7 @@ class AptDownloads:
         return remaining
 
 
-def run_downloads(arguments, *, limit, cadence, observe, terminate, progress=None):
+def run_downloads(arguments, *, limit, cadence, observe, terminate):
     options = ['-o', 'Debug::pkgAcquire::Worker=true', '-o', 'Acquire::Queue-Mode=access',
                '-o', 'Acquire::http::Pipeline-Depth=0', '-o', 'Acquire::https::Pipeline-Depth=0']
     command = [arguments[0], *options, *arguments[1:]]
@@ -94,12 +94,8 @@ def run_downloads(arguments, *, limit, cadence, observe, terminate, progress=Non
     try:
         with contextlib.ExitStack() as operations:
             watch = AptDownloads(process, limit, operations, observe)
-            next_progress = time.monotonic()
             while True:
                 readable, _, _ = select.select([process.stdout], [], [], min(cadence, watch.remaining()))
-                if progress is not None and time.monotonic()>=next_progress:
-                    progress()
-                    next_progress=time.monotonic()+cadence
                 if not readable:
                     continue
                 chunk = os.read(process.stdout.fileno(), 65536)
@@ -113,8 +109,6 @@ def run_downloads(arguments, *, limit, cadence, observe, terminate, progress=Non
                 if len(pending) > 1048576:
                     raise RuntimeError('oversized APT progress record')
             code = process.wait(timeout=watch.remaining())
-            if progress is not None:
-                progress()
             if code:
                 error = subprocess.CalledProcessError(code, arguments, output=tail.decode(errors='replace'))
                 error.add_note(error.stdout)
