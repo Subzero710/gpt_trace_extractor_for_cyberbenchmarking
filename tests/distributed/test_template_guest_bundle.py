@@ -38,8 +38,9 @@ def test_uploads_current_controls_and_supervisors_without_changing_golden_identi
                  for host, guest in [spec.split(':', 1)] if flag == '--upload')
     assert installed == original
     assert json.loads(files['/opt/gpt-trace/bundle/guest-contract.json'].read_bytes()) == {**original, **controls()}
-    for name in ('apt_downloads.py', 'conda_trace.py'):
-        assert files['/opt/gpt-trace/bundle/' + name] == ROOT / 'infra/workstation/image' / name
+    for guest_name, source_name in (('apt_downloads.py', 'apt_downloads.py'),
+                                    ('conda_trace.py', 'template_conda_trace.py')):
+        assert files['/opt/gpt-trace/bundle/' + guest_name] == ROOT / 'infra/workstation/image' / source_name
     assert len(files) == 3
 
 

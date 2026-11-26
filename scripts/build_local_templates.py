@@ -446,12 +446,14 @@ def template_bundle_upload_arguments(directory, installed_contract, current_cont
     destination = Path(directory) / "guest-contract.json"
     atomic_json(destination, contract)
     source = Path(source_root) / "infra/workstation/image"
-    files = (destination, source / "apt_downloads.py", source / "conda_trace.py")
+    files = ((destination, destination.name),
+             (source / "apt_downloads.py", "apt_downloads.py"),
+             (source / "template_conda_trace.py", "conda_trace.py"))
     arguments = []
-    for path in files:
+    for path, guest_name in files:
         if path.is_symlink() or not path.is_file():
             raise RuntimeError("missing versioned template guest bundle input: " + str(path))
-        arguments.extend(("--upload", str(path) + ":/opt/gpt-trace/bundle/" + path.name))
+        arguments.extend(("--upload", str(path) + ":/opt/gpt-trace/bundle/" + guest_name))
     return arguments
 
 
