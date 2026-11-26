@@ -171,7 +171,8 @@ def stream_digest(path):
 # Reproducibility records BOTH scripts and the solver policy in the guest image.
 def locked_environment_script(env_hash, record, lock):
     """Construct an environment only from exact lock transaction archives."""
-    if not isinstance(record, dict) or record.get("stored_name") != "swegym_" + env_hash:
+    if (not re.fullmatch(r"[a-f0-9]+", env_hash) or not isinstance(record, dict)
+            or record.get("stored_name") != "swegym_" + env_hash):
         raise RuntimeError("environment identity differs from the pinned contract")
     row = lock.get("environments", {}).get(env_hash)
     if not isinstance(row, dict) or row.get("recipe_sha256") != hashlib.sha256(
@@ -192,10 +193,11 @@ def locked_environment_script(env_hash, record, lock):
         package_files.append("/opt/swe-gym-lock/" + package_sha + "/" + filename)
     if not package_files:
         raise RuntimeError("Conda lock transaction is empty")
-    prefix = "/opt/miniconda3/envs/" + record["stored_name"]
+    prefix = str(CONDA.parent.parent / "envs" / record["stored_name"])
     explicit = "/opt/swe-gym-lock/" + env_hash + ".explicit"
-    lines = ["rm -rf " + shlex.quote(prefix), "mkdir -p /opt/swe-gym-lock"]
+    lines = ["mkdir -p /opt/swe-gym-lock"]
     lines += ["test -f " + shlex.quote(path) for path in package_files]
+    lines.append("rm -rf --one-file-system -- " + shlex.quote(prefix))
     lines += ["printf '%s\\n' '@EXPLICIT' " + " ".join(shlex.quote('file://' + path) for path in package_files) + " > " + shlex.quote(explicit),
               "/opt/miniconda3/bin/conda create --offline --yes --prefix " + shlex.quote(prefix) + " --file " + shlex.quote(explicit)]
     return lines
@@ -908,6 +910,27 @@ def freeze_downloads():
     (ROOT / "download-provenance.json").write_text(json.dumps(records, sort_keys=True))
 
 
+def common_environment_ready(prefix, inventory_file, recipe_file, expected_proof):
+    temporary_files = (inventory_file.with_suffix(".json.tmp"), recipe_file.with_suffix(".json.tmp"))
+    if (prefix.parent.is_symlink() or prefix.is_symlink() or prefix.is_mount()
+            or (prefix.exists() and not prefix.is_dir())
+            or any(path.is_symlink() or (path.exists() and not path.is_file())
+                   for path in (inventory_file, recipe_file, *temporary_files))):
+        raise RuntimeError("untrusted Conda checkpoint path: " + str(prefix))
+    if recipe_file.exists():
+        if (prefix.is_dir() and inventory_file.is_file()
+                and recipe_file.read_text() == expected_proof
+                and json.loads(inventory_file.read_text()) == env_inventory(prefix)):
+            return True
+        raise RuntimeError("committed Conda checkpoint differs; preserving " + str(prefix))
+    if prefix.exists() or inventory_file.exists() or any(path.exists() for path in temporary_files):
+        print("SWE-Gym rebuilding uncommitted environment: " + str(prefix), flush=True)
+        inventory_file.unlink(missing_ok=True)
+        for path in temporary_files:
+            path.unlink(missing_ok=True)
+    return False
+
+
 def build_common(inputs):
     for folder in ("environments", "logs", "task-provenance", "wheelhouse", "caches/pip", "caches/npm", "caches/pdm", "caches/pipx"):
         (ROOT / folder).mkdir(parents=True, exist_ok=True)
@@ -923,24 +946,13 @@ def build_common(inputs):
     for env_hash, record in sorted(inputs["environments"].items()):
         commands = locked_environment_script(env_hash, record, lock)
         recipe_proof = {"lock_sha256": stream_digest(lock_path), "transactions": len(lock["environments"][env_hash]["transactions"])}
-        prefix = Path("/opt/miniconda3/envs") / record["stored_name"]
+        prefix = CONDA.parent.parent / "envs" / record["stored_name"]
         inventory_file = ROOT / "environments" / (env_hash + ".json")
         recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
         expected_proof = json.dumps(recipe_proof, sort_keys=True)
-        # A successful environment is a durable checkpoint inside common.qcow2.
-        # Never trust the mere existence of its directory as proof of completion.
-        if inventory_file.exists() and recipe_file.exists() and prefix.is_dir():
-            if (recipe_file.read_text() == expected_proof and
-                    json.loads(inventory_file.read_text()) == env_inventory(prefix)):
-                print("SWE-Gym verified environment checkpoint: " + env_hash, flush=True)
-                continue
-        # Incomplete or unverifiable environments are discarded individually.
-        # Valid environments and the verified Conda package download cache survive.
-        if prefix.is_symlink() or inventory_file.is_symlink() or recipe_file.is_symlink():
-            raise RuntimeError("untrusted Conda checkpoint path")
-        if prefix.exists() or inventory_file.exists() or recipe_file.exists():
-            raise RuntimeError("existing Conda environment/checkpoint is not verified; preserving "
-                               + str(prefix) + "; inspect or migrate explicitly")
+        if common_environment_ready(prefix, inventory_file, recipe_file, expected_proof):
+            print("SWE-Gym verified environment checkpoint: " + env_hash, flush=True)
+            continue
         print("SWE-Gym environment " + env_hash + ": exact Conda lock transaction replay", flush=True)
         env = build_limits({**os.environ, "PATH": str(ROOT / "offline-bin") + ":" + os.environ["PATH"]})
         log = ROOT / "logs" / (env_hash + ".build.log")
