@@ -126,5 +126,153 @@ def test_fresh_and_resume_boot_import_provenance_before_build():
     source = (ROOT / 'scripts/build_local_templates.py').read_text()
     copy = 'cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/'
     assert source.count(copy) == 2
-    for section in source.split(copy)[1:]:
-        assert section.index('template_step remove-build-payload') < section.index("module['build_common']")
+    assert source.count(copy + "\n''' + bootstrap_marker + npm_boot + common_tail") == 2
+    tail = source.split("common_tail = r'''", 1)[1].split("'''", 1)[0]
+    assert tail.index('template_step remove-build-payload') < tail.index("module['build_common']")
+
+
+@pytest.fixture
+def sealed_pool(tmp_path, monkeypatch):
+    from gpt_trace_transport import local_templates
+    if os.geteuid() != 0:
+        # Exercise the real mode/path checks on unprivileged CI-owned fixtures.
+        # Only root ownership is substituted for the fixture's current UID.
+        def safe(path, *, immutable=False, directory=False):
+            path = Path(path).absolute()
+            assert not any(parent.is_symlink() for parent in (path, *path.parents))
+            assert path.stat().st_uid == os.geteuid()
+            assert not path.stat().st_mode & (0o222 if immutable else 0o022)
+            assert path.is_dir() if directory else path.is_file()
+            return path
+        monkeypatch.setattr(local_templates, 'safe', safe)
+    folder = tmp_path / 'ready'
+    raw = b'verified archive bytes'
+    sha = hashlib.sha256(raw).hexdigest()
+    relative = 'objects/sha256/' + sha[:2] + '/' + sha
+    obj = folder / relative
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(raw)
+    apt = folder / 'apt/archives/package_1_all.deb'
+    apt.parent.mkdir(parents=True)
+    os.link(obj, apt)
+    record = {'sha256': sha, 'size': len(raw), 'path': relative}
+    inventory = {'objects': {sha: record}, 'files': [record, {**record, 'path': apt.relative_to(folder).as_posix()}]}
+    for path in sorted(folder.rglob('*'), reverse=True):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    folder.chmod(0o555)
+    yield folder, obj, apt, inventory, sha
+    for path in [folder, *folder.rglob('*')]:
+        if path.is_dir():
+            path.chmod(0o755)
+
+
+def test_published_pool_proof_reused_after_process_restart(sealed_pool, monkeypatch):
+    folder, obj, _, inventory, sha = sealed_pool
+    original_open = Path.open
+    def no_archive_read(path, *args, **kwargs):
+        if path == obj:
+            pytest.fail('sealed archive must not be read or hashed during resume')
+        return original_open(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', no_archive_read)
+    for _ in range(2):
+        fresh = builder.PublishedPoolArchives(folder, inventory)
+        assert fresh.archive(sha) == obj
+        assert fresh.sizes[sha] == obj.stat().st_size
+    invalid = {**inventory, 'files': []}
+    with pytest.raises(RuntimeError, match='verified publication'):
+        builder.PublishedPoolArchives(folder, invalid).archive(sha)
+    obj.chmod(0o644)
+    with pytest.raises((ValueError, AssertionError)):
+        builder.PublishedPoolArchives(folder, inventory).archive(sha)
+    obj.chmod(0o444)
+
+
+def test_apt_reuses_published_inode_instead_of_copy_or_rehash(sealed_pool, tmp_path, monkeypatch):
+    folder, obj, apt, inventory, sha = sealed_pool
+    archive_index = builder.PublishedPoolArchives(folder, inventory)
+    closure = {'requested': ['package'], 'resolved': [{'sha256': sha, 'package': 'package', 'version': '1', 'architecture': 'all'}]}
+    packages = builder.published_apt_archives(archive_index, closure)
+    name = apt.name
+    destination = tmp_path / 'resolved'
+    destination.mkdir()
+    (destination / name).write_bytes(b'old independent copy')
+    manifest = {'schema_version': 1, 'requested': closure['requested'], 'artifacts': {name: packages[name][1]}}
+    monkeypatch.setattr(builder, 'digest', lambda *args: pytest.fail('APT archive was rehashed'))
+    builder.bind_os_archives(destination, manifest, closure, packages)
+    assert (destination / name).samefile(obj)
+    inode = (destination / name).stat().st_ino
+    builder.bind_os_archives(destination, manifest, closure, packages)
+    assert (destination / name).stat().st_ino == inode
+    bad = {**manifest, 'requested': []}
+    with pytest.raises(RuntimeError, match='signed APT closure'):
+        builder.bind_os_archives(destination, bad, closure, packages)
+
+
+@pytest.mark.parametrize('mode,root_entries,runtime,legacy', [
+    ('bootstrap', set(), set(), False),
+    ('bootstrap', {'swe-gym-lite', 'miniconda3'}, set(), False),
+    ('legacy-prepared', {'swe-gym-lite', 'miniconda3'}, set(), True),
+    ('resume-inputs', {'swe-gym-lite', 'miniconda3', 'swe-gym-build'}, set(), True),
+    ('bootstrap-prepared', {'swe-gym-lite', 'miniconda3', 'swe-gym-build'}, {'common-bootstrap-complete.json'}, False),
+    ('prepared', {'swe-gym-lite', 'miniconda3', 'swe-gym-build'}, {'common-inputs-complete.json'}, False),
+])
+def test_common_resume_selects_only_uncommitted_stage(tmp_path, mode, root_entries, runtime, legacy):
+    disk = tmp_path / 'common.qcow2'
+    disk.touch()
+    expected = {'kind': 'common-inputs', 'pool_manifest_sha256': 'pool'}
+    def read(_image, path):
+        return {**expected, 'kind': 'common-bootstrap'} if 'bootstrap' in path else expected
+    actual = builder.common_input_mode(disk, expected, list_directory=lambda _, path: root_entries if path == '/opt' else runtime,
+                                       read_json=read, legacy_ready=lambda: legacy)
+    assert actual == mode
+
+
+def test_changed_input_checkpoint_is_not_accepted(tmp_path):
+    disk = tmp_path / 'common.qcow2'
+    disk.touch()
+    with pytest.raises(RuntimeError, match='checkpoint differs'):
+        builder.common_input_mode(disk, {'kind': 'common-inputs'},
+            list_directory=lambda _, path: {'swe-gym-lite'} if path == '/opt' else {'common-inputs-complete.json'},
+            read_json=lambda *_: {}, legacy_ready=lambda: pytest.fail('invalid checkpoint must not be bypassed'))
+
+
+def test_injection_resumes_only_uncommitted_batches(tmp_path, monkeypatch):
+    import subprocess
+    import tarfile
+    payload = tmp_path / 'swe-gym-build'
+    payload.mkdir()
+    for name in ('a', 'b', 'c'):
+        (payload / name).write_bytes(name.encode())
+    disk = tmp_path / 'common.qcow2'
+    disk.touch()
+    work = tmp_path / 'scratch'
+    work.mkdir()
+    monkeypatch.setitem(builder._CONTROLS, 'template_payload_batch_members', 1)
+    committed, attempts = [], []
+    def run(*argv):
+        if argv[0] == 'tar':
+            subprocess.run(argv, check=True)
+            return
+        assert argv[0] == 'virt-tar-in'
+        with tarfile.open(argv[3]) as tar:
+            names = tar.getnames()
+        attempts.append(names)
+        if len(attempts) == 3:
+            raise RuntimeError('interrupted injection')
+    def record(done, total):
+        committed.append((done, total))
+    with pytest.raises(RuntimeError, match='interrupted'):
+        builder._inject_payload(disk, payload, work, run, checkpoint=record)
+    assert committed == [(1, 4), (2, 4)]
+    builder._inject_payload(disk, payload, work, run, completed_batches=committed[-1][0], checkpoint=record)
+    assert attempts == [['swe-gym-build'], ['swe-gym-build/a'], ['swe-gym-build/b'], ['swe-gym-build/b'], ['swe-gym-build/c']]
+    assert committed[-1] == (4, 4)
+
+
+def test_guest_checkpoints_are_atomically_persisted(tmp_path, monkeypatch):
+    monkeypatch.setattr(guest, 'ROOT', tmp_path)
+    for kind, name in [('common-bootstrap', 'common-bootstrap-complete.json'), ('common-inputs', 'common-inputs-complete.json')]:
+        proof = {'kind': kind, 'pool_manifest_sha256': 'pool'}
+        guest.commit_common_inputs(proof)
+        assert json.loads((tmp_path / name).read_text()) == proof
+        assert not (tmp_path / (name + '.tmp')).exists()

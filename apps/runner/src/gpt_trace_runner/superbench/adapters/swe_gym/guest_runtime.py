@@ -390,7 +390,7 @@ def seed_pool_vcs(item):
     run('git','config','--global','protocol.file.allow','always')
 
 
-def seed_pool_npm():
+def seed_pool_npm(*, cleanup=True):
     """Load the authoritative URL-to-integrity tarballs into npm's cacache."""
     manifest = ROOT / 'npm-pool.json'
     if not manifest.exists():
@@ -426,7 +426,8 @@ for (const entry of entries) {
     if not folder.is_dir() or folder.is_symlink():
         raise RuntimeError('host-fetched npm artifacts missing')
     run('node', '-e', script, str(folder), str(manifest), str(ROOT / 'caches/npm'))
-    shutil.rmtree(folder)
+    if cleanup:
+        shutil.rmtree(folder)
 
 def runtime_environment(item, *, offline):
     env = build_limits()
@@ -937,6 +938,31 @@ def common_environment_ready(prefix, inventory_file, recipe_file, expected_proof
     return False
 
 
+def _durable_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(value, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def commit_common_inputs(checkpoint):
+    names = {"common-bootstrap": "common-bootstrap-complete.json",
+             "common-inputs": "common-inputs-complete.json"}
+    _durable_json(ROOT / names[checkpoint["kind"]], checkpoint)
+
+
 def build_common(inputs):
     for folder in ("environments", "logs", "task-provenance", "wheelhouse", "caches/pip", "caches/npm", "caches/pdm", "caches/pipx"):
         (ROOT / folder).mkdir(parents=True, exist_ok=True)
@@ -995,13 +1021,10 @@ def build_common(inputs):
                 time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
         # Persist proof only after all official commands and the exact installed
         # package inventory succeeded. Atomic rename avoids torn JSON checkpoints.
-        data = json.dumps(env_inventory(prefix), sort_keys=True)
-        temporary = inventory_file.with_suffix(".json.tmp")
-        temporary.write_text(data)
-        os.replace(temporary, inventory_file)
-        temporary = recipe_file.with_suffix(".json.tmp")
-        temporary.write_text(expected_proof)
-        os.replace(temporary, recipe_file)
+        inventory = env_inventory(prefix)
+        run("sync", "-f", str(prefix))
+        _durable_json(inventory_file, inventory)
+        _durable_json(recipe_file, recipe_proof)
     # Task setup is performed only in disposable builder overlays. The common
     # image has never contained benchmark checkouts or source archives.
     validate_isolation()

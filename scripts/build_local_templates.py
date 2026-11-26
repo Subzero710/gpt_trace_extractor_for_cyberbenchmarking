@@ -104,6 +104,8 @@ def qemu_system_binary():
 
 
 COMMON_COMPLETION = "/opt/swe-gym-lite/common-template-complete.json"
+COMMON_INPUTS_COMPLETION = "/opt/swe-gym-lite/common-inputs-complete.json"
+COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
@@ -369,6 +371,125 @@ def common_archive_provenance(lock, filenames, npm_urls, verified, bootstrap_sha
     }
 
 
+class PublishedPoolArchives:
+    def __init__(self, root, inventory):
+        from gpt_trace_transport.local_templates import safe
+        self.root = safe(root, directory=True, immutable=True)
+        self.objects = inventory["objects"]
+        self.files = {row["path"]: row for row in inventory["files"]}
+        if len(self.files) != len(inventory["files"]):
+            raise RuntimeError("duplicate sealed pool inventory entries")
+        self.sizes = {}
+        self.paths = {}
+
+    def file(self, relative, sha, size):
+        from gpt_trace_transport.local_templates import safe
+        row = self.files.get(relative)
+        if (not isinstance(sha, str) or not SHA.fullmatch(sha) or type(size) is not int
+                or size < 0 or row is None or row.get("sha256") != sha
+                or row.get("size") != size or row.get("type") == "symlink"):
+            raise RuntimeError("archive differs from verified publication: " + relative)
+        path = self.root / relative
+        if not path.is_relative_to(self.root) or ".." in Path(relative).parts:
+            raise RuntimeError("invalid sealed archive path")
+        for parent in path.parents:
+            if parent == self.root:
+                break
+            safe(parent, directory=True, immutable=True)
+        path = safe(path, immutable=True)
+        if path.stat().st_size != size:
+            raise RuntimeError("sealed archive size changed: " + relative)
+        return path
+
+    def archive(self, sha):
+        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+            raise RuntimeError("invalid dependency pool archive identity")
+        if sha not in self.paths:
+            row = self.objects.get(sha)
+            relative = "objects/sha256/" + sha[:2] + "/" + sha
+            if (not isinstance(row, dict) or row.get("path") != relative
+                    or row.get("sha256") != sha):
+                raise RuntimeError("archive missing from verified publication: " + sha)
+            self.paths[sha] = self.file(relative, sha, row.get("size"))
+            self.sizes[sha] = row["size"]
+        return self.paths[sha]
+
+    def metadata(self, relative):
+        row = self.files[relative]
+        path = self.file(relative, row["sha256"], row["size"])
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != row["sha256"]:
+            raise RuntimeError("published metadata changed: " + relative)
+        return json.loads(raw)
+
+
+def published_apt_archives(archives, closure):
+    identities = {row["sha256"]: row for row in closure["resolved"]}
+    if len(identities) != len(closure["resolved"]):
+        raise RuntimeError("duplicate signed APT archive identities")
+    result = {}
+    for relative, row in archives.files.items():
+        path = Path(relative)
+        if path.parent != Path("apt/archives") or path.suffix != ".deb":
+            continue
+        sha = row["sha256"]
+        if sha not in identities:
+            raise RuntimeError("unregistered APT archive in verified publication")
+        entry = identities[sha]
+        record = {key: entry[key] for key in ("package", "version", "architecture")}
+        record.update(sha256=sha, size=row["size"])
+        result[path.name] = (archives.file(relative, sha, row["size"]), record)
+    if {record["sha256"] for _, record in result.values()} != set(identities):
+        raise RuntimeError("signed APT archive closure incomplete")
+    return result
+
+
+def bind_os_archives(folder, manifest, closure, packages):
+    from gpt_trace_transport.local_templates import safe
+    safe(folder, directory=True)
+    if (manifest.get("schema_version") != 1 or manifest.get("requested") != closure["requested"]
+            or manifest.get("artifacts") != {name: record for name, (_, record) in packages.items()}):
+        raise RuntimeError("completed OS manifest differs from signed APT closure")
+    if set(path.name for path in folder.glob("*.deb")) - packages.keys():
+        raise RuntimeError("unexpected OS archive in resolved closure")
+    for name, (source, _) in packages.items():
+        path = folder / name
+        if path.exists() or path.is_symlink():
+            safe(path)
+            if path.samefile(source):
+                continue
+        # Install the already authenticated inode, never trust a prior guest
+        # copy based only on its filename, size or claimed digest.
+        temporary = folder / (".apt-link-" + uuid.uuid4().hex)
+        try:
+            os.link(source, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    from gpt_trace_transport.local_templates import sync_directory
+    sync_directory(folder)
+
+
+def common_input_mode(image, expected, *, list_directory, read_json, legacy_ready):
+    if not image.exists():
+        return "bootstrap"
+    entries = list_directory(image, "/opt")
+    if "swe-gym-lite" not in entries:
+        return "bootstrap"
+    runtime = list_directory(image, "/opt/swe-gym-lite")
+    if Path(COMMON_INPUTS_COMPLETION).name in runtime:
+        if read_json(image, COMMON_INPUTS_COMPLETION) != expected:
+            raise RuntimeError("common input checkpoint differs from verified pool")
+        return "prepared"
+    if Path(COMMON_BOOTSTRAP_COMPLETION).name in runtime:
+        if read_json(image, COMMON_BOOTSTRAP_COMPLETION) != {**expected, "kind": "common-bootstrap"}:
+            raise RuntimeError("common bootstrap checkpoint differs from verified pool")
+        return "bootstrap-prepared"
+    if "miniconda3" in entries and legacy_ready():
+        return "resume-inputs" if "swe-gym-build" in entries else "legacy-prepared"
+    return "bootstrap"
+
+
 def copy_git_mirror(source, destination):
     """Keep all pinned Git objects, including commits not reachable from refs.
 
@@ -496,15 +617,24 @@ def _payload_batches(payload):
         yield entries
 
 
-def _inject_payload(image, payload, work, run):
+def _inject_payload(image, payload, work, run, *, completed_batches=0, checkpoint=None):
+    batches = list(_payload_batches(payload))
+    if type(completed_batches) is not int or not 0 <= completed_batches <= len(batches):
+        raise RuntimeError("invalid payload injection checkpoint")
     with tempfile.TemporaryDirectory(prefix=".guest-payload-", dir=work) as temporary:
         staging = Path(temporary)
         names, archive = staging / "names", staging / "payload.tar"
-        for batch in _payload_batches(payload):
+        for index, batch in enumerate(batches, start=1):
+            if index <= completed_batches:
+                continue
             names.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in batch))
             run("tar", "-C", str(payload.parent), "--no-recursion", "--null",
                 "--verbatim-files-from", "--files-from=" + str(names), "-cf", str(archive))
             run("virt-tar-in", "-a", str(image), str(archive), "/opt")
+            if checkpoint is not None:
+                with Path(image).open("rb") as disk:
+                    os.fsync(disk.fileno())
+                checkpoint(index, len(batches))
 
 
 
@@ -842,7 +972,7 @@ def build(args, *, progress=None):
             progress(stage, completed, total, unit, details)
     if os.geteuid() != 0:
         raise RuntimeError("local preparation requires the execution host root execution broker")
-    from workstation_broker.preparation import verify_worker_claim
+    from workstation_broker.preparation import verify_worker_claim, verify_published_inventory
     job = verify_worker_claim(args.operation_id)
     pool_compatibility = job["compatibility"]
     dependency_pool = BASE.parent / "dependency-pool" / "ready"
@@ -851,9 +981,12 @@ def build(args, *, progress=None):
     pool_inventory = dependency_pool / "inventory.json"
     if pool_inventory.is_symlink() or not pool_inventory.is_file():
         raise RuntimeError("verified dependency pool inventory is missing")
-    pool_record = json.loads(pool_inventory.read_bytes())
-    if pool_record.get("complete") is not True:
-        raise RuntimeError("dependency pool is not complete")
+    publication = job.get("publication_verified")
+    if (not isinstance(publication, dict) or publication.get("kind") != "download-only-pool"
+            or publication.get("complete") is not True or publication.get("pool_directory") != str(dependency_pool)):
+        raise RuntimeError("template construction requires a verified sealed pool publication")
+    pool_record = verify_published_inventory(dependency_pool, job, publication)
+    archives = PublishedPoolArchives(dependency_pool, pool_record)
     from workstation_broker.preparation_resources import source_container_arguments
     if (args.virtual_gib, args.free_space_gib) != (VIRTUAL_GIB, FREE_SPACE_GIB):
         raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
@@ -875,7 +1008,6 @@ def build(args, *, progress=None):
     job = {**job, "compatibility": installed, "pool_compatibility": pool_compatibility}
     repository_from_url = load_module("swe_gym_pool_repository", ROOT / "scripts/superbench_pool.py").github_repository
     tools = load_module("swe_gym_task_sources", GUEST.with_name("task_sources.py"))
-    os_tools = load_module("swe_gym_os_packages", GUEST.with_name("os_packages.py"))
     target_root = TEMPLATES / "swe-gym-lite"
     target_root.mkdir(mode=0o755, parents=True, exist_ok=True)
     from gpt_trace_transport.local_templates import safe
@@ -1017,7 +1149,7 @@ def build(args, *, progress=None):
         template_bundle_uploads = None
 
         def provision(image, boot, payload=None, *, network, completion=None,
-                      cache_disk=None, trim=True, serial_log=None, refresh_runtime=False):
+                      cache_disk=None, trim=True, serial_log=None, refresh_runtime=False, extra_uploads=()):
             nonlocal template_bundle_uploads
             if template_bundle_uploads is None:
                 template_bundle_uploads = template_bundle_upload_arguments(
@@ -1030,7 +1162,7 @@ def build(args, *, progress=None):
                 _inject_payload(image, payload, scratch_root, cmd)
             if refresh_runtime:
                 argv += runtime_upload_arguments()
-            cmd(*argv, *template_bundle_uploads, *template_golden_isolation_arguments(),
+            cmd(*argv, *extra_uploads, *template_bundle_uploads, *template_golden_isolation_arguments(),
                 "--firstboot", str(boot_file))
             memory_mb, vcpus = guest_resources()
             print(f"Execution host preparation VM: RAM={memory_mb} MiB, vCPUs={vcpus}, image={image.name}", flush=True)
@@ -1347,9 +1479,10 @@ def build(args, *, progress=None):
             # not an immutable snapshot ID. Resolve in one persistent resumable
             # resolver volume; never recreate it merely because a host copy-out
             # was interrupted.
-            closure_path = dependency_pool / "metadata/apt-closure.json"
-            rows = json.loads(closure_path.read_bytes())
-            closure_sha = digest(closure_path)
+            closure_relative = "metadata/apt-closure.json"
+            rows = archives.metadata(closure_relative)
+            closure_sha = archives.files[closure_relative]["sha256"]
+            apt_packages = published_apt_archives(archives, rows)
             status_sha = rows["golden_dpkg_status_sha256"]
             if SHA.fullmatch(status_sha) is None:
                 raise RuntimeError("invalid golden dpkg status identity in APT closure")
@@ -1359,11 +1492,8 @@ def build(args, *, progress=None):
             resolver_completion = {"schema": 2, "kind": "os-resolver",
                 "source_fingerprint": inputs["source_fingerprint"], "apt_closure_sha256": closure_sha}
             if (os_folder / "manifest.json").is_file():
-                os_manifest = json.loads((os_folder / "manifest.json").read_text())
-                os_tools.verify_artifacts(os_folder, os_manifest)
-                actual = {entry["sha256"] for entry in os_manifest["artifacts"].values()}
-                if actual != {entry["sha256"] for entry in rows["resolved"]}:
-                    raise RuntimeError("existing completed OS closure differs from current signed plan; preserved")
+                os_manifest = json.loads(safe(os_folder / "manifest.json").read_text())
+                bind_os_archives(os_folder, os_manifest, rows, apt_packages)
                 print("reused verified OS package closure", flush=True)
             else:
                 _purge_apt_partial(staged)
@@ -1396,23 +1526,9 @@ def build(args, *, progress=None):
                     shutil.copyfile(GUEST.with_name("os_packages.py"), os_payload / "os_packages.py")
                     artifact_root = os_payload / "artifacts"
                     artifact_root.mkdir()
-                    expected = {entry["sha256"]:entry for entry in rows["resolved"]}
-                    received = {}
-                    for archive in sorted((dependency_pool / "apt/archives").glob("*.deb")):
-                        sha = digest(archive)
-                        if sha not in expected:
-                            raise RuntimeError("unregistered OS artifact in dependency pool")
-                        entry = expected[sha]
-                        identity = os_tools.deb_identity(archive)
-                        if identity != {"package":entry["package"], "version":entry["version"],
-                                        "architecture":entry["architecture"]}:
-                            raise RuntimeError("resolved Kali archive identity mismatch")
-                        shutil.copyfile(archive, artifact_root / archive.name)
-                        received[sha] = {**identity,"sha256":sha,"size":archive.stat().st_size}
-                    if set(received) != set(expected):
-                        raise RuntimeError("host Kali package closure incomplete")
-                    packages = {name:received[digest(artifact_root / name)]
-                                for name in sorted(path.name for path in artifact_root.glob("*.deb"))}
+                    for name, (archive, _) in sorted(apt_packages.items()):
+                        os.link(archive, artifact_root / name)
+                    packages = {name: record for name, (_, record) in apt_packages.items()}
                     (artifact_root / "acquired.json").write_text(json.dumps({
                         "requested":rows["requested"], "artifacts":packages},sort_keys=True))
                     resolver_boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\n"
@@ -1427,102 +1543,124 @@ def build(args, *, progress=None):
                     # Host-side copy-out scratch only; the resolver QCOW2 is kept.
                     shutil.rmtree(os_parent)
                 os_parent.mkdir()
-                cmd("virt-copy-out", "-a", str(resolver), "/opt/swe-gym-os", str(os_parent))
-                os_manifest = json.loads((os_folder / "manifest.json").read_text())
-                os_tools.verify_artifacts(os_folder, os_manifest)
+                os_folder.mkdir()
+                os_manifest = guest_json(resolver, "/opt/swe-gym-os/manifest.json")
+                atomic_json(os_folder / "manifest.json", os_manifest)
+                bind_os_archives(os_folder, os_manifest, rows, apt_packages)
 
             # The OS closure is checked; APT's _apt-owned partial download
             # directory is neither a dependency nor a reusable checkpoint.
             _purge_apt_partial(staged)
-            payload = staged / "swe-gym-build"
-            _discard(payload)
-            payload.mkdir()
-            for name in ("runtime.py", "task_sources.py", "os_packages.py", "target_environment.py"):
-                shutil.copyfile(GUEST if name == "runtime.py" else GUEST.with_name(name), payload / name)
-            (payload / "environments.json").write_text(json.dumps({"environments": inputs["environments"]}, sort_keys=True))
-            lock_source = ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json"
-            if lock_source.is_symlink() or not lock_source.is_file():
-                raise RuntimeError("pinned Conda lock is missing from the build source")
-            shutil.copyfile(lock_source, payload / "conda-lock.json")
-            locked_pool = BASE.parent / "dependency-pool" / "ready" / "objects" / "sha256"
-            lock_payload = json.loads(lock_source.read_bytes())
-            verified_archives = {}
-
-            def verified_archive(sha):
-                if not isinstance(sha, str) or not SHA.fullmatch(sha):
-                    raise RuntimeError("invalid dependency pool archive identity")
-                source = safe(locked_pool / sha[:2] / sha, immutable=True)
-                if sha not in verified_archives:
-                    if digest(source) != sha:
-                        raise RuntimeError("dependency pool archive digest mismatch: " + sha)
-                    verified_archives[sha] = source.stat().st_size
-                return source
-
-            conda_root = payload / "conda-artifacts"
-            conda_root.mkdir()
-            for sha, artifact in sorted(lock_payload.get("artifacts", {}).items()):
-                filename = Path(str(artifact.get("url", ""))).name
-                if not filename or "/" in filename:
-                    raise RuntimeError("invalid locked Conda archive filename")
-                source = verified_archive(sha)
-                target = conda_root / sha / filename
-                target.parent.mkdir(parents=True)
-                os.link(source, target)
-            shutil.copytree(os_folder, payload / "os-artifacts", copy_function=os.link)
-            bootstrap = pool_record.get("provenance", {}).get("bootstrap", {}).get("miniconda-installer", [])
-            if MINICONDA_SHA256 not in bootstrap:
-                raise RuntimeError("Miniconda bootstrap absent from dependency pool")
-            os.link(verified_archive(MINICONDA_SHA256), payload / "miniconda.sh")
-
-            # Import verified wheel/sdist and npm bytes from the *same* pool
-            # that the unprivileged resolver produced. Builders never refetch.
-            package_root = payload / 'pip-artifacts'
-            package_root.mkdir()
-            filenames = {}
-            for path in sorted((dependency_pool / 'metadata').glob('pip-plan-*.json')):
-                plan = json.loads(path.read_bytes())
-                if plan.get('optional_failed'):
-                    continue
-                for row in plan['packages']:
-                    name, sha = row['filename'], row['sha256']
-                    if not isinstance(name,str) or name != Path(name).name or not SHA.fullmatch(sha):
-                        raise RuntimeError('invalid resolved Python artifact')
-                    old = filenames.setdefault(name,sha)
-                    if old != sha:
-                        raise RuntimeError('different Python artifacts share one immutable filename: '+name)
-            for name, sha in sorted(filenames.items()):
-                os.link(verified_archive(sha), package_root / name)
-            npm_root = payload / 'npm-artifacts'
-            npm_root.mkdir()
-            npm_shas = set()
-            for category, groups in pool_record.get('provenance', {}).items():
-                if category.startswith('npm'):
-                    for hashes in groups.values():
-                        npm_shas.update(hashes)
-            npm_urls = []
-            for url, sha in sorted(pool_record.get('url_index', {}).items()):
-                if sha not in npm_shas or urlparse(url).scheme != 'https':
-                    continue
-                dest = npm_root / sha
-                if not dest.exists():
-                    os.link(verified_archive(sha), dest)
-                npm_urls.append({'url':url,'sha256':sha})
-            if npm_shas - {row['sha256'] for row in npm_urls}:
-                raise RuntimeError('npm dependency has no recorded download URL')
-            (payload / 'npm-pool.json').write_text(json.dumps(npm_urls,sort_keys=True))
-            archive_provenance = common_archive_provenance(
-                lock_payload, filenames, npm_urls, verified_archives, MINICONDA_SHA256)
-            atomic_json(payload / "environment-cache-provenance.json", archive_provenance)
-
             report("Construction du template commun")
             common = staged / "common.qcow2"
             initial_common = not common.exists()
-            if initial_common:
-                overlay(common, BASE)
+            if not initial_common or common.is_symlink():
+                safe(common)
             common_completion = {"schema": 2, "kind": "common",
                 "template_abi": job["compatibility"]["template_abi"],
                 "source_fingerprint": inputs["source_fingerprint"]}
+            common_ready = not initial_common and completion_matches(common, COMMON_COMPLETION, common_completion)
+            input_completion = {**common_completion, "kind": "common-inputs",
+                "pool_manifest_sha256": publication["manifest_sha256"],
+                "apt_closure_sha256": closure_sha}
             marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
+            payload = staged / "swe-gym-build"
+            _discard(payload)
+
+            def archive_inputs():
+                lock_source = GUEST.with_name("conda-lock.json")
+                lock_bytes = lock_source.read_bytes()
+                if (lock_source.is_symlink() or hashlib.sha256(lock_bytes).hexdigest() !=
+                        pool_record["conda_lock_sha256"]):
+                    raise RuntimeError("pinned Conda lock differs from verified dependency pool")
+                lock_payload = json.loads(lock_bytes)
+                for sha in lock_payload["artifacts"]:
+                    archives.archive(sha)
+                bootstrap = pool_record["provenance"]["bootstrap"]["miniconda-installer"]
+                if MINICONDA_SHA256 not in bootstrap:
+                    raise RuntimeError("Miniconda bootstrap absent from dependency pool")
+                archives.archive(MINICONDA_SHA256)
+                filenames = {}
+                for relative in sorted(archives.files):
+                    if Path(relative).parent != Path("metadata") or not Path(relative).match("pip-plan-*.json"):
+                        continue
+                    plan = archives.metadata(relative)
+                    if plan.get("optional_failed"):
+                        continue
+                    for row in plan["packages"]:
+                        name, sha = row["filename"], row["sha256"]
+                        if not isinstance(name, str) or not name or name != Path(name).name:
+                            raise RuntimeError("invalid resolved Python artifact filename")
+                        if filenames.setdefault(name, sha) != sha:
+                            raise RuntimeError("different Python artifacts share one immutable filename: " + name)
+                        archives.archive(sha)
+                npm_shas = {sha for category, groups in pool_record["provenance"].items()
+                            if category.startswith("npm") for hashes in groups.values() for sha in hashes}
+                npm_urls = [{"url": url, "sha256": sha} for url, sha in sorted(pool_record["url_index"].items())
+                            if sha in npm_shas and urlparse(url).scheme == "https"]
+                if npm_shas != {row["sha256"] for row in npm_urls}:
+                    raise RuntimeError("npm dependency has no recorded download URL")
+                for sha in npm_shas:
+                    archives.archive(sha)
+                provenance = common_archive_provenance(lock_payload, filenames, npm_urls,
+                                                       archives.sizes, MINICONDA_SHA256)
+                return lock_source, lock_payload, filenames, npm_urls, provenance
+
+            def make_payload(mode, lock_source, lock_payload, filenames, npm_urls, provenance):
+                payload.mkdir()
+                if mode == "bootstrap":
+                    for name in ("runtime.py", "task_sources.py", "os_packages.py", "target_environment.py"):
+                        shutil.copyfile(GUEST if name == "runtime.py" else GUEST.with_name(name), payload / name)
+                    atomic_json(payload / "environments.json", {"environments": inputs["environments"]})
+                    shutil.copyfile(lock_source, payload / "conda-lock.json")
+                    conda_root = payload / "conda-artifacts"
+                    conda_root.mkdir()
+                    for sha, artifact in sorted(lock_payload["artifacts"].items()):
+                        filename = Path(str(artifact["url"])).name
+                        if not filename or filename in {".", ".."}:
+                            raise RuntimeError("invalid locked Conda archive filename")
+                        target = conda_root / sha / filename
+                        target.parent.mkdir(parents=True)
+                        os.link(archives.archive(sha), target)
+                    os_payload = payload / "os-artifacts"
+                    os_payload.mkdir()
+                    os.link(os_folder / "manifest.json", os_payload / "manifest.json")
+                    for name, (source, _) in sorted(apt_packages.items()):
+                        os.link(source, os_payload / name)
+                    os.link(archives.archive(MINICONDA_SHA256), payload / "miniconda.sh")
+                package_root = payload / "pip-artifacts"
+                package_root.mkdir()
+                for name, sha in sorted(filenames.items()):
+                    os.link(archives.archive(sha), package_root / name)
+                npm_root = payload / "npm-artifacts"
+                npm_root.mkdir()
+                for sha in sorted({row["sha256"] for row in npm_urls}):
+                    os.link(archives.archive(sha), npm_root / sha)
+                atomic_json(payload / "npm-pool.json", npm_urls)
+                atomic_json(payload / "environment-cache-provenance.json", provenance)
+
+            def common_marker(checkpoint):
+                return ("template_step common-input-sync sync\n"
+                        "/usr/bin/python3 - <<'PY_INPUTS'\nimport runpy\n"
+                        "runpy.run_path('/opt/swe-gym-lite/runtime.py')['commit_common_inputs'](" + repr(checkpoint) + ")\n"
+                        "PY_INPUTS\n")
+
+            input_marker = common_marker(input_completion)
+            bootstrap_marker = common_marker({**input_completion, "kind": "common-bootstrap"})
+            npm_boot = r'''
+/usr/bin/python3 - <<'PY_NPM'
+import runpy
+runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm'](cleanup=False)
+PY_NPM
+''' + input_marker
+            common_tail = r'''
+template_step remove-build-payload rm -rf /opt/swe-gym-build /opt/swe-gym-lite/npm-artifacts
+/usr/bin/python3 - <<'PY_GUEST'
+import runpy,json
+module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
+module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
+json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
+''' + marker_line + "PY_GUEST\n"
             boot = r'''
 mkdir -p /opt/swe-gym-lite
 cp /opt/swe-gym-build/runtime.py /opt/swe-gym-build/task_sources.py /opt/swe-gym-build/os_packages.py /opt/swe-gym-build/target_environment.py /opt/swe-gym-lite/
@@ -1538,90 +1676,137 @@ cp /opt/swe-gym-build/os-artifacts/manifest.json /opt/swe-gym-lite/os-manifest.j
 /usr/bin/python3 - <<'PY_GUEST'
 import runpy,json
 module=runpy.run_path('/opt/swe-gym-lite/os_packages.py')
-module['install']('/opt/swe-gym-build/os-artifacts',json.load(open('/opt/swe-gym-lite/os-manifest.json')))
+manifest=json.load(open('/opt/swe-gym-lite/os-manifest.json'))
+if module['installed']() != manifest['installed_after']:
+    module['install']('/opt/swe-gym-build/os-artifacts',manifest)
 PY_GUEST
 ''' + root_growth() + r'''
 test ! -e /opt/miniconda3
 template_step miniconda-bootstrap bash /opt/swe-gym-build/miniconda.sh -b -p /opt/miniconda3
-/usr/bin/python3 - <<'PY_NPM'
-import runpy
-runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
-PY_NPM
 cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
-template_step remove-build-payload rm -rf /opt/swe-gym-build
-/usr/bin/python3 - <<'PY_GUEST'
-import runpy,json
-module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
-module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
-json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
-''' + marker_line + r'''PY_GUEST
-'''
+''' + bootstrap_marker + npm_boot + common_tail
             boot_resume = r'''
 mkdir -p /opt/swe-gym-lite/caches/pip-index /opt/swe-gym-lite/npm-artifacts
 template_copy_files /opt/swe-gym-build/pip-artifacts /opt/swe-gym-lite/caches/pip-index
 template_copy_files /opt/swe-gym-build/npm-artifacts /opt/swe-gym-lite/npm-artifacts
 cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
-/usr/bin/python3 - <<'PY_NPM'
-import runpy
-runpy.run_path('/opt/swe-gym-lite/runtime.py')['seed_pool_npm']()
-PY_NPM
 cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
-template_step remove-build-payload rm -rf /opt/swe-gym-build
-/usr/bin/python3 - <<'PY_GUEST'
-import runpy,json
-module=runpy.run_path('/opt/swe-gym-lite/runtime.py')
-module['build_common'](json.load(open('/opt/swe-gym-lite/build-environments.json')))
-json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-validation.json','w'))
-''' + marker_line + r'''PY_GUEST
-'''
-            common_ready = completion_matches(common, COMMON_COMPLETION, common_completion)
-
-            def refresh_incomplete_common_runtime():
-                # Only incomplete common images are mutable. Refresh all helper
-                # files by their exact guest names so a resumed build never runs a
-                # stale runtime inherited from an earlier checkout.
-                original_mode = stat.S_IMODE(common.stat().st_mode)
-                common.chmod(0o600)
-                try:
-                    cmd("virt-customize", "--no-network", "-a", str(common),
-                        "--run-command", "mkdir -p /opt/swe-gym-lite",
-                        *runtime_upload_arguments())
-                    for source, guest_path in (
-                            (GUEST, "/opt/swe-gym-lite/runtime.py"),
-                            (GUEST.with_name("task_sources.py"), "/opt/swe-gym-lite/task_sources.py"),
-                            (GUEST.with_name("os_packages.py"), "/opt/swe-gym-lite/os_packages.py")):
-                        updated = subprocess.check_output(["virt-cat", "-a", str(common), guest_path], timeout=180)
-                        if hashlib.sha256(updated).hexdigest() != digest(source):
-                            raise RuntimeError("common helper update did not verify: " + guest_path)
-                finally:
-                    common.chmod(original_mode)
-
+''' + bootstrap_marker + npm_boot + common_tail
             if common_ready:
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout())
                 print("reused verified complete immutable common QCOW2", flush=True)
             else:
-                # A generic base-image marker is never accepted as common proof.
-                # Resume verified Conda checkpoints in-place; otherwise reset only
-                # incomplete guest directories, never the QCOW2 volume itself.
-                has_conda = (not initial_common and subprocess.run(
-                    ["virt-cat", "-a", str(common), "/opt/miniconda3/bin/conda"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode == 0)
-                if has_conda:
-                    refresh_incomplete_common_runtime()
+                lock_source, lock_payload, filenames, npm_urls, archive_provenance = archive_inputs()
+
+                def guest_directory(image, path):
+                    return set(capture("virt-ls", "-a", str(image), path).decode().splitlines())
+
+                def legacy_inputs_ready():
+                    # Previous builders removed their staging payload only after
+                    # APT, Miniconda, all archive copies and npm seeding succeeded.
+                    # Require a committed environment as independent evidence
+                    # that execution entered build_common after that boundary.
+                    runtime = guest_directory(common, "/opt/swe-gym-lite")
+                    if "environments" not in runtime:
+                        return False
+                    first = min(inputs["environments"])
+                    files = guest_directory(common, "/opt/swe-gym-lite/environments")
+                    if not {first + ".json", first + ".recipe.json"} <= files:
+                        if any(name.endswith(".recipe.json") for name in files):
+                            raise RuntimeError("historical Conda checkpoint sequence incomplete; preserved")
+                        return False
+                    expected = {"lock_sha256": pool_record["conda_lock_sha256"],
+                                "transactions": len(lock_payload["environments"][first]["transactions"])}
+                    if (guest_json(common, "/opt/swe-gym-lite/environments/" + first + ".recipe.json") != expected
+                            or guest_json(common, "/opt/swe-gym-lite/build-environments.json") != {"environments": inputs["environments"]}
+                            or hashlib.sha256(capture("virt-cat", "-a", str(common), "/opt/swe-gym-lite/conda-lock.json")).hexdigest() != pool_record["conda_lock_sha256"]
+                            or guest_json(common, "/opt/swe-gym-lite/os-manifest.json") != os_manifest
+                            or guest_json(common, "/opt/swe-gym-lite/npm-pool.json") != npm_urls
+                            or guest_directory(common, "/opt/swe-gym-lite/caches/pip-index") != set(filenames)
+                            or not set(lock_payload["artifacts"]) <= guest_directory(common, "/opt/swe-gym-lock")):
+                        raise RuntimeError("historical common input checkpoint differs; preserved")
+                    if "environment-cache-provenance.json" in runtime:
+                        prior_provenance = guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json")
+                        if prior_provenance.get("kind") == "verified-input-archives" and prior_provenance != archive_provenance:
+                            raise RuntimeError("historical archive provenance differs; preserved")
+                    return True
+
+                mode = common_input_mode(common, input_completion, list_directory=guest_directory,
+                                         read_json=guest_json, legacy_ready=legacy_inputs_ready)
+                uploads = ()
+                if mode in {"prepared", "legacy-prepared", "bootstrap-prepared"}:
+                    if mode != "legacy-prepared":
+                        if guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json") != archive_provenance:
+                            raise RuntimeError("common input provenance differs from verified pool")
+                    else:
+                        provenance_file = scratch_root / "common-archive-provenance.json"
+                        atomic_json(provenance_file, archive_provenance)
+                        uploads = ("--upload", str(provenance_file) + ":/opt/swe-gym-lite/environment-cache-provenance.json")
+                    print("resuming common after completed archive integration: " + mode, flush=True)
+                    selected_boot = ({"legacy-prepared": input_marker, "prepared": "",
+                                      "bootstrap-prepared": npm_boot}[mode]) + common_tail
+                    selected_payload = None
                 else:
-                    if not initial_common:
+                    if initial_common:
+                        overlay(common, BASE)
+                    image_info = common.stat()
+                    injection_identity = {"inputs": input_completion,
+                        "image": [image_info.st_dev, image_info.st_ino],
+                        "runtime": {path.name: digest(path) for path in
+                                    (GUEST, GUEST.with_name("task_sources.py"), GUEST.with_name("os_packages.py"),
+                                     GUEST.with_name("target_environment.py"))},
+                        "layout": digest(Path(__file__))}
+                    injection_name = "common-payload-injected.json"
+                    injected = read_checkpoint(injection_name)
+                    guest_payload_present = not initial_common and "swe-gym-build" in guest_directory(common, "/opt")
+                    same_injection = (isinstance(injected, dict) and injected.get("identity") == injection_identity
+                                      and guest_payload_present)
+                    if same_injection:
+                        if (type(injected.get("completed")) is not int or type(injected.get("total")) is not int
+                                or not 0 < injected["completed"] <= injected["total"]
+                                or injected.get("mode") not in {"bootstrap", "resume-inputs"}):
+                            raise RuntimeError("invalid persisted common injection checkpoint")
+                        injection_mode = injected["mode"]
+                        if mode == "bootstrap" and injection_mode != "bootstrap":
+                            raise RuntimeError("common bootstrap checkpoint lost its installed prerequisites")
+                    else:
+                        injection_mode = mode
+                    if not same_injection or injected["completed"] != injected["total"]:
+                        make_payload(injection_mode, lock_source, lock_payload, filenames, npm_urls, archive_provenance)
+                        batch_count = sum(1 for _ in _payload_batches(payload))
+                        if same_injection and injected["total"] != batch_count:
+                            raise RuntimeError("common injection batch layout changed")
+                        if not same_injection and guest_payload_present:
+                            cmd("virt-customize", "--no-network", "-a", str(common),
+                                "--run-command", "rm -rf /opt/swe-gym-build")
+                        def record_batch(completed, total):
+                            write_checkpoint(injection_name, {"identity": injection_identity, "mode": injection_mode,
+                                                              "completed": completed, "total": total})
+                        common.chmod(0o600)
+                        _inject_payload(common, payload, scratch_root, cmd,
+                            completed_batches=injected["completed"] if same_injection else 0,
+                            checkpoint=record_batch)
+                        shutil.rmtree(payload)
+                    else:
+                        print("reused completely injected common payload", flush=True)
+                    if mode == "bootstrap" and not initial_common:
+                        # Before the first successful Miniconda bootstrap there
+                        # cannot be an environment checkpoint. Keep staged input
+                        # archives, and clear only the uncommitted runtime prefix.
                         cmd("virt-customize", "--no-network", "-a", str(common),
-                            "--run-command", "rm -rf /opt/miniconda3 /opt/swe-gym-lite /opt/swe-gym-build")
-                    print("resuming incomplete common QCOW2 in place before Miniconda checkpoint", flush=True)
+                            "--run-command", "rm -rf /opt/miniconda3 /opt/swe-gym-lite")
+                    selected_payload = None
+                    selected_boot = boot if mode == "bootstrap" else boot_resume
+                    print("resuming common input stage: " + mode, flush=True)
+                common.chmod(0o600)
                 try:
-                    provision(common, boot_resume if has_conda else boot,
-                              payload, network=False,
-                              completion=(COMMON_COMPLETION, common_completion))
+                    provision(common, selected_boot, selected_payload, network=False,
+                              completion=(COMMON_COMPLETION, common_completion),
+                              refresh_runtime=mode != "bootstrap", extra_uploads=uploads)
                 except RuntimeError as exc:
                     if _transient_failure(exc):
                         raise RecoverableBuildError("transient guest download; common checkpoint retained: " + str(exc)) from exc
                     raise
-            shutil.rmtree(payload)
             common.chmod(0o444)
             environments = {key: guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json") for key in inputs["environments"]}
             common_cache = guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json")
@@ -2054,7 +2239,7 @@ json.dump(module['validate_isolation'](),open('/opt/swe-gym-lite/isolation-valid
                 "miniconda": {"installer": MINICONDA, "sha256": MINICONDA_SHA256},
                 "capacity": {"virtual_gib": args.virtual_gib, "free_space_gib": args.free_space_gib},
                 "resolved_os": os_manifest, "environments": environments,
-                "dependency_pool": {"inventory_sha256": digest(pool_inventory),
+                "dependency_pool": {"inventory_sha256": publication["manifest_sha256"],
                                      "operation_id": pool_record.get("operation_id"),
                                      "objects": len(pool_record.get("objects", {}))},
                 "environment_downloads_sha256": digest(audit / 'environment-downloads.json'),
