@@ -54,7 +54,8 @@ def run(*args, cwd=None, env=None, input=None):
 
 
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
-BUILDER_WHEEL_STORE = Path("/opt/swe-gym-task/wheel-cas")
+TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
+BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
 TASK_RUNTIME_SCHEMA = 4
 
 
@@ -352,7 +353,7 @@ def setup_commands(item, destination, prefix):
 
 def seed_pool_vcs(item):
     """Use only host-fetched, SHA-pinned Git mirrors during task warm-up."""
-    index = Path('/opt/swe-gym-task/vcs-index.json')
+    index = TASK_INPUT_ROOT / "vcs-index.json"
     if not index.is_file() or index.is_symlink():
         raise RuntimeError('host-fetched task VCS index was not staged')
     rows = json.loads(index.read_text())
@@ -360,6 +361,7 @@ def seed_pool_vcs(item):
         raise RuntimeError('invalid host-fetched VCS index')
     root = ROOT / 'caches/git'
     root.mkdir(parents=True, exist_ok=True)
+    mappings = []
     for record in rows:
         if set(record) != {'url', 'commit', 'archive'}:
             raise RuntimeError('invalid staged VCS record')
@@ -370,7 +372,7 @@ def seed_pool_vcs(item):
                 not re.fullmatch(r'[a-f0-9]{40}', commit) or
                 not re.fullmatch(r'[0-9a-f]{64}\.git', relative)):
             raise RuntimeError('untrusted staged VCS identity')
-        source = Path('/opt/swe-gym-task/vcs') / relative
+        source = (TASK_INPUT_ROOT / "vcs") / relative
         if source.is_symlink() or not source.is_dir():
             raise RuntimeError('missing staged Git mirror')
         if run('git','--git-dir',str(source),'cat-file','-t',commit).decode().strip() != 'commit':
@@ -385,9 +387,16 @@ def seed_pool_vcs(item):
         run('git','--git-dir',str(target),'symbolic-ref','HEAD','refs/heads/frozen')
         # Rewrite only a fully qualified repository URL. The sandbox can never
         # contact GitHub from warm or replay, even if a recipe makes a mistake.
-        for variant in (url, url.removesuffix('.git'), url.removesuffix('.git')+'.git'):
-            run('git','config','--global','--add','url.file://' + str(target) + '.insteadOf',variant)
-    run('git','config','--global','protocol.file.allow','always')
+        for variant in sorted({url, url.removesuffix('.git'), url.removesuffix('.git') + '.git'}):
+            mappings.append(("url.file://" + str(target) + ".insteadOf", variant))
+    config = ROOT / "attempt-vcs.gitconfig"
+    with tempfile.TemporaryDirectory(prefix=".vcs-config-", dir=ROOT) as directory:
+        staged = Path(directory) / config.name
+        staged.write_text('[protocol "file"]\n\tallow = always\n')
+        for key, variant in mappings:
+            run("git", "config", "--file", str(staged), "--add", key, variant)
+        os.replace(staged, config)
+    os.environ["GIT_CONFIG_GLOBAL"] = str(config)
 
 
 def seed_pool_npm(*, cleanup=True):

@@ -86,7 +86,6 @@ MEMORY_RESERVE_MB = int(_CONTROLS["memory_reserve_mb"])
 MEMORY_MIN_MB = int(_CONTROLS["memory_min_mb"])
 MEMORY_CAP_MB = int(_CONTROLS["memory_cap_mb"])
 VCPU_CAP = int(_CONTROLS["vcpu_cap"])
-SWAP_GIB = int(_CONTROLS["swap_gib"])
 FREE_SPACE_GIB = int(_CONTROLS["free_space_gib"])
 ROOT_MIN_GIB = int(_CONTROLS["root_min_gib"])
 
@@ -748,13 +747,13 @@ def verify_sources(inputs, mirrors):
 
 
 def firstboot(body, *, trim=True, shared_warm_cache=False):
-    # Disposable configured swap inside the QCOW2 overlay prevents guest OOM.
     # Task scratch overlays are truncated/recreated between tasks, so fstrim on
     # every warm task only burns HDD time; permanent common/repo images still trim.
     trim_step = r'''
-        elif ! template_step filesystem-trim fstrim -av; then
-            echo 'failed to reclaim temporary guest swap blocks'
-            rc=1
+    if [ "$rc" -eq 0 ] && ! template_step filesystem-trim fstrim -av; then
+        echo 'failed to trim template filesystem'
+        rc=1
+    fi
 ''' if trim else ""
     cache_setup = r'''
 test -b /dev/vdb
@@ -801,21 +800,11 @@ template_copy_files() {
         template_step copy-build-input cp -a "$item" "$dest/" || return "$?"
     done
 }
-SWAP_FILE=/root/.gpt-trace-swe-gym-build.swap
 WARM_CACHE_MOUNT=
 finish() {
     rc=$?
     trap - EXIT
-    if [ "$rc" -eq 0 ]; then
-        if ! template_step swap-disable swapoff "$SWAP_FILE"; then
-            echo 'failed to disable temporary guest swap'
-            rc=1
-        elif ! rm -f "$SWAP_FILE"; then
-            echo 'failed to remove temporary guest swap'
-            rc=1
-""" + trim_step + """        fi
-    fi
-    if test -n "$WARM_CACHE_MOUNT" && mountpoint -q "$WARM_CACHE_MOUNT"; then
+""" + trim_step + """    if test -n "$WARM_CACHE_MOUNT" && mountpoint -q "$WARM_CACHE_MOUNT"; then
         if ! template_step warm-cache-sync sync -f "$WARM_CACHE_MOUNT"; then
             rc=1
         fi
@@ -840,22 +829,18 @@ finish() {
 trap finish EXIT
 template_step reset-completion rm -f /etc/gpt-trace-image-build-complete /etc/gpt-trace-image-build-failed
 template_step stop-desktop systemctl stop --no-block gpt-trace-workstation-agent.service display-manager.service 2>/dev/null || true
-test ! -L "$SWAP_FILE"
-if test -e "$SWAP_FILE"; then
-    test -f "$SWAP_FILE"
-    test "$(stat -c %u:%a "$SWAP_FILE")" = "0:600"
-    test "$(stat -c %s "$SWAP_FILE")" = "__SWAP_BYTES__"
-else
-    template_step swap-reserve fallocate -l __SWAP_GIB__G "$SWAP_FILE"
-    chmod 600 "$SWAP_FILE"
-    template_step swap-format mkswap "$SWAP_FILE"
+if [ "$(wc -l </proc/swaps)" -gt 1 ]; then
+    template_step swap-disable swapoff -a
 fi
-template_step swap-enable swapon "$SWAP_FILE"
-echo 'temporary guest build swap enabled: __SWAP_GIB__ GiB'
+legacy_swap=/root/.gpt-trace-swe-gym-build.swap
+test ! -L "$legacy_swap"
+if test -e "$legacy_swap"; then
+    test -f "$legacy_swap"
+    test "$(stat -c %u:%a "$legacy_swap")" = "0:600"
+    template_step remove-legacy-swap rm -- "$legacy_swap"
+fi
 """ + cache_setup + body + "\n"
-    return (script.replace("__SWAP_BYTES__", str(SWAP_GIB * 1024**3))
-            .replace("__SWAP_GIB__", str(SWAP_GIB))
-            .replace("__TEMPLATE_SECONDS__", str(_versioned_host_subprocess_timeout())))
+    return script.replace("__TEMPLATE_SECONDS__", str(_versioned_host_subprocess_timeout()))
 
 def root_growth():
     # cloud-guest-utils comes from the verified, locally staged .deb closure.
@@ -1278,7 +1263,12 @@ def build(args, *, progress=None):
             body = "\n".join(lines) + "\n"
             wrapped = "/usr/bin/python3 - <<'PY_GUEST'\ntry:\n"
             wrapped += "".join("    " + line + "\n" for line in body.splitlines())
-            wrapped += "except BaseException as exc:\n    raise RuntimeError(type(exc).__name__ + ': ' + str(exc)[:3000]) from None\nPY_GUEST\n"
+            wrapped += ("except BaseException as exc:\n"
+                        "    detail = getattr(exc, 'stderr', None)\n"
+                        "    if isinstance(detail, bytes): detail = detail.decode(errors='replace')\n"
+                        "    message = type(exc).__name__ + ': ' + str(exc)[:1000]\n"
+                        "    if detail: message += '\\n' + str(detail)[-2000:]\n"
+                        "    raise RuntimeError(message) from None\nPY_GUEST\n")
             return wrapped, completion
 
 
