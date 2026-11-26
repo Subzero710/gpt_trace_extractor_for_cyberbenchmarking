@@ -6,7 +6,6 @@ import inspect
 import json
 import os
 import subprocess
-import shutil
 from pathlib import Path
 
 import pytest
@@ -38,7 +37,9 @@ def deb(tmp_path):
     output = tmp_path / "codex-template-test_1.0-1_all.deb"
     subprocess.run(["dpkg-deb", "--build", str(folder), str(output)], env={**os.environ,"TMPDIR":str(tmp_path)}, check=True, capture_output=True)
     record = {**os_packages.deb_identity(output), "sha256": os_packages.digest(output), "size": output.stat().st_size}
-    return output, {"schema_version": 1, "artifacts": {output.name: record}, "installed_before": {}, "installed_after": {}}
+    installed = {record["package"]: {key: record[key] for key in ("version", "architecture")}}
+    return output, {"schema_version": 1, "requested": [record["package"]],
+                    "artifacts": {output.name: record}, "installed_before": {}, "installed_after": installed}
 
 
 @pytest.mark.parametrize("attack", ["missing", "bytes", "size", "metadata", "symlink"])
@@ -58,7 +59,8 @@ def test_resolved_debs_fail_closed_on_any_mutation(deb, tmp_path, attack):
 def test_common_os_replay_has_no_network_or_package_resolution(deb, monkeypatch):
     path, manifest = deb
     os_packages.verify_artifacts(path.parent, manifest)
-    monkeypatch.setattr(os_packages, "installed", lambda: {})
+    inventories = iter([manifest["installed_before"], manifest["installed_after"]])
+    monkeypatch.setattr(os_packages, "installed", lambda: next(inventories))
     calls = []
     original_run = subprocess.run
     monkeypatch.setattr(os_packages.subprocess, "run", lambda args, **kw: calls.append(args) if args[0] == "unshare" else original_run(args, **kw))
@@ -76,33 +78,40 @@ def test_os_replay_rejects_wrong_golden_or_result_inventory(deb, monkeypatch):
     monkeypatch.setattr(os_packages, "installed", lambda: {"wrong": {"version": "1", "architecture": "all"}})
     with pytest.raises(RuntimeError, match="golden"):
         os_packages.install(path.parent, manifest)
-    calls = iter([{}, {"new": {"version": "2", "architecture": "all"}}])
+    calls = iter([{}, {**manifest["installed_after"], "new": {"version": "2", "architecture": "all"}}])
     monkeypatch.setattr(os_packages, "installed", lambda: next(calls))
     original_run = subprocess.run
     monkeypatch.setattr(os_packages.subprocess, "run", lambda args, **kw: None if args[0] == "unshare" else original_run(args, **kw))
     with pytest.raises(RuntimeError, match="inventory"):
         os_packages.install(path.parent, manifest)
+    calls = iter([{}, {}])
+    with pytest.raises(RuntimeError, match="omitted requested packages"):
+        os_packages.install(path.parent, manifest)
 
 
 def test_two_phase_resolution_preserves_real_deb_bytes_and_exact_inventory(deb, tmp_path, monkeypatch):
-    artifact, _ = deb
+    artifact, fixture = deb
     output = tmp_path / "resolved"
-    state = iter([{}, {}, {"codex-template-test":{"version":"1.0-1","architecture":"all"}}])
-    monkeypatch.setattr(os_packages,"installed",lambda:next(state))
-    monkeypatch.setattr(os_packages,"PACKAGES",("codex-template-test",))
-    monkeypatch.setattr(os_packages,"repository_metadata",lambda:{"signed-apt-index":{"sha256":"a"*64,"size":10}})
+    evidence = {"requested": fixture["requested"], "artifacts": fixture["artifacts"],
+                "repository_metadata": {"signed-apt-index": {"sha256": "a" * 64, "size": 10}}}
+    (artifact.parent / "acquired.json").write_text(json.dumps(evidence))
+    state = iter([fixture["installed_before"], fixture["installed_before"], fixture["installed_after"]])
+    monkeypatch.setattr(os_packages, "installed", lambda: next(state))
     calls, original = [], subprocess.run
     def run(args, **kwargs):
-        if args[0] not in {"apt-get","unshare"}: return original(args, **kwargs)
+        if args[0] == "apt-get":
+            pytest.fail("guest must not run online APT resolution")
+        if args[0] != "unshare":
+            return original(args, **kwargs)
         calls.append(args)
-        if "--download-only" in args: shutil.copyfile(artifact, output / artifact.name)
-    monkeypatch.setattr(os_packages.subprocess,"run",run)
-    manifest = os_packages.resolve(output)
-    assert calls[0] == ["apt-get","update"]
-    assert "--download-only" in calls[1] and "--reinstall" in calls[1]
-    assert calls[2][:3] == ["unshare","--net","apt-get"] and "--no-download" in calls[2]
-    assert "upgrade" not in {arg for call in calls for arg in call}
-    assert manifest["artifacts"][artifact.name]["sha256"] == os_packages.digest(artifact)
+    monkeypatch.setattr(os_packages.subprocess, "run", run)
+    manifest = os_packages.resolve_from_pool(output, artifact.parent)
+    assert len(calls) == 1
+    assert calls[0][:3] == ["unshare", "--net", "apt-get"]
+    assert "--no-download" in calls[0] and "--no-remove" in calls[0]
+    assert str(output / artifact.name) in calls[0]
+    assert not {"update", "upgrade", "--download-only"}.intersection(calls[0])
+    assert manifest == {**fixture, "repository_metadata": evidence["repository_metadata"]}
     assert (output / artifact.name).read_bytes() == artifact.read_bytes()
     assert json.loads((output / "manifest.json").read_text()) == manifest
 
@@ -162,7 +171,10 @@ def test_common_recipe_never_runs_floating_apt_or_builds_task_sources():
     common = inspect.getsource(guest_runtime.build_common)
     assert "apt-get" not in common
     assert "warm_task" not in common and "builder-mirrors" not in common
-    assert "upgrade" not in inspect.getsource(os_packages.resolve)
+    assert not hasattr(os_packages, "resolve")
+    assert not hasattr(os_packages, "PACKAGES")
+    assert "upgrade" not in inspect.getsource(os_packages.resolve_from_pool)
+    assert "--no-download" in inspect.getsource(os_packages.install)
     builder_source = inspect.getsource(builder.build)
     assert builder_source.index("generation = generation_identity(resolved)") > builder_source.index("qemu-img\", \"check")
     assert "builder-mirrors" not in builder_source

@@ -82,7 +82,7 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertEqual(self.builder.warm_cache_gib(self.builder.VIRTUAL_GIB), 128)
         source = (ROOT / "scripts/build_local_templates.py").read_text()
         self.assertIn("recovering completed work from interrupted task warm scratch", source)
-        self.assertIn("module['warm_task'](item,artifact)", source)
+        self.assertIn("module['warm_task'](item,artifact,common_identity=", source)
         self.assertNotIn("module['replay_task'](item,artifact,cache)", source)
         self.assertIn('prepared_setup_proof(item, cache_record)', source)
         self.assertIn('audit / "prepared-setups.json"', source)
@@ -119,11 +119,18 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         contract = local.template_contract(ROOT)
         self.assertEqual(contract["task_runtime_schema"], local.TASK_RUNTIME_SCHEMA)
 
-    def test_package_capture_prefers_built_wheels_and_uses_all_four_guest_cpus(self):
+    def test_package_capture_requires_built_wheels_and_uses_all_four_guest_cpus(self):
         source = (ROOT / "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py").read_text()
         self.assertIn('workers = max(1, min(4, os.cpu_count() or 1))', source)
-        self.assertIn('"pip", "wheel", "--no-deps"', source)
-        self.assertIn('"pip", "download", "--no-deps"', source)
+        tree = ast.parse(source)
+        capture = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == '_capture_install_artifacts')
+        commands = [n for n in ast.walk(capture) if isinstance(n, (ast.Tuple, ast.List))]
+        def arguments(node):
+            return [n.value for n in node.elts if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        self.assertTrue(any({'pip', 'wheel', '--no-deps', '--no-index'} <= set(arguments(n))
+                            for n in commands))
+        self.assertFalse(any({'pip', 'download'} <= set(arguments(n)) for n in commands))
 
 
 class WheelCacheFormatTests(unittest.TestCase):

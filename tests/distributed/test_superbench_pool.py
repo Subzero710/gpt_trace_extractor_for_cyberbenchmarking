@@ -2494,8 +2494,10 @@ class TestPublicationRecovery(unittest.TestCase):
         tree = ast.parse(source)
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'PreparationManager')
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == '_reconcile')
-        verifier = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                        and node.name == 'verify_published_inventory')
+        dependencies = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name in {'verify_published_inventory', '_retired_pool', 'identifier'}]
+        self.assertEqual({node.name for node in dependencies},
+                         {'verify_published_inventory', '_retired_pool', 'identifier'})
         class Scope:
             @staticmethod
             def members(state): return []
@@ -2503,8 +2505,8 @@ class TestPublicationRecovery(unittest.TestCase):
             def close(state): return state
         namespace = {'JobScope': Scope, 'TERMINAL': {'ready','failed','canceled','interrupted'},
                      'RuntimeError': RuntimeError, 'Path': Path, 'json': json, 'hashlib': hashlib,
-                     'safe': lambda path, **kwargs: Path(path)}
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[verifier, method], type_ignores=[])),
+                     'safe': lambda path, **kwargs: Path(path), 'SHA': pool.SHA}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[*dependencies, method], type_ignores=[])),
                      str(ROOT / 'apps/workstation-broker/src/workstation_broker/preparation.py'), 'exec'), namespace)
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp) / 'golden.qcow2'; base.write_bytes(b'unrelated')

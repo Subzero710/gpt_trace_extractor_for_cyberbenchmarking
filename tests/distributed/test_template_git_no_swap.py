@@ -75,11 +75,23 @@ def test_firstboot_never_allocates_or_enables_swap(trim, shared):
 def test_task_boot_preserves_native_stderr():
     tree = ast.parse((ROOT / 'scripts/build_local_templates.py').read_text())
     node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'task_boot')
-    namespace = {'TASK_RUNTIME_SCHEMA': builder.TASK_RUNTIME_SCHEMA, 'TASK_COMPLETION': builder.TASK_COMPLETION}
+    golden = hashlib.sha256(b'fixture golden').hexdigest()
+    pool_manifest = hashlib.sha256(b'fixture pool manifest').hexdigest()
+    namespace = {'TASK_RUNTIME_SCHEMA': builder.TASK_RUNTIME_SCHEMA, 'TASK_COMPLETION': builder.TASK_COMPLETION,
+                 'job': {'compatibility': {'golden_sha256': golden}},
+                 'publication': {'manifest_sha256': pool_manifest},
+                 'digest': builder.digest, 'GUEST': builder.GUEST}
     exec(compile(ast.Module(body=[node], type_ignores=[]), '<task_boot>', 'exec'), namespace)
     script, _ = namespace['task_boot']({'instance_id': 'sample'}, {}, mode='warm')
     python = script.split("<<'PY_GUEST'\n", 1)[1].rsplit('\nPY_GUEST', 1)[0]
     compile(python, '<guest>', 'exec')
+    warm_calls = [call for call in ast.walk(ast.parse(python)) if isinstance(call, ast.Call)
+                  and isinstance(call.func, ast.Subscript) and isinstance(call.func.slice, ast.Constant)
+                  and call.func.slice.value == 'warm_task']
+    assert len(warm_calls) == 1
+    identity = next(kw.value for kw in warm_calls[0].keywords if kw.arg == 'common_identity')
+    assert ast.literal_eval(identity) == {'golden_sha256': golden, 'pool_manifest_sha256': pool_manifest,
+                                          'runtime_sha256': builder.digest(builder.GUEST)}
     handler = python[python.index('except BaseException as exc:'):]
     with pytest.raises(RuntimeError, match=r'fatal: \$HOME not set'):
         exec('try:\n    raise subprocess.CalledProcessError(128, ["git"], stderr=b"fatal: $HOME not set")\n' + handler,

@@ -64,4 +64,4 @@ def test_worker_budget_callback_uses_sealed_policy_and_live_rx(monkeypatch, caps
     with pytest.raises(SystemExit) as error:
         check(limit)
     assert error.value.code == FETCH_BUDGET_EXIT_CODE
-    assert 'planned Pip download exceeds fetch budget' in capsys.readouterr().err
+    assert 'planned archive download exceeds fetch budget' in capsys.readouterr().err
