@@ -94,6 +94,16 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path, monk
             return status
         return original_check_output(command, **kwargs)
     monkeypatch.setattr(jobs.subprocess, "check_output", read_status)
+    original_run = jobs.subprocess.run
+    header_archive = b"fixture header tar"
+    def export_headers(command, **kwargs):
+        if command[0] == "guestfish":
+            assert command[:-1] == ["guestfish", "--ro", "--format=qcow2", "-a", str(manager.base),
+                                    "-i", "tar-out", "/usr/include"]
+            Path(command[-1]).write_bytes(header_archive)
+            return subprocess.CompletedProcess(command, 0)
+        return original_run(command, **kwargs)
+    monkeypatch.setattr(jobs.subprocess, "run", export_headers)
     original_identity = jobs.golden_dependency_identity
     jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
     try:
@@ -131,6 +141,8 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path, monk
     assert stat.S_IMODE(staged_dependency.stat().st_mode) == 0o444
     assert (source_root / "golden-dpkg-status").read_bytes() == status
     assert stat.S_IMODE((source_root / "golden-dpkg-status").stat().st_mode) == 0o444
+    assert (source_root / "golden-include.tar").read_bytes() == header_archive
+    assert stat.S_IMODE((source_root / "golden-include.tar").stat().st_mode) == 0o444
     assert stat.S_IMODE(source_root.stat().st_mode) == 0o555
 
 

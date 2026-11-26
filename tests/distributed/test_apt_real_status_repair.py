@@ -93,20 +93,25 @@ def test_offline_options_override_signed_sources_and_lists_with_real_apt(tmp_pat
 
 
 def compatibility(old):
-    digest = broker._APT_REPAIR_PREDECESSOR if old else broker._APT_REPAIR_SUCCESSOR
-    return {'fetcher_sha256': digest, 'fetch_sources': {'scripts/superbench_pool.py': digest,
-            'other': 'unchanged'}, 'golden_dependency': {'same': True}, 'pool_schema': 4}
+    key = 'scripts/superbench_pool.py'
+    changed = ('shared/gpt_trace_transport/local_templates.py',
+               'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py')
+    digest = broker._APT_REPAIR_SUCCESSOR if old else hashlib.sha256((ROOT / key).read_bytes()).hexdigest()
+    sources = {key: digest, 'other': 'unchanged', **{name: 'old' if old else 'new' for name in changed}}
+    if not old:
+        sources.update({'scripts/native_requirements.py': 'native',
+                        'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py': 'upstream'})
+    return {'fetcher_sha256': digest, 'fetch_sources': sources,
+            'golden_dependency': {'same': True}, 'pool_schema': 4}
 
 
 def test_repair_is_bound_to_exact_transition():
     old, new = compatibility(True), compatibility(False)
-    assert broker._apt_repair_compatible(old, new)
-    assert not broker._apt_repair_compatible(new, old)
-    assert not broker._apt_repair_compatible(old, {**new, 'pool_schema': 5})
-    assert not broker._apt_repair_compatible(old, {**new, 'fetch_sources': {**new['fetch_sources'], 'other': 'changed'}})
-    assert not broker._apt_repair_compatible(old, {**new, 'fetcher_sha256': 'f' * 64,
-        'fetch_sources': {**new['fetch_sources'], 'scripts/superbench_pool.py': 'f' * 64}})
-    assert hashlib.sha256((ROOT / 'scripts/superbench_pool.py').read_bytes()).hexdigest() == broker._APT_REPAIR_SUCCESSOR
+    assert broker._native_apt_repair_compatible(old, new)
+    assert not broker._native_apt_repair_compatible(new, old)
+    assert not broker._native_apt_repair_compatible(old, {**new, 'pool_schema': 5})
+    assert not broker._native_apt_repair_compatible(old, {**new, 'fetch_sources': {**new['fetch_sources'], 'other': 'changed'}})
+    assert not broker._native_apt_repair_compatible(old, {**new, 'fetcher_sha256': 'f' * 64})
 
 
 def put(folder, relative, data):
@@ -171,7 +176,7 @@ def test_prior_publication_is_recoverable_before_and_after_retirement(tmp_path, 
     journals = tmp_path / 'preparations'
     old_id = hashlib.sha256(broker.canonical(compatibility(True))).hexdigest()
     (journals / old_id).mkdir(parents=True)
-    raw = b'{"requested":["fixture-java"],"resolved":[]}'
+    raw = json.dumps({'requested': ['fixture-java'], 'resolved': [], 'golden_dpkg_status_sha256': 'd'*64}).encode()
     closure = put(ready, 'metadata/apt-closure.json', raw)
     old_inventory = {'operation_id': old_id, 'complete': True, 'issues': [], 'files': [closure],
                      'kind': 'download-only-pool', 'tasks': 1, 'repos': 1, 'conda_recipes': 1,

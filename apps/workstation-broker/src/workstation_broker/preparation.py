@@ -191,6 +191,14 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
     status_path.write_bytes(status)
     os.chown(status_path, 0, 0)
     status_path.chmod(0o444)
+    # Export the real Golden include tree without starting a target VM.
+    headers = snapshot / 'golden-include.tar'
+    subprocess.run(['guestfish', '--ro', '--format=qcow2', '-a', str(safe(manager.base, immutable=True)),
+                    '-i', 'tar-out', '/usr/include', str(headers)], check=True, timeout=limit)
+    if headers.is_symlink() or not headers.is_file() or not headers.stat().st_size:
+        raise RuntimeError('Golden header export is empty')
+    os.chown(headers, 0, 0)
+    headers.chmod(0o444)
     for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
                             key=lambda p: len(p.parts), reverse=True):
         os.chown(directory, 0, 0)
@@ -1174,22 +1182,38 @@ def verify_published_inventory(folder, state, proof):
     return inventory
 
 
-# This migration is authorized only from the exact fetcher whose synthetic
-# dpkg status was repaired. No future fetcher change inherits this authorization.
-_APT_REPAIR_PREDECESSOR = "af2f0b605323326ab5a48ffda7aabfca550e1e82adc6f39217d25051a32a64f2"
+# Only the audited real-status predecessor can reuse non-APT plans.
 _APT_REPAIR_SUCCESSOR = "d78f6388c036abffa17e37fa3db43c09e13f9ec235cd9c9288cded477331eaab"
+_NATIVE_APT_REPAIR_V1 = "1277aa7ebf0a7eba7ee9667b55a3bf6358ca7ff1a986408b298a266b254a43c0"
+_NATIVE_APT_REPAIR_SUCCESSOR = "0a5e0bcbab7cce209ac396e71ea8c17f0182a7b96d5c5c47e985ba450b5c3f89"
 
 
-def _apt_repair_compatible(previous, current):
-    if not isinstance(previous,dict) or not isinstance(current,dict):
+def _native_apt_repair_compatible(previous, current):
+    if not isinstance(previous, dict) or not isinstance(current, dict):
         return False
-    key='scripts/superbench_pool.py'
-    old=dict(previous);new=dict(current)
-    old_sources=dict(old.pop('fetch_sources',{}));new_sources=dict(new.pop('fetch_sources',{}))
-    old_fetcher=old.pop('fetcher_sha256',None);new_fetcher=new.pop('fetcher_sha256',None)
-    return (old_fetcher==old_sources.pop(key,None)==_APT_REPAIR_PREDECESSOR
-            and new_fetcher==new_sources.pop(key,None)==_APT_REPAIR_SUCCESSOR
-            and old==new and old_sources==new_sources)
+    old, new = dict(previous), dict(current)
+    old_sources, new_sources = dict(old.pop('fetch_sources', {})), dict(new.pop('fetch_sources', {}))
+    key = 'scripts/superbench_pool.py'
+    old_fetcher = old.pop('fetcher_sha256', None)
+    if old_fetcher != old_sources.get(key) or old_fetcher not in (_APT_REPAIR_SUCCESSOR, _NATIVE_APT_REPAIR_V1):
+        return False
+    if new.pop('fetcher_sha256', None) != new_sources.get(key) or new_sources.get(key)!=_NATIVE_APT_REPAIR_SUCCESSOR:
+        return False
+    # The schema change affects only task warm/cache replay, never acquired
+    # archive identities. All other compatibility fields must stay identical.
+    if 'task_runtime_schema' in old or 'task_runtime_schema' in new:
+        if old.pop('task_runtime_schema', None) != 4 or new.pop('task_runtime_schema', None) != 5:
+            return False
+    if old_fetcher == _APT_REPAIR_SUCCESSOR:
+        added = {'scripts/native_requirements.py',
+                  'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py'}
+        changed = {key, 'shared/gpt_trace_transport/local_templates.py',
+                    'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py'}
+    else:
+        added = set()
+        changed = {key, 'scripts/native_requirements.py', 'shared/gpt_trace_transport/local_templates.py'}
+    return (old == new and set(new_sources)-set(old_sources)==added and not set(old_sources)-set(new_sources)
+            and {name for name in old_sources if old_sources[name]!=new_sources[name]}==changed)
 
 
 def _retired_pool(root, operation_id):
@@ -1203,7 +1227,7 @@ def _apt_repair_source(manager, root, state):
         if not directory.is_dir() or directory.is_symlink() or SHA.fullmatch(directory.name) is None:
             continue
         prior=manager._read(directory.name)
-        if prior is None or not _apt_repair_compatible(prior['compatibility'],state['compatibility']):
+        if prior is None or not _native_apt_repair_compatible(prior['compatibility'],state['compatibility']):
             continue
         proof=prior.get('publication_verified')
         if (prior['phase'] not in TERMINAL or prior.get('result') is not None
@@ -1220,10 +1244,14 @@ def _apt_repair_source(manager, root, state):
         raw=path.read_bytes()
         rows=[row for row in inventory['files'] if row['path']=='metadata/apt-closure.json']
         if (len(rows)!=1 or rows[0]['sha256']!=hashlib.sha256(raw).hexdigest()
-                or rows[0]['size']!=len(raw) or 'golden_dpkg_status_sha256' in json.loads(raw)):
+                or rows[0]['size']!=len(raw) or 'golden_dpkg_status_sha256' not in json.loads(raw)
+                or (candidate/'metadata/native-pip-inspection.json').exists()):
             raise RuntimeError('prior APT closure does not match repair contract')
         candidates.append((candidate,prior,inventory))
     if len(candidates)>1:
+        immediate = [row for row in candidates if row[1]['compatibility']['fetcher_sha256'] == _NATIVE_APT_REPAIR_V1]
+        if len(immediate) == 1:
+            return immediate[0]
         raise RuntimeError('ambiguous sealed APT repair predecessor')
     return candidates[0] if candidates else None
 
@@ -1246,7 +1274,7 @@ def _link_apt_repair_files(stage, inventory, migration):
         if target.exists() or target.is_symlink():
             continue
         if (row!=original.get(relative) or relative.startswith('apt/')
-                or relative in ('metadata/apt-closure.json','metadata/fetch-progress.json')):
+                or relative in ('metadata/apt-closure.json','metadata/apt-policy.json','metadata/fetch-progress.json')):
             raise RuntimeError('APT repair attempted to import an unapproved file')
         source=safe(donor/relative,immutable=True)
         if source.stat().st_size!=row['size']:

@@ -108,7 +108,7 @@ COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 4
+TASK_RUNTIME_SCHEMA = 5
 
 
 class RecoverableBuildError(RuntimeError):
@@ -252,6 +252,12 @@ def _compatible_stage_candidates(target_root, staged, identity):
 
 def _adopt_resumable_stage(target_root, staged, identity):
     candidates = _compatible_stage_candidates(target_root, staged, identity)
+    if "pool_manifest_sha256" in identity:
+        # A different acquisition can change the installed OS closure. Reuse
+        # its validated task-source files, not the old common/overlay state.
+        candidates = [candidate for candidate in candidates
+                      if json.loads((candidate / "build-identity.json").read_bytes()).get("pool_manifest_sha256")
+                      == identity["pool_manifest_sha256"]]
     if not candidates:
         return False
     # Keep one canonical stage.  Completed source/task artifacts from every
@@ -1007,7 +1013,8 @@ def build(args, *, progress=None):
         # checkout/build implementation.  The operation ID is the hash of the
         # stable compatibility record, so code-only changes reuse this path.
         staged = target_root / (".build-resumable-v3-" + args.operation_id)
-        identity = {"schema": 3, "compatibility": job["compatibility"]}
+        identity = {"schema": 3, "compatibility": job["compatibility"],
+                    "pool_manifest_sha256": publication["manifest_sha256"]}
         if staged.exists():
             from gpt_trace_transport.local_templates import safe
             safe(staged, directory=True)
@@ -1016,6 +1023,8 @@ def build(args, *, progress=None):
             if not _compatibility_matches(prior_identity.get("compatibility"), identity["compatibility"]):
                 raise RuntimeError("persistent template stage belongs to another template contract; "
                                    "preserved; only make throw_volumes may remove it")
+            if prior_identity.get("pool_manifest_sha256") != identity["pool_manifest_sha256"]:
+                raise RuntimeError("existing template stage belongs to another dependency publication; preserved")
             sealed_stage = (staged / "local-validation.json").exists()
             if prior_identity != identity and not sealed_stage:
                 atomic_json(previous, identity)
@@ -1243,14 +1252,17 @@ def build(args, *, progress=None):
                               "logical_task_id": item["instance_id"], "cache_format": 2}
                 if mode == "warm":
                     lines += [
-                        "module['warm_task'](item,artifact)",
+                        "module['warm_task'](item,artifact,common_identity=" + repr({
+                            "golden_sha256": job["compatibility"]["golden_sha256"],
+                            "pool_manifest_sha256": publication["manifest_sha256"],
+                            "runtime_sha256": digest(GUEST),
+                        }) + ")",
                         "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')",
                         "json.dump(proof,open('/opt/swe-gym-task/cache-proof.json','w'),sort_keys=True)",
                         "json.dump(" + repr(completion) + ",open('" + TASK_COMPLETION + "','w'),sort_keys=True)",
                     ]
                 else:
                     lines += [
-                        "module['prime_shared_pip_cache'](item)",
                         "reusable=module['warm_task_ready'](item)",
                         "json.dump({'reusable':bool(reusable)},open('/opt/swe-gym-task/recovery.json','w'),sort_keys=True)",
                         "if reusable:",
@@ -1548,7 +1560,8 @@ def build(args, *, progress=None):
                 safe(common)
             common_completion = {"schema": 2, "kind": "common",
                 "template_abi": job["compatibility"]["template_abi"],
-                "source_fingerprint": inputs["source_fingerprint"]}
+                "source_fingerprint": inputs["source_fingerprint"],
+                "pool_manifest_sha256": publication["manifest_sha256"]}
             common_ready = not initial_common and completion_matches(common, COMMON_COMPLETION, common_completion)
             input_completion = {**common_completion, "kind": "common-inputs",
                 "pool_manifest_sha256": publication["manifest_sha256"],
@@ -1683,6 +1696,8 @@ cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
 ''' + bootstrap_marker + npm_boot + common_tail
             if common_ready:
+                if guest_json(common, "/opt/swe-gym-lite/os-manifest.json") != os_manifest:
+                    raise RuntimeError("completed common QCOW2 uses another OS closure; explicit common reconstruction required")
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout())
                 print("reused verified complete immutable common QCOW2", flush=True)
             else:
@@ -1899,6 +1914,8 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 key = mapping[logical]["setup_cache"]
                 expected_relative = Path("setup-caches") / (key + ".tar.gz")
                 for old in historical_stages:
+                    if json.loads((old / "build-identity.json").read_bytes()).get("pool_manifest_sha256") != identity["pool_manifest_sha256"]:
+                        continue
                     old_checkpoints = [old / ".checkpoints" / ckpt_name]
                     prefix = ckpt_name.removesuffix(".json") + "-"
                     old_checkpoints += [p for p in sorted((old / ".checkpoints").glob(prefix + "*.json"))

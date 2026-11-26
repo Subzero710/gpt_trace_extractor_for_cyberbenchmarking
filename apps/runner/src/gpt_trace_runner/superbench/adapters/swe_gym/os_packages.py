@@ -11,10 +11,6 @@ import signal
 import subprocess
 from pathlib import Path
 
-PACKAGES = ("build-essential", "cmake", "libpq-dev", "locales", "locales-all", "openjdk-21-jdk",
-            "openjdk-21-jre", "pipx", "nodejs", "npm", "libffi-dev", "libtiff-dev", "jq", "cloud-guest-utils")
-
-
 @contextlib.contextmanager
 def _template_operation(name):
     if os.environ.get("GPTTRACE_TEMPLATE_TRACE") != "1":
@@ -86,12 +82,6 @@ def deb_identity(path):
     return values
 
 
-def repository_metadata():
-    return {str(path): {"sha256": digest(path), "size": path.stat().st_size}
-            for root in (Path("/etc/apt"), Path("/var/lib/apt/lists"))
-            for path in sorted(root.rglob("*")) if path.is_file() and not path.is_symlink()}
-
-
 def verify_artifacts(folder, manifest):
     folder = Path(folder)
     artifacts = manifest.get("artifacts")
@@ -107,6 +97,17 @@ def verify_artifacts(folder, manifest):
             raise RuntimeError("resolved .deb artifact integrity mismatch")
         if deb_identity(path) != {key: record[key] for key in ("package", "version", "architecture")}:
             raise RuntimeError("resolved .deb version/architecture mismatch")
+
+
+def require_requested(requested, inventory):
+    if (not isinstance(requested, list) or not requested or len(set(requested)) != len(requested)
+            or not all(isinstance(name, str) and re.fullmatch(r'[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?', name) for name in requested)):
+        raise RuntimeError('invalid requested OS package roots')
+    present = {identity for name, row in inventory.items()
+               for identity in (name.split(':')[0], name.split(':')[0]+':'+row['architecture'])}
+    missing = set(requested)-present
+    if missing:
+        raise RuntimeError('offline APT replay omitted requested packages: '+', '.join(sorted(missing)))
 
 
 def install(folder, manifest, *, compare_final=True):
@@ -125,30 +126,11 @@ def install(folder, manifest, *, compare_final=True):
     with (folder / "install.log").open("wb") as log:
         _install_archives(command, log)
     actual = installed()
+    require_requested(manifest['requested'], actual)
     if compare_final and actual != manifest["installed_after"]:
         raise RuntimeError("installed OS inventory differs from resolved artifact closure")
     return actual
 
-
-def resolve(folder):
-    """Run only in a disposable trusted resolver overlay, never common.qcow2."""
-    folder = Path(folder)
-    folder.mkdir(parents=True)
-    before = installed()
-    with (folder / "resolve.log").open("wb") as log:
-        for command in (["apt-get", "update"], ["apt-get", "-y", "--no-remove", "--download-only", "--reinstall",
-                         "-o", "Dir::Cache::Archives=" + str(folder), "install", *PACKAGES]):
-            subprocess.run(command, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}, check=True, stdout=log, stderr=subprocess.STDOUT)
-    artifacts = {path.name: {**deb_identity(path), "sha256": digest(path), "size": path.stat().st_size}
-                 for path in sorted(folder.glob("*.deb"))}
-    repositories = repository_metadata()
-    manifest = {"schema_version": 1, "requested": list(PACKAGES), "installed_before": before,
-                "artifacts": artifacts, "repository_metadata": repositories}
-    manifest["installed_after"] = install(folder, manifest, compare_final=False)
-    if not set(PACKAGES) <= {name.split(":")[0] for name in manifest["installed_after"]}:
-        raise RuntimeError("resolved closure lacks a required OS package")
-    (folder / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
-    return manifest
 
 def resolve_from_pool(folder, source):
     """Produce the exact Kali OS manifest from host-fetched packages, offline.
@@ -164,7 +146,7 @@ def resolve_from_pool(folder, source):
     evidence = json.loads((source / 'acquired.json').read_text())
     requested = evidence.get('requested')
     records = evidence.get('artifacts')
-    if (not isinstance(requested, list) or not set(PACKAGES).issubset(requested)
+    if (not isinstance(requested, list) or not requested
             or not isinstance(records, dict) or not records):
         raise RuntimeError('acquired OS closure is incomplete')
     folder.mkdir(parents=True, exist_ok=True)
@@ -185,8 +167,5 @@ def resolve_from_pool(folder, source):
                 'installed_before': before, 'artifacts': records,
                 'repository_metadata': evidence.get('repository_metadata', {})}
     manifest['installed_after'] = install(folder, manifest, compare_final=False)
-    present = {name.split(':')[0] for name in manifest['installed_after']}
-    if not set(PACKAGES).issubset(present):
-        raise RuntimeError('offline APT replay omitted a mandatory package')
     (folder / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, separators=(',',':')))
     return manifest

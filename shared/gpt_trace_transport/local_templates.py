@@ -24,9 +24,10 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
-TASK_RUNTIME_SCHEMA = 4
+TASK_RUNTIME_SCHEMA = 5
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
+    "scripts/native_requirements.py",
     "scripts/verified_resolver_bridge.py",
     "infra/workstation/image/apt_downloads.py",
     "infra/workstation/image/conda_trace.py",
@@ -39,6 +40,7 @@ FETCH_SOURCE_FILES = (
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/contract.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/conda-lock.json",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
 )

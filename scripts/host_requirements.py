@@ -46,6 +46,10 @@ COMMAND_PACKAGES = {
 }
 
 GOLDEN_BUILD_COMMAND_PACKAGES = {
+    "guestfish": "libguestfs-tools",
+    "gcc": "gcc",
+    "unzip": "unzip",
+    "zstd": "zstd",
     "virt-customize": "libguestfs-tools",
     "virt-cat": "libguestfs-tools",
     "virt-ls": "libguestfs-tools",

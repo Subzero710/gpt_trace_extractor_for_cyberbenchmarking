@@ -56,7 +56,7 @@ def run(*args, cwd=None, env=None, input=None):
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
 BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
-TASK_RUNTIME_SCHEMA = 4
+TASK_RUNTIME_SCHEMA = 5
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -100,29 +100,49 @@ def _shared_warm_cache():
     return SHARED_WARM_CACHE_ROOT
 
 
+def configure_warm_wheel_context(item, artifact, common_identity):
+    """Bind persistent Pip caching to authenticated immutable build inputs.
+
+    The instance ID is not itself a cache key. Distinct source/recipe inputs
+    must not share a Pip-built native wheel solely because the Python tag and
+    distribution version match.
+    """
+    if not isinstance(common_identity, dict) or not all(
+            re.fullmatch(r"[a-f0-9]{64}", str(common_identity.get(field, "")))
+            for field in ("golden_sha256", "pool_manifest_sha256", "runtime_sha256")):
+        raise RuntimeError("missing authenticated native wheel build context")
+    sha = artifact.get("sha256")
+    if not re.fullmatch(r"[a-f0-9]{64}", str(sha)):
+        raise RuntimeError("invalid native wheel source identity")
+    vcs = TASK_INPUT_ROOT / "vcs-index.json"
+    if vcs.is_symlink() or not vcs.is_file():
+        raise RuntimeError("missing frozen task VCS input")
+    evidence = {"common": common_identity, "source_sha256": sha,
+                "repo": item["repo"], "base_commit": item["base_commit"], "env_hash": item["env_hash"],
+                "setup": item["repo_script_list"], "evaluation_setup": item["eval_setup_commands"],
+                "vcs_sha256": stream_digest(vcs)}
+    # Include the actual build environment, not a guessed list of relevant
+    # flags. Do not expose its values in the persistent cache metadata.
+    evidence["environment_sha256"] = hashlib.sha256(json.dumps(
+        {key: value for key, value in build_limits().items() if key != "GPT_TRACE_WHEEL_BUILD_CONTEXT"},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    os.environ["GPT_TRACE_WHEEL_BUILD_CONTEXT"] = key
+    return key
+
+
 def prime_shared_pip_cache(item):
-    """One-time migration of the pre-cache-disk pip cache from a preserved warm scratch."""
+    """Open the context-specific Pip cache; never import unscoped legacy wheels."""
     shared = _shared_warm_cache()
     if shared is None:
         return False
-    marker = shared / ".legacy-pip-imported-v1"
-    if marker.exists():
-        if marker.is_symlink() or marker.read_text() != "ok\n":
-            raise RuntimeError("shared warm cache migration marker changed")
-        return False
-    source = ROOT / "caches/pip"
-    target = shared / "pip"
-    def copy():
-        if source.exists():
-            if source.is_symlink() or not source.is_dir():
-                raise RuntimeError("legacy warm pip cache is unsafe")
-            shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
-        else:
-            target.mkdir(parents=True, exist_ok=True)
-        marker.write_text("ok\n")
-        with marker.open("rb") as handle:
-            os.fsync(handle.fileno())
-    _timed(item, "shared_pip_cache_import", copy)
+    context = os.environ.get("GPT_TRACE_WHEEL_BUILD_CONTEXT", "")
+    if not re.fullmatch(r"[a-f0-9]{64}", context):
+        raise RuntimeError("shared warm cache has no authenticated build context")
+    path = shared / "pip-contexts" / context
+    if any(parent.is_symlink() for parent in (path, path.parent)):
+        raise RuntimeError("unsafe native wheel cache context")
+    path.mkdir(parents=True, exist_ok=True)
     return True
 
 
@@ -155,7 +175,7 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
             result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
             if result.returncode:
                 output.seek(0, os.SEEK_END)
-                output.seek(max(0, output.tell()-4000))
+                output.seek(max(0, output.tell()-16384))
                 raise RuntimeError(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}")
 
 
@@ -441,7 +461,11 @@ for (const entry of entries) {
 def runtime_environment(item, *, offline):
     env = build_limits()
     shared = None if offline else _shared_warm_cache()
-    pip_cache = (shared / "pip") if shared is not None else (ROOT / "caches/pip")
+    if shared is not None:
+        prime_shared_pip_cache(item)
+        pip_cache = shared / "pip-contexts" / os.environ["GPT_TRACE_WHEEL_BUILD_CONTEXT"]
+    else:
+        pip_cache = ROOT / "caches/pip"
     pip_cache.mkdir(parents=True, exist_ok=True)
     env.update(HOME="/root", PIP_CACHE_DIR=str(pip_cache),
                npm_config_cache=str(ROOT / "caches/npm"), PDM_CACHE_DIR=str(ROOT / "caches/pdm"),
@@ -691,7 +715,7 @@ def warm_task_ready(item):
             info = stored.stat()
             pool_inodes.add((info.st_dev, info.st_ino, info.st_size))
         for path in wheelhouse.iterdir():
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or path.suffix != ".whl":
                 return False
             # warm_task() hardlinks every captured distribution into caches/wheels.
             # Inode identity is enough for recovery; export_setup_cache hashes each
@@ -716,23 +740,139 @@ def _write_warm_state(item):
         os.fsync(handle.fileno())
 
 
-def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse):
-    """Prefer built wheels so offline replay does not rebuild source distributions."""
+def _capture_wheel_manifest(folder):
+    wheels = {}
+    for path in sorted(folder.iterdir()):
+        if path.is_symlink() or not path.is_file() or path.suffix != ".whl":
+            raise RuntimeError("unexpected non-wheel capture artifact: " + path.name)
+        wheels[path.name] = {"sha256": stream_digest(path), "size": path.stat().st_size}
+    if not wheels:
+        raise RuntimeError("Pip wheel capture produced no wheels")
+    return _wheel_files(wheels)
+
+
+def _capture_cache_identity(context, requirements, inventory, env):
+    if not re.fullmatch(r"[a-f0-9]{64}", context):
+        raise RuntimeError("invalid wheel capture context")
+    # The exact installed Conda/Pip state is included because wheel capture
+    # occurs after the official setup and evaluation setup, not before it.
+    identity = {"context": context, "requirements_sha256": stream_digest(requirements),
+                "inventory": inventory,
+                "environment_sha256": hashlib.sha256(json.dumps(env, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest(),
+                "command": ["pip", "wheel", "--no-deps", "--no-index"]}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _verified_capture_object(path, record):
+    if (path.is_symlink() or not path.is_file() or path.stat().st_size != record["size"]
+            or stream_digest(path) != record["sha256"]):
+        raise RuntimeError("shared wheel object differs: " + str(path))
+
+
+def _capture_object_path(objects, filename, record):
+    # Official wheels are already materialized from the authenticated pool.
+    official = ROOT / "caches/pip-index" / filename
+    if official.is_file() and not official.is_symlink() and official.stat().st_size == record["size"]:
+        if stream_digest(official) == record["sha256"]:
+            return official
+    return objects / record["sha256"]
+
+
+def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
+    """Capture only wheels. Reuse a successful capture of identical inputs."""
     env = runtime_environment(item, offline=False)
+    if any(wheelhouse.iterdir()):
+        raise RuntimeError("wheel capture destination must start empty")
+    # The task-specific directory is empty; only the verified input index is
+    # a source of capture artifacts.
+    env["PIP_FIND_LINKS"] = str(ROOT / "caches/pip-index")
+    shared = _shared_warm_cache()
+    command = (str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps", "--no-index",
+               "--wheel-dir", str(wheelhouse), "--requirement", str(requirements_file))
+    if shared is None:
+        run(*command, env=env)
+        return _capture_wheel_manifest(wheelhouse)
+    context = os.environ["GPT_TRACE_WHEEL_BUILD_CONTEXT"]
+    key = _capture_cache_identity(context, requirements_file, inventory, env)
+    cache = shared / "wheel-capture-v1"
+    objects, records = cache / "objects", cache / "records"
+    for folder in (cache, objects, records):
+        if folder.is_symlink():
+            raise RuntimeError("unsafe shared wheel capture store")
+        folder.mkdir(parents=True, exist_ok=True)
+    receipt = records / (key + ".json")
+    if receipt.is_symlink():
+        raise RuntimeError("unsafe wheel capture receipt")
+    if receipt.exists():
+        proof = json.loads(receipt.read_bytes())
+        if proof.get("key") != key or proof.get("schema") != 1:
+            raise RuntimeError("shared wheel capture identity differs")
+        wheels = _wheel_files(proof["wheels"])
+        if not wheels or any(not name.endswith(".whl") for name in wheels):
+            raise RuntimeError("invalid successful wheel capture receipt")
+        for filename, record in wheels.items():
+            source = _capture_object_path(objects, filename, record)
+            _verified_capture_object(source, record)
+            target = wheelhouse / filename
+            with _template_operation("reuse-native-wheel"):
+                with source.open("rb") as src, target.open("xb") as dst:
+                    shutil.copyfileobj(src, dst)
+                _verified_capture_object(target, record)
+        return wheels
+    # A cache miss is the normal build path, not an error recovery path.
+    # A failed wheel build is fatal; no source archive download/replay fallback.
+    run(*command, env=env)
+    wheels = _capture_wheel_manifest(wheelhouse)
+    pip_wheels = Path(env["PIP_CACHE_DIR"]) / "wheels"
+    by_filename = {}
+    if pip_wheels.is_dir():
+        for path in pip_wheels.rglob("*.whl"):
+            by_filename.setdefault(path.name, []).append(path)
+    for filename, record in wheels.items():
+        target = _capture_object_path(objects, filename, record)
+        if target.parent != objects or target.exists():
+            _verified_capture_object(target, record)
+            continue
+        if target.is_symlink():
+            raise RuntimeError("unsafe shared native wheel object")
+        # Pip normally already cached its built wheel on the same volume.
+        # Link that object rather than writing a second copy.
+        for candidate in by_filename.get(filename, ()):
+            if (not candidate.is_symlink() and candidate.is_file()
+                    and candidate.stat().st_size == record["size"]
+                    and stream_digest(candidate) == record["sha256"]):
+                os.link(candidate, target)
+                break
+        else:
+            with _template_operation("publish-native-wheel"):
+                with tempfile.NamedTemporaryFile(dir=objects, prefix=".incoming-wheel-", delete=False) as dst:
+                    temporary = Path(dst.name)
+                    try:
+                        with (wheelhouse / filename).open("rb") as src:
+                            shutil.copyfileobj(src, dst)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                        _verified_capture_object(temporary, record)
+                        os.link(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+        _verified_capture_object(target, record)
+        with target.open("rb") as handle:
+            os.fsync(handle.fileno())
+    fd = os.open(objects, os.O_DIRECTORY)
     try:
-        run(str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps",
-            "--wheel-dir", str(wheelhouse), "--requirement", str(requirements_file), env=env)
-    except subprocess.CalledProcessError:
-        for path in wheelhouse.iterdir():
-            if path.is_symlink() or not path.is_file():
-                raise RuntimeError("unexpected partial wheelhouse entry")
-            path.unlink()
-        run(str(prefix / "bin/python"), "-m", "pip", "download", "--no-deps",
-            "--dest", str(wheelhouse), "--requirement", str(requirements_file), env=env)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _durable_json(receipt, {"schema": 1, "key": key, "wheels": wheels})
+    return wheels
 
 
-def warm_task(item, artifact):
-    prime_shared_pip_cache(item)
+def warm_task(item, artifact, *, common_identity=None):
+    if _shared_warm_cache() is not None:
+        configure_warm_wheel_context(item, artifact, common_identity)
+        prime_shared_pip_cache(item)
     if not (ROOT / "caches/pip-index").is_dir():
         raise RuntimeError("verified host-fetched pip pool is not installed")
     seed_pool_vcs(item)
@@ -781,7 +921,7 @@ print(json.dumps(result))
     if reqs:
         _timed(item, "warm_capture_wheels",
                lambda: _capture_install_artifacts(
-                   item, prefix, requirements_file, wheelhouse))
+                   item, prefix, requirements_file, wheelhouse, inventory))
     requirements_file.unlink()
     _timed(item, "warm_freeze_vcs", lambda: freeze_vcs_dependencies(item, prefix))
     pool = ROOT / "caches/wheels"
