@@ -548,6 +548,10 @@ def test_effective_pool_identity_excludes_progress_but_not_payload():
     inventory['files'][-1]['size'] = 8
     closure['historical_suites'] = ['changed transfer metadata']
     assert builder.effective_pool_inputs(inventory, closure) == first
+    closure['native_discovery'] = {'providers': {'header:fixture.h': {'paths': ['usr/include/fixture.h']}}}
+    proof = builder.effective_pool_inputs(inventory, closure)
+    assert proof['pool_inputs_sha256'] == first['pool_inputs_sha256']
+    assert proof['apt_validation_sha256'] != first['apt_validation_sha256']
     closure['resolved'][0]['version'] = '2'
     second = builder.effective_pool_inputs(inventory, closure)
     assert second['nonapt_inputs_sha256'] == first['nonapt_inputs_sha256']

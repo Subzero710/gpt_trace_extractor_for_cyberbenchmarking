@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,102 @@ def _template_operation(label):
             serial.write("GPTTRACE_TEMPLATE end " + label + "\n")
 
 
-def run(*args, cwd=None, env=None, input=None):
+def _pip_processes(pid):
+    rows = {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(') ', 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields[3]) == pid and fields[0] != 'Z':
+            rows[int(entry.name)] = (int(fields[1]), int(fields[19]), int(fields[11]) + int(fields[12]))
+    return rows
+
+
+def _run_elementary_pip(args, *, cwd, env, input):
+    # A Pip invocation is orchestration. Only its active elementary children
+    # (including the launcher when it is itself a leaf) consume wall budgets.
+    limits = json.loads(Path('/opt/gpt-trace/bundle/guest-contract.json').read_bytes())
+    limit = int(os.environ['GPTTRACE_TEMPLATE_TIMEOUT'])
+    cadence = limits['progress_interval_seconds']
+    cleanup = limits['cleanup_timeout_seconds']
+    if not (type(cadence) is type(cleanup) is int and 1 <= cadence <= limit <= 180 and 1 <= cleanup <= limit):
+        raise RuntimeError('invalid Pip elementary deadlines')
+    if input is not None:
+        raise RuntimeError('elementary Pip capture does not accept stdin')
+    ticks = os.sysconf('SC_CLK_TCK')
+    with tempfile.TemporaryFile() as output, Path('/dev/ttyS0').open('w', buffering=1) as serial:
+        process = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        active = {}
+        elapsed = {}
+        parents_seen = set()
+        def event(kind, marker):
+            serial.write('GPTTRACE_TEMPLATE ' + kind + ' pip-' + str(marker[0]) + '-' + str(marker[1]) + '\n')
+        try:
+            while True:
+                status = process.poll()
+                rows = _pip_processes(process.pid)
+                now = time.monotonic()
+                parents = {row[0] for row in rows.values()}
+                leaves = {(pid, row[1]) for pid, row in rows.items() if pid not in parents}
+                parents_seen.update((pid, row[1]) for pid, row in rows.items() if pid in parents)
+                for marker in tuple(active):
+                    if marker not in leaves:
+                        elapsed[marker] = elapsed.get(marker, 0) + now - active.pop(marker)
+                        event('end', marker)
+                for marker in sorted(leaves):
+                    if marker not in active:
+                        age = 0 if marker in parents_seen else max(0, time.clock_gettime(time.CLOCK_BOOTTIME) - marker[1] / ticks)
+                        active[marker] = now - age
+                        event('begin', marker)
+                    if elapsed.get(marker, 0) + now - active[marker] >= limit:
+                        raise TimeoutError('Pip elementary process exceeded deadline: ' + str(marker[0]))
+                for pid, row in rows.items():
+                    if row[2] / ticks >= limit:
+                        raise TimeoutError('Pip elementary process exceeded CPU deadline: ' + str(pid))
+                elapsed = {marker: duration for marker, duration in elapsed.items()
+                           if marker[0] in rows and rows[marker[0]][1] == marker[1]}
+                if status is not None:
+                    if rows:
+                        raise RuntimeError('Pip exited with live build descendants')
+                    break
+                remaining = min((limit - elapsed.get(marker, 0) - (now - start)
+                                 for marker, start in active.items()), default=limit)
+                delay = min(cadence, max(0, remaining))
+                try:
+                    process.wait(timeout=delay)
+                except subprocess.TimeoutExpired:
+                    pass
+            output.seek(0)
+            data = output.read()
+            if status:
+                raise subprocess.CalledProcessError(status, args, output=data)
+            return data
+        except BaseException:
+            if process.poll() is None or _pip_processes(process.pid):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + cleanup
+                process.wait(timeout=cleanup)
+                while _pip_processes(process.pid):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError('Pip process group remained live after termination')
+                    time.sleep(min(cadence, remaining))
+            raise
+        finally:
+            for marker in active:
+                event('end', marker)
+
+
+def run(*args, cwd=None, env=None, input=None, elementary=False):
+    if elementary and os.environ.get('GPTTRACE_TEMPLATE_TRACE') == '1':
+        return _run_elementary_pip(args, cwd=cwd, env=env, input=input)
     if (os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1" and Path(args[0]) == CONDA
             and (args[1:2] == ("create",) or args[1:3] == ("env", "remove"))):
         return subprocess.run([*_conda_trace_command(), *args[1:]], cwd=cwd, env=env, input=input,
@@ -58,7 +154,7 @@ def run(*args, cwd=None, env=None, input=None):
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
 BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
-TASK_RUNTIME_SCHEMA = 6
+TASK_RUNTIME_SCHEMA = 7
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -126,10 +222,11 @@ def configure_warm_wheel_context(item, artifact, common_identity):
     # Include the actual build environment, not a guessed list of relevant
     # flags. Do not expose its values in the persistent cache metadata.
     evidence["environment_sha256"] = hashlib.sha256(json.dumps(
-        {key: value for key, value in build_limits().items() if key != "GPT_TRACE_WHEEL_BUILD_CONTEXT"},
+        {key: value for key, value in build_limits().items() if key not in {"GPT_TRACE_WHEEL_BUILD_CONTEXT", "GPT_TRACE_COMPILER_GOLDEN_SHA256"}},
         sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     key = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     os.environ["GPT_TRACE_WHEEL_BUILD_CONTEXT"] = key
+    os.environ["GPT_TRACE_COMPILER_GOLDEN_SHA256"] = common_identity["golden_sha256"]
     return key
 
 
@@ -204,12 +301,25 @@ def compiler_cache_exports():
     if folder.is_symlink():
         raise RuntimeError('unsafe shared compiler cache directory')
     folder.mkdir(exist_ok=True)
-    hashes = {}
+    hashes_path = Path('/run/gpt-trace-compiler-hashes.json')
+    if hashes_path.is_symlink():
+        raise RuntimeError('unsafe guest compiler digest cache')
+    hashes = json.loads(hashes_path.read_bytes()) if hashes_path.exists() else {}
+    def signature(path):
+        row = path.stat()
+        return [row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns]
     def file_hash(path):
         path = Path(path).resolve(strict=True)
-        if path not in hashes:
-            hashes[path] = stream_digest(path)
-        return hashes[path]
+        key = str(path)
+        before = signature(path)
+        record = hashes.get(key)
+        if (not isinstance(record, dict) or record.get('signature') != before
+                or not re.fullmatch(r'[a-f0-9]{64}', str(record.get('sha256', '')))):
+            value = stream_digest(path)
+            if signature(path) != before:
+                raise RuntimeError('compiler executable changed during hashing: ' + key)
+            record = hashes[key] = {'signature': before, 'sha256': value}
+        return record['sha256']
     metadata = prefix / 'conda-meta'
     if metadata.is_symlink() or not metadata.is_dir():
         raise RuntimeError('active target has no Conda package provenance')
@@ -226,7 +336,11 @@ def compiler_cache_exports():
     installed = os_manifest['installed_after']
     if not isinstance(installed, dict) or not installed:
         raise RuntimeError('missing installed system package identities')
-    identity = {'schema': 2, 'os_packages': installed,
+    golden_sha = os.environ.get('GPT_TRACE_COMPILER_GOLDEN_SHA256', '')
+    if not re.fullmatch(r'[a-f0-9]{64}', golden_sha):
+        raise RuntimeError('missing authenticated compiler Golden identity')
+    identity = {'schema': 3, 'golden_sha256': golden_sha, 'os_packages': installed,
+                'os_archives': os_manifest['artifacts'],
                 'compiler_cache': file_hash(ccache), 'compilers': {}}
     variables = {}
     executables = set()
@@ -255,6 +369,7 @@ def compiler_cache_exports():
         identity['compilers'][name] = toolchain
         variables[name] = shlex.join([ccache, *command])
     identity['conda_toolchain'] = _compiler_conda_closure(prefix, packages, executables)
+    _durable_json(hashes_path, hashes)
     namespace = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     variables.update(CCACHE_DIR=str(folder), CCACHE_NAMESPACE=namespace,
                      CCACHE_COMPILERCHECK='content', CCACHE_NODIRECT='1',
@@ -292,8 +407,29 @@ def _with_compiler_cache(commands, prefix):
     return result
 
 
-def _template_script(commands):
+class RecipeFailure(RuntimeError):
+    def __init__(self, message, observations):
+        super().__init__(message)
+        self.native_observations = observations
+
+
+def _recipe_observations(output, marker):
+    output.seek(0)
+    observations = set()
+    with _template_operation('scan-native-diagnostics'):
+        for raw in output:
+            line = raw.decode(errors='replace')
+            if line.startswith(marker):
+                observations.clear()
+            else:
+                observations.update(_native_diagnostics(line))
+    return observations
+
+
+def _template_script(commands, *, marker=None):
     for index, command in enumerate(commands):
+        if marker is not None:
+            yield 'printf "%s\\n" ' + shlex.quote(marker + str(index))
         # Each pinned recipe entry is a complete Bash fragment. Keep it in the
         # same shell so activation, variables, cwd and failure semantics persist.
         if command.startswith(str(CONDA) + " create "):
@@ -301,13 +437,20 @@ def _template_script(commands):
             continue
         label = f"recipe-{index}"
         yield f"printf 'GPTTRACE_TEMPLATE begin {label}\\n' >/dev/ttyS0"
+        if marker is not None:
+            yield "trap " + shlex.quote(f"printf 'GPTTRACE_TEMPLATE end {label}\\n' >/dev/ttyS0") + " EXIT"
         yield command
+        if marker is not None:
+            yield "trap - EXIT"
         yield f"printf 'GPTTRACE_TEMPLATE end {label}\\n' >/dev/ttyS0"
 
 
 def shell(commands, *, cwd, env=None, offline=False, log=None):
+    marker = None
     if os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1":
-        commands = _template_script(commands)
+        if os.environ.get('GPT_TRACE_NATIVE_ROUND'):
+            marker = 'GPTTRACE_RECIPE_' + os.urandom(16).hex() + '_'
+        commands = _template_script(commands, marker=marker)
     script = "set -eo pipefail\n" + "\n".join(commands) + "\n"
     if offline:
         script = "ip link set lo up\n" + script
@@ -320,9 +463,10 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
         with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
             result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
             if result.returncode:
+                observations = _recipe_observations(output, marker) if marker is not None else None
                 output.seek(0, os.SEEK_END)
                 output.seek(max(0, output.tell()-16384))
-                raise RuntimeError(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}")
+                raise RecipeFailure(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}", observations)
 
 
 def stream_digest(path):
@@ -907,7 +1051,7 @@ def _capture_cache_key(context, requirement_sha, inventory, env):
                 "inventory": inventory,
                 "environment_sha256": hashlib.sha256(json.dumps(env, sort_keys=True,
                     separators=(",", ":")).encode()).hexdigest(),
-                "command": ["conda", "run", "pip", "wheel", "--no-deps", "--no-index"]}
+                "command": ["activated-target", "pip", "wheel", "--no-deps", "--no-index"]}
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -963,39 +1107,92 @@ def _capture_wheel_name(filename, requirements):
 
 
 def _validate_captured_wheel(path, requirements):
+    import base64
+    import csv
+    import io
     import zipfile
     from email.parser import BytesParser
     from packaging.utils import canonicalize_name, parse_wheel_filename
     from packaging.version import Version
+    from pathlib import PurePosixPath
     name = _capture_wheel_name(path.name, requirements)
     _, version, _, _ = parse_wheel_filename(path.name)
-    # In a failed batch a partially copied file must never become a durable
-    # receipt. The central directory and the wheel's metadata must be readable.
     with zipfile.ZipFile(path) as archive:
         members = archive.namelist()
         if len(members) != len(set(members)):
             raise RuntimeError('duplicate wheel archive entries: ' + path.name)
+        for entry in members:
+            if (not entry or PurePosixPath(entry).is_absolute() or '..' in PurePosixPath(entry).parts
+                    or '\\' in entry or PurePosixPath(entry).as_posix() != entry.rstrip('/')):
+                raise RuntimeError('unsafe wheel archive entry: ' + entry)
         metadata = [entry for entry in members if entry.count('/') == 1 and entry.endswith('.dist-info/METADATA')]
         if len(metadata) != 1:
             raise RuntimeError('captured wheel has no unique metadata: ' + path.name)
         directory = metadata[0].rsplit('/', 1)[0]
-        if not {directory + '/WHEEL', directory + '/RECORD'} <= set(members):
+        record_name = directory + '/RECORD'
+        if not {directory + '/WHEEL', record_name} <= set(members):
             raise RuntimeError('captured wheel is incomplete: ' + path.name)
+        record = {}
+        with archive.open(record_name) as raw:
+            for row in csv.reader(io.TextIOWrapper(raw, encoding='utf-8', newline='')):
+                if len(row) != 3 or row[0] in record:
+                    raise RuntimeError('invalid wheel RECORD: ' + path.name)
+                record[row[0]] = row[1:]
+        signatures = {record_name + '.jws', record_name + '.p7s'}
+        files = {entry for entry in members if not archive.getinfo(entry).is_dir()}
+        if (set(record) != files - signatures or record[record_name][0]
+                or record[record_name][1] not in ('', str(archive.getinfo(record_name).file_size))):
+            raise RuntimeError('wheel RECORD does not cover exact archive contents: ' + path.name)
+        for entry in sorted(files - {record_name}):
+            if entry in signatures:
+                with archive.open(entry) as stream:
+                    while stream.read(1048576):
+                        pass
+                continue
+            hash_field, size_field = record[entry]
+            algorithm, separator, expected = hash_field.partition('=')
+            if not separator or algorithm not in hashlib.algorithms_guaranteed or not size_field.isdecimal():
+                raise RuntimeError('invalid wheel RECORD digest or size: ' + entry)
+            digest = hashlib.new(algorithm)
+            if digest.digest_size < 32:
+                raise RuntimeError('weak or variable-length wheel RECORD digest: ' + entry)
+            size = 0
+            with archive.open(entry) as stream:
+                for block in iter(lambda: stream.read(1048576), b''):
+                    size += len(block)
+                    digest.update(block)
+            if (size != int(size_field) or base64.urlsafe_b64encode(digest.digest()).decode().rstrip('=') != expected):
+                raise RuntimeError('wheel RECORD content differs: ' + entry)
         row = BytesParser().parsebytes(archive.read(metadata[0]))
         if canonicalize_name(row['Name']) != name or Version(row['Version']) != version:
             raise RuntimeError('captured wheel metadata differs from filename: ' + path.name)
-        archive.read(directory + '/WHEEL')
-        archive.read(directory + '/RECORD')
     return name
 
 
-def _capture_missing_install_artifacts(prefix, requirements_file, wheelhouse, env, *, shared):
+def _activated_capture_environment(prefix, env, *, shared):
+    prefix = Path(prefix)
     activation = (str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output')
     compiler_cache = () if shared is None else ('/bin/bash', '-c',
         'set -e; ' + _compiler_cache_shell(prefix) + '; exec "$@"', 'compiler-cache')
-    command = (*activation, *compiler_cache, str(prefix / 'bin/python'), '-m', 'pip', 'wheel', '--no-deps', '--no-index',
+    with tempfile.TemporaryDirectory(prefix='wheel-activation-') as raw:
+        output = Path(raw) / 'environment.json'
+        code = ('import json,os,sys; from pathlib import Path; '
+                'Path(sys.argv[1]).write_text(json.dumps({"prefix":sys.prefix,"env":dict(os.environ)}))')
+        run(*activation, *compiler_cache, str(prefix / 'bin/python'), '-I', '-c', code, str(output), env=env)
+        payload = json.loads(output.read_bytes())
+    activated = payload['env']
+    if not isinstance(activated, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in activated.items()):
+        raise RuntimeError('invalid activated wheel capture environment')
+    if (Path(payload['prefix']).resolve(strict=True) != prefix.resolve(strict=True)
+            or Path(activated['CONDA_PREFIX']).resolve(strict=True) != prefix.resolve(strict=True)):
+        raise RuntimeError('wheel capture activation differs from the target prefix')
+    return activated
+
+
+def _capture_missing_install_artifacts(prefix, requirements_file, wheelhouse, env):
+    command = (str(Path(prefix) / 'bin/python'), '-m', 'pip', 'wheel', '--no-deps', '--no-index',
                '--wheel-dir', str(wheelhouse), '--requirement', str(requirements_file))
-    run(*command, env=env)
+    run(*command, env=env, elementary=True)
 
 
 def _publish_capture_object(objects, filename, record, source):
@@ -1024,19 +1221,22 @@ def _publish_capture_object(objects, filename, record, source):
 
 
 def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
-    """One activated Pip batch; individually durable exact wheel receipts."""
+    """One target activation, independent Pip transactions and durable receipts."""
     if any(wheelhouse.iterdir()):
         raise RuntimeError('wheel capture destination must start empty')
     requirements = _capture_requirements(requirements_file.read_text().splitlines())
+    if not requirements:
+        return {}
     env = runtime_environment(item, offline=False)
     env['PIP_FIND_LINKS'] = str(ROOT / 'caches/pip-index')
     shared = _shared_warm_cache()
+    env = _activated_capture_environment(prefix, env, shared=shared)
     pending = dict(requirements)
     wheels = {}
     receipt_keys = {}
     if shared is not None:
         context = os.environ['GPT_TRACE_WHEEL_BUILD_CONTEXT']
-        cache = shared / 'wheel-capture-v1'
+        cache = shared / 'wheel-capture-v2'
         objects, records = cache / 'objects', cache / 'records'
         for folder in (cache, objects, records):
             if folder.is_symlink():
@@ -1051,7 +1251,7 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             if not receipt.exists():
                 continue
             proof = json.loads(receipt.read_bytes())
-            if proof.get('key') != key or proof.get('schema') != 1:
+            if proof.get('key') != key or proof.get('schema') != 2:
                 raise RuntimeError('shared wheel capture identity differs')
             result = _wheel_files(proof['wheels'])
             if len(result) != 1:
@@ -1070,39 +1270,35 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             del pending[name]
     if not pending:
         return _wheel_files(wheels)
-    with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix='.wheel-capture-') as raw:
-        scratch = Path(raw)
-        request = scratch / 'requirements.txt'
-        request.write_text('\n'.join(line for line, _ in pending.values()) + '\n')
-        output = scratch / 'wheels'
-        output.mkdir()
-        failure = None
-        try:
-            _capture_missing_install_artifacts(prefix, request, output, env, shared=shared)
-        except subprocess.CalledProcessError as exc:
-            # Pip wheel publishes successful wheel files before its final batch
-            # status. Preserve those exact results but propagate the failure.
-            failure = exc
-        completed = {}
-        for path in sorted(output.iterdir()):
-            if path.is_symlink() or not path.is_file() or path.suffix != '.whl':
-                raise RuntimeError('unexpected non-wheel capture artifact: ' + path.name)
-            name = _validate_captured_wheel(path, pending)
-            if name in completed or path.name in wheels:
-                raise RuntimeError('duplicate wheel from distinct capture requirements: ' + path.name)
+    for name, (line, requirement) in pending.items():
+        with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix='.wheel-capture-') as raw:
+            scratch = Path(raw)
+            request = scratch / 'requirements.txt'
+            request.write_text(line + '\n')
+            output = scratch / 'wheels'
+            output.mkdir()
+            failure = None
+            try:
+                _capture_missing_install_artifacts(prefix, request, output, env)
+            except (subprocess.CalledProcessError, TimeoutError) as exc:
+                failure = exc
+            paths = sorted(output.iterdir())
+            if not paths and failure is not None:
+                raise failure
+            if len(paths) != 1 or paths[0].is_symlink() or not paths[0].is_file() or paths[0].suffix != '.whl':
+                raise RuntimeError('Pip did not produce one exact wheel for ' + name) from failure
+            path, = paths
+            with _template_operation('validate-captured-wheel'):
+                _validate_captured_wheel(path, {name: (line, requirement)})
             record = {'sha256': stream_digest(path), 'size': path.stat().st_size}
-            completed[name] = path, record
-        if failure is None and set(completed) != set(pending):
-            raise RuntimeError('Pip wheel capture omitted exact requirements: ' + ', '.join(sorted(set(pending)-set(completed))))
-        for name, (path, record) in completed.items():
             if shared is not None:
                 _publish_capture_object(objects, path.name, record, path)
                 key, receipt = receipt_keys[name]
-                _durable_json(receipt, {'schema': 1, 'key': key, 'wheels': {path.name: record}})
+                _durable_json(receipt, {'schema': 2, 'key': key, 'wheels': {path.name: record}})
             os.link(path, wheelhouse / path.name)
             wheels[path.name] = record
-        if failure is not None:
-            raise failure
+            if failure is not None:
+                raise failure
     return _wheel_files(wheels)
 
 
@@ -1485,7 +1681,9 @@ def _native_recipe(item, prefix, callback, log=None):
                 text += '\n' + detail.decode(errors='replace')
             elif isinstance(detail, str):
                 text += '\n' + detail
-        observations = _native_diagnostics(text)
+        observations = getattr(exc, 'native_observations', None)
+        if observations is None:
+            observations = _native_diagnostics(text)
         if observations and os.environ.get('GPT_TRACE_NATIVE_ROUND'):
             _native_report(_native_requests(prefix, observations))
         raise
@@ -1538,7 +1736,9 @@ def build_common(inputs):
                 shell(commands, cwd=ROOT, env=env, log=log)
                 break
             except RuntimeError as exc:
-                observed = _native_diagnostics(str(exc))
+                observed = getattr(exc, 'native_observations', None)
+                if observed is None:
+                    observed = _native_diagnostics(str(exc))
                 if observed and (prefix / 'bin/python').is_file():
                     _native_report(_native_requests(prefix, observed))
                 # Retry only explicitly recognized transient transport failures;

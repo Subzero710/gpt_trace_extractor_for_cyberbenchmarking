@@ -226,5 +226,8 @@ def test_prior_publication_is_recoverable_before_and_after_retirement(tmp_path, 
     retired = broker._retired_pool(root, old_id)
     ready.rename(retired)
     assert broker._apt_repair_source(manager, root, state) == (retired, prior, old_inventory)
+    proof.update(runtime_integrated=True, prepared_setups=True, generation='a'*64)
+    prior.update(phase='ready', result=proof)
+    assert broker._apt_repair_source(manager, root, state) == (retired, prior, old_inventory)
     assert (retired/'metadata/apt-closure.json').read_bytes() == raw
     assert broker._apt_repair_source(manager, root, {'compatibility': donor_contract}) is None

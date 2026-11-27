@@ -194,12 +194,17 @@ def test_conda_inventory_reads_only_declared_file_paths(tmp_path):
 
 
 def write_fixture_wheel(path, distribution, version):
+    import base64
     import zipfile
     prefix = distribution + '-' + version + '.dist-info/'
+    files = {prefix+'METADATA': f'Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n'.encode(),
+             prefix+'WHEEL': b'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+             distribution+'/__init__.py': b'payload'}
+    record = ''.join(name+',sha256='+base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip('=')+','+str(len(data))+'\n' for name,data in files.items())
     with zipfile.ZipFile(path, 'w') as archive:
-        archive.writestr(prefix + 'METADATA', f'Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n')
-        archive.writestr(prefix + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
-        archive.writestr(prefix + 'RECORD', '')
+        for name,data in files.items():
+            archive.writestr(name,data)
+        archive.writestr(prefix+'RECORD', record+prefix+'RECORD,,\n')
 
 
 def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, monkeypatch):
@@ -218,6 +223,7 @@ def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, m
         calls.append(args)
         folder = Path(args[args.index('--wheel-dir')+1])
         write_fixture_wheel(folder/name, 'fixture', '1')
+    monkeypatch.setattr(runtime, '_activated_capture_environment', lambda prefix, env, **kwargs: env)
     monkeypatch.setattr(runtime, 'run', wheel)
     item = {'instance_id': 'fixture'}
     env = {'pip_freeze': 'fixture==1', 'conda_explicit': 'fixture'}
@@ -256,7 +262,7 @@ def test_native_repair_has_no_revision_allowlist():
                    for item in ast.walk(node))
 
 
-def test_batched_capture_persists_exact_successes_before_reporting_failure(tmp_path, monkeypatch):
+def test_independent_capture_persists_exact_successes_before_reporting_failure(tmp_path, monkeypatch):
     runtime = load(ADAPTER/'guest_runtime.py')
     root = tmp_path/'guest'; shared = tmp_path/'shared'; shared.mkdir()
     (root/'caches/pip-index').mkdir(parents=True)
@@ -272,23 +278,26 @@ def test_batched_capture_persists_exact_successes_before_reporting_failure(tmp_p
         folder = Path(args[args.index('--wheel-dir')+1])
         if len(calls) == 1:
             write_fixture_wheel(folder/'alpha-1-py3-none-any.whl', 'alpha', '1')
+            return
+        if len(calls) == 2:
             raise subprocess.CalledProcessError(1, args)
         write_fixture_wheel(folder/'beta-2-py3-none-any.whl', 'beta', '2')
+    monkeypatch.setattr(runtime, '_activated_capture_environment', lambda prefix, env, **kwargs: env)
     monkeypatch.setattr(runtime, 'run', wheel)
     env = {'pip_freeze': 'alpha==1\nbeta==2', 'conda_explicit': 'fixture'}
     item = {'instance_id': 'fixture'}
     first = tmp_path/'first'; first.mkdir()
     with pytest.raises(subprocess.CalledProcessError):
         runtime._capture_install_artifacts(item, tmp_path/'prefix', req, first, env)
-    assert len(list((shared/'wheel-capture-v1/records').glob('*.json'))) == 1
+    assert len(list((shared/'wheel-capture-v2/records').glob('*.json'))) == 1
     second = tmp_path/'second'; second.mkdir()
     result = runtime._capture_install_artifacts(item, tmp_path/'prefix', req, second, env)
     assert set(result) == {'alpha-1-py3-none-any.whl', 'beta-2-py3-none-any.whl'}
-    assert calls == ['alpha==1\nbeta==2\n', 'beta==2\n']
-    assert len(list((shared/'wheel-capture-v1/records').glob('*.json'))) == 2
+    assert calls == ['alpha==1\n', 'beta==2\n', 'beta==2\n']
+    assert len(list((shared/'wheel-capture-v2/records').glob('*.json'))) == 2
     third = tmp_path/'third'; third.mkdir()
     assert runtime._capture_install_artifacts(item, tmp_path/'prefix', req, third, env) == result
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_capture_rejects_wrong_or_truncated_wheel(tmp_path):
@@ -321,3 +330,27 @@ def test_compiler_namespace_uses_only_owned_conda_toolchain(tmp_path):
     records[0]['files'] = []
     with pytest.raises(RuntimeError, match='ownership'):
         runtime._compiler_conda_closure(prefix, records, [compiler])
+
+
+def test_wheel_record_rejects_crc_valid_corruption(tmp_path):
+    import zipfile
+    runtime = load(ADAPTER/'guest_runtime.py')
+    path = tmp_path/'alpha-1-py3-none-any.whl'
+    write_fixture_wheel(path, 'alpha', '1')
+    req = runtime._capture_requirements(['alpha==1'])
+    assert runtime._validate_captured_wheel(path, req) == 'alpha'
+    with zipfile.ZipFile(path) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    files['alpha/__init__.py'] = b'changed'
+    with zipfile.ZipFile(path, 'w') as archive:
+        for name,data in files.items(): archive.writestr(name, data)
+    with pytest.raises(RuntimeError, match='RECORD content differs'):
+        runtime._validate_captured_wheel(path, req)
+
+
+def test_full_recipe_log_discovers_only_failing_command(tmp_path):
+    runtime = load(ADAPTER/'guest_runtime.py')
+    marker = 'GPTTRACE_RECIPE_fixture_'
+    data = (marker+'0\nfatal error: optional.h: No such file or directory\n'+marker+'1\n'
+            'fatal error: required.h: No such file or directory\n'+'x'*20000+'\n').encode()
+    assert runtime._recipe_observations(io.BytesIO(data), marker) == {('header','required.h')}

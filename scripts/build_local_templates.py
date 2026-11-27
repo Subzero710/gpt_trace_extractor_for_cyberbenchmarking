@@ -109,7 +109,7 @@ COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 6
+TASK_RUNTIME_SCHEMA = 7
 
 
 class RecoverableBuildError(RuntimeError):
@@ -443,9 +443,8 @@ def effective_pool_inputs(inventory, closure):
               'url_index': {url: sha for url, sha in inventory['url_index'].items() if sha in shas},
               **{key: inventory[key] for key in ('task_plan', 'environment_plan', 'git_plan',
                                                  'conda_transactions', 'conda_lock_sha256')}}
-    apt = {'schema': 1, 'requested': sorted(closure['requested']),
+    apt = {'schema': 2,
            'resolved': sorted(closure['resolved'], key=lambda row: (row['package'], row['architecture'], row['version'], row['sha256'])),
-           'providers': closure.get('native_discovery', {}).get('providers', {}),
            'golden_dpkg_status_sha256': closure['golden_dpkg_status_sha256'],
            'golden_package_inventory_sha256': closure['golden_package_inventory_sha256']}
     # APT filenames and identities are also consumed by the guest replay.
@@ -453,8 +452,23 @@ def effective_pool_inputs(inventory, closure):
                        if Path(row['path']).parent == Path('apt/archives') and Path(row['path']).suffix == '.deb'}
     def identity(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    return {'nonapt_inputs_sha256': identity(inputs), 'apt_inputs_sha256': identity(apt),
-            'pool_inputs_sha256': identity({'nonapt': identity(inputs), 'apt': identity(apt)})}
+    nonapt_sha, apt_sha = identity(inputs), identity(apt)
+    validation = {'apt_inputs_sha256': apt_sha, 'requested': sorted(closure['requested']),
+                  'providers': closure.get('native_discovery', {}).get('providers', {})}
+    return {'nonapt_inputs_sha256': nonapt_sha, 'apt_inputs_sha256': apt_sha,
+            'apt_validation_sha256': identity(validation),
+            'pool_inputs_sha256': identity({'nonapt': nonapt_sha, 'apt': apt_sha})}
+
+
+def os_replay_identity(manifest):
+    return {key: manifest[key] for key in ('schema_version', 'artifacts', 'installed_before', 'installed_after')}
+
+
+def os_validation_matches(manifest, closure, packages):
+    return (manifest.get('schema_version') == 1
+            and manifest.get('requested') == closure['requested']
+            and manifest.get('artifacts') == {name: record for name, (_, record) in packages.items()}
+            and manifest.get('native_headers', {}) == closure.get('native_discovery', {}).get('providers', {}))
 
 
 def published_apt_archives(archives, closure):
@@ -481,9 +495,7 @@ def published_apt_archives(archives, closure):
 def bind_os_archives(folder, manifest, closure, packages):
     from gpt_trace_transport.local_templates import safe
     safe(folder, directory=True)
-    if (manifest.get("schema_version") != 1 or manifest.get("requested") != closure["requested"]
-            or manifest.get("artifacts") != {name: record for name, (_, record) in packages.items()}
-            or manifest.get("native_headers", {}) != closure.get("native_discovery", {}).get("providers", {})):
+    if not os_validation_matches(manifest, closure, packages):
         raise RuntimeError("completed OS manifest differs from signed APT closure")
     if set(path.name for path in folder.glob("*.deb")) - packages.keys():
         raise RuntimeError("unexpected OS archive in resolved closure")
@@ -1553,13 +1565,18 @@ def build(args, *, progress=None):
             status_sha = rows["golden_dpkg_status_sha256"]
             if SHA.fullmatch(status_sha) is None:
                 raise RuntimeError("invalid golden dpkg status identity in APT closure")
-            resolver = cache_root / ("os-resolver-" + closure_sha + ".qcow2")
+            validation_sha = identity["apt_validation_sha256"]
+            resolver = cache_root / ("os-resolver-" + validation_sha + ".qcow2")
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
             resolver_completion = {"schema": 3, "kind": "os-resolver",
-                "source_fingerprint": inputs["source_fingerprint"], "apt_inputs_sha256": closure_sha}
-            if (os_folder / "manifest.json").is_file():
-                os_manifest = json.loads(safe(os_folder / "manifest.json").read_text())
+                "source_fingerprint": inputs["source_fingerprint"], "apt_validation_sha256": validation_sha}
+            prior_os = (json.loads(safe(os_folder / "manifest.json").read_text())
+                        if (os_folder / "manifest.json").is_file() else None)
+            if prior_os is not None and prior_os.get('artifacts') != {name: record for name, (_, record) in apt_packages.items()}:
+                raise RuntimeError('persistent stage OS archive identities differ; preserved')
+            if prior_os is not None and os_validation_matches(prior_os, rows, apt_packages):
+                os_manifest = prior_os
                 bind_os_archives(os_folder, os_manifest, rows, apt_packages)
                 print("reused verified OS package closure", flush=True)
             else:
@@ -1609,14 +1626,15 @@ def build(args, *, progress=None):
                     shutil.rmtree(os_payload)
                 else:
                     print("reused verified persistent OS resolver volume", flush=True)
-                if os_parent.exists():
-                    # Host-side copy-out scratch only; the resolver QCOW2 is kept.
-                    shutil.rmtree(os_parent)
-                os_parent.mkdir()
-                os_folder.mkdir()
                 os_manifest = guest_json(resolver, "/opt/swe-gym-os/manifest.json")
-                atomic_json(os_folder / "manifest.json", os_manifest)
+                if not os_validation_matches(os_manifest, rows, apt_packages):
+                    raise RuntimeError('resolver manifest differs from current signed provider evidence')
+                if prior_os is not None and os_replay_identity(prior_os) != os_replay_identity(os_manifest):
+                    raise RuntimeError('identical OS inputs produced different installed inventories; preserved')
+                os_parent.mkdir(exist_ok=True)
+                os_folder.mkdir(exist_ok=True)
                 bind_os_archives(os_folder, os_manifest, rows, apt_packages)
+                atomic_json(os_folder / "manifest.json", os_manifest)
 
             # The OS closure is checked; APT's _apt-owned partial download
             # directory is neither a dependency nor a reusable checkpoint.
@@ -1763,7 +1781,7 @@ cp /opt/swe-gym-build/npm-pool.json /opt/swe-gym-lite/npm-pool.json
 cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
 ''' + bootstrap_marker + npm_boot + common_tail
             if common_ready:
-                if guest_json(common, "/opt/swe-gym-lite/os-manifest.json") != os_manifest:
+                if os_replay_identity(guest_json(common, "/opt/swe-gym-lite/os-manifest.json")) != os_replay_identity(os_manifest):
                     raise RuntimeError("completed common QCOW2 uses another OS closure; explicit common reconstruction required")
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout())
                 print("reused verified complete immutable common QCOW2", flush=True)
@@ -1792,7 +1810,7 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                     if (guest_json(common, "/opt/swe-gym-lite/environments/" + first + ".recipe.json") != expected
                             or guest_json(common, "/opt/swe-gym-lite/build-environments.json") != {"environments": inputs["environments"]}
                             or hashlib.sha256(capture("virt-cat", "-a", str(common), "/opt/swe-gym-lite/conda-lock.json")).hexdigest() != pool_record["conda_lock_sha256"]
-                            or guest_json(common, "/opt/swe-gym-lite/os-manifest.json") != os_manifest
+                            or os_replay_identity(guest_json(common, "/opt/swe-gym-lite/os-manifest.json")) != os_replay_identity(os_manifest)
                             or guest_json(common, "/opt/swe-gym-lite/npm-pool.json") != npm_urls
                             or guest_directory(common, "/opt/swe-gym-lite/caches/pip-index") != set(filenames)
                             or not set(lock_payload["artifacts"]) <= guest_directory(common, "/opt/swe-gym-lock")):

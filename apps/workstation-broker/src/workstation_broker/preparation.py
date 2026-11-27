@@ -1262,8 +1262,13 @@ def _apt_repair_source(manager, root, state):
         if not _native_apt_repair_compatible(prior['compatibility'], state['compatibility']):
             continue
         proof = prior.get('publication_verified')
-        if (prior['phase'] not in TERMINAL or prior.get('result') is not None
-                or not isinstance(proof, dict) or proof.get('runtime_integrated') != 'pending'):
+        if prior['phase'] not in TERMINAL or not isinstance(proof, dict):
+            continue
+        if prior['phase'] == 'ready':
+            if (prior.get('result') != proof or proof.get('runtime_integrated') is not True
+                    or proof.get('prepared_setups') is not True or not SHA.fullmatch(str(proof.get('generation', '')))):
+                raise RuntimeError('ready predecessor has an invalid integration proof')
+        elif prior.get('result') is not None or proof.get('runtime_integrated') != 'pending':
             continue
         if JobScope.members(prior) or manager._containers(prior):
             raise RuntimeError('APT repair predecessor still has active owners')
