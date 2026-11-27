@@ -59,7 +59,7 @@ def _pip_processes(pid):
     return rows
 
 
-def _run_elementary_pip(args, *, cwd, env, input):
+def _run_elementary_pip(args, *, cwd, env, input, log=None):
     # A Pip invocation is orchestration. Only its active elementary children
     # (including the launcher when it is itself a leaf) consume wall budgets.
     limits = json.loads(Path('/opt/gpt-trace/bundle/guest-contract.json').read_bytes())
@@ -67,15 +67,14 @@ def _run_elementary_pip(args, *, cwd, env, input):
     cadence = limits['progress_interval_seconds']
     cleanup = limits['cleanup_timeout_seconds']
     if not (type(cadence) is type(cleanup) is int and 1 <= cadence <= limit <= 180 and 1 <= cleanup <= limit):
-        raise RuntimeError('invalid Pip elementary deadlines')
+        raise RuntimeError('invalid guest elementary deadlines')
     if input is not None:
-        raise RuntimeError('elementary Pip capture does not accept stdin')
+        raise RuntimeError('elementary guest command does not accept stdin')
     ticks = os.sysconf('SC_CLK_TCK')
-    with tempfile.TemporaryFile() as output, Path('/dev/ttyS0').open('w', buffering=1) as serial:
+    with (tempfile.TemporaryFile() if log is None else contextlib.nullcontext(log)) as output, Path('/dev/ttyS0').open('w', buffering=1) as serial:
         process = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         active = {}
-        elapsed = {}
         parents_seen = set()
         def event(kind, marker):
             serial.write('GPTTRACE_TEMPLATE ' + kind + ' pip-' + str(marker[0]) + '-' + str(marker[1]) + '\n')
@@ -89,31 +88,31 @@ def _run_elementary_pip(args, *, cwd, env, input):
                 parents_seen.update((pid, row[1]) for pid, row in rows.items() if pid in parents)
                 for marker in tuple(active):
                     if marker not in leaves:
-                        elapsed[marker] = elapsed.get(marker, 0) + now - active.pop(marker)
+                        active.pop(marker)
                         event('end', marker)
                 for marker in sorted(leaves):
                     if marker not in active:
                         age = 0 if marker in parents_seen else max(0, time.clock_gettime(time.CLOCK_BOOTTIME) - marker[1] / ticks)
                         active[marker] = now - age
                         event('begin', marker)
-                    if elapsed.get(marker, 0) + now - active[marker] >= limit:
-                        raise TimeoutError('Pip elementary process exceeded deadline: ' + str(marker[0]))
+                    if now - active[marker] >= limit:
+                        raise TimeoutError('guest elementary process exceeded deadline: ' + str(marker[0]))
                 for pid, row in rows.items():
-                    if row[2] / ticks >= limit:
-                        raise TimeoutError('Pip elementary process exceeded CPU deadline: ' + str(pid))
-                elapsed = {marker: duration for marker, duration in elapsed.items()
-                           if marker[0] in rows and rows[marker[0]][1] == marker[1]}
+                    if (pid, row[1]) not in parents_seen and row[2] / ticks >= limit:
+                        raise TimeoutError('guest elementary process exceeded CPU deadline: ' + str(pid))
+                parents_seen.intersection_update((pid, row[1]) for pid, row in rows.items())
                 if status is not None:
                     if rows:
-                        raise RuntimeError('Pip exited with live build descendants')
+                        raise RuntimeError('guest command exited with live descendants')
                     break
-                remaining = min((limit - elapsed.get(marker, 0) - (now - start)
-                                 for marker, start in active.items()), default=limit)
+                remaining = min((limit - (now - start) for start in active.values()), default=limit)
                 delay = min(cadence, max(0, remaining))
                 try:
                     process.wait(timeout=delay)
                 except subprocess.TimeoutExpired:
                     pass
+            if log is not None:
+                return status
             output.seek(0)
             data = output.read()
             if status:
@@ -130,7 +129,7 @@ def _run_elementary_pip(args, *, cwd, env, input):
                 while _pip_processes(process.pid):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise RuntimeError('Pip process group remained live after termination')
+                        raise RuntimeError('guest process group remained live after termination')
                     time.sleep(min(cadence, remaining))
             raise
         finally:
@@ -154,7 +153,7 @@ def run(*args, cwd=None, env=None, input=None, elementary=False):
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
 BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
-TASK_RUNTIME_SCHEMA = 8
+TASK_RUNTIME_SCHEMA = 9
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -447,10 +446,18 @@ def _template_script(commands, *, marker=None):
 
 def shell(commands, *, cwd, env=None, offline=False, log=None):
     marker = None
-    if os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1":
+    traced = os.environ.get("GPTTRACE_TEMPLATE_TRACE") == "1"
+    elementary = False
+    if traced:
+        commands = list(commands)
         if os.environ.get('GPT_TRACE_NATIVE_ROUND'):
             marker = 'GPTTRACE_RECIPE_' + os.urandom(16).hex() + '_'
-        commands = _template_script(commands, marker=marker)
+        if any(command.startswith(str(CONDA) + ' create ') for command in commands):
+            commands = _template_script(commands, marker=marker)
+        else:
+            elementary = True
+            commands = [fragment for index, command in enumerate(commands)
+                        for fragment in ((['printf "%s\\n" ' + shlex.quote(marker + str(index))] if marker else []) + [command])]
     script = "set -eo pipefail\n" + "\n".join(commands) + "\n"
     if offline:
         script = "ip link set lo up\n" + script
@@ -461,12 +468,13 @@ def shell(commands, *, cwd, env=None, offline=False, log=None):
         if offline:
             argv = ["unshare", "--net", *argv]
         with Path(log).open("w+b") if log else tempfile.TemporaryFile() as output:
-            result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
-            if result.returncode:
+            status = (_run_elementary_pip(argv, cwd=cwd, env=env, input=None, log=output) if elementary else
+                      subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT).returncode)
+            if status:
                 observations = _recipe_observations(output, marker) if marker is not None else None
                 output.seek(0, os.SEEK_END)
                 output.seek(max(0, output.tell()-16384))
-                raise RecipeFailure(f"official setup failed ({result.returncode}): {output.read().decode(errors='replace')}", observations)
+                raise RecipeFailure(f"official setup failed ({status}): {output.read().decode(errors='replace')}", observations)
 
 
 def stream_digest(path):
@@ -580,8 +588,12 @@ def recovery_env_prefix(item):
     return Path("/opt/miniconda3/envs/testbed")
 
 
+def _distribution_name(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def pip_versions(prefix):
-    return {entry["name"].lower().replace("_", "-"): entry["version"]
+    return {_distribution_name(entry["name"]): entry["version"]
             for entry in json.loads(run(str(prefix / "bin/python"), "-m", "pip",
                                         "list", "--format=json").decode())}
 
@@ -778,7 +790,7 @@ def relocate_checkout(commands, destination):
     return [re.sub(pattern, lambda _: str(destination), line) for line in commands]
 
 
-def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
+def prepare(item, *, artifact, offline=True, destination="/testbed", log=None, wheel_capture=None):
     prefix_name = "replay" if offline else "warm"
     _timed(item, prefix_name + "_clean_checkout",
            lambda: clean_checkout(item, artifact, destination))
@@ -794,9 +806,10 @@ def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
     pool_backed = (ROOT / "caches/pip-index").is_dir()
-    _timed(item, prefix_name + "_repo_setup",
-           lambda: _native_recipe(item, prefix, lambda: shell(commands, cwd=destination,
-                         env=runtime_environment(item, offline=offline), offline=offline or pool_backed, log=log), log))
+    with _capture_pip_installations(prefix, wheel_capture, runtime_environment(item, offline=offline)) as env:
+        _timed(item, prefix_name + "_repo_setup",
+               lambda: _native_recipe(item, prefix, lambda: shell(commands, cwd=destination,
+                             env=env, offline=offline or pool_backed, log=log), log))
     if offline:
         expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).read_text())
         if env_inventory(prefix) != expected:
@@ -1221,6 +1234,272 @@ def _publish_capture_object(objects, filename, record, source):
             os.close(fd)
 
 
+
+_PIP_INSTALL_CAPTURE = r'''import hashlib, importlib.abc, importlib.machinery, inspect, json, os, re, sys, tempfile, zipfile
+from pathlib import Path
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1048576), b''):
+            value.update(block)
+    return value.hexdigest()
+
+
+def publish(directory, value):
+    path = directory / (value['name'] + '.json')
+    fd, temporary = tempfile.mkstemp(dir=str(directory), prefix='.receipt-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+        descriptor = os.open(str(directory), os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def inside(path, prefix):
+    return os.path.commonpath([os.path.realpath(str(path)), str(prefix)]) == str(prefix)
+
+
+def capture(arguments, directory, prefix):
+    from email.parser import BytesParser
+    from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
+    path = Path(arguments['wheel_path'])
+    scheme = arguments['scheme']
+    if not all(inside(getattr(scheme, key), prefix) for key in ('purelib', 'platlib')):
+        return
+    name, version, _, _ = parse_wheel_filename(path.name)
+    if name != canonicalize_name(arguments['name']):
+        raise RuntimeError('installed wheel name differs from Pip request')
+    with zipfile.ZipFile(str(path)) as archive:
+        metadata = [entry for entry in archive.namelist()
+                    if entry.count('/') == 1 and entry.endswith('.dist-info/WHEEL')]
+        if len(metadata) != 1:
+            raise RuntimeError('installed wheel metadata is ambiguous')
+        raw = BytesParser().parsebytes(archive.read(metadata[0]))
+        pure = raw.get('Root-Is-Purelib', '').lower()
+        if pure not in ('true', 'false'):
+            raise RuntimeError('installed wheel has invalid installation scheme')
+        root = Path(scheme.purelib if pure == 'true' else scheme.platlib)
+        info = root / metadata[0].rsplit('/', 1)[0]
+    record = info / 'RECORD'
+    if not inside(record, prefix) or record.is_symlink() or not record.is_file():
+        raise RuntimeError('installed wheel has no target RECORD')
+    direct = info / 'direct_url.json'
+    origin = json.loads(direct.read_bytes()) if direct.is_file() else None
+    objects = directory / 'objects'
+    receipts = directory / 'receipts'
+    for folder in (objects, receipts):
+        if folder.is_symlink():
+            raise RuntimeError('unsafe wheel capture store')
+        folder.mkdir(exist_ok=True)
+    value = hashlib.sha256()
+    fd, temporary = tempfile.mkstemp(dir=str(objects), prefix='.wheel-')
+    size = 0
+    try:
+        with os.fdopen(fd, 'wb') as output, path.open('rb') as source:
+            for block in iter(lambda: source.read(1048576), b''):
+                value.update(block)
+                output.write(block)
+                size += len(block)
+            output.flush()
+            os.fsync(output.fileno())
+        sha = value.hexdigest()
+        target = objects / sha
+        try:
+            os.link(temporary, str(target))
+        except FileExistsError:
+            if target.is_symlink() or target.stat().st_size != size or digest(target) != sha:
+                raise RuntimeError('installed wheel capture object differs')
+        descriptor = os.open(str(objects), os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        publish(receipts, {'name': name, 'version': str(version), 'filename': path.name,
+                           'sha256': sha, 'size': size, 'origin': origin,
+                           'record': os.path.relpath(str(record), str(prefix)),
+                           'record_sha256': digest(record)})
+    finally:
+        os.unlink(temporary)
+
+
+class CaptureLoader:
+    def __init__(self, delegate, directory, prefix):
+        self.delegate, self.directory, self.prefix = delegate, directory, prefix
+
+    def create_module(self, spec):
+        return self.delegate.create_module(spec)
+
+    def exec_module(self, module):
+        self.delegate.exec_module(module)
+        original = module.install_wheel
+        signature = inspect.signature(original)
+        if not {'name', 'wheel_path', 'scheme'} <= set(signature.parameters):
+            raise RuntimeError('Pip wheel installer capture API differs')
+        def install_wheel(*args, **kwargs):
+            arguments = signature.bind(*args, **kwargs).arguments
+            result = original(*args, **kwargs)
+            capture(arguments, self.directory, self.prefix)
+            return result
+        install_wheel.gpttrace_capture = True
+        module.install_wheel = install_wheel
+
+
+class CaptureFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, directory, prefix):
+        self.directory, self.prefix = directory, prefix
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != 'pip._internal.operations.install.wheel':
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        if spec is None or spec.loader is None:
+            raise ImportError('Pip wheel installer is unavailable')
+        spec.loader = CaptureLoader(spec.loader, self.directory, self.prefix)
+        return spec
+
+
+def enable():
+    directory = Path(os.environ['GPT_TRACE_PIP_CAPTURE_DIR'])
+    prefix = Path(os.environ['GPT_TRACE_PIP_CAPTURE_PREFIX']).resolve()
+    if Path(sys.prefix).resolve() != prefix:
+        return
+    if not directory.is_dir() or directory.is_symlink():
+        raise RuntimeError('invalid task wheel capture directory')
+    sys.meta_path.insert(0, CaptureFinder(directory, prefix))
+'''
+
+
+@contextlib.contextmanager
+def _capture_pip_installations(prefix, directory, env):
+    """Observe Pip's actual install boundary; do not re-run a backend to export its wheel."""
+    if directory is None:
+        yield env
+        return
+    prefix, directory = Path(prefix).resolve(strict=True), Path(directory)
+    if directory.is_symlink():
+        raise RuntimeError('unsafe task wheel capture directory')
+    directory.mkdir(parents=True, exist_ok=True)
+    hook = directory / 'capture.py'
+    if hook.exists() or hook.is_symlink():
+        if hook.is_symlink() or hook.read_text() != _PIP_INSTALL_CAPTURE:
+            raise RuntimeError('task wheel capture hook differs')
+    else:
+        with hook.open('x') as stream:
+            stream.write(_PIP_INSTALL_CAPTURE)
+    paths = json.loads(run(str(prefix / 'bin/python'), '-I', '-c',
+                           'import json,sysconfig; print(json.dumps([sysconfig.get_path(k) for k in ("purelib","platlib")]))').decode())
+    installed = []
+    capture_env = dict(env, GPT_TRACE_PIP_CAPTURE_DIR=str(directory), GPT_TRACE_PIP_CAPTURE_PREFIX=str(prefix))
+    # The .pth affects only this disposable cloned prefix, and only while the
+    # capture environment is present. No permanent template or evaluator is patched.
+    line = ('import os,runpy; os.environ.get("GPT_TRACE_PIP_CAPTURE_DIR") and '
+            'runpy.run_path(' + repr(str(hook)) + ')["enable"]()\n')
+    try:
+        for raw in sorted(set(paths)):
+            root = Path(raw).resolve(strict=True)
+            if not root.is_relative_to(prefix):
+                raise RuntimeError('capture site-packages is outside the target prefix')
+            path = root / ('gpttrace-capture-' + hashlib.sha256(line.encode()).hexdigest() + '.pth')
+            with path.open('x') as stream:
+                stream.write(line)
+            installed.append(path)
+        run(str(prefix / 'bin/python'), '-I', '-c',
+            'from pip._internal.operations.install.wheel import install_wheel; '
+            'assert getattr(install_wheel,"gpttrace_capture",False)', env=capture_env)
+        yield capture_env
+    finally:
+        for path in installed:
+            path.unlink()
+
+
+def _captured_install_wheel(prefix, directory, name, requirement, *, tags=None):
+    """Re-use an exact installed wheel, including relocated wheel data and scripts."""
+    import base64
+    import csv
+    import urllib.parse
+    from packaging.utils import parse_wheel_filename
+    from packaging.version import Version
+    if directory is None:
+        return None
+    prefix, directory = Path(prefix).resolve(strict=True), Path(directory)
+    receipt = directory / 'receipts' / (name + '.json')
+    if receipt.is_symlink():
+        raise RuntimeError('unsafe installed wheel receipt')
+    if not receipt.is_file():
+        return None
+    row = json.loads(receipt.read_bytes())
+    filename = row['filename']
+    wheel_name, version, _, wheel_tags = parse_wheel_filename(filename)
+    if wheel_name != name or Version(row['version']) != version or row['name'] != name:
+        raise RuntimeError('installed wheel receipt identity differs')
+    if tags is not None and not {str(tag) for tag in wheel_tags} & tags:
+        return None
+    if requirement.url is None:
+        if not requirement.specifier.contains(version, prereleases=True):
+            return None
+    else:
+        raw = urllib.parse.urlsplit(requirement.url.removeprefix('git+'))
+        repository, separator, commit = raw.path.rpartition('@')
+        origin = row['origin'] or {}
+        actual = urllib.parse.urlsplit(origin.get('url', ''))
+        subdirectory = urllib.parse.parse_qs(raw.fragment).get('subdirectory', [])
+        if (not separator or (raw.scheme, raw.netloc, repository.removesuffix('.git')) !=
+                (actual.scheme, actual.netloc, actual.path.removesuffix('.git')) or
+                origin.get('vcs_info', {}).get('commit_id') != commit or
+                subdirectory != ([origin['subdirectory']] if origin.get('subdirectory') else [])):
+            return None
+    relative = Path(row['record'])
+    if relative.is_absolute() or '..' in relative.parts:
+        raise RuntimeError('unsafe installed distribution RECORD path')
+    record_path = prefix / relative
+    if (not record_path.is_file() or record_path.is_symlink() or
+            not record_path.resolve(strict=True).is_relative_to(prefix) or
+            stream_digest(record_path) != row['record_sha256']):
+        return None
+    # The installation ledger records Pip's final RECORD, not the archive's
+    # pre-relocation RECORD. Validate every recorded hashed file against the
+    # actual installed payload, including generated scripts and native modules.
+    with record_path.open(encoding='utf-8', newline='') as stream:
+        rows = list(csv.reader(stream))
+    if any(len(fields) != 3 for fields in rows) or len({fields[0] for fields in rows}) != len(rows):
+        raise RuntimeError('invalid installed wheel RECORD')
+    root = record_path.parent.parent
+    for relative, signature, size in rows:
+        target = root / relative
+        if not target.is_file() or target.is_symlink() or not target.resolve(strict=True).is_relative_to(prefix):
+            return None
+        if not signature:
+            if target.resolve() != record_path.resolve() and target.suffix != '.pyc':
+                return None
+            continue
+        algorithm, separator, expected = signature.partition('=')
+        if not separator or not size.isdecimal() or target.stat().st_size != int(size):
+            return None
+        value = hashlib.new(algorithm)
+        with _template_operation('verify-installed-wheel-member'), target.open('rb') as stream:
+            for block in iter(lambda: stream.read(1048576), b''):
+                value.update(block)
+        if base64.urlsafe_b64encode(value.digest()).decode().rstrip('=') != expected:
+            return None
+    integrity = _wheel_files({filename: {'sha256': row['sha256'], 'size': row['size']}})[filename]
+    source = directory / 'objects' / integrity['sha256']
+    _verified_capture_object(source, integrity)
+    with _template_operation('validate-installed-wheel'):
+        _validate_captured_wheel(source, {name: (str(requirement), requirement)}, filename=filename)
+    return filename, source, integrity
+
+
 def _installed_wheel_evidence(prefix, requirements, env):
     code = r'''import csv, importlib.metadata, io, json, sys
 from pip._vendor.packaging.tags import sys_tags
@@ -1329,13 +1608,25 @@ def _wheel_distribution_key(requirement):
     return hashlib.sha256(canonicalize_name(requirement.name).encode()).hexdigest()
 
 
-def _matching_capture_candidates(requirement, evidence, tags, pip_candidates, *, cache=None):
+def _matching_capture_candidates(requirement, evidence, tags, pip_candidates, *, cache=None, provenance=None):
     from packaging.utils import canonicalize_name, parse_wheel_filename
     if requirement.url is not None:
         return None
     # Only wheels actually built by Pip from this task's frozen local archive
     # index, or independently verified CAS objects from previous captures.
     candidates = []
+    if provenance is None:
+        path = ROOT / 'environment-cache-provenance.json'
+        provenance = json.loads(path.read_bytes()) if path.is_file() else {}
+    for filename, record in sorted(provenance.get('pip', {}).items()):
+        if not filename.endswith('.whl'):
+            continue
+        wheel_name, version, _, _ = parse_wheel_filename(filename)
+        if wheel_name != canonicalize_name(requirement.name) or not requirement.specifier.contains(version, prereleases=True):
+            continue
+        source = ROOT / 'caches/pip-index' / filename
+        _verified_capture_object(source, record)
+        candidates.append((filename, source, record))
     for path in pip_candidates.get(canonicalize_name(requirement.name), ()):
         if path.is_symlink() or not path.is_file():
             raise RuntimeError('unsafe Pip wheel cache entry')
@@ -1355,8 +1646,7 @@ def _matching_capture_candidates(requirement, evidence, tags, pip_candidates, *,
         sha = row.get('archive_info', {}).get('hashes', {}).get('sha256')
         if not re.fullmatch(r'[a-f0-9]{64}', str(sha)):
             continue
-        provenance = json.loads((ROOT / 'environment-cache-provenance.json').read_bytes())
-        if provenance['pip'].get(source.name, {}).get('sha256') != sha or stream_digest(source) != sha:
+        if provenance.get('pip', {}).get(source.name, {}).get('sha256') != sha or stream_digest(source) != sha:
             raise RuntimeError('cached wheel source differs from the frozen acquisition')
         candidates.append((path.name, path, None))
     if cache is not None:
@@ -1403,7 +1693,7 @@ def _index_captured_wheel(cache, requirement, filename, record):
         _durable_json(path, value)
 
 
-def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
+def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory, *, installed_capture=None):
     """One target activation, independent Pip transactions and durable receipts."""
     if any(wheelhouse.iterdir()):
         raise RuntimeError('wheel capture destination must start empty')
@@ -1417,6 +1707,22 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
     pending = dict(requirements)
     wheels = {}
     receipt_keys = {}
+    if installed_capture is not None:
+        tags = set(json.loads(run(str(Path(prefix) / 'bin/python'), '-I', '-c',
+            'import json; from pip._vendor.packaging.tags import sys_tags; '
+            'print(json.dumps([str(tag) for tag in sys_tags()]))', env=env).decode()))
+        for name, (line, requirement) in requirements.items():
+            matched = _captured_install_wheel(prefix, installed_capture, name, requirement, tags=tags)
+            if matched is None:
+                if (Path(installed_capture) / 'receipts' / (name + '.json')).exists():
+                    raise RuntimeError('actual installed wheel receipt no longer matches: ' + name)
+                continue
+            filename, source, record = matched
+            target = wheelhouse / filename
+            with _template_operation('retain-actual-installed-wheel'):
+                os.link(source, target)
+            wheels[filename] = record
+            del pending[name]
     if shared is not None:
         context = os.environ['GPT_TRACE_WHEEL_BUILD_CONTEXT']
         cache = shared / 'wheel-capture-v2'
@@ -1425,10 +1731,21 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             if folder.is_symlink():
                 raise RuntimeError('unsafe shared wheel capture store')
             folder.mkdir(parents=True, exist_ok=True)
-        for name, (line, _) in requirements.items():
+        for name, (line, requirement) in requirements.items():
             key = _capture_cache_key(context, hashlib.sha256((line + '\n').encode()).hexdigest(), inventory, env)
             receipt = records / (key + '.json')
             receipt_keys[name] = key, receipt
+            if name not in pending:
+                filename = next(filename for filename in wheels if _capture_wheel_name(filename, requirements) == name)
+                record = wheels[filename]
+                _publish_capture_object(objects, filename, record, wheelhouse / filename)
+                _index_captured_wheel(cache, requirement, filename, record)
+                _durable_json(receipt, {'schema': 2, 'key': key, 'wheels': {filename: record}})
+                continue
+            # An earlier context receipt does not prove the bytes installed now.
+            # The real installation path must establish that proof independently.
+            if installed_capture is not None:
+                continue
             if receipt.is_symlink():
                 raise RuntimeError('unsafe wheel capture receipt')
             if not receipt.exists():
@@ -1460,8 +1777,12 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             name, _, _, _ = parse_wheel_filename(path.name)
             if name in pending:
                 pip_candidates.setdefault(name, []).append(path)
+        provenance_path = ROOT / 'environment-cache-provenance.json'
+        provenance = json.loads(provenance_path.read_bytes()) if provenance_path.is_file() else {}
+        official = {parse_wheel_filename(filename)[0] for filename in provenance.get('pip', {})
+                    if filename.endswith('.whl')}
         eligible = {name: pair for name, pair in pending.items()
-                    if pair[1].url is None and (name in pip_candidates or
+                    if pair[1].url is None and (name in official or name in pip_candidates or
                         (shared is not None and (cache / 'distributions' /
                             _wheel_distribution_key(pair[1])).is_dir()))}
         evidence = (_installed_wheel_evidence(prefix, eligible, env) if eligible else
@@ -1472,7 +1793,8 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             if installed is None or requirement.url is not None:
                 continue
             matched = _matching_capture_candidates(requirement, installed, tags, pip_candidates,
-                                                    cache=cache if shared is not None else None)
+                                                    cache=cache if shared is not None else None,
+                                                    provenance=provenance)
             if matched is None:
                 continue
             filename, source, record = matched
@@ -1488,6 +1810,8 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
                 _verified_capture_object(target, record)
             wheels[filename] = record
             del pending[name]
+    if pending and installed_capture is not None:
+        raise RuntimeError('no exact wheel evidence for installed distributions: ' + ', '.join(sorted(pending)))
     for name, (line, requirement) in pending.items():
         with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix='.wheel-capture-') as raw:
             scratch = Path(raw)
@@ -1530,27 +1854,32 @@ def warm_task(item, artifact, *, common_identity=None):
     seed_pool_vcs(item)
     _reset_task_warm_outputs(item)
     baseline = pip_versions(pristine_stored_env(item))
+    capture_directory = TASK_INPUT_ROOT / 'installed-wheel-capture'
+    if capture_directory.exists() or capture_directory.is_symlink():
+        raise RuntimeError('unexpected task wheel capture state; preserved')
     prefix = prepare(item, artifact=artifact, offline=False,
-                     log=ROOT / "logs" / (item["instance_id"] + ".warm.log"))
+                     log=ROOT / "logs" / (item["instance_id"] + ".warm.log"),
+                     wheel_capture=capture_directory)
     (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(
         json.dumps(env_inventory(prefix), sort_keys=True))
-    _timed(item, "warm_eval_setup",
-           lambda: _native_recipe(item, prefix, lambda: shell(_with_compiler_cache(item["eval_setup_commands"], prefix), cwd="/testbed",
-                         env=runtime_environment(item, offline=False), offline=True, log=ROOT / "logs/eval-warm.log"),
-                         ROOT / "logs/eval-warm.log"))
+    with _capture_pip_installations(prefix, capture_directory, runtime_environment(item, offline=False)) as env:
+        _timed(item, "warm_eval_setup",
+               lambda: _native_recipe(item, prefix, lambda: shell(_with_compiler_cache(item["eval_setup_commands"], prefix), cwd="/testbed",
+                             env=env, offline=True, log=ROOT / "logs/eval-warm.log"),
+                             ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
     (ROOT / "task-provenance" / (item["instance_id"] + ".json")).write_text(json.dumps(inventory, sort_keys=True))
     packages = json.loads(run(str(prefix / "bin/python"), "-m", "pip", "list", "--format=json").decode())
     editable = json.loads(run(str(prefix / "bin/python"), "-m", "pip", "list", "--editable", "--format=json").decode())
-    excluded = {entry["name"].lower().replace("_", "-") for entry in editable}
-    direct = json.loads(run(str(prefix / "bin/python"), "-c", """import importlib.metadata,json
+    excluded = {_distribution_name(entry["name"]) for entry in editable}
+    direct = json.loads(run(str(prefix / "bin/python"), "-c", """import importlib.metadata,json,re
 result={}
 for dist in importlib.metadata.distributions():
     raw=dist.read_text('direct_url.json')
     if raw:
-        result[dist.metadata['Name'].lower().replace('_','-')]=json.loads(raw)
+        result[re.sub(r'[-_.]+','-',dist.metadata['Name']).lower()]=json.loads(raw)
 print(json.dumps(result))
 """).decode())
     reqs = []
@@ -1558,8 +1887,9 @@ print(json.dumps(result))
     if native:
         _native_report(native)
     for entry in packages:
-        name = entry["name"].lower().replace("_", "-")
-        if name in excluded or baseline.get(name) == entry["version"]:
+        name = _distribution_name(entry["name"])
+        captured = (capture_directory / "receipts" / (name + ".json")).is_file()
+        if name in excluded or (baseline.get(name) == entry["version"] and not captured):
             continue
         record = direct.get(name, {})
         if "vcs_info" in record:
@@ -1577,8 +1907,9 @@ print(json.dumps(result))
     if reqs:
         _timed(item, "warm_capture_wheels",
                lambda: _native_recipe(item, prefix, lambda: _capture_install_artifacts(
-                   item, prefix, requirements_file, wheelhouse, inventory)))
+                   item, prefix, requirements_file, wheelhouse, inventory, installed_capture=capture_directory)))
     requirements_file.unlink()
+    shutil.rmtree(capture_directory)
     _timed(item, "warm_freeze_vcs", lambda: freeze_vcs_dependencies(item, prefix))
     pool = ROOT / "caches/wheels"
     pool.mkdir(parents=True, exist_ok=True)
@@ -1768,7 +2099,7 @@ def commit_common_inputs(checkpoint):
     _durable_json(ROOT / names[checkpoint["kind"]], checkpoint)
 
 
-def _native_profile(prefix, *, loader_needed=False):
+def _native_profile(prefix, *, loader_needed=False, interpreter=None, environment=None):
     """Read the real activated interpreter's build configuration in the guest."""
     code = r'''import json, os, sys, sysconfig, shlex, subprocess, shutil, re
 from pathlib import Path
@@ -1829,9 +2160,15 @@ if sys.argv[1] == "loader":
 print("GPTTRACE_NATIVE_PROFILE " + json.dumps({"headers": roots, "libraries": libraries[0],
     "loader": loader_paths, "missing": sorted(set(missing))}))
 '''
-    output = run(str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output',
-                 str(Path(prefix) / 'bin/python'), '-I', '-c', code,
-                 'loader' if loader_needed else 'compiler', env=build_limits()).decode()
+    if interpreter is None:
+        command = (str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output', str(Path(prefix) / 'bin/python'))
+        environment = build_limits()
+    else:
+        command = (str(interpreter),)
+        if environment is None:
+            raise RuntimeError('native profile needs the active metadata environment')
+    output = run(*command, '-I', '-c', code,
+                 'loader' if loader_needed else 'compiler', env=environment).decode()
     marker = 'GPTTRACE_NATIVE_PROFILE '
     rows = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
     if len(rows) != 1:

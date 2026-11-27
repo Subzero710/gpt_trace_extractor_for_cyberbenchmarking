@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Host-only SWE-Gym Lite dependency acquisition. No execution of task recipes.
+"""SWE-Gym Lite acquisition; the host resolves and downloads immutable inputs.
 
-The downloader runs as a dedicated non-root account. The privileged broker owns
-publication. Fetch resolves deterministic build/download inputs only; it never
-starts a VM, invokes a task script or deletes persisted data. Native package
-metadata hooks and their build dependencies run in disposable private prefixes.
+The privileged broker owns publication and an offline target metadata VM.
+Package backends execute in that VM, not in the host acquisition process.
 """
 from __future__ import annotations
 import argparse
@@ -3604,6 +3602,7 @@ class Pool:
         # Per-attempt indexes are rebuilt from verified retained content.
         self.by_url = {}
         self.by_sri = {}
+        self.retained_urls = {}
         self.sri_verified = set()
         self.verified_objects = set()  # SHA-256 verified at acquisition or recovery
         self._verified_signatures = {}
@@ -3643,6 +3642,24 @@ class Pool:
             self.verified_objects.add(sha)
             return info.st_size
 
+    def _link_object(self, sha, destination):
+        source = self.objects / sha[:2] / sha
+        if source.stat().st_uid == os.geteuid():
+            os.link(source, destination)
+            return
+        path = os.environ.get('GPT_TRACE_SEALED_CAS_LINKS')
+        if not path:
+            raise RuntimeError('sealed CAS alias requires its broker link service')
+        request = {'sha256': sha, 'destination': Path(destination).relative_to(self.stage).as_posix()}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.settimeout(_operation_timeout())
+            channel.connect(path)
+            channel.sendall(json.dumps(request).encode()+b'\n')
+            with channel.makefile('rb') as wire:
+                response = json.loads(wire.readline(8192))
+            if response != {'ok': True}:
+                raise RuntimeError('sealed CAS link refused: ' + repr(response))
+
     def link_verified_object(self, sha, destination):
         """Link a SHA-verified CAS object without racing another link's ctime.
 
@@ -3664,7 +3681,7 @@ class Pool:
                     raise RuntimeError('CAS hardlink destination differs from verified object')
             else:
                 with _registered_operation('verified CAS link'):
-                    os.link(source, destination)
+                    self._link_object(sha, destination)
             if not destination.is_file() or not destination.samefile(source):
                 raise RuntimeError('CAS hardlink identity changed')
             self._verified_signatures[sha] = self._object_signature(source.lstat())
@@ -3724,7 +3741,7 @@ class Pool:
                 return
             import secrets
             temporary = path.parent / ('.pool-link-' + secrets.token_hex(16))
-            os.link(target, temporary)
+            self._link_object(sha, temporary)
             try:
                 os.replace(temporary, path)
             finally:
@@ -3768,6 +3785,18 @@ class Pool:
                     if item in self.by_sri:
                         cached = self.by_sri[item]
                         break
+                if cached is None:
+                    prior = self.retained_urls.get(url)
+                    if prior is not None and (self.objects/prior[:2]/prior).is_file():
+                        # Never trust a URL mapping alone across attempts.
+                        candidate = self.objects/prior[:2]/prior
+                        self.verify_object(prior)
+                        try:
+                            verify_sri(candidate, sri)
+                        except RuntimeError:
+                            pass
+                        else:
+                            cached = prior
             elif url in self.by_url:
                 cached = self.by_url[url]
             # Even when the known digest is new, a previously fetched URL may exist.
@@ -3841,7 +3870,7 @@ class Pool:
 
 # GPT_TRACE_SWEGYM_VERIFIED_RESUME_V1
 # Copy a FAILED stage into a fresh candidate. Never modify the original.
-def salvage_verified_stage(old, new, *, conda_artifacts=None):
+def salvage_verified_stage(old, new, *, conda_artifacts=None, reuse_plans=True):
     old, new = Path(old), Path(new)
     if (old.resolve()==new.resolve() or new.resolve().is_relative_to(old.resolve())
             or old.resolve().is_relative_to(new.resolve())):
@@ -3882,7 +3911,13 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
                 continue
             target=new/'objects'/'sha256'/sha[:2]/sha
             target.parent.mkdir(parents=True,exist_ok=True)
-            os.link(obj,target)  # Verified immutable bytes, zero-copy reuse.
+            if target.exists():
+                if target.is_symlink() or not target.is_file() or digest(target) != sha:
+                    raise RuntimeError('preseeded CAS differs from retained identity')
+            elif obj.stat().st_uid == os.geteuid():
+                os.link(obj,target)
+            else:
+                raise RuntimeError('root-owned retained CAS must be admitted by the broker before recovery')
             good[(obj.stat().st_dev,obj.stat().st_ino)]=(sha,target)
             count+=1
     # Old workers (before per-completion CAS registration) left SHA-verified
@@ -3981,31 +4016,10 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
             if identity not in good:continue
             dest=new/kind/file.relative_to(source)
             dest.parent.mkdir(parents=True,exist_ok=True)
-            os.link(good[identity][1],dest)
-    # Reuse a logical pip plan only when it already belongs to this exact
-    # resolver-policy schema and every referenced immutable object survived
-    # SHA-256 validation. Resolver changes invalidate decisions, never CAS bytes.
-    good_shas={value[0] for value in good.values()}
-    old_metadata=old/'metadata'
-    if old_metadata.is_dir():
-        for plan_path in sorted(old_metadata.glob('pip-plan-*.json')):
-            if plan_path.is_symlink() or not plan_path.is_file() or plan_path.stat().st_size>4*1024*1024:
-                continue
-            try:
-                raw=plan_path.read_bytes(); plan=json.loads(raw)
-                if (plan.get('optional_failed') or plan.get('artifact_model')!=PIP_ARTIFACT_MODEL
-                        or plan.get('plan_schema')!=PIP_PLAN_SCHEMA):
-                    continue
-                _coerce_target(plan.get('target'))
-                key = plan_path.name[len('pip-plan-'):-len('.json')]
-                dependencies = _read_pip_plan_tree(old, key)
-                artifact_shas={sha for completed in dependencies.values()
-                               for sha in _pip_plan_artifact_shas(completed)}
-                if not artifact_shas<=good_shas:
-                    continue
-                write_new(new/'metadata'/plan_path.name,raw)
-            except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError,RuntimeError):
-                continue
+            if good[identity][1].stat().st_uid == os.geteuid():
+                os.link(good[identity][1],dest)
+    if reuse_plans:
+        salvage_pip_plans(old, new, {value[0] for value in good.values()})
 
     # APT will verify these archives again against the signed repository indexes.
     # They are writable APT cache entries, so COPY instead of hardlinking them.
@@ -4018,6 +4032,36 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
             shutil.copy2(deb,dest)
     print('[pool] verified resume: '+str(count)+' CAS artifacts, '+str(conda_recovered)+' legacy Conda archives and retained Git mirrors',flush=True)
     return {value[0] for value in good.values()}
+
+
+def salvage_pip_plans(old, new, good_shas):
+    old, new = Path(old), Path(new)
+    # Reuse a logical pip plan only when it already belongs to this exact
+    # resolver-policy schema and every referenced immutable object survived
+    # SHA-256 validation. Resolver changes invalidate decisions, never CAS bytes.
+    old_metadata=old/'metadata'
+    if old_metadata.is_dir():
+        for plan_path in sorted(old_metadata.glob('pip-plan-*.json')):
+            if plan_path.is_symlink() or not plan_path.is_file() or plan_path.stat().st_size>4*1024*1024:
+                continue
+            try:
+                raw=plan_path.read_bytes(); plan=json.loads(raw)
+                if (plan.get('optional_failed') or plan.get('artifact_model')!=PIP_ARTIFACT_MODEL
+                        or plan.get('plan_schema')!=PIP_PLAN_SCHEMA):
+                    continue
+                if plan.get('resolver_policy', {}).get('runtime') != _resolver_runtime_identity():
+                    continue
+                _coerce_target(plan.get('target'))
+                key = plan_path.name[len('pip-plan-'):-len('.json')]
+                dependencies = _read_pip_plan_tree(old, key)
+                artifact_shas={sha for completed in dependencies.values()
+                               for sha in _pip_plan_artifact_shas(completed)}
+                if not artifact_shas<=good_shas:
+                    continue
+                write_new(new/'metadata'/plan_path.name,raw)
+            except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError,RuntimeError):
+                continue
+
 
 
 # GPT_TRACE_SWEGYM_CONDA_LOCK_V1
@@ -5798,7 +5842,9 @@ def acquire_pinned_sdist(pool, requirement, plan_key, python_version, *, constra
     return acquire_source_distribution(pool,requirement,plan_key,python_version,constraints=constraints)
 
 
-PIP_PLAN_SCHEMA = 21
+PIP_PLAN_SCHEMA = 22
+_NATIVE_APT_INPUTS = None
+_NATIVE_STAGE = None
 PIP_RESOLVER_POLICY = 'mandatory-native-rust-solver-v2-global-shared-artifacts'
 
 
@@ -6092,9 +6138,15 @@ def _resolver_runtime_identity():
     source_files = ('rust/verified-resolver/Cargo.toml',
                     'rust/verified-resolver/Cargo.lock',
                     'rust/verified-resolver/src/main.rs',
-                    'scripts/verified_resolver_bridge.py')
+                    'scripts/verified_resolver_bridge.py',
+                    'scripts/native_guest_execution.py',
+                    'scripts/native_guest_broker.py',
+                    'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py',
+                    'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py',
+                    'infra/workstation/image/apt_downloads.py')
     return {'packaging': packaging.__version__,
             'python': '.'.join(map(str, sys.version_info[:3])),
+            'target_metadata_os_sha256': _NATIVE_APT_INPUTS,
             'native_solver_source_sha256': {
                 relative: digest(root / relative) for relative in source_files}}
 
@@ -6120,14 +6172,26 @@ def _native_pip_stall_timeout():
 _NATIVE_POOL_LOCK = threading.RLock()
 
 
+@functools.lru_cache(maxsize=1)
+def _native_guest_module():
+    path = Path(__file__).resolve().with_name('native_guest_execution.py')
+    spec = importlib.util.spec_from_file_location('pool_native_guest_execution', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _native_pool_runtime(pool):
-    """Private, non-root host scratch for exact locked interpreters (no KVM)."""
+    """Host exchange scratch; all package tools run in the broker's guest."""
     with _bounded_lock(_NATIVE_POOL_LOCK):
         runtime = getattr(pool, '_native_runtime', None)
         if runtime is not None:
             return runtime
         if not isinstance(getattr(pool, 'conda_lock', None), dict):
             raise RuntimeError('native resolver needs the validated locked Conda transactions')
+        client = getattr(pool, 'native_guest', None)
+        if client is None:
+            raise RuntimeError('native metadata requires the broker-owned target guest')
         temporary = tempfile.TemporaryDirectory(prefix='.native-pip-', dir=pool.stage)
         root = Path(temporary.name)
         home = root / 'home'
@@ -6149,13 +6213,14 @@ def _native_pool_runtime(pool):
             'PIP_CONFIG_FILE': '/dev/null', 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
             'PIP_NO_INPUT': '1', 'PIP_INDEX_URL': 'https://pypi.org/simple',
             'PIP_CACHE_DIR': str(pip_cache),
-            'CONDARC': '/dev/null', 'CONDA_PKGS_DIRS': str(root / 'conda-pkgs'),
-            'CONDA_ENVS_DIRS': str(root / 'envs'),
+            'CONDARC': '/dev/null', 'CONDA_PKGS_DIRS': str(client.local / 'conda-pkgs'),
+            'CONDA_ENVS_DIRS': str(client.local / 'envs'),
             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
             'NPM_CONFIG_USERCONFIG': str(npm_configs['user']),
             'NPM_CONFIG_GLOBALCONFIG': str(npm_configs['global']),
         }
         native = {'context': temporary, 'root': root, 'env': environ,
+                  'guest_client': client, 'guest_local': client.local,
                   '_pip_byte_progress': _NativePipByteProgress(_conda_progress_interval()),
                   'prefixes': {}, 'bootstrapped': False,
                   'submodule_lock': threading.RLock(),
@@ -6789,6 +6854,8 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
     channel = child_channel = None
     requests = bytearray()
     resolver = runtime.get('_native_build_resolver')
+    observations = set()
+    diagnostics = runtime.get('_native_diagnostics')
     try:
         environment = {**environment, 'PIP_DEFAULT_TIMEOUT': str(limit)}
         launch = command
@@ -6816,6 +6883,8 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
             if line.strip():
                 last_output = time.monotonic()
             if not meter.observe(identity, line):
+                if diagnostics is not None:
+                    observations.update(diagnostics(line.decode(errors='replace')))
                 tail.extend(line)
                 if len(tail) > 65536:
                     del tail[:-65536]
@@ -6982,9 +7051,11 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
                for row in _native_process_tree_snapshot(process.pid)):
             raise RuntimeError('Pip exited while its process group still has live descendants')
         if process.returncode:
-            raise RuntimeError('native Pip invocation failed (exit '
-                               + str(process.returncode) + '): '
-                               + tail[-5000:].decode(errors='replace'))
+            error = RuntimeError('native Pip invocation failed (exit '
+                                 + str(process.returncode) + '): '
+                                 + tail[-5000:].decode(errors='replace'))
+            error.native_observations = observations
+            raise error
         return bytes(tail)
     except BaseException:
         if process is not None:
@@ -7002,7 +7073,7 @@ def _native_run_pip_elementary(command, runtime, environment, *, metadata_build=
         meter.end(identity)
 
 
-def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build=False):
+def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build=False, input=None):
     """Run an actual package tool with a complete, per-invocation interpreter PATH.
 
     Build backends and installed command entrypoints can invoke
@@ -7011,11 +7082,14 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     modifying global state or contaminating parallel target environments.
     The Miniconda prefix is discoverable even while its bootstrap is underway.
     """
+    if 'guest_client' in runtime:
+        return runtime['guest_client'].run(argv, runtime, timeout=timeout, interpreter=interpreter,
+                                          metadata_build=metadata_build, input=input)
     command = [str(arg) for arg in argv]
     if not command:
         raise RuntimeError('empty native package command')
     environment = dict(runtime['env'])
-    base_bin = Path(runtime['root']) / 'conda' / 'bin'
+    base_bin = Path(runtime.get('guest_local', runtime['root'])) / 'conda' / 'bin'
     paths = [str(base_bin)]
     if interpreter is not None:
         selected = Path(interpreter)
@@ -7027,7 +7101,7 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
             # Never add an alias to a host-owned directory. Long /usr/bin/python3.X
             # names use a per-runtime, per-interpreter private launcher instead.
             identity = hashlib.sha256(os.fsencode(str(selected))).hexdigest()
-            executable_dir = Path(runtime['root']) / 'python-launchers' / identity
+            executable_dir = Path(runtime.get('guest_local', runtime['root'])) / 'python-launchers' / identity
             executable_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
             alias = executable_dir / 'python'
             try:
@@ -7046,6 +7120,8 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     for index in range(len(command) - 2):
         if (command[index:index + 2] == ['-m', 'pip']
                 and command[index + 2] in {'install', 'wheel'}):
+            if input is not None:
+                raise RuntimeError('Pip metadata command cannot accept stdin')
             command.insert(index + 3, '--progress-bar=raw')
             return _native_run_pip_elementary(
                 command, runtime, environment, metadata_build=metadata_build)
@@ -7059,10 +7135,11 @@ def _native_run(argv, runtime, *, timeout=None, interpreter=None, metadata_build
     started = time.monotonic()
     with _registered_operation('native package subprocess', limit=timeout, started=started, supervised=True):
         process = subprocess.Popen(command, cwd=runtime['root'], env=environment,
+                                   stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         try:
-            output, _ = process.communicate(timeout=max(0, started + timeout - time.monotonic()))
+            output, _ = process.communicate(input=input, timeout=max(0, started + timeout - time.monotonic()))
             if any(row['state'] != 'Z' for row in _native_process_tree_snapshot(process.pid)):
                 raise RuntimeError('native package command exited with live descendants')
         except BaseException:
@@ -7154,6 +7231,9 @@ def _native_metadata_command(argv, runtime, directory):
     # other native commands. The build-isolation subprocess inherits the flag.
     if not callable(runtime.get('_native_build_resolver')):
         raise RuntimeError('native metadata requires a verified build dependency producer')
+    if 'guest_client' in runtime:
+        return runtime['guest_client'].run(argv, runtime, interpreter=argv[0], metadata_build=True,
+                                           capture_build_requirements=True)
     use_stdlib = _native_interpreter_has_stdlib_distutils(runtime, argv[0])
     with tempfile.TemporaryDirectory(prefix='build-metadata-', dir=directory) as temporary:
         environment = {**runtime['env'], 'TMPDIR': temporary, 'PYTHONUNBUFFERED': '1'}
@@ -7170,7 +7250,7 @@ def _native_metadata_command(argv, runtime, directory):
 
 def _native_bootstrap(pool, runtime):
     if runtime['bootstrapped']:
-        return runtime['root'] / 'conda' / 'bin' / 'conda'
+        return Path(runtime.get('guest_local', runtime['root'])) / 'conda' / 'bin' / 'conda'
     path = Path(__file__).resolve().parents[1] / 'config/preparation.toml'
     with path.open('rb') as stream:
         bootstrap = tomllib.load(stream)['bootstrap']
@@ -7187,193 +7267,103 @@ def _native_bootstrap(pool, runtime):
     # Preserve the immutable CAS object: link its verified bytes into the
     # private bootstrap scratch instead of copying or renaming the CAS.
     installer = runtime['root'] / name
-    os.link(archive, installer)
-    destination = runtime['root'] / 'conda'
+    if 'guest_client' in runtime:
+        pool.link_verified_object(sha, installer)
+    else:
+        os.link(archive, installer)
+    destination = Path(runtime.get('guest_local', runtime['root'])) / 'conda'
     _native_run(['/bin/bash', installer, '-b', '-p', destination], runtime)
     executable = destination / 'bin' / 'conda'
-    if not executable.is_file():
+    if 'guest_client' in runtime:
+        _native_run(['/usr/bin/test', '-x', executable], runtime)
+    elif not executable.is_file():
         raise RuntimeError('pinned Miniconda bootstrap did not install conda')
     runtime['bootstrapped'] = True
     return executable
 
 
-def _native_conda_package_index(pool, runtime, sha, transaction_key):
-    """Read only info/index.json from a SHA-locked Conda artifact.
-
-    Dependency names come from the *package itself*. A fully solved locked
-    transaction supplies each dependency's exact version/build; no host solver,
-    guessed ABI requirements or repository repodata is consulted.
-    """
-    with _bounded_lock(_NATIVE_POOL_LOCK):
-        completed = runtime.setdefault('conda_package_indices', {})
-        cached = completed.get(sha)
-        if cached is not None:
-            return cached
-        inflight = runtime.setdefault('conda_package_indices_inflight', {})
-        pending = inflight.get(sha)
-        owner = pending is None
-        if owner:
-            pending = _OwnedFuture()
-            inflight[sha] = pending
-    if not owner:
-        return _shared_future_result(pending)
-    try:
-        item = pool.conda_lock['artifacts'][sha]
-        pool.download(item['url'], 'native-python-metadata', transaction_key, sha=sha)
-        filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
-        if (not filename or Path(filename).name != filename
-                or not filename.endswith(('.conda', '.tar.bz2'))):
-            raise RuntimeError('invalid pinned Conda package filename')
-        folder = runtime['root'] / 'package-indices' / sha
-        folder.mkdir(parents=True, exist_ok=True)
-        archive = pool.link_verified_object(sha, folder / filename)
-        # The Miniconda bootstrap is shared between concurrent metadata workers.
-        with runtime['conda_install_lock']:
-            conda = _native_bootstrap(pool, runtime)
-        script = ("import conda_package_handling.api as c, json, pathlib, sys\n"
-                  "archive, destination = map(pathlib.Path, sys.argv[1:])\n"
-                  "c.extract(str(archive), dest_dir=str(destination), components='info')\n"
-                  "metadata = json.loads((destination / 'info/index.json').read_text())\n"
-                  "print(json.dumps(metadata, sort_keys=True))\n")
-        extracted = folder / 'extracted-info'
-        result = _native_run([conda.parent / 'python', '-I', '-B', '-c', script,
-                              archive, extracted], runtime,
-                             interpreter=conda.parent / 'python')
-        metadata = json.loads(result)
-        if (not isinstance(metadata, dict)
-                or any(metadata.get(name) != item[name] for name in ('name', 'version', 'build'))
-                or not isinstance(metadata.get('depends', []), list)
-                or not all(isinstance(value, str) and value for value in metadata.get('depends', []))):
-            raise RuntimeError('locked Conda package metadata differs from its pinned identity')
-    except BaseException as error:
-        pending.set_exception(error)
-        raise
-    else:
-        with _bounded_lock(_NATIVE_POOL_LOCK):
-            completed[sha] = metadata
-            inflight.pop(sha)
-        pending.set_result(metadata)
-        return metadata
-
-
-def _native_minimal_python_packages(pool, runtime, sha):
-    """Derive only the Python+pip recursive dependency closure from one lock."""
-    candidates = []
-    for env in pool.conda_lock['environments'].values():
-        for transaction in env['transactions']:
-            packages = transaction['packages']
-            if sha in packages:
-                candidates.append((len(packages), transaction['key'], packages))
-    if not candidates:
-        raise RuntimeError('locked Python absent from Conda transactions: ' + sha)
-    _, key, solution = min(candidates, key=lambda row: (row[0], row[1]))
-    artifacts = pool.conda_lock['artifacts']
-    by_name = {}
-    for package_sha in solution:
-        name = artifacts[package_sha]['name']
-        if name in by_name:
-            raise RuntimeError('duplicate Conda package in pinned transaction: ' + name)
-        by_name[name] = package_sha
-    if by_name.get('python') != sha:
-        raise RuntimeError('selected Conda transaction has the wrong locked Python artifact')
-    required = [artifacts[sha]['name'], 'pip']
-    selected = set()
-    while required:
-        name = required.pop()
-        if name.startswith('__'):
-            continue  # Conda's virtual OS packages are not downloadable archives.
-        package_sha = by_name.get(name)
-        if package_sha is None:
-            raise RuntimeError('locked transaction lacks Python bootstrap dependency: ' + name)
-        if package_sha in selected:
-            continue
-        selected.add(package_sha)
-        metadata = _native_conda_package_index(pool, runtime, package_sha, key)
-        for dependency in metadata.get('depends', []):
-            found = re.match(r'^([A-Za-z0-9_.-]+)(?:\s|$)', dependency)
-            if found is None:
-                raise RuntimeError('malformed locked Conda dependency: ' + dependency)
-            required.append(found.group(1))
-    return key, sorted(selected)
-
-
 def _native_locked_python(pool, target):
-    """Single-flight exact CPython provisioning with concurrent CAS acquisitions.
-
-    Artifact downloads for different targets have disjoint immutable hardlink
-    trees. Conda bootstrap and package-cache mutation remain serialized: only
-    their expensive network downloads are allowed to overlap.
-    """
+    """Materialize the exact transaction inside the offline target VM."""
     target = _coerce_target(target)
     runtime = _native_pool_runtime(pool)
     sha = target.python_artifact_sha256
     if sha is None:
-        return None  # golden system interpreter uses pip's explicit cross-target mode
-    if not SHA.fullmatch(sha):
-        raise RuntimeError('target Python does not have a locked package identity')
+        if target != _golden_target() or target.interpreter_sha256 is None:
+            raise RuntimeError('metadata requires a verified system target interpreter')
+        with _bounded_lock(_NATIVE_POOL_LOCK):
+            cached = runtime.get('system_python')
+            if cached is not None:
+                return cached
+        # The executable is selected in the actual guest, then independently
+        # compared against the sealed Golden identity.
+        script = ("import hashlib, json, platform, sys; from pathlib import Path; "
+                  "p = Path(sys.executable).resolve(strict=True); "
+                  "print(json.dumps({'path': str(p), 'version': platform.python_version(), "
+                  "'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}))")
+        actual = json.loads(_native_run(['/usr/bin/python3', '-I', '-c', script], runtime))
+        if actual['version'] != target.python_full_version or actual['sha256'] != target.interpreter_sha256:
+            raise RuntimeError('system metadata interpreter differs from verified Golden identity')
+        python = Path(actual['path'])
+        with _bounded_lock(_NATIVE_POOL_LOCK):
+            runtime['system_python'] = python
+        return python
+    fields = target.source.split(':', 2)
+    if len(fields) != 3 or fields[0] != 'locked-conda':
+        raise RuntimeError('native metadata requires an exact locked Conda transaction')
+    env_hash, key = fields[1:]
+    matches = [row for row in pool.conda_lock['environments'][env_hash]['transactions'] if row['key'] == key]
+    if len(matches) != 1 or sha not in matches[0]['packages']:
+        raise RuntimeError('metadata target differs from locked Conda transaction')
+    packages = matches[0]['packages']
+    if pool.conda_lock['artifacts'][sha]['version'] != target.python_full_version:
+        raise RuntimeError('locked native Python differs from target identity')
+    identity = hashlib.sha256(json.dumps(packages, separators=(',', ':')).encode()).hexdigest()
     with _bounded_lock(_NATIVE_POOL_LOCK):
-        if pool.conda_lock['artifacts'][sha]['version'] != target.python_full_version:
-            raise RuntimeError('locked native Python differs from target identity')
-        cached = runtime['prefixes'].get(sha)
+        cached = runtime['prefixes'].get(identity)
         if cached is not None:
             return cached
         pending_by_sha = runtime.setdefault('locked_python_inflight', {})
-        pending = pending_by_sha.get(sha)
+        pending = pending_by_sha.get(identity)
         owner = pending is None
         if owner:
             pending = _OwnedFuture()
-            pending_by_sha[sha] = pending
+            pending_by_sha[identity] = pending
     if not owner:
         return _shared_future_result(pending)
     try:
-        # Resolve only the recursive dependencies of pinned Python and pip.
-        # A 300-500-package science stack must never be installed to read one
-        # local project's PEP 517 metadata.
-        key, packages = _native_minimal_python_packages(pool, runtime, sha)
-        archive_root = runtime['root'] / 'archives' / sha
-        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_root = runtime['root'] / 'archives'
+        archive_root.mkdir(exist_ok=True)
         explicit = []
         for package_sha in packages:
             item = pool.conda_lock['artifacts'][package_sha]
             pool.download(item['url'], 'conda', key, sha=package_sha)
             filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
-            if (not filename or Path(filename).name != filename
-                    or not filename.endswith(('.conda', '.tar.bz2'))):
+            if (not filename or Path(filename).name != filename or not filename.endswith(('.conda', '.tar.bz2'))):
                 raise RuntimeError('invalid locked Conda artifact filename')
             archive = archive_root / package_sha / filename
             archive.parent.mkdir(parents=True, exist_ok=True)
-            # pool.download already checks the pinned digest. Linking the same
-            # inode is identity-preserving; a second digest of the hardlink can
-            # fail spuriously if another target simultaneously adds a link.
-            pool.link_verified_object(package_sha, archive)
+            archive = pool.link_verified_object(package_sha, archive)
             explicit.append(archive.as_uri())
-        explicit_file = runtime['root'] / ('python-' + sha + '.explicit')
-        explicit_file.write_text('@EXPLICIT\n' + '\n'.join(explicit) + '\n')
-        prefix = runtime['root'] / 'envs' / sha
-        # Conda modifies a shared package cache. Never run two Conda creates
-        # against it simultaneously, even for different pinned interpreters.
+        explicit_file = runtime['root'] / ('python-' + identity + '.explicit')
+        write_new(explicit_file, '@EXPLICIT\n' + '\n'.join(explicit) + '\n')
+        prefix = runtime['guest_local'] / 'envs' / identity
         with runtime['conda_install_lock']:
             conda = _native_bootstrap(pool, runtime)
-            _native_run([conda.parent / 'python', '-m', 'conda',
-                         'create', '--offline', '--yes', '--prefix', prefix,
-                         '--file', explicit_file], runtime,
-                         interpreter=conda.parent / 'python')
+            _native_run([conda.parent / 'python', '-m', 'conda', 'create', '--offline', '--yes',
+                         '--prefix', prefix, '--file', explicit_file], runtime, interpreter=conda.parent / 'python')
         python = prefix / 'bin' / 'python'
-        version = _native_run([python, '-c',
-             'import platform; print(platform.python_version())'], runtime,
-             interpreter=python).decode().strip()
+        version = _native_run([python, '-c', 'import platform; print(platform.python_version())'],
+                              runtime, interpreter=python).decode().strip()
         if version != target.python_full_version:
             raise RuntimeError('materialized locked interpreter has the wrong patch version')
         _native_run([python, '-m', 'pip', '--version'], runtime, interpreter=python)
     except BaseException as error:
-        # Do not retry a partially created prefix during the same acquisition.
-        # Preserve the exact failing result for every concurrent waiter.
         pending.set_exception(error)
         raise
     else:
         with _bounded_lock(_NATIVE_POOL_LOCK):
-            runtime['prefixes'][sha] = python
-            pending_by_sha.pop(sha, None)
+            runtime['prefixes'][identity] = python
+            pending_by_sha.pop(identity, None)
         pending.set_result(python)
         return python
 
@@ -7525,7 +7515,7 @@ def _legacy_setup_entries(archive):
     return entries
 
 
-def _check_legacy_setup_syntax(archive, interpreter):
+def _check_legacy_setup_syntax(archive, interpreter, runtime):
     """Compile, never execute, setuptools' setup.py with the LOCKED target Python.
 
     Read only the archive members at its distribution root; no extraction or
@@ -7558,13 +7548,9 @@ def _check_legacy_setup_syntax(archive, interpreter):
               "    print('invalid:' + str(exc.lineno))\n"
               "else:\n"
               "    print('valid')\n")
-    completed = subprocess.run([str(interpreter), '-I', '-B', '-c', script],
-                               input=entries[setup_name], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, timeout=_operation_timeout())
-    if completed.returncode != 0:
-        raise RuntimeError('locked target Python setup.py syntax probe failed: '
-                           + completed.stderr[-1000:].decode(errors='replace'))
-    outcome = completed.stdout.decode('ascii', errors='strict').strip()
+    output = _native_run([str(interpreter), '-I', '-B', '-c', script], runtime, interpreter=interpreter,
+                         input=entries[setup_name])
+    outcome = output.decode('ascii', errors='strict').strip()
     if outcome.startswith('invalid:') and outcome.removeprefix('invalid:').isdigit():
         raise _IncompatibleSourceSyntax('verified source setup.py cannot compile on '
                                         + str(interpreter) + ' at line '
@@ -7606,7 +7592,7 @@ def _native_source_candidate_metadata(pool, candidate, key, target):
             _target_fingerprint(target) / sha)
     root.mkdir(parents=True, exist_ok=True)
     archive = pool.link_verified_object(sha, root / filename)
-    _check_legacy_setup_syntax(archive, python)
+    _check_legacy_setup_syntax(archive, python, runtime)
     report = root / 'pip-report.json'
     command = [python, '-m', 'pip', 'install', '--use-pep517', '--dry-run',
                '--ignore-installed', '--no-deps', '--report', report,
@@ -8525,7 +8511,7 @@ def _native_sdist_graph_metadata(pool, candidate, key, target):
     interpreter = _native_locked_python(pool, target)
     if interpreter is None:
         raise RuntimeError('source metadata requires a locked target Python')
-    _check_legacy_setup_syntax(archive, interpreter)
+    _check_legacy_setup_syntax(archive, interpreter, _native_pool_runtime(pool))
     requirements, extras = fields
     return {'kind': 'sdist', 'name': candidate['name'],
             'version': candidate['version'], 'filename': candidate['filename'],
@@ -9717,6 +9703,22 @@ def _sri_archive_plan(pool, ordered, phase, category, owner):
                 cached=next((pool.by_sri[token] for token in sri_parts(sri) if token in pool.by_sri),None)
             if cached is not None:
                 return identity, {'size':pool.verify_object(cached),'cached':True,'retained_bytes':0}
+            prior = pool.retained_urls.get(url)
+            if prior is not None and (pool.objects/prior[:2]/prior).is_file():
+                candidate = pool.objects/prior[:2]/prior
+                size = pool.verify_object(prior)
+                try:
+                    matched = verify_sri(candidate, sri)
+                except RuntimeError:
+                    pass
+                else:
+                    with _bounded_lock(pool._state_lock):
+                        pool.by_url[url] = prior
+                        for token in matched:
+                            existing = pool.by_sri.setdefault(token, prior)
+                            if existing != prior:
+                                raise RuntimeError('conflicting retained SRI identity')
+                    return identity, {'size':size,'cached':True,'retained_bytes':0}
             raw = pool.stage/'downloads'/hashlib.sha256(url.encode()).hexdigest()
             if raw.is_file():
                 try:
@@ -10170,7 +10172,7 @@ def _apt_repair_inventory(pool, previous, operation_id):
 
 
 def main(argv=None):
-    global _POOL_PROGRESS, _OPERATION_EVENT_FD
+    global _POOL_PROGRESS, _OPERATION_EVENT_FD, _NATIVE_STAGE, _NATIVE_APT_INPUTS
     p=argparse.ArgumentParser()
     p.add_argument('--repo-root',required=True,type=Path)
     p.add_argument('--stage',required=True,type=Path)
@@ -10178,7 +10180,6 @@ def main(argv=None):
     p.add_argument('--operation-events-fd', required=True, type=int)
     p.add_argument('--reuse-from',type=Path)
     p.add_argument('--reuse-apt-from',type=Path,action='append',default=[])
-    p.add_argument('--repair-apt-from',type=Path)
     p.add_argument('--network-rx-baseline',required=True,type=json.loads)
     args=p.parse_args(argv)
     if os.geteuid()==0:raise RuntimeError('refusing privileged fetch account')
@@ -10188,7 +10189,13 @@ def main(argv=None):
     _OPERATION_EVENT_FD = args.operation_events_fd
     os.set_inheritable(_OPERATION_EVENT_FD, False)
     os.set_blocking(_OPERATION_EVENT_FD, False)
-    if args.stage.exists() or args.stage.is_symlink():raise RuntimeError('candidate stage already exists; refusing overwrite')
+    if (args.stage.is_symlink() or not args.stage.is_dir()
+            or args.stage.stat().st_uid != os.geteuid() or args.stage.stat().st_mode & 0o077
+            or set(path.name for path in args.stage.iterdir()) - {'objects', 'git', 'git-extra', 'retained-urls.json', 'STAGING'}
+            or (args.stage/'STAGING').is_symlink() or not (args.stage/'STAGING').is_file()
+            or (args.stage/'STAGING').read_bytes() != b'Uncommitted, verified-resumable dependency acquisition.\n'
+            or not os.environ.get('GPT_TRACE_NATIVE_GUEST_AGENT')):
+        raise RuntimeError('missing broker-admitted native metadata guest stage')
     repo_root=args.repo_root.resolve(strict=True)
     request_file = repo_root/'native-requests.json'
     if request_file.is_symlink() or not request_file.is_file() or request_file.stat().st_uid != 0 or request_file.stat().st_mode & 0o222:
@@ -10209,89 +10216,42 @@ def main(argv=None):
     if not tasks or not environments or not {r['repo'] for r in tasks.values()}:
         raise RuntimeError('unexpected SWE-Gym Lite coverage')
     stage=args.stage
+    _NATIVE_STAGE=stage
     apt_reuse_sources = tuple(sorted(set(args.reuse_apt_from)))
     for retained in apt_reuse_sources:
         if (retained == stage or retained.parent != stage.parent or retained.is_symlink()
                 or not retained.is_dir() or (retained/'STAGING').is_symlink()
                 or not (retained/'STAGING').is_file()):
             raise RuntimeError('invalid retained APT acquisition stage')
-    stage.mkdir(mode=0o700)
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
-    write_new(stage/'STAGING','Uncommitted, verified-resumable dependency acquisition.\n')
     budget = _fetch_download_budget(repo_root,args.network_rx_baseline)
     _POOL_PROGRESS = _PoolProgress(
         progress_path=stage/'metadata'/'fetch-progress.json', operation_id=args.operation_id,
         rx_counter=budget.received_bytes)
     _pool_progress('Verified recovery')
-    if args.repair_apt_from is not None:
-        if args.reuse_from is not None:
-            raise RuntimeError('APT repair cannot combine two recovery sources')
-        previous=json.loads((args.repair_apt_from/'inventory.json').read_bytes())
-        prior_apt=json.loads((args.repair_apt_from/'metadata'/'apt-closure.json').read_bytes())
-        if (previous.get('schema') != 2 or previous.get('kind') != 'download-only-pool'
-                or previous['complete'] is not True or previous['issues']
-                or previous['conda_lock_sha256'] != conda_lock_sha256
-                or prior_apt['golden_package_inventory_sha256'] != _golden_dependency()['apt_package_manifest_sha256']
-                or prior_apt.get('golden_dpkg_status_sha256') != digest(repo_root/'golden-dpkg-status')
-                or set(previous['task_plan']) != set(tasks)
-                or set(previous['environment_plan']) != set(environments)
-                or set(previous['git_plan']) != {row['repo'] for row in tasks.values()}):
-            raise RuntimeError('incompatible prior APT publication')
-        for logical, row in previous['task_plan'].items():
-            if any(row.get(key) != tasks[logical][key] for key in ('repo', 'base_commit', 'env_hash')):
-                raise RuntimeError('retained task differs from pinned contract: ' + logical)
-        for env, transactions in previous['conda_transactions'].items():
-            if env not in conda_lock['environments'] or transactions != [row['key'] for row in conda_lock['environments'][env]['transactions']]:
-                raise RuntimeError('retained Conda transactions differ from lock: ' + env)
-        if set(previous['conda_transactions']) != set(environments):
-            raise RuntimeError('retained Conda transactions do not cover the contract')
-        pool=Pool(stage)
-        pool.download_budget=budget
-        pool.apt_repair_source=args.repair_apt_from
-        pool.apt_reuse_sources=apt_reuse_sources
-        retained_shas={sha for category,groups in previous['provenance'].items() if category!='apt'
-                       for hashes in groups.values() for sha in hashes}
-        for sha in retained_shas:
-            size=previous['objects'][sha]['size']
-            _POOL_PROGRESS._volume_record(sha,size,size)
-        if 'golden_dpkg_status_sha256' in prior_apt:
-            base, environment_roots = _declared_apt_roots(adapter, pins, environments)
-            # Preserve the predecessor's authenticated static task analysis,
-            # including pinned evaluator prelude and expanded Makefile commands.
-            policy_relative = 'metadata/apt-policy.json'
-            policy_file = args.repair_apt_from / policy_relative
-            records = [row for row in previous['files'] if row['path']==policy_relative]
-            if len(records)!=1 or digest(policy_file)!=records[0]['sha256']:
-                raise RuntimeError('retained APT policy does not match verified publication')
-            policy = json.loads(policy_file.read_bytes())
-            if policy['schema']!=1 or policy['upgrade_policy']!='suppress-on-frozen-golden':
-                raise RuntimeError('incompatible prior APT policy')
-            if 'native_discovery' in prior_apt:
-                if set(policy['upstream_base_packages']) != base or set(policy['requested_install_packages']) != base | set(policy['recipe_packages']):
-                    raise RuntimeError('retained native APT policy differs from pinned base')
-                direct = set(policy['recipe_packages']) | environment_roots
-            else:
-                direct = set(policy['requested_install_packages']) | environment_roots
-            suppressed = set(policy['suppressed_tasks'])
-            if not direct-environment_roots <= set(prior_apt['requested']):
-                raise RuntimeError('retained task APT roots differ from predecessor closure')
-            _write_apt_policy(stage, base, direct, suppressed)
-            _pool_progress('Signed Kali APT resolution',details='Resolving declared and target-observed requirements')
-            apt_closure(pool, base | direct, native_requests=native_requests, base_roots=base-direct)
-        else:
-            raise RuntimeError('predecessor must have the verified Golden dpkg status; apply the historical APT repair first')
-        _apt_repair_inventory(pool,previous,args.operation_id)
-        return
     verified=set()
     if args.reuse_from is not None:
-        verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'])
+        verified=salvage_verified_stage(args.reuse_from,stage,conda_artifacts=conda_lock['artifacts'], reuse_plans=False)
     pool=Pool(stage)
+    retained_urls = stage/'retained-urls.json'
+    if retained_urls.exists():
+        hints = json.loads(retained_urls.read_bytes())
+        if not isinstance(hints, dict) or any(not isinstance(url, str) or not isinstance(sha, str)
+                or not SHA.fullmatch(sha) for url, sha in hints.items()):
+            raise RuntimeError('invalid retained artifact URL index')
+        pool.retained_urls = hints
+        retained_urls.unlink()
     pool.operation_id = args.operation_id
     pool.resume_from = args.reuse_from
     pool.apt_reuse_sources = apt_reuse_sources
     pool.download_budget = budget
     pool.conda_lock=conda_lock
+    pool.native_guest = _native_guest_module().NativeGuestClient(
+        os.environ['GPT_TRACE_NATIVE_GUEST_AGENT'], repo_root,
+        int(os.environ['GPT_TRACE_NATIVE_GUEST_UID']), int(os.environ['GPT_TRACE_NATIVE_GUEST_GID']),
+        os.environ['GPT_TRACE_NATIVE_GUEST_LOCAL'], limit=_operation_timeout(),
+        cadence=_conda_progress_interval(), operation=_registered_operation)
     pool.verified_objects.update(verified)
     grouped=defaultdict(set)
     for task in tasks.values():grouped[task['repo']].add(task['base_commit'])
@@ -10629,6 +10589,39 @@ def main(argv=None):
         raise RuntimeError('static dependency analysis rejected before native resolution: '
                            +str(len(static_issues))+' issue(s); first: '+static_issues[0])
 
+    # APT roots are independent of dynamic Python metadata. Resolve and install
+    # them before any package backend is executed in the target.
+    base_roots, environment_roots = _declared_apt_roots(adapter, pins, environments)
+    direct_roots = environment_roots | {name for result in static_results for name in result[3]}
+    early_roots = base_roots | direct_roots
+    early_suppressed = {task for result in static_results for task in result[4]}
+    _write_apt_policy(stage, base_roots, direct_roots, early_suppressed)
+    _pool_progress('Signed Kali APT resolution', details=f'{len(early_roots)} declared packages')
+    apt_closure(pool, early_roots, native_requests=native_requests, base_roots=base_roots-direct_roots)
+    closure = json.loads((stage/'metadata/apt-closure.json').read_bytes())
+    _NATIVE_APT_INPUTS = hashlib.sha256(json.dumps({
+        'golden': closure['golden_dpkg_status_sha256'],
+        'resolved': sorted(closure['resolved'], key=lambda row: (row['package'], row['architecture'], row['version'], row['sha256']))},
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    _resolver_runtime_identity.cache_clear()
+    if args.reuse_from is not None:
+        salvage_pip_plans(args.reuse_from, stage, verified)
+    _pool_progress('Target metadata guest APT installation')
+    runtime = _native_pool_runtime(pool)
+    apt_input = runtime['root'] / 'apt-input'
+    apt_input.mkdir()
+    resolved = {row['sha256']: row for row in closure['resolved']}
+    records = {}
+    for archive in sorted((stage/'apt/archives').glob('*.deb')):
+        sha = digest(archive)
+        record = resolved[sha]
+        records[archive.name] = {**record, 'size': archive.stat().st_size}
+        pool.link_verified_object(sha, apt_input/archive.name)
+    if {row['sha256'] for row in records.values()} != set(resolved):
+        raise RuntimeError('target metadata guest APT input differs from signed closure')
+    write_new(apt_input/'acquired.json', json.dumps({'requested':closure['requested'],
+        'artifacts':records, 'native_headers':closure.get('native_discovery',{}).get('providers',{})}, sort_keys=True))
+    pool.native_guest.run([apt_input], runtime, install_apt=True)
     requests={result[0]:result[7] for result in static_results if result[7] is not None}
     native_metadata={}
     if requests:
@@ -10670,10 +10663,8 @@ def main(argv=None):
             print('[pool] static issue: '+issue,file=sys.stderr,flush=True)
         raise RuntimeError('static dependency closure rejected before network resolution: '
                            +str(len(static_issues))+' issue(s); first: '+static_issues[0])
-    base_roots, environment_roots = _declared_apt_roots(adapter, pins, environments)
-    direct_roots = apt_requested | environment_roots
-    apt_requested = base_roots | direct_roots
-    _write_apt_policy(stage, base_roots, direct_roots, apt_upgrade_tasks)
+    if apt_requested | environment_roots != direct_roots or apt_upgrade_tasks != early_suppressed:
+        raise RuntimeError('native metadata changed the authenticated static APT policy')
     # Every locked Conda archive has an immutable SHA and URL, so its volume
     # can be measured independently of Pip/VCS discovery and without downloading it.
     conda_entries={sha:(item['url'],stage/'downloads'/('conda-'+sha))
@@ -10857,8 +10848,6 @@ def main(argv=None):
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
         raise RuntimeError('acquired Conda transaction identities differ from prevalidated lock')
-    _pool_progress('Signed Kali APT resolution', details=f'{len(apt_requested)} declared packages')
-    apt_closure(pool, apt_requested, native_requests=native_requests, base_roots=base_roots-direct_roots)
     _native_close(pool)
     with (Path(__file__).resolve().parents[1] / 'config/preparation.toml').open('rb') as stream:
         bootstrap=tomllib.load(stream)['bootstrap']
@@ -10871,6 +10860,11 @@ def main(argv=None):
     pool.download(bootstrap_url,'bootstrap','miniconda-installer',sha=bootstrap_sha)
     if _POOL_PROGRESS is not None:
         _POOL_PROGRESS.close_volume(pool.links)
+    # Only the current verified plan is published. Removing candidate aliases
+    # cannot remove any previously published or retained content.
+    for path in pool.objects.glob('*/*'):
+        if path.name not in pool.links:
+            path.unlink()
     _pool_progress('Verifying final pool inventory')
     audit_inventory(pool,task_plan,envplan,gitplan,args.operation_id,contract_tasks=tasks,
                     conda_transactions=conda_transaction_plan,
@@ -10883,6 +10877,16 @@ def _pool_cli_entry():
             _conda_elementary_entry()
         else:
             main()
+    except _native_guest_module().NativeGuestRequired as exc:
+        if _NATIVE_STAGE is None:
+            raise RuntimeError('unbound metadata native observation') from exc
+        report = _native_requirement_paths(exc.requirements)
+        if not report:
+            raise RuntimeError('empty metadata native observation') from exc
+        write_new(_NATIVE_STAGE/'metadata/target-metadata-native.json', json.dumps(report, sort_keys=True))
+        if _POOL_PROGRESS is not None:
+            _POOL_PROGRESS.finish()
+        raise SystemExit(_native_guest_module().NATIVE_METADATA_EXIT_CODE)
     except SystemExit as exc:
         if exc.code is None or exc.code == 0:
             raise

@@ -34,7 +34,7 @@ from gpt_trace_transport.local_templates import (ROOT, SHA, atomic_json, canonic
     compatibility, file_signature, golden_dependency_identity, safe, source_contract,
     verify_local_validation, verify_manifest, activate, FETCH_SOURCE_FILES, fetch_runtime_executables, fetch_runtime_build_identity_path,
     verify_fetch_runtime_build_identity, pool_contract, seal,
-    sync_directory, namespace_rx_bytes, namespace_rx_delta, fetch_download_limit, FETCH_BUDGET_EXIT_CODE)
+    sync_directory, namespace_rx_bytes, namespace_rx_delta, fetch_download_limit, FETCH_BUDGET_EXIT_CODE, NATIVE_METADATA_EXIT_CODE)
 
 from workstation_broker.preparation_resources import JobScope, source_containers, remove_source_containers
 
@@ -919,7 +919,7 @@ class PreparationManager:
                     **({"publication_attempt": previous.get("publication_attempt", previous["attempt"])}
                        if previous and previous.get("publication_verified") else {}),
                     "built_generation": previous.get("built_generation") if previous else None,
-                    **({key: previous[key] for key in ('native_requests', 'native_pending', 'native_publication')
+                    **({key: previous[key] for key in ('native_requests', 'native_pending', 'native_publication', 'metadata_pending', 'metadata_resume')
                         if key in previous} if previous else {})}
                 self._write(state)
                 environment = dict(os.environ, GPT_TRACE_PREPARATION_ID=operation_id, LIBGUESTFS_BACKEND="direct")
@@ -1240,7 +1240,44 @@ def _retired_pool(root, operation_id):
     return root / ('retired-'+identifier(operation_id))
 
 
-def _apt_repair_source(manager, root, state):
+def _metadata_artifact_compatible(previous, current):
+    # Only immutable artifact bytes cross this boundary. Neither old resolver
+    # decisions nor old build-layer observations authorize target metadata.
+    keys = {'fetch_kind', 'pool_schema', 'pins', 'platform', 'coverage',
+            'conda_lock_sha256', 'golden_dependency'}
+    return (isinstance(previous, dict) and isinstance(current, dict)
+            and previous != current and keys <= previous.keys() and keys <= current.keys()
+            and all(previous[key] == current[key] for key in keys))
+
+
+def _metadata_retained_stage(root, state, account):
+    record = state.get('metadata_resume')
+    if record is None:
+        return None
+    if (not isinstance(record, dict) or set(record) != {'attempt', 'requests_sha256'}
+            or type(record['attempt']) is not int or not 1 <= record['attempt'] <= state['attempt']):
+        raise RuntimeError('invalid target metadata recovery record')
+    operation = identifier(state['operation_id'])
+    attempt = str(record['attempt'])
+    name = 'metadata-retained-' + operation + '-' + attempt + '-' + identifier(record['requests_sha256'])
+    retained = root / name
+    original = root / ('incoming-' + operation + '-' + attempt)
+    if not retained.exists():
+        if retained.is_symlink() or original.is_symlink() or not original.is_dir():
+            raise RuntimeError('target metadata recovery source is unavailable')
+        if (original.stat().st_uid != account.pw_uid or original.stat().st_mode & 0o077
+                or not (original/'STAGING').is_file() or (original/'STAGING').is_symlink()):
+            raise RuntimeError('unsafe target metadata recovery source')
+        os.rename(original, retained)
+        sync_directory(root)
+    if (retained.is_symlink() or not retained.is_dir() or retained.stat().st_uid != account.pw_uid
+            or retained.stat().st_mode & 0o077 or not (retained/'STAGING').is_file()
+            or (retained/'STAGING').is_symlink()):
+        raise RuntimeError('unsafe target metadata retained stage')
+    return retained
+
+
+def _apt_repair_source(manager, root, state, *, compatible=_native_apt_repair_compatible):
     ready = root/'ready'
     candidates = []
     if ready.exists() or ready.is_symlink():
@@ -1259,7 +1296,7 @@ def _apt_repair_source(manager, root, state):
         prior = manager._read(prior_id)
         if prior is None or prior['operation_id'] != prior_id:
             raise RuntimeError('published pool has no authenticated preparation owner')
-        if not _native_apt_repair_compatible(prior['compatibility'], state['compatibility']):
+        if not compatible(prior['compatibility'], state['compatibility']):
             continue
         proof = prior.get('publication_verified')
         if prior['phase'] not in TERMINAL or not isinstance(proof, dict):
@@ -1596,7 +1633,7 @@ class _FetchOperationWatch:
 
 
 def _prepare(manager, state):
-    # Download on the execution host without guest VMs or persistent deletion capabilities.
+    # Host acquisition plus broker-owned, offline target metadata execution.
     import pwd
     import grp
 
@@ -1628,7 +1665,7 @@ def _prepare(manager, state):
             state = _finish_native_publication(manager, state, ready)
         return _integrate_published_pool(manager, state, ready, state['publication_verified'])
     native_round = state.get('native_pending') is True
-    if isinstance(pending, dict) and pending.get("runtime_integrated") != True and not native_round:
+    if isinstance(pending, dict) and pending.get("runtime_integrated") != True and not native_round and not state.get('metadata_pending'):
         if not ready.exists() and not ready.is_symlink():
             acquisition_attempt = state.get('publication_attempt', state['attempt'])
             if type(acquisition_attempt) is not int or not 1 <= acquisition_attempt <= state['attempt']:
@@ -1643,7 +1680,7 @@ def _prepare(manager, state):
         previous = verify_published_inventory(ready, state, pending)
         migration = (ready, state, previous)
     else:
-        migration = _apt_repair_source(manager,root,state)
+        migration = _apt_repair_source(manager,root,state, compatible=_metadata_artifact_compatible)
     if migration is not None and not native_round:
         # The old operation may have observed native requirements which never
         # reached its next acquisition. Its admitted target/lock are identical.
@@ -1658,10 +1695,13 @@ def _prepare(manager, state):
                 manager._write(state)
     if (ready.exists() or ready.is_symlink()) and (migration is None or migration[0]!=ready):
         raise RuntimeError("dependency pool already published; manual version migration required")
+    metadata_retained = _metadata_retained_stage(root, state, account)
     if stage.exists() or stage.is_symlink():
         raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
     retained = retained_dependency_stage(manager, root, state, account, all_stages=True)
-    reuse = max(retained, key=_retained_stage_score) if retained and migration is None else None
+    if metadata_retained is not None:
+        retained = tuple(sorted(set(retained) | {metadata_retained}))
+    reuse = max(retained, key=_retained_stage_score) if retained else None
     source_program = manager.source_root / "scripts/superbench_pool.py"
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
@@ -1700,7 +1740,7 @@ def _prepare(manager, state):
     }
 
     # Use only the local audited worker file, with fixed validated arguments.
-    # No shell, no template builder, no qemu, no guest execution.
+    # The broker owns the offline metadata VM; the acquisition worker owns no host VM.
     policy = manager.source_root / 'config/preparation.toml'
     if policy.is_symlink() or not policy.is_file():
         raise RuntimeError('missing versioned preparation watchdog policy')
@@ -1731,67 +1771,93 @@ def _prepare(manager, state):
         if amount >= download_limit:
             raise RuntimeError('fetch download budget reached: %.3f/%.3f GiB received in fetch namespace' %
                                (amount / 1024 ** 3, download_limit / 1024 ** 3))
-    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
-    try:
+    guest_path = source_root / 'scripts/native_guest_broker.py'
+    guest_spec = importlib.util.spec_from_file_location('metadata_guest_broker', guest_path)
+    guest_broker = importlib.util.module_from_spec(guest_spec)
+    guest_spec.loader.exec_module(guest_broker)
+    with guest_broker.metadata_guest(manager, stage, source_root, account, donor=migration, reuse=reuse, retained=retained) as guest_env:
+        env.update(guest_env)
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
         try:
-            child = subprocess.Popen(fetch_worker_command(account, interpreter,
-                            [str(program), "--repo-root", str(source_root), "--stage", str(stage),
-                             "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
-                             "--network-rx-baseline", json.dumps(baseline, sort_keys=True),
-                             *(["--reuse-from", str(reuse)] if reuse is not None else []),
-                             *(value for retained_stage in retained for value in ("--reuse-apt-from", str(retained_stage))),
-                             *(["--repair-apt-from", str(migration[0])] if migration is not None else [])]),
-                           cwd=source_root, env=env, pass_fds=(write_fd,),
-                           stdin=subprocess.DEVNULL, start_new_session=True,
-                           umask=FETCH_WORKER_UMASK)
-        finally:
-            os.close(write_fd)
-        watch = _FetchOperationWatch(child.pid, elementary_limit, cleanup_timeout)
-        last_observation = None
-        next_check = time.monotonic() + cadence
-        try:
-            while True:
-                check_at = watch.next_deadline(next_check)
-                readable, _, _ = select.select([read_fd], [], [], max(0, check_at - time.monotonic()))
-                if readable:
-                    chunk = os.read(read_fd, 65536)
-                    if chunk:
-                        watch.feed(chunk)
-                    else:
-                        exitcode = child.wait(timeout=cleanup_timeout)
-                        enforce_download_limit()
-                        if exitcode == 0 and (watch.active or watch.pending):
-                            raise RuntimeError('acquisition worker exited with unresolved operation records')
-                        break
-                if time.monotonic() < watch.next_deadline(next_check):
-                    continue
-                enforce_download_limit()
-                progress = manager._progress(state)
-                if progress is not None:
-                    observation = (progress['stage'], progress['completed'],
-                                   progress['network_bytes'], progress['pip_bytes'])
-                    if observation != last_observation:
-                        last_observation = observation
-                        watch.last_transition = time.monotonic()
-                descendants = {stamp['pid'] for stamp in JobScope.members(state)}
-                watch.inspect(idle_limit=idle_limit, descendants=descendants)
-                next_check = time.monotonic() + cadence
-        except BaseException:
-            if child.poll() is None:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
             try:
-                child.wait(timeout=cleanup_timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError('download worker remained unreaped after group SIGKILL; stage preserved') from exc
-            _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
-            raise
-    finally:
-        os.close(read_fd)
+                child = subprocess.Popen(fetch_worker_command(account, interpreter,
+                                [str(program), "--repo-root", str(source_root), "--stage", str(stage),
+                                 "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
+                                 "--network-rx-baseline", json.dumps(baseline, sort_keys=True),
+                                 *(["--reuse-from", str(reuse)] if reuse is not None else []),
+                                 *(value for retained_stage in retained for value in ("--reuse-apt-from", str(retained_stage)))]),
+                               cwd=source_root, env=env, pass_fds=(write_fd,),
+                               stdin=subprocess.DEVNULL, start_new_session=True,
+                               umask=FETCH_WORKER_UMASK)
+            finally:
+                os.close(write_fd)
+            watch = _FetchOperationWatch(child.pid, elementary_limit, cleanup_timeout)
+            last_observation = None
+            next_check = time.monotonic() + cadence
+            try:
+                while True:
+                    check_at = watch.next_deadline(next_check)
+                    readable, _, _ = select.select([read_fd], [], [], max(0, check_at - time.monotonic()))
+                    if readable:
+                        chunk = os.read(read_fd, 65536)
+                        if chunk:
+                            watch.feed(chunk)
+                        else:
+                            exitcode = child.wait(timeout=cleanup_timeout)
+                            enforce_download_limit()
+                            if exitcode == 0 and (watch.active or watch.pending):
+                                raise RuntimeError('acquisition worker exited with unresolved operation records')
+                            break
+                    if time.monotonic() < watch.next_deadline(next_check):
+                        continue
+                    enforce_download_limit()
+                    progress = manager._progress(state)
+                    if progress is not None:
+                        observation = (progress['stage'], progress['completed'],
+                                       progress['network_bytes'], progress['pip_bytes'])
+                        if observation != last_observation:
+                            last_observation = observation
+                            watch.last_transition = time.monotonic()
+                    descendants = {stamp['pid'] for stamp in JobScope.members(state)}
+                    watch.inspect(idle_limit=idle_limit, descendants=descendants)
+                    next_check = time.monotonic() + cadence
+            except BaseException:
+                if child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    child.wait(timeout=cleanup_timeout)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError('download worker remained unreaped after group SIGKILL; stage preserved') from exc
+                _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
+                raise
+        finally:
+            os.close(read_fd)
     if exitcode != 0:
         _kill_verified_fetch_descendants(state, cleanup_timeout, cadence)
+        if exitcode == NATIVE_METADATA_EXIT_CODE:
+            report_path = stage / 'metadata/target-metadata-native.json'
+            if (report_path.is_symlink() or not report_path.is_file()
+                    or report_path.stat().st_uid != account.pw_uid or report_path.stat().st_size > 1048576):
+                raise RuntimeError('missing or unsafe target metadata native requirement report')
+            requested = _native_requirements(manager, json.loads(report_path.read_bytes()))
+            with manager.lock():
+                current = manager._read(state['operation_id'])
+                prior = _native_requirements(manager, current.get('native_requests', {}))
+                if not requested or any(key in prior and prior[key] != paths for key, paths in requested.items()):
+                    raise RuntimeError('invalid target metadata native requirement transition')
+                merged = {**prior, **requested}
+                if merged == prior:
+                    raise RuntimeError('target metadata native resolution made no progress')
+                updated = {**current, 'phase': 'running', 'metadata_pending': True,
+                           'native_requests': merged, 'metadata_resume': {'attempt': state['attempt'],
+                               'requests_sha256': hashlib.sha256(canonical(merged)).hexdigest()}}
+                manager._write(updated)
+                _metadata_retained_stage(root, updated, account)
+            remove_fetch_sources(source_root)
+            return None
         if exitcode == FETCH_BUDGET_EXIT_CODE:
             progress = manager._progress(state)
             if (progress is None or progress['unit'] != 'bytes' or progress['total'] is None
@@ -1826,7 +1892,7 @@ def _prepare(manager, state):
              or len(inventory["task_plan"]) != task_count
              or not isinstance(inventory.get("objects"),dict)):
         raise RuntimeError("incomplete/unverified downloaded dependency pool")
-    checked_inodes = _link_apt_repair_files(stage,inventory,migration) if migration is not None else {}
+    checked_inodes = {}
     expected = set()
     for entry in inventory["files"]:
         relative = entry["path"]
@@ -1920,7 +1986,8 @@ def _prepare(manager, state):
               "file_count": len(inventory["files"]),
               "manifest_sha256": hashlib.sha256(raw).hexdigest(),
               "pool_directory": str(ready), "runtime_integrated": "pending"}
-    state = {**state, "publication_attempt": state['attempt']}
+    state = {**state, "publication_attempt": state['attempt'], "metadata_pending": False}
+    state.pop("metadata_resume", None)
     with manager.lock():
         if native_round:
             state = {**state, 'native_publication': {'proof': result, 'attempt': state['attempt']}}
@@ -1983,7 +2050,7 @@ def worker(operation_id, slot_fd):
         result = _prepare(manager, state)
         while result is None:
             state = verify_worker_claim(operation_id)
-            if state.get('native_pending') is not True:
+            if state.get('native_pending') is not True and state.get('metadata_pending') is not True:
                 raise RuntimeError('native resolution iteration lacks its durable request')
             result = _prepare(manager, state)
         state = verify_worker_claim(operation_id)

@@ -628,3 +628,50 @@ def test_native_common_stage_requires_exact_incomplete_image_proof(tmp_path):
     (checkpoints/('task-v' + str(builder.TASK_RUNTIME_SCHEMA) + '-proof.json')).unlink()
     image.write_bytes(b'changed image')
     assert builder.select_native_common_stage([stage],next_identity,current,archives) is None
+
+
+def test_completed_common_donor_requires_unchanged_inputs_and_independent_copy(tmp_path, monkeypatch):
+    if os.geteuid() != 0:
+        pytest.skip('root-owned donor required')
+    builder = load(ROOT/'scripts/build_local_templates.py')
+    previous, current = _additive_manifest_fixture()
+    folder = tmp_path/'donor'; folder.mkdir()
+    compatibility = {'template_abi': 1, 'source_fingerprint': 'a'*64}
+    identity = {'compatibility': compatibility, 'nonapt_inputs_sha256': 'b'*64,
+                'pool_inputs_sha256': 'c'*64, 'apt_inputs_sha256': 'd'*64}
+    builder.atomic_json(folder/'build-identity.json', identity)
+    manifest = folder/'os/swe-gym-os/manifest.json'; manifest.parent.mkdir(parents=True)
+    builder.atomic_json(manifest, previous)
+    common = folder/'common.qcow2'
+    with common.open('wb') as stream:
+        stream.write(b'fixture')
+        stream.seek(2**20)
+        stream.write(b'end')
+    common.chmod(0o444)
+    proof = {'schema':3, 'kind':'common', **compatibility, 'pool_inputs_sha256':identity['pool_inputs_sha256']}
+    markers = {builder.COMMON_COMPLETION: proof, builder.COMMON_INPUTS_COMPLETION: {
+        **proof, 'kind':'common-inputs', 'apt_inputs_sha256':identity['apt_inputs_sha256']},
+        '/opt/swe-gym-lite/os-manifest.json':previous,
+        '/opt/swe-gym-lite/environment-cache-provenance.json':{'kind':'verified-input-archives','conda':{'fixture':'same'}}}
+    options = dict(archive_provenance=markers['/opt/swe-gym-lite/environment-cache-provenance.json'],
+                   completion_matches=lambda image,path,value: markers.get(path)==value,
+                   guest_json=lambda image,path: markers[path],
+                   image_info=lambda image: {'format':'qcow2','backing-filename':str(builder.BASE)})
+    assert builder._completed_common_candidate([folder], identity, previous, **options) == (True,folder,identity,previous,None)
+    next_identity = {**identity, 'pool_inputs_sha256':'e'*64,'apt_inputs_sha256':'f'*64}
+    assert builder._completed_common_candidate([folder], next_identity,current,**options) == (False,folder,identity,previous,None)
+    changed_plan = {**next_identity,'nonapt_inputs_sha256':'1'*64}
+    assert builder._completed_common_candidate([folder],changed_plan,current,**options) == (False,folder,identity,previous,None)
+    assert builder._completed_common_candidate([folder],changed_plan,previous,**options) == (False,folder,identity,previous,None)
+    assert builder._completed_common_candidate([folder],changed_plan,current,**{**options,'archive_provenance':{'kind':'changed'}}) is None
+    assert builder._completed_common_candidate([folder],next_identity,{**current,'installed_after': {**current['installed_after'],'first':{'version':'2','architecture':'all'}}},**options) is None
+    monkeypatch.setattr(builder, 'free_space', lambda *_: None)
+    copy = tmp_path/'common-copy.qcow2'
+    builder._copy_completed_common(common,copy,builder.digest(common),margin=0)
+    assert copy.read_bytes() == common.read_bytes()
+    assert not copy.samefile(common)
+    copy.write_bytes(b'changed')
+    assert common.read_bytes().startswith(b'fixture')
+    with pytest.raises(RuntimeError, match='bytes differ'):
+        builder._copy_completed_common(common,tmp_path/'bad.qcow2','0'*64,margin=0)
+    assert not (tmp_path/'bad.qcow2').exists()

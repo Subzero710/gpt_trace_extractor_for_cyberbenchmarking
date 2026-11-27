@@ -193,13 +193,13 @@ def test_conda_inventory_reads_only_declared_file_paths(tmp_path):
     assert native.conda_inventory(path, path.name) == ['include/example.h', 'lib/libexample.so']
 
 
-def write_fixture_wheel(path, distribution, version):
+def write_fixture_wheel(path, distribution, version, *, payload=b'payload'):
     import base64
     import zipfile
     prefix = distribution + '-' + version + '.dist-info/'
     files = {prefix+'METADATA': f'Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n'.encode(),
              prefix+'WHEEL': b'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
-             distribution+'/__init__.py': b'payload'}
+             distribution+'/__init__.py': payload}
     record = ''.join(name+',sha256='+base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip('=')+','+str(len(data))+'\n' for name,data in files.items())
     with zipfile.ZipFile(path, 'w') as archive:
         for name,data in files.items():
@@ -415,3 +415,239 @@ def test_target_elf_loader_resolves_transitive_rpath_and_reports_missing(tmp_pat
     assert key.startswith('soname:' + leaf.name + '@')
     assert all(path.endswith('/' + leaf.name) for path in requests[key])
     assert load(ADAPTER/'os_packages.py').native_requirement_paths(requests) == requests
+
+
+def test_actual_pip_install_capture_retains_ephemeral_wheel_bytes(tmp_path):
+    import os
+    import venv
+    from packaging.requirements import Requirement
+    runtime = load(ADAPTER/'guest_runtime.py')
+    prefix = tmp_path/'prefix'
+    venv.EnvBuilder(with_pip=True).create(prefix)
+    wheel = tmp_path/'fixture-1-py3-none-any.whl'
+    write_fixture_wheel(wheel, 'fixture', '1')
+    directory = tmp_path/'capture'
+    with runtime._capture_pip_installations(prefix, directory, dict(os.environ)) as env:
+        subprocess.run([str(prefix/'bin/python'), '-m', 'pip', 'install', '--no-index',
+                        '--no-cache-dir', str(wheel)], env=env, check=True, capture_output=True)
+    original = wheel.read_bytes()
+    wheel.unlink()
+    result = runtime._captured_install_wheel(prefix, directory, 'fixture', Requirement('fixture==1'), tags={'py3-none-any'})
+    assert result is not None
+    filename, source, record = result
+    assert filename == 'fixture-1-py3-none-any.whl'
+    assert source.read_bytes() == original
+    assert record['sha256'] == hashlib.sha256(original).hexdigest()
+    receipt = json.loads((directory/'receipts/fixture.json').read_bytes())
+    record_path = prefix/receipt['record']
+    installed = record_path.parent.parent/'fixture/__init__.py'
+    installed.write_bytes(b'changed')
+    assert runtime._captured_install_wheel(prefix, directory, 'fixture', Requirement('fixture==1')) is None
+    assert not list(prefix.rglob('gpttrace-capture-*.pth'))
+
+
+def test_traced_recipe_preserves_shell_state_and_failed_command_diagnostic(tmp_path, monkeypatch):
+    import os
+    runtime = load(ADAPTER/'guest_runtime.py')
+    monkeypatch.setenv('GPTTRACE_TEMPLATE_TRACE', '1')
+    monkeypatch.setenv('GPT_TRACE_NATIVE_ROUND', 'a'*64)
+    calls = []
+    def supervise(argv, *, cwd, env, input, log):
+        calls.append(Path(argv[-1]).read_text())
+        return subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT).returncode
+    monkeypatch.setattr(runtime, '_run_elementary_pip', supervise)
+    monkeypatch.setattr(runtime, '_template_operation', lambda *_: __import__('contextlib').nullcontext())
+    with pytest.raises(runtime.RecipeFailure) as error:
+        runtime.shell(['export FIXTURE=correct', 'test "$FIXTURE" = correct; echo "fatal error: optional.h: No such file or directory"',
+                       'echo "fatal error: required.h: No such file or directory"; false'], cwd=tmp_path, env=dict(os.environ))
+    assert error.value.native_observations == {('header','required.h')}
+    assert len(calls) == 1
+    assert 'GPTTRACE_TEMPLATE begin recipe' not in calls[0]
+
+
+def test_production_capture_never_rebuilds_unproved_installed_distribution(tmp_path, monkeypatch):
+    runtime = load(ADAPTER/'guest_runtime.py')
+    root = tmp_path/'guest'; shared = tmp_path/'shared'; shared.mkdir()
+    (root/'caches/pip-index').mkdir(parents=True)
+    prefix = tmp_path/'prefix'; prefix.mkdir()
+    capture = tmp_path/'capture'; capture.mkdir()
+    monkeypatch.setattr(runtime, 'ROOT', root)
+    monkeypatch.setattr(runtime, 'SHARED_WARM_CACHE_ROOT', shared)
+    monkeypatch.setenv('GPT_TRACE_SHARED_WARM_CACHE', str(shared))
+    monkeypatch.setenv('GPT_TRACE_WHEEL_BUILD_CONTEXT', 'a'*64)
+    monkeypatch.setattr(runtime, '_activated_capture_environment', lambda prefix, env, **kwargs: env)
+    monkeypatch.setattr(runtime, '_installed_wheel_evidence', lambda *args: {'distributions': {}, 'tags': []})
+    def command(*args, **kwargs):
+        if '-I' in args:
+            return b'["py3-none-any"]'
+        folder = Path(args[args.index('--wheel-dir')+1])
+        write_fixture_wheel(folder/'fixture-1-py3-none-any.whl','fixture','1')
+    monkeypatch.setattr(runtime,'run',command)
+    req = tmp_path/'requirements.txt'; req.write_text('fixture==1\n')
+    item = {'instance_id':'fixture'}
+    inventory = {'pip_freeze':'fixture==1','conda_explicit':'fixture'}
+    first = tmp_path/'first'; first.mkdir()
+    runtime._capture_install_artifacts(item,prefix,req,first,inventory)
+    second = tmp_path/'second'; second.mkdir()
+    def forbid(*args, **kwargs):
+        if '-I' in args:
+            return b'["py3-none-any"]'
+        raise AssertionError('rebuilding an unproved installed wheel is forbidden')
+    monkeypatch.setattr(runtime,'run',forbid)
+    with pytest.raises(RuntimeError,match='no exact wheel evidence'):
+        runtime._capture_install_artifacts(item,prefix,req,second,inventory,installed_capture=capture)
+    assert not list(second.iterdir())
+
+
+def test_native_guest_protocol_runs_real_pep517_static_and_dynamic_layers(tmp_path):
+    import contextlib
+    import os
+    import sys
+    import venv
+    transport = load(ROOT/'scripts/native_guest_execution.py')
+    interpreter = tmp_path/'target'
+    venv.EnvBuilder(with_pip=True).create(interpreter)
+    python = interpreter/'bin/python'
+    exchange = tmp_path/'exchange'; exchange.mkdir()
+    local = tmp_path/'guest-local'; local.mkdir()
+    source = exchange/'project'; source.mkdir()
+    (source/'pyproject.toml').write_text('''[build-system]
+requires = ["fixture-static-helper==1"]
+build-backend = "fixture_backend"
+backend-path = ["."]
+''')
+    (source/'fixture_backend.py').write_text('''from pathlib import Path
+
+def get_requires_for_build_wheel(config_settings=None):
+    import fixture_static_helper
+    return ["fixture-dynamic-helper==1"]
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    import fixture_static_helper, fixture_dynamic_helper
+    target = Path(metadata_directory) / "fixture_project-1.dist-info"
+    target.mkdir()
+    (target/"METADATA").write_text("Metadata-Version: 2.1\\nName: fixture-project\\nVersion: 1\\nRequires-Dist: fixture-runtime==2\\n")
+    (target/"WHEEL").write_text("Wheel-Version: 1.0\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n")
+    return target.name
+''')
+    wheels = {}
+    for name in ('fixture-static-helper', 'fixture-dynamic-helper'):
+        distribution = name.replace('-', '_')
+        wheel = exchange/(distribution+'-1-py3-none-any.whl')
+        write_fixture_wheel(wheel, distribution, '1', payload=b'VALUE = 1\n')
+        wheels[name+'==1'] = str(wheel)
+    calls = []
+    def resolve(requirements):
+        calls.append(requirements)
+        return [wheels[requirement] for requirement in requirements]
+    active = set()
+    @contextlib.contextmanager
+    def observe(label, *, limit=None):
+        token = object(); active.add(token)
+        try: yield
+        finally: active.remove(token)
+    class LocalGuest:
+        def __init__(self): self.children = {}
+        def start(self, command):
+            index = command.index('/usr/bin/python3')
+            process = subprocess.Popen([sys.executable, *command[index+1:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.children[process.pid] = process
+            return process.pid
+        def status(self, pid):
+            status = self.children[pid].poll()
+            return {'exited':status is not None, 'exitcode':status}
+        def run(self, command): subprocess.run(command, check=True, timeout=10)
+    client = transport.NativeGuestClient('unused', ROOT, os.getuid(), os.getgid(), local, limit=180, cadence=0.01, operation=observe)
+    client.agent = LocalGuest()
+    report = exchange/'report.json'
+    runtime = {'root':exchange, 'env':{'PATH':'/usr/bin:/bin', 'HOME':str(local), 'PIP_NO_INDEX':'1', 'PIP_CONFIG_FILE':'/dev/null', 'LANG':'C.UTF-8'},
+               '_native_build_resolver':resolve}
+    result = client.run([str(python), '-m', 'pip', 'install', '--dry-run', '--ignore-installed', '--no-deps',
+                         '--report', report, source], runtime, interpreter=python,
+                        metadata_build=True, capture_build_requirements=True)
+    assert calls == [['fixture-static-helper==1'], ['fixture-dynamic-helper==1']]
+    assert sorted(result) == [['fixture_dynamic_helper==1'], ['fixture_static_helper==1']]
+    assert json.loads(report.read_bytes())['install'][0]['metadata']['requires_dist'] == ['fixture-runtime==2']
+    assert not active
+    assert all(process.poll() == 0 for process in client.agent.children.values())
+    # Real target backend failure must become a durable native lookup request,
+    # not an optional package rejection or a controller-side compilation.
+    (source/'fixture_backend.py').write_text('''import subprocess
+
+def get_requires_for_build_wheel(config_settings=None):
+    return []
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    subprocess.run(["gcc", "-E", "-x", "c", "-"],
+                   input=b"#include <gpttrace_fixture_missing_native_header.h>\\n", check=True)
+''')
+    with pytest.raises(transport.NativeGuestRequired) as error:
+        client.run([str(python), '-m', 'pip', 'install', '--dry-run', '--ignore-installed', '--no-deps',
+                    '--report', report, source], runtime, interpreter=python,
+                   metadata_build=True, capture_build_requirements=True)
+    assert len(error.value.requirements) == 1
+    key, paths = next(iter(error.value.requirements.items()))
+    assert key.startswith('header:gpttrace_fixture_missing_native_header.h@')
+    assert 'usr/include/gpttrace_fixture_missing_native_header.h' in paths
+    assert not active
+
+
+def test_sealed_cas_guest_links_only_admitted_immutable_inodes(tmp_path):
+    import os
+    import socket
+    import types
+    if os.geteuid() != 0:
+        pytest.skip('root-owned sealed CAS fixture required')
+    broker = load(ROOT/'scripts/native_guest_broker.py')
+    stage = tmp_path/'stage'; stage.mkdir()
+    sha = hashlib.sha256(b'fixture').hexdigest()
+    original = stage/'objects/sha256'/sha[:2]/sha
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b'fixture'); original.chmod(0o444)
+    scratch = stage/'.native-pip-fixture'; scratch.mkdir()
+    path = tmp_path/'links.sock'
+    account = types.SimpleNamespace(pw_uid=os.getuid(),pw_gid=os.getgid())
+    service = broker.SealedCasLinks(path,stage,account,2)
+    def link(destination, digest=sha):
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(str(path))
+            connection.sendall(json.dumps({'sha256':digest,'destination':destination}).encode()+b'\n')
+            with connection.makefile('rb') as wire:
+                return json.loads(wire.readline())
+    try:
+        assert link('.native-pip-fixture/archive') == {'ok':True}
+        assert (scratch/'archive').samefile(original)
+        assert 'error' in link('../outside')
+        assert 'error' in link('.native-pip-fixture/archive')
+        (scratch/'outside').symlink_to(tmp_path,target_is_directory=True)
+        assert 'error' in link('.native-pip-fixture/outside/forbidden')
+        assert not (tmp_path/'forbidden').exists()
+        late_sha = hashlib.sha256(b'late').hexdigest()
+        late = stage/'objects/sha256'/late_sha[:2]/late_sha
+        late.parent.mkdir(exist_ok=True)
+        late.write_bytes(b'late'); late.chmod(0o444)
+        assert 'error' in link('.native-pip-fixture/late',late_sha)
+        assert original.read_bytes() == b'fixture'
+    finally:
+        service.close()
+    assert not service.thread.is_alive()
+
+
+def test_native_metadata_exception_is_preserved_across_worker_entry(tmp_path, monkeypatch):
+    pool = load(ROOT/'scripts/superbench_pool.py')
+    transport = pool._native_guest_module()
+    assert pool._native_guest_module() is transport
+    stage = tmp_path/'stage'; stage.mkdir()
+    monkeypatch.setattr(pool,'_NATIVE_STAGE',stage)
+    paths = ['usr/include/fixture.h']
+    identity = 'header:fixture.h@'+hashlib.sha256(json.dumps(paths,separators=(',',':')).encode()).hexdigest()
+    requirements = {identity:paths}
+    def fail():
+        raise transport.NativeGuestRequired(requirements)
+    monkeypatch.setattr(pool,'main',fail)
+    monkeypatch.setattr('sys.argv',['superbench_pool.py'])
+    with pytest.raises(SystemExit) as failure:
+        pool._pool_cli_entry()
+    assert failure.value.code == transport.NATIVE_METADATA_EXIT_CODE
+    assert json.loads((stage/'metadata/target-metadata-native.json').read_bytes()) == requirements

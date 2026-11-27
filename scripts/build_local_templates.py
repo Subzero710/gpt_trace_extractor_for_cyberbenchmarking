@@ -109,7 +109,7 @@ COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 8
+TASK_RUNTIME_SCHEMA = 9
 
 
 class RecoverableBuildError(RuntimeError):
@@ -249,6 +249,136 @@ def _compatible_stage_candidates(target_root, staged, identity):
         if _compatibility_matches(previous.get("compatibility"), identity["compatibility"]):
             candidates.append(old)
     return candidates
+
+
+def _sealed_generation_donors(target_root, identity):
+    """Admit only independently sealed generations with the same template ABI."""
+    from gpt_trace_transport.local_templates import safe, verify_local_validation
+    root = target_root / 'generations'
+    if not root.exists():
+        return []
+    safe(root, directory=True)
+    result = []
+    for folder in sorted(root.iterdir()):
+        if not SHA.fullmatch(folder.name):
+            raise RuntimeError('unexpected local template generation name: ' + folder.name)
+        safe(folder, directory=True, immutable=True)
+        record = folder / 'build-identity.json'
+        if not record.exists():
+            continue
+        prior = json.loads(safe(record, immutable=True).read_bytes())
+        if not _compatibility_matches(prior.get('compatibility'), identity['compatibility']):
+            continue
+        manifest = json.loads(safe(folder / 'manifest.json', immutable=True).read_bytes())
+        if manifest.get('generation') != folder.name:
+            raise RuntimeError('sealed donor generation identity differs')
+        validation = verify_local_validation(folder, manifest, expected=identity['compatibility'], complete=False)
+        if validation['files'].get('build-identity.json') != {'sha256': digest(record), 'size': record.stat().st_size}:
+            raise RuntimeError('sealed donor build identity differs')
+        result.append(folder)
+    return result
+
+
+def _completed_common_candidate(candidates, identity, os_manifest, *, archive_provenance, completion_matches, guest_json, image_info):
+    """Select a complete common without mutating any prior image or task backing."""
+    from gpt_trace_transport.local_templates import safe
+    native = load_module('swegym_completed_common_apt', GUEST.with_name('os_packages.py'))
+    eligible = []
+    for folder in candidates:
+        prior = json.loads(safe(folder / 'build-identity.json', immutable=True).read_bytes())
+        image = folder / 'common.qcow2'
+        manifest_path = folder / 'os/swe-gym-os/manifest.json'
+        if not image.is_file() or not manifest_path.is_file():
+            continue
+        if not SHA.fullmatch(str(prior.get('pool_inputs_sha256', ''))) or not SHA.fullmatch(str(prior.get('apt_inputs_sha256', ''))):
+            continue
+        previous = json.loads(safe(manifest_path, immutable=True).read_bytes())
+        same = (prior['pool_inputs_sha256'] == identity['pool_inputs_sha256'] and
+                os_replay_identity(previous) == os_replay_identity(os_manifest))
+        if os_replay_identity(previous) != os_replay_identity(os_manifest) and native.additive_os_delta(previous, os_manifest) is None:
+            continue
+        if image.is_symlink() or image.stat().st_mode & 0o222:
+            continue
+        safe(image, immutable=True)
+        marker = {'schema': 3, 'kind': 'common', 'template_abi': identity['compatibility']['template_abi'],
+                  'source_fingerprint': identity['compatibility']['source_fingerprint'],
+                  'pool_inputs_sha256': prior['pool_inputs_sha256']}
+        if not completion_matches(image, COMMON_COMPLETION, marker):
+            continue
+        if guest_json(image, COMMON_INPUTS_COMPLETION) != {**marker, 'kind': 'common-inputs', 'apt_inputs_sha256': prior['apt_inputs_sha256']}:
+            raise RuntimeError('completed donor common has different input proof')
+        if guest_json(image, '/opt/swe-gym-lite/environment-cache-provenance.json') != archive_provenance:
+            continue
+        if os_replay_identity(guest_json(image, '/opt/swe-gym-lite/os-manifest.json')) != os_replay_identity(previous):
+            raise RuntimeError('completed donor common has different installed OS proof')
+        info = image_info(image)
+        if info.get('format') != 'qcow2' or info.get('backing-filename') != str(BASE):
+            raise RuntimeError('completed donor common has a different Golden backing')
+        expected_sha = None
+        if (folder / 'local-validation.json').exists():
+            validation = json.loads(safe(folder / 'local-validation.json', immutable=True).read_bytes())
+            files = validation['files']
+            relative = manifest_path.relative_to(folder).as_posix()
+            if files.get(relative) != {'sha256': digest(manifest_path), 'size': manifest_path.stat().st_size}:
+                raise RuntimeError('sealed donor OS manifest differs')
+            entry = files.get('common.qcow2')
+            if not isinstance(entry, dict) or entry.get('size') != image.stat().st_size or not SHA.fullmatch(str(entry.get('sha256', ''))):
+                raise RuntimeError('sealed donor common byte inventory differs')
+            expected_sha = entry['sha256']
+        eligible.append((same, folder, prior, previous, expected_sha))
+    if not eligible:
+        return None
+    return max(eligible, key=lambda row: (row[0], _stage_score(row[1])))
+
+
+def _copy_completed_common(source, destination, expected_sha, *, margin):
+    """Copy only allocated/nonzero bytes, with a separate inode and bounded batches."""
+    from gpt_trace_transport.local_templates import safe, file_signature, sync_directory
+    from gpt_trace_transport.operation_watch import host_operation
+    source = safe(source, immutable=True)
+    destination = Path(destination)
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError('completed common import requires an absent destination')
+    before = file_signature(source)
+    batch_bytes = _CONTROLS['golden_qcow2_copy_mib'] * 1024 ** 2
+    limit = _versioned_host_subprocess_timeout()
+    value = hashlib.sha256()
+    fd, name = tempfile.mkstemp(prefix='.common-import-', dir=destination.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as output, source.open('rb') as stream:
+            remaining = before[2]
+            while remaining:
+                free_space(destination.parent, margin)
+                deadline = time.monotonic() + limit
+                with host_operation('copy-completed-common-batch'):
+                    budget = min(batch_bytes, remaining)
+                    while budget:
+                        data = stream.read(min(budget, 1024 ** 2))
+                        if not data:
+                            raise RuntimeError('completed donor common was truncated')
+                        value.update(data)
+                        if data.count(0) == len(data):
+                            output.seek(len(data), os.SEEK_CUR)
+                        else:
+                            output.write(data)
+                        budget -= len(data)
+                        remaining -= len(data)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('completed common copy batch exceeded deadline')
+                    output.flush()
+                    os.fsync(output.fileno())
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('completed common copy batch exceeded deadline')
+            output.truncate(before[2])
+            output.flush()
+            os.fsync(output.fileno())
+        if file_signature(source) != before or (expected_sha is not None and value.hexdigest() != expected_sha):
+            raise RuntimeError('completed donor common bytes differ from verified identity')
+        os.link(temporary, destination)
+        sync_directory(destination.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _adopt_resumable_stage(target_root, staged, identity):
@@ -1181,7 +1311,8 @@ def build(args, *, progress=None):
         checkpoints.mkdir(mode=0o700, exist_ok=True)
         from gpt_trace_transport.local_templates import safe
         safe(checkpoints, directory=True)
-        historical_stages = _compatible_stage_candidates(target_root, staged, identity)
+        historical_stages = (_compatible_stage_candidates(target_root, staged, identity)
+                             + _sealed_generation_donors(target_root, identity))
         migration_path = checkpoints / 'common-native-migration.json'
         common_migration = None
         if migration_path.exists() or migration_path.is_symlink():
@@ -1709,21 +1840,6 @@ def build(args, *, progress=None):
             # directory is neither a dependency nor a reusable checkpoint.
             _purge_apt_partial(staged)
             report("Construction du template commun")
-            common = staged / "common.qcow2"
-            initial_common = not common.exists()
-            if not initial_common or common.is_symlink():
-                safe(common)
-            common_completion = {"schema": 3, "kind": "common",
-                "template_abi": job["compatibility"]["template_abi"],
-                "source_fingerprint": inputs["source_fingerprint"],
-                "pool_inputs_sha256": identity["pool_inputs_sha256"]}
-            common_ready = not initial_common and completion_matches(common, COMMON_COMPLETION, common_completion)
-            input_completion = {**common_completion, "kind": "common-inputs",
-                "apt_inputs_sha256": closure_sha}
-            marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
-            payload = staged / "swe-gym-build"
-            _discard(payload)
-
             def archive_inputs():
                 lock_source = GUEST.with_name("conda-lock.json")
                 lock_bytes = lock_source.read_bytes()
@@ -1762,6 +1878,75 @@ def build(args, *, progress=None):
                 provenance = common_archive_provenance(lock_payload, filenames, npm_urls,
                                                        archives.sizes, MINICONDA_SHA256)
                 return lock_source, lock_payload, filenames, npm_urls, provenance
+
+            archive_data = None
+            common = staged / "common.qcow2"
+            # Bind the import before copying. Never edit an old completed common:
+            # repository images and task scratch overlays may still depend on it.
+            donor_record = read_checkpoint('common-completed-donor.json')
+            if not common.exists() and not common.is_symlink():
+                candidates = historical_stages
+                if donor_record is not None:
+                    relative = Path(donor_record['folder'])
+                    if relative.is_absolute() or '..' in relative.parts:
+                        raise RuntimeError('unsafe completed common donor journal')
+                    candidates = [target_root / relative]
+                donor = None
+                if candidates:
+                    archive_data = archive_inputs()
+                    donor = _completed_common_candidate(candidates, identity, os_manifest,
+                        archive_provenance=archive_data[-1], completion_matches=completion_matches, guest_json=guest_json,
+                        image_info=lambda path: json.loads(capture('qemu-img', 'info', '--output=json', str(path))))
+                if donor is None and donor_record is not None:
+                    raise RuntimeError('recorded completed common donor is no longer compatible; preserved')
+                if donor is not None:
+                    same, folder, prior, previous_os, expected_sha = donor
+                    record = {'schema': 1, 'folder': folder.relative_to(target_root).as_posix(),
+                              'prior': prior, 'previous_os': previous_os, 'sha256': expected_sha}
+                    if donor_record is not None and donor_record != record:
+                        raise RuntimeError('completed common donor changed during import; preserved')
+                    if donor_record is None:
+                        write_checkpoint('common-completed-donor.json', record)
+                    donor_record = record
+                    _copy_completed_common(folder / 'common.qcow2', common, expected_sha, margin=margin)
+                    print('imported verified completed common: ' + str(folder), flush=True)
+            if donor_record is not None:
+                prior, previous_os = donor_record['prior'], donor_record['previous_os']
+                cmd('qemu-img', 'check', str(common))
+                if prior['pool_inputs_sha256'] != identity['pool_inputs_sha256']:
+                    journal = {'schema': 1, 'from': prior['pool_inputs_sha256'],
+                               'to': identity['pool_inputs_sha256'], 'previous_apt_inputs_sha256': prior['apt_inputs_sha256'],
+                               'previous_os': previous_os}
+                    if common_migration is not None and common_migration != journal:
+                        raise RuntimeError('completed common import conflicts with native migration journal')
+                    if common_migration is None:
+                        write_checkpoint('common-native-migration.json', journal)
+                        common_migration = journal
+                # The copied volume and, when required, the migration journal
+                # are now durable. The import receipt must not follow a later
+                # in-place migration to a different pool identity.
+                (checkpoints / 'common-completed-donor.json').unlink()
+                from gpt_trace_transport.local_templates import sync_directory
+                sync_directory(checkpoints)
+            initial_common = not common.exists()
+            if not initial_common or common.is_symlink():
+                safe(common)
+            common_completion = {"schema": 3, "kind": "common",
+                "template_abi": job["compatibility"]["template_abi"],
+                "source_fingerprint": inputs["source_fingerprint"],
+                "pool_inputs_sha256": identity["pool_inputs_sha256"]}
+            common_ready = not initial_common and completion_matches(common, COMMON_COMPLETION, common_completion)
+            if common_ready and guest_json(common, '/opt/swe-gym-lite/os-manifest.json') != os_manifest:
+                # Provider evidence may change without changing any archive.
+                # Revalidate it in the target rather than accepting stale proof.
+                if os_replay_identity(guest_json(common, '/opt/swe-gym-lite/os-manifest.json')) != os_replay_identity(os_manifest):
+                    raise RuntimeError('completed common has another installed OS identity')
+                common_ready = False
+            input_completion = {**common_completion, "kind": "common-inputs",
+                "apt_inputs_sha256": closure_sha}
+            marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
+            payload = staged / "swe-gym-build"
+            _discard(payload)
 
             def make_payload(mode, lock_source, lock_payload, filenames, npm_urls, provenance):
                 payload.mkdir()
@@ -1855,7 +2040,9 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 subprocess.run(["qemu-img", "check", str(common)], check=True, timeout=_versioned_host_subprocess_timeout())
                 print("reused verified complete immutable common QCOW2", flush=True)
             else:
-                lock_source, lock_payload, filenames, npm_urls, archive_provenance = archive_inputs()
+                if archive_data is None:
+                    archive_data = archive_inputs()
+                lock_source, lock_payload, filenames, npm_urls, archive_provenance = archive_data
 
                 def guest_directory(image, path):
                     return set(capture("virt-ls", "-a", str(image), path).decode().splitlines())
@@ -1894,9 +2081,12 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 if common_migration is not None:
                     previous_os = common_migration['previous_os']
                     native_tools = load_module('swegym_os_additive_replay', GUEST.with_name('os_packages.py'))
-                    delta = native_tools.additive_os_delta(previous_os, os_manifest)
-                    if delta is None:
-                        raise RuntimeError('new installed OS closure is not a strict additive continuation')
+                    if os_replay_identity(previous_os) == os_replay_identity(os_manifest):
+                        delta = {}
+                    else:
+                        delta = native_tools.additive_os_delta(previous_os, os_manifest)
+                        if delta is None:
+                            raise RuntimeError('new installed OS closure is not a strict additive continuation')
                     old_input = guest_json(common, COMMON_INPUTS_COMPLETION)
                     old_manifest = guest_json(common, '/opt/swe-gym-lite/os-manifest.json')
                     expected_old_input = {**input_completion, 'pool_inputs_sha256': common_migration['from']}
@@ -1928,7 +2118,11 @@ from pathlib import Path
 folder=Path('/opt/swe-gym-build/os-artifacts')
 previous=json.loads((folder/'previous.json').read_bytes())
 current=json.loads((folder/'manifest.json').read_bytes())
-runpy.run_path('/opt/swe-gym-lite/os_packages.py')['extend'](folder,previous,current)
+module=runpy.run_path('/opt/swe-gym-lite/os_packages.py')
+if all(previous[key] == current[key] for key in ('schema_version','artifacts','installed_before','installed_after')):
+    module['_validate_installed_manifest'](current,compare_final=True)
+else:
+    module['extend'](folder,previous,current)
 runpy.run_path('/opt/swe-gym-lite/runtime.py')['_durable_json'](Path('/opt/swe-gym-lite/os-manifest.json'),current)
 PY_APT_DELTA
 """ + input_marker + common_tail
@@ -1946,6 +2140,23 @@ PY_APT_DELTA
                     print("resuming common after completed archive integration: " + mode, flush=True)
                     selected_boot = ({"legacy-prepared": input_marker, "prepared": "",
                                       "bootstrap-prepared": npm_boot}[mode]) + common_tail
+                    if mode == 'prepared' and guest_json(common, '/opt/swe-gym-lite/os-manifest.json') != os_manifest:
+                        old_manifest = guest_json(common, '/opt/swe-gym-lite/os-manifest.json')
+                        if os_replay_identity(old_manifest) != os_replay_identity(os_manifest):
+                            raise RuntimeError('prepared common has another installed OS identity')
+                        current_manifest = scratch_root / 'common-os-validation.json'
+                        atomic_json(current_manifest, os_manifest)
+                        uploads = (*uploads, '--upload', str(current_manifest) + ':/opt/swe-gym-lite/os-validation-input.json')
+                        selected_boot = """/usr/bin/python3 - <<'PY_APT_VALIDATE'
+import json,runpy
+from pathlib import Path
+path=Path('/opt/swe-gym-lite/os-validation-input.json')
+manifest=json.loads(path.read_bytes())
+runpy.run_path('/opt/swe-gym-lite/os_packages.py')['_validate_installed_manifest'](manifest,compare_final=True)
+runpy.run_path('/opt/swe-gym-lite/runtime.py')['_durable_json'](Path('/opt/swe-gym-lite/os-manifest.json'),manifest)
+path.unlink()
+PY_APT_VALIDATE
+""" + selected_boot
                     selected_payload = None
                 else:
                     if initial_common:
@@ -2001,6 +2212,7 @@ PY_APT_DELTA
                     print("resuming common input stage: " + mode, flush=True)
                 common.chmod(0o600)
                 try:
+                    selected_boot = 'rm -f ' + shlex.quote(COMMON_COMPLETION) + '\n' + selected_boot
                     provision(common, selected_boot, selected_payload, network=False,
                               completion=(COMMON_COMPLETION, common_completion),
                               refresh_runtime=mode != "bootstrap", extra_uploads=uploads)

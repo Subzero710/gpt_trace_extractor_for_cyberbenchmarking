@@ -24,10 +24,12 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
-TASK_RUNTIME_SCHEMA = 8
+TASK_RUNTIME_SCHEMA = 9
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "scripts/native_requirements.py",
+    "scripts/native_guest_execution.py",
+    "scripts/native_guest_broker.py",
     "scripts/verified_resolver_bridge.py",
     "infra/workstation/image/apt_downloads.py",
     "infra/workstation/image/conda_trace.py",
@@ -42,9 +44,11 @@ FETCH_SOURCE_FILES = (
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/constants.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/upstream/dockerfiles.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/os_packages.py",
+    "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/guest_runtime.py",
     "apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym/target_environment.py",
 )
 FETCH_BUDGET_EXIT_CODE = 75
+NATIVE_METADATA_EXIT_CODE = 76
 
 
 def namespace_rx_bytes(contents):
