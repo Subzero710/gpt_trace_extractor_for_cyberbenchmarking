@@ -124,7 +124,7 @@ class PersistentBuilderPolicyTests(unittest.TestCase):
         self.assertIn('workers = max(1, min(4, os.cpu_count() or 1))', source)
         tree = ast.parse(source)
         capture = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-                       and n.name == '_capture_one_install_artifact')
+                       and n.name == '_capture_missing_install_artifacts')
         commands = [n for n in ast.walk(capture) if isinstance(n, (ast.Tuple, ast.List))]
         def arguments(node):
             return [n.value for n in node.elts if isinstance(n, ast.Constant) and isinstance(n.value, str)]

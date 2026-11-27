@@ -193,6 +193,15 @@ def test_conda_inventory_reads_only_declared_file_paths(tmp_path):
     assert native.conda_inventory(path, path.name) == ['include/example.h', 'lib/libexample.so']
 
 
+def write_fixture_wheel(path, distribution, version):
+    import zipfile
+    prefix = distribution + '-' + version + '.dist-info/'
+    with zipfile.ZipFile(path, 'w') as archive:
+        archive.writestr(prefix + 'METADATA', f'Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n')
+        archive.writestr(prefix + 'WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
+        archive.writestr(prefix + 'RECORD', '')
+
+
 def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, monkeypatch):
     import os
     runtime = load(ADAPTER/'guest_runtime.py')
@@ -208,7 +217,7 @@ def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, m
     def wheel(*args, **kwargs):
         calls.append(args)
         folder = Path(args[args.index('--wheel-dir')+1])
-        (folder/name).write_bytes(b'fixture wheel')
+        write_fixture_wheel(folder/name, 'fixture', '1')
     monkeypatch.setattr(runtime, 'run', wheel)
     item = {'instance_id': 'fixture'}
     env = {'pip_freeze': 'fixture==1', 'conda_explicit': 'fixture'}
@@ -216,7 +225,7 @@ def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, m
     second = tmp_path/'second'; second.mkdir()
     assert runtime._capture_install_artifacts(item, tmp_path/'prefix', req, first, env) == runtime._capture_install_artifacts(item, tmp_path/'prefix', req, second, env)
     assert len(calls) == 1
-    assert (second/name).read_bytes() == b'fixture wheel'
+    assert (second/name).read_bytes() == (first/name).read_bytes()
     def failure(*args, **kwargs):
         calls.append(args)
         raise subprocess.CalledProcessError(1, args)
@@ -245,3 +254,70 @@ def test_native_repair_has_no_revision_allowlist():
     assert not any(isinstance(item, ast.Constant) and isinstance(item.value, str)
                    and len(item.value) == 64 and all(char in '0123456789abcdef' for char in item.value)
                    for item in ast.walk(node))
+
+
+def test_batched_capture_persists_exact_successes_before_reporting_failure(tmp_path, monkeypatch):
+    runtime = load(ADAPTER/'guest_runtime.py')
+    root = tmp_path/'guest'; shared = tmp_path/'shared'; shared.mkdir()
+    (root/'caches/pip-index').mkdir(parents=True)
+    monkeypatch.setattr(runtime, 'ROOT', root)
+    monkeypatch.setattr(runtime, 'SHARED_WARM_CACHE_ROOT', shared)
+    monkeypatch.setenv('GPT_TRACE_SHARED_WARM_CACHE', str(shared))
+    monkeypatch.setenv('GPT_TRACE_WHEEL_BUILD_CONTEXT', 'a'*64)
+    req = tmp_path/'requirements'; req.write_text('alpha==1\nbeta==2\n')
+    calls = []
+    def wheel(*args, **kwargs):
+        requirements = Path(args[args.index('--requirement')+1]).read_text()
+        calls.append(requirements)
+        folder = Path(args[args.index('--wheel-dir')+1])
+        if len(calls) == 1:
+            write_fixture_wheel(folder/'alpha-1-py3-none-any.whl', 'alpha', '1')
+            raise subprocess.CalledProcessError(1, args)
+        write_fixture_wheel(folder/'beta-2-py3-none-any.whl', 'beta', '2')
+    monkeypatch.setattr(runtime, 'run', wheel)
+    env = {'pip_freeze': 'alpha==1\nbeta==2', 'conda_explicit': 'fixture'}
+    item = {'instance_id': 'fixture'}
+    first = tmp_path/'first'; first.mkdir()
+    with pytest.raises(subprocess.CalledProcessError):
+        runtime._capture_install_artifacts(item, tmp_path/'prefix', req, first, env)
+    assert len(list((shared/'wheel-capture-v1/records').glob('*.json'))) == 1
+    second = tmp_path/'second'; second.mkdir()
+    result = runtime._capture_install_artifacts(item, tmp_path/'prefix', req, second, env)
+    assert set(result) == {'alpha-1-py3-none-any.whl', 'beta-2-py3-none-any.whl'}
+    assert calls == ['alpha==1\nbeta==2\n', 'beta==2\n']
+    assert len(list((shared/'wheel-capture-v1/records').glob('*.json'))) == 2
+    third = tmp_path/'third'; third.mkdir()
+    assert runtime._capture_install_artifacts(item, tmp_path/'prefix', req, third, env) == result
+    assert len(calls) == 2
+
+
+def test_capture_rejects_wrong_or_truncated_wheel(tmp_path):
+    import zipfile
+    runtime = load(ADAPTER/'guest_runtime.py')
+    req = runtime._capture_requirements(['alpha==1'])
+    wrong = tmp_path/'alpha-2-py3-none-any.whl'
+    write_fixture_wheel(wrong, 'alpha', '2')
+    with pytest.raises(RuntimeError, match='version differs'):
+        runtime._validate_captured_wheel(wrong, req)
+    truncated = tmp_path/'alpha-1-py3-none-any.whl'
+    truncated.write_bytes(b'PK\x03\x04')
+    with pytest.raises(zipfile.BadZipFile):
+        runtime._validate_captured_wheel(truncated, req)
+
+
+def test_compiler_namespace_uses_only_owned_conda_toolchain(tmp_path):
+    runtime = load(ADAPTER/'guest_runtime.py')
+    prefix = tmp_path/'prefix'; prefix.mkdir()
+    compiler = prefix/'bin/gcc'; compiler.parent.mkdir(); compiler.write_bytes(b'compiler')
+    records = [{'name':'compiler','version':'1','files':['bin/gcc'],'depends':['runtime >=1']},
+               {'name':'runtime','version':'1','files':[],'depends':['__linux']},
+               {'name':'unrelated','version':'1','files':[],'depends':[]}]
+    initial = runtime._compiler_conda_closure(prefix, records, [compiler])
+    assert set(initial) == {'compiler','runtime'}
+    records[-1]['version'] = '2'
+    assert runtime._compiler_conda_closure(prefix, records, [compiler]) == initial
+    records[1]['version'] = '2'
+    assert runtime._compiler_conda_closure(prefix, records, [compiler]) != initial
+    records[0]['files'] = []
+    with pytest.raises(RuntimeError, match='ownership'):
+        runtime._compiler_conda_closure(prefix, records, [compiler])

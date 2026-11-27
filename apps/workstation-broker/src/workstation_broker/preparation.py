@@ -1639,6 +1639,18 @@ def _prepare(manager, state):
         migration = (ready, state, previous)
     else:
         migration = _apt_repair_source(manager,root,state)
+    if migration is not None and not native_round:
+        # The old operation may have observed native requirements which never
+        # reached its next acquisition. Its admitted target/lock are identical.
+        prior_requests = _native_requirements(manager, migration[1].get('native_requests', {}))
+        current_requests = _native_requirements(manager, state.get('native_requests', {}))
+        if any(key in current_requests and current_requests[key] != paths for key, paths in prior_requests.items()):
+            raise RuntimeError('retained native observation conflicts with current preparation')
+        merged = {**prior_requests, **current_requests}
+        if merged != current_requests:
+            with manager.lock():
+                state = {**manager._read(state['operation_id']), 'native_requests': merged}
+                manager._write(state)
     if (ready.exists() or ready.is_symlink()) and (migration is None or migration[0]!=ready):
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():

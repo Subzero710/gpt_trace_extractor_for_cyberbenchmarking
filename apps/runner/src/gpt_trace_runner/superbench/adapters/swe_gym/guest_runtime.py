@@ -111,7 +111,7 @@ def configure_warm_wheel_context(item, artifact, common_identity):
     """
     if not isinstance(common_identity, dict) or not all(
             re.fullmatch(r"[a-f0-9]{64}", str(common_identity.get(field, "")))
-            for field in ("golden_sha256", "pool_manifest_sha256", "runtime_sha256")):
+            for field in ("golden_sha256", "pool_inputs_sha256", "runtime_sha256")):
         raise RuntimeError("missing authenticated native wheel build context")
     sha = artifact.get("sha256")
     if not re.fullmatch(r"[a-f0-9]{64}", str(sha)):
@@ -148,6 +148,48 @@ def prime_shared_pip_cache(item):
     return True
 
 
+def _compiler_conda_closure(prefix, records, executables):
+    """Use the installed toolchain owners and their declared Conda dependencies."""
+    prefix = Path(prefix).resolve(strict=True)
+    wanted = set()
+    for executable in executables:
+        for path in (Path(executable).absolute(), Path(executable).resolve(strict=True)):
+            if prefix in path.parents:
+                wanted.add(path.relative_to(prefix).as_posix())
+    owners = {}
+    packages = {}
+    for row in records:
+        name = row.get('name')
+        if not isinstance(name, str) or not name or name in packages:
+            raise RuntimeError('invalid or duplicate installed Conda package record')
+        files = row.get('files')
+        dependencies = row.get('depends')
+        if not isinstance(files, list) or not isinstance(dependencies, list):
+            raise RuntimeError('installed Conda package lacks its file/dependency inventory: ' + name)
+        packages[name] = row
+        for path in wanted.intersection(files):
+            owners.setdefault(path, set()).add(name)
+    if set(owners) != wanted or any(len(names) != 1 for names in owners.values()):
+        raise RuntimeError('target Conda compiler ownership is missing or ambiguous: ' + repr(sorted(wanted)))
+    pending = {name for names in owners.values() for name in names}
+    result = {}
+    while pending:
+        name = pending.pop()
+        if name in result:
+            continue
+        row = packages.get(name)
+        if row is None:
+            raise RuntimeError('installed Conda toolchain dependency is absent: ' + name)
+        result[name] = {key: row.get(key) for key in ('name', 'version', 'build', 'sha256', 'md5', 'url')}
+        for dependency in row['depends']:
+            if not isinstance(dependency, str) or not dependency.split():
+                raise RuntimeError('invalid installed Conda toolchain dependency')
+            dependency_name = dependency.split()[0]
+            if not dependency_name.startswith('__') and dependency_name not in result:
+                pending.add(dependency_name)
+    return dict(sorted(result.items()))
+
+
 def compiler_cache_exports():
     shared = _shared_warm_cache()
     if shared is None or not os.environ.get('CONDA_PREFIX'):
@@ -162,12 +204,12 @@ def compiler_cache_exports():
     if folder.is_symlink():
         raise RuntimeError('unsafe shared compiler cache directory')
     folder.mkdir(exist_ok=True)
+    hashes = {}
     def file_hash(path):
-        digest = hashlib.sha256()
-        with Path(path).open('rb') as stream:
-            for block in iter(lambda: stream.read(1048576), b''):
-                digest.update(block)
-        return digest.hexdigest()
+        path = Path(path).resolve(strict=True)
+        if path not in hashes:
+            hashes[path] = stream_digest(path)
+        return hashes[path]
     metadata = prefix / 'conda-meta'
     if metadata.is_symlink() or not metadata.is_dir():
         raise RuntimeError('active target has no Conda package provenance')
@@ -175,13 +217,19 @@ def compiler_cache_exports():
     for path in sorted(metadata.glob('*.json')):
         if path.is_symlink() or not path.is_file():
             raise RuntimeError('unsafe target Conda package record')
-        row = json.loads(path.read_bytes())
-        packages.append({key: row.get(key) for key in ('name', 'version', 'build', 'sha256', 'md5', 'url')})
+        packages.append(json.loads(path.read_bytes()))
     if not packages:
         raise RuntimeError('empty target Conda package provenance')
-    identity = {'os_manifest': file_hash(ROOT / 'os-manifest.json'), 'conda': packages,
+    # Transport evidence (Contents/Release hashes and provider observations)
+    # cannot change compiler output. Keep the exact installed system inventory.
+    os_manifest = json.loads((ROOT / 'os-manifest.json').read_bytes())
+    installed = os_manifest['installed_after']
+    if not isinstance(installed, dict) or not installed:
+        raise RuntimeError('missing installed system package identities')
+    identity = {'schema': 2, 'os_packages': installed,
                 'compiler_cache': file_hash(ccache), 'compilers': {}}
     variables = {}
+    executables = set()
     for name in ('CC', 'CXX'):
         arguments = shlex.split(os.environ.get(name) or sysconfig.get_config_var(name) or '')
         if not arguments:
@@ -193,19 +241,20 @@ def compiler_cache_exports():
             raise RuntimeError('configured target compiler is missing: ' + arguments[0])
         if Path(executable).resolve() == Path(ccache).resolve():
             raise RuntimeError('nested compiler cache launcher')
-        # Keep argv[0] and arguments selected by Conda/CPython; the actual
-        # compiler and its GCC subprocesses are content-bound to the namespace.
         command = [executable, *arguments[1:]]
         toolchain = {'command': command, 'compiler': file_hash(executable), 'programs': {}}
+        executables.add(executable)
         for program in ('cc1', 'cc1plus', 'as'):
             result = subprocess.check_output(command + ['-print-prog-name=' + program], text=True).strip()
             selected = shutil.which(result) if result else None
             if selected is not None:
+                executables.add(selected)
                 toolchain['programs'][program] = {'path': selected, 'sha256': file_hash(selected)}
             else:
                 toolchain['programs'][program] = {'reported': result}
         identity['compilers'][name] = toolchain
         variables[name] = shlex.join([ccache, *command])
+    identity['conda_toolchain'] = _compiler_conda_closure(prefix, packages, executables)
     namespace = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     variables.update(CCACHE_DIR=str(folder), CCACHE_NAMESPACE=namespace,
                      CCACHE_COMPILERCHECK='content', CCACHE_NODIRECT='1',
@@ -220,7 +269,6 @@ def compiler_cache_exports():
             stream.write(contents)
         config.chmod(0o444)
     variables['CCACHE_CONFIGPATH'] = str(config)
-    # Do not inherit optional unsafe ccache modes from recipe environments.
     commands = ['unset ' + key for key in sorted(os.environ) if key.startswith('CCACHE_')
                 and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)]
     commands.extend('export ' + key + '=' + shlex.quote(value) for key, value in sorted(variables.items()))
@@ -852,17 +900,19 @@ def _capture_wheel_manifest(folder):
     return _wheel_files(wheels)
 
 
-def _capture_cache_identity(context, requirements, inventory, env):
+def _capture_cache_key(context, requirement_sha, inventory, env):
     if not re.fullmatch(r"[a-f0-9]{64}", context):
         raise RuntimeError("invalid wheel capture context")
-    # The exact installed Conda/Pip state is included because wheel capture
-    # occurs after the official setup and evaluation setup, not before it.
-    identity = {"context": context, "requirements_sha256": stream_digest(requirements),
+    identity = {"context": context, "requirements_sha256": requirement_sha,
                 "inventory": inventory,
                 "environment_sha256": hashlib.sha256(json.dumps(env, sort_keys=True,
                     separators=(",", ":")).encode()).hexdigest(),
                 "command": ["conda", "run", "pip", "wheel", "--no-deps", "--no-index"]}
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _capture_cache_identity(context, requirements, inventory, env):
+    return _capture_cache_key(context, stream_digest(requirements), inventory, env)
 
 
 def _verified_capture_object(path, record):
@@ -880,125 +930,180 @@ def _capture_object_path(objects, filename, record):
     return objects / record["sha256"]
 
 
+def _capture_requirements(lines):
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    result = {}
+    for line in lines:
+        if not line or line != line.strip() or line.startswith('-'):
+            raise RuntimeError('invalid individual wheel capture requirement')
+        requirement = Requirement(line)
+        name = canonicalize_name(requirement.name)
+        specs = list(requirement.specifier)
+        if (name in result or requirement.extras or requirement.marker is not None
+                or (requirement.url is None and (len(specs) != 1 or specs[0].operator != '==' or '*' in specs[0].version))
+                or (requirement.url is not None and (not requirement.url.startswith('git+https://')
+                    or not re.search(r'@[a-f0-9]{40}(?:#|$)', requirement.url)))):
+            raise RuntimeError('wheel capture requires unique exact distributions: ' + line)
+        result[name] = (line, requirement)
+    if not result:
+        raise RuntimeError('empty wheel capture requirements')
+    return result
+
+
+def _capture_wheel_name(filename, requirements):
+    from packaging.utils import parse_wheel_filename
+    name, version, _, _ = parse_wheel_filename(filename)
+    if name not in requirements:
+        raise RuntimeError('unrequested wheel from capture: ' + filename)
+    requirement = requirements[name][1]
+    if requirement.url is None and not requirement.specifier.contains(version, prereleases=True):
+        raise RuntimeError('captured wheel version differs from exact requirement: ' + filename)
+    return name
+
+
+def _validate_captured_wheel(path, requirements):
+    import zipfile
+    from email.parser import BytesParser
+    from packaging.utils import canonicalize_name, parse_wheel_filename
+    from packaging.version import Version
+    name = _capture_wheel_name(path.name, requirements)
+    _, version, _, _ = parse_wheel_filename(path.name)
+    # In a failed batch a partially copied file must never become a durable
+    # receipt. The central directory and the wheel's metadata must be readable.
+    with zipfile.ZipFile(path) as archive:
+        members = archive.namelist()
+        if len(members) != len(set(members)):
+            raise RuntimeError('duplicate wheel archive entries: ' + path.name)
+        metadata = [entry for entry in members if entry.count('/') == 1 and entry.endswith('.dist-info/METADATA')]
+        if len(metadata) != 1:
+            raise RuntimeError('captured wheel has no unique metadata: ' + path.name)
+        directory = metadata[0].rsplit('/', 1)[0]
+        if not {directory + '/WHEEL', directory + '/RECORD'} <= set(members):
+            raise RuntimeError('captured wheel is incomplete: ' + path.name)
+        row = BytesParser().parsebytes(archive.read(metadata[0]))
+        if canonicalize_name(row['Name']) != name or Version(row['Version']) != version:
+            raise RuntimeError('captured wheel metadata differs from filename: ' + path.name)
+        archive.read(directory + '/WHEEL')
+        archive.read(directory + '/RECORD')
+    return name
+
+
+def _capture_missing_install_artifacts(prefix, requirements_file, wheelhouse, env, *, shared):
+    activation = (str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output')
+    compiler_cache = () if shared is None else ('/bin/bash', '-c',
+        'set -e; ' + _compiler_cache_shell(prefix) + '; exec "$@"', 'compiler-cache')
+    command = (*activation, *compiler_cache, str(prefix / 'bin/python'), '-m', 'pip', 'wheel', '--no-deps', '--no-index',
+               '--wheel-dir', str(wheelhouse), '--requirement', str(requirements_file))
+    run(*command, env=env)
+
+
+def _publish_capture_object(objects, filename, record, source):
+    target = _capture_object_path(objects, filename, record)
+    if target.exists() or target.is_symlink():
+        _verified_capture_object(target, record)
+        return
+    # The Pip cache is mutable. Publish only a verified independent CAS inode.
+    with _template_operation('publish-native-wheel'):
+        with tempfile.NamedTemporaryFile(dir=objects, prefix='.incoming-wheel-', delete=False) as dst:
+            temporary = Path(dst.name)
+            try:
+                with source.open('rb') as src:
+                    shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+                _verified_capture_object(temporary, record)
+                os.link(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        fd = os.open(objects, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
-    """Commit one verified wheel receipt per exact requirement, not per batch."""
+    """One activated Pip batch; individually durable exact wheel receipts."""
     if any(wheelhouse.iterdir()):
-        raise RuntimeError("wheel capture destination must start empty")
-    requirements = requirements_file.read_text().splitlines()
-    if (not requirements or len(set(requirements)) != len(requirements)
-            or any(not row or row != row.strip() or row.startswith("-") for row in requirements)):
-        raise RuntimeError("invalid individual wheel capture requirements")
-    wheels = {}
-    with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix=".wheel-capture-") as raw:
-        scratch = Path(raw)
-        for requirement in requirements:
-            request = scratch / "requirement.txt"
-            request.write_text(requirement + "\n")
-            output = scratch / "wheel"
-            output.mkdir()
-            records = _capture_one_install_artifact(item, prefix, request, output, inventory)
-            if len(records) != 1:
-                raise RuntimeError("exact wheel requirement did not produce one artifact: " + requirement)
-            filename, record = next(iter(records.items()))
-            if filename in wheels:
-                raise RuntimeError("duplicate wheel from distinct capture requirements: " + filename)
-            os.link(output / filename, wheelhouse / filename)
-            wheels[filename] = record
-            shutil.rmtree(output)
-    return _wheel_files(wheels)
-
-
-def _capture_one_install_artifact(item, prefix, requirements_file, wheelhouse, inventory):
-    """Build or reuse one wheel under the exact activated target context."""
+        raise RuntimeError('wheel capture destination must start empty')
+    requirements = _capture_requirements(requirements_file.read_text().splitlines())
     env = runtime_environment(item, offline=False)
-    if any(wheelhouse.iterdir()):
-        raise RuntimeError("wheel capture destination must start empty")
-    # The task-specific directory is empty; only the verified input index is
-    # a source of capture artifacts.
-    env["PIP_FIND_LINKS"] = str(ROOT / "caches/pip-index")
+    env['PIP_FIND_LINKS'] = str(ROOT / 'caches/pip-index')
     shared = _shared_warm_cache()
-    activation = (str(CONDA), "run", "--prefix", str(prefix), "--no-capture-output")
-    compiler_cache = () if shared is None else ("/bin/bash", "-c",
-        "set -e; " + _compiler_cache_shell(prefix) + '; exec "$@"', "compiler-cache")
-    command = (*activation, *compiler_cache, str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps", "--no-index",
-               "--wheel-dir", str(wheelhouse), "--requirement", str(requirements_file))
-    if shared is None:
-        run(*command, env=env)
-        return _capture_wheel_manifest(wheelhouse)
-    context = os.environ["GPT_TRACE_WHEEL_BUILD_CONTEXT"]
-    key = _capture_cache_identity(context, requirements_file, inventory, env)
-    cache = shared / "wheel-capture-v1"
-    objects, records = cache / "objects", cache / "records"
-    for folder in (cache, objects, records):
-        if folder.is_symlink():
-            raise RuntimeError("unsafe shared wheel capture store")
-        folder.mkdir(parents=True, exist_ok=True)
-    receipt = records / (key + ".json")
-    if receipt.is_symlink():
-        raise RuntimeError("unsafe wheel capture receipt")
-    if receipt.exists():
-        proof = json.loads(receipt.read_bytes())
-        if proof.get("key") != key or proof.get("schema") != 1:
-            raise RuntimeError("shared wheel capture identity differs")
-        wheels = _wheel_files(proof["wheels"])
-        if not wheels or any(not name.endswith(".whl") for name in wheels):
-            raise RuntimeError("invalid successful wheel capture receipt")
-        for filename, record in wheels.items():
+    pending = dict(requirements)
+    wheels = {}
+    receipt_keys = {}
+    if shared is not None:
+        context = os.environ['GPT_TRACE_WHEEL_BUILD_CONTEXT']
+        cache = shared / 'wheel-capture-v1'
+        objects, records = cache / 'objects', cache / 'records'
+        for folder in (cache, objects, records):
+            if folder.is_symlink():
+                raise RuntimeError('unsafe shared wheel capture store')
+            folder.mkdir(parents=True, exist_ok=True)
+        for name, (line, _) in requirements.items():
+            key = _capture_cache_key(context, hashlib.sha256((line + '\n').encode()).hexdigest(), inventory, env)
+            receipt = records / (key + '.json')
+            receipt_keys[name] = key, receipt
+            if receipt.is_symlink():
+                raise RuntimeError('unsafe wheel capture receipt')
+            if not receipt.exists():
+                continue
+            proof = json.loads(receipt.read_bytes())
+            if proof.get('key') != key or proof.get('schema') != 1:
+                raise RuntimeError('shared wheel capture identity differs')
+            result = _wheel_files(proof['wheels'])
+            if len(result) != 1:
+                raise RuntimeError('invalid successful wheel capture receipt')
+            filename, record = next(iter(result.items()))
+            if _capture_wheel_name(filename, requirements) != name or filename in wheels:
+                raise RuntimeError('shared wheel capture receipt belongs to another requirement')
             source = _capture_object_path(objects, filename, record)
             _verified_capture_object(source, record)
             target = wheelhouse / filename
-            with _template_operation("reuse-native-wheel"):
-                with source.open("rb") as src, target.open("xb") as dst:
+            with _template_operation('reuse-native-wheel'):
+                with source.open('rb') as src, target.open('xb') as dst:
                     shutil.copyfileobj(src, dst)
                 _verified_capture_object(target, record)
-        return wheels
-    # A cache miss is the normal build path, not an error recovery path.
-    # A failed wheel build is fatal; no source archive download/replay fallback.
-    run(*command, env=env)
-    wheels = _capture_wheel_manifest(wheelhouse)
-    pip_wheels = Path(env["PIP_CACHE_DIR"]) / "wheels"
-    by_filename = {}
-    if pip_wheels.is_dir():
-        for path in pip_wheels.rglob("*.whl"):
-            by_filename.setdefault(path.name, []).append(path)
-    for filename, record in wheels.items():
-        target = _capture_object_path(objects, filename, record)
-        if target.parent != objects or target.exists():
-            _verified_capture_object(target, record)
-            continue
-        if target.is_symlink():
-            raise RuntimeError("unsafe shared native wheel object")
-        # Pip normally already cached its built wheel on the same volume.
-        # Link that object rather than writing a second copy.
-        for candidate in by_filename.get(filename, ()):
-            if (not candidate.is_symlink() and candidate.is_file()
-                    and candidate.stat().st_size == record["size"]
-                    and stream_digest(candidate) == record["sha256"]):
-                os.link(candidate, target)
-                break
-        else:
-            with _template_operation("publish-native-wheel"):
-                with tempfile.NamedTemporaryFile(dir=objects, prefix=".incoming-wheel-", delete=False) as dst:
-                    temporary = Path(dst.name)
-                    try:
-                        with (wheelhouse / filename).open("rb") as src:
-                            shutil.copyfileobj(src, dst)
-                        dst.flush()
-                        os.fsync(dst.fileno())
-                        _verified_capture_object(temporary, record)
-                        os.link(temporary, target)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-        _verified_capture_object(target, record)
-        with target.open("rb") as handle:
-            os.fsync(handle.fileno())
-    fd = os.open(objects, os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    _durable_json(receipt, {"schema": 1, "key": key, "wheels": wheels})
-    return wheels
+            wheels[filename] = record
+            del pending[name]
+    if not pending:
+        return _wheel_files(wheels)
+    with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix='.wheel-capture-') as raw:
+        scratch = Path(raw)
+        request = scratch / 'requirements.txt'
+        request.write_text('\n'.join(line for line, _ in pending.values()) + '\n')
+        output = scratch / 'wheels'
+        output.mkdir()
+        failure = None
+        try:
+            _capture_missing_install_artifacts(prefix, request, output, env, shared=shared)
+        except subprocess.CalledProcessError as exc:
+            # Pip wheel publishes successful wheel files before its final batch
+            # status. Preserve those exact results but propagate the failure.
+            failure = exc
+        completed = {}
+        for path in sorted(output.iterdir()):
+            if path.is_symlink() or not path.is_file() or path.suffix != '.whl':
+                raise RuntimeError('unexpected non-wheel capture artifact: ' + path.name)
+            name = _validate_captured_wheel(path, pending)
+            if name in completed or path.name in wheels:
+                raise RuntimeError('duplicate wheel from distinct capture requirements: ' + path.name)
+            record = {'sha256': stream_digest(path), 'size': path.stat().st_size}
+            completed[name] = path, record
+        if failure is None and set(completed) != set(pending):
+            raise RuntimeError('Pip wheel capture omitted exact requirements: ' + ', '.join(sorted(set(pending)-set(completed))))
+        for name, (path, record) in completed.items():
+            if shared is not None:
+                _publish_capture_object(objects, path.name, record, path)
+                key, receipt = receipt_keys[name]
+                _durable_json(receipt, {'schema': 1, 'key': key, 'wheels': {path.name: record}})
+            os.link(path, wheelhouse / path.name)
+            wheels[path.name] = record
+        if failure is not None:
+            raise failure
+    return _wheel_files(wheels)
 
 
 def warm_task(item, artifact, *, common_identity=None):
@@ -1366,14 +1471,7 @@ def _native_requests(prefix, observations, *, profile=None):
 
 
 def _native_report(requirements):
-    requirements = runpy.run_path(str(ROOT / 'os_packages.py'))['native_requirement_paths'](requirements)
-    if not requirements:
-        raise RuntimeError('empty target native requirement report')
-    token = os.environ.get('GPT_TRACE_NATIVE_ROUND')
-    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{64}', token):
-        raise RuntimeError('native requirement observation outside a bound preparation round')
-    _durable_json(ROOT / 'native-requirements.json', {'schema': 1, 'round': token, 'requirements': requirements})
-    raise RuntimeError('target native dependency resolution required: ' + ', '.join(requirements))
+    runpy.run_path(str(ROOT / 'os_packages.py'))['report_native_requirements'](requirements, ROOT)
 
 
 def _native_recipe(item, prefix, callback, log=None):
@@ -1418,10 +1516,8 @@ def build_common(inputs):
     provenance = json.loads(provenance_path.read_bytes())
     if provenance.get("schema") != 1 or provenance.get("kind") != "verified-input-archives":
         raise RuntimeError("invalid common archive provenance")
+    runpy.run_path(str(ROOT / 'os_packages.py'))['require_build_tools'](ROOT)
     native_requests = {}
-    if shutil.which('ccache') is None:
-        native_requests.update(_native_requests(None, {('tool', 'ccache')},
-            profile={'tools': os.environ['PATH'].split(os.pathsep)}))
     for env_hash, record in sorted(inputs["environments"].items()):
         commands = locked_environment_script(env_hash, record, lock)
         recipe_proof = {"lock_sha256": lock_sha256, "transactions": len(lock["environments"][env_hash]["transactions"])}

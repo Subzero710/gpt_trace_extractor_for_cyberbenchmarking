@@ -429,6 +429,34 @@ class PublishedPoolArchives:
         return json.loads(raw)
 
 
+def effective_pool_inputs(inventory, closure):
+    nonapt = {category: groups for category, groups in inventory['provenance'].items()
+              if category != 'apt'}
+    shas = {sha for groups in nonapt.values() for hashes in groups.values() for sha in hashes}
+    # These files are read by the builder itself, not simply download receipts.
+    files = {row['path']: row for row in inventory['files']
+             if row['path'].startswith(('git/', 'git-extra/'))
+             or (Path(row['path']).parent == Path('metadata') and
+                 (Path(row['path']).match('pip-plan-*.json') or row['path'] == 'metadata/vcs-frozen.json'))}
+    inputs = {'schema': 1, 'objects': {sha: inventory['objects'][sha] for sha in sorted(shas)},
+              'provenance': nonapt, 'files': files,
+              'url_index': {url: sha for url, sha in inventory['url_index'].items() if sha in shas},
+              **{key: inventory[key] for key in ('task_plan', 'environment_plan', 'git_plan',
+                                                 'conda_transactions', 'conda_lock_sha256')}}
+    apt = {'schema': 1, 'requested': sorted(closure['requested']),
+           'resolved': sorted(closure['resolved'], key=lambda row: (row['package'], row['architecture'], row['version'], row['sha256'])),
+           'providers': closure.get('native_discovery', {}).get('providers', {}),
+           'golden_dpkg_status_sha256': closure['golden_dpkg_status_sha256'],
+           'golden_package_inventory_sha256': closure['golden_package_inventory_sha256']}
+    # APT filenames and identities are also consumed by the guest replay.
+    apt['archives'] = {row['path']: row for row in inventory['files']
+                       if Path(row['path']).parent == Path('apt/archives') and Path(row['path']).suffix == '.deb'}
+    def identity(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return {'nonapt_inputs_sha256': identity(inputs), 'apt_inputs_sha256': identity(apt),
+            'pool_inputs_sha256': identity({'nonapt': identity(inputs), 'apt': identity(apt)})}
+
+
 def published_apt_archives(archives, closure):
     identities = {row["sha256"]: row for row in closure["resolved"]}
     if len(identities) != len(closure["resolved"]):
@@ -981,6 +1009,9 @@ def build(args, *, progress=None):
         raise RuntimeError("template construction requires a verified sealed pool publication")
     pool_record = verify_published_inventory(dependency_pool, job, publication)
     archives = PublishedPoolArchives(dependency_pool, pool_record)
+    closure_relative = "metadata/apt-closure.json"
+    rows = archives.metadata(closure_relative)
+    payload_identity = effective_pool_inputs(pool_record, rows)
     from workstation_broker.preparation_resources import source_container_arguments
     if (args.virtual_gib, args.free_space_gib) != (VIRTUAL_GIB, FREE_SPACE_GIB):
         raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
@@ -1015,18 +1046,26 @@ def build(args, *, progress=None):
         # One deterministic resumable stage per *template identity*, not per
         # checkout/build implementation.  The operation ID is the hash of the
         # stable compatibility record, so code-only changes reuse this path.
-        identity = {"schema": 3, "compatibility": job["compatibility"],
-                    "pool_manifest_sha256": publication["manifest_sha256"]}
-        staged = target_root / (".build-resumable-v3-" + args.operation_id + "-" + publication["manifest_sha256"])
-        previous_stage = target_root / (".build-resumable-v3-" + args.operation_id)
-        if previous_stage.exists() or previous_stage.is_symlink():
-            safe(previous_stage, directory=True)
-            prior = json.loads(safe(previous_stage / "build-identity.json", immutable=True).read_bytes())
-            if prior.get("pool_manifest_sha256") == publication["manifest_sha256"]:
-                if staged.exists() or staged.is_symlink():
-                    raise RuntimeError("two template stages claim the same publication")
-                # The existing stage may be referenced by retained QCOW2 backing paths.
-                staged = previous_stage
+        identity = {"schema": 4, "compatibility": job["compatibility"],
+                    "pool_manifest_sha256": publication["manifest_sha256"], **payload_identity}
+        staged = target_root / (".build-resumable-v4-" + args.operation_id + "-" + identity["pool_inputs_sha256"])
+        # Keep absolute scratch backing paths valid: select a compatible stage
+        # in place rather than renaming it to the new publication's name.
+        if not staged.exists() and not staged.is_symlink():
+            candidates = []
+            for candidate in _compatible_stage_candidates(target_root, staged, identity):
+                prior = json.loads(safe(candidate / "build-identity.json", immutable=True).read_bytes())
+                if (prior.get("pool_inputs_sha256") == identity["pool_inputs_sha256"]
+                        and not (candidate / "local-validation.json").exists()):
+                    candidates.append(candidate)
+            if candidates:
+                staged = max(candidates, key=_stage_score)
+        if staged.exists() and (staged / "local-validation.json").exists():
+            prior = json.loads(safe(staged / "build-identity.json", immutable=True).read_bytes())
+            if prior.get("pool_manifest_sha256") != publication["manifest_sha256"]:
+                # A sealed generation is permanently bound to its publication.
+                # Do not rewrite its manifest to impersonate another pool.
+                staged = target_root / (staged.name + "-" + publication["manifest_sha256"])
         if staged.exists():
             from gpt_trace_transport.local_templates import safe
             safe(staged, directory=True)
@@ -1035,12 +1074,14 @@ def build(args, *, progress=None):
             if not _compatibility_matches(prior_identity.get("compatibility"), identity["compatibility"]):
                 raise RuntimeError("persistent template stage belongs to another template contract; "
                                    "preserved; only make throw_volumes may remove it")
-            if prior_identity.get("pool_manifest_sha256") != identity["pool_manifest_sha256"]:
-                raise RuntimeError("existing template stage belongs to another dependency publication; preserved")
+            if prior_identity.get("pool_inputs_sha256") != identity["pool_inputs_sha256"]:
+                raise RuntimeError("existing template stage belongs to different verified build inputs; preserved")
             sealed_stage = (staged / "local-validation.json").exists()
             if prior_identity != identity and not sealed_stage:
                 atomic_json(previous, identity)
             if sealed_stage:
+                if prior_identity.get("pool_manifest_sha256") != publication["manifest_sha256"]:
+                    raise RuntimeError("sealed template stage belongs to another publication")
                 # An interrupted seal/atomic rename is recoverable without any
                 # rebuild. Validate every immutable byte before publication.
                 from gpt_trace_transport.local_templates import (verify_manifest,
@@ -1065,9 +1106,8 @@ def build(args, *, progress=None):
                 return final
             print("resuming verified host preparation " + args.operation_id, flush=True)
         else:
-            if not _adopt_resumable_stage(target_root, staged, identity):
-                staged.mkdir(mode=0o755)
-                atomic_json(staged / "build-identity.json", identity)
+            staged.mkdir(mode=0o755)
+            atomic_json(staged / "build-identity.json", identity)
         checkpoints = staged / ".checkpoints"
         checkpoints.mkdir(mode=0o700, exist_ok=True)
         from gpt_trace_transport.local_templates import safe
@@ -1281,7 +1321,7 @@ def build(args, *, progress=None):
                     lines += [
                         "module['warm_task'](item,artifact,common_identity=" + repr({
                             "golden_sha256": job["compatibility"]["golden_sha256"],
-                            "pool_manifest_sha256": publication["manifest_sha256"],
+                            "pool_inputs_sha256": identity["pool_inputs_sha256"],
                             "runtime_sha256": digest(GUEST),
                         }) + ")",
                         "proof=module['export_setup_cache'](item,'/opt/swe-gym-task/setup-cache.tar.gz')",
@@ -1508,9 +1548,7 @@ def build(args, *, progress=None):
             # not an immutable snapshot ID. Resolve in one persistent resumable
             # resolver volume; never recreate it merely because a host copy-out
             # was interrupted.
-            closure_relative = "metadata/apt-closure.json"
-            rows = archives.metadata(closure_relative)
-            closure_sha = archives.files[closure_relative]["sha256"]
+            closure_sha = identity["apt_inputs_sha256"]
             apt_packages = published_apt_archives(archives, rows)
             status_sha = rows["golden_dpkg_status_sha256"]
             if SHA.fullmatch(status_sha) is None:
@@ -1518,8 +1556,8 @@ def build(args, *, progress=None):
             resolver = cache_root / ("os-resolver-" + closure_sha + ".qcow2")
             os_parent = staged / "os"
             os_folder = os_parent / "swe-gym-os"
-            resolver_completion = {"schema": 2, "kind": "os-resolver",
-                "source_fingerprint": inputs["source_fingerprint"], "apt_closure_sha256": closure_sha}
+            resolver_completion = {"schema": 3, "kind": "os-resolver",
+                "source_fingerprint": inputs["source_fingerprint"], "apt_inputs_sha256": closure_sha}
             if (os_folder / "manifest.json").is_file():
                 os_manifest = json.loads(safe(os_folder / "manifest.json").read_text())
                 bind_os_archives(os_folder, os_manifest, rows, apt_packages)
@@ -1562,7 +1600,9 @@ def build(args, *, progress=None):
                         "requested":rows["requested"], "artifacts":packages,
                         "native_headers":rows.get("native_discovery", {}).get("providers", {})},sort_keys=True))
                     resolver_boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\n"
-                    resolver_boot += "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve_from_pool']('/opt/swe-gym-os','/opt/swe-gym-os-helper/artifacts')\n"
+                    resolver_boot += "module=runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')\n"
+                    resolver_boot += "module['resolve_from_pool']('/opt/swe-gym-os','/opt/swe-gym-os-helper/artifacts')\n"
+                    resolver_boot += "module['require_build_tools']('/opt/swe-gym-lite')\n"
                     resolver_boot += "json.dump(" + repr(resolver_completion) + ",open('" + RESOLVER_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
                     provision(resolver, resolver_boot, os_payload, network=False,
                         completion=(RESOLVER_COMPLETION, resolver_completion))
@@ -1586,14 +1626,13 @@ def build(args, *, progress=None):
             initial_common = not common.exists()
             if not initial_common or common.is_symlink():
                 safe(common)
-            common_completion = {"schema": 2, "kind": "common",
+            common_completion = {"schema": 3, "kind": "common",
                 "template_abi": job["compatibility"]["template_abi"],
                 "source_fingerprint": inputs["source_fingerprint"],
-                "pool_manifest_sha256": publication["manifest_sha256"]}
+                "pool_inputs_sha256": identity["pool_inputs_sha256"]}
             common_ready = not initial_common and completion_matches(common, COMMON_COMPLETION, common_completion)
             input_completion = {**common_completion, "kind": "common-inputs",
-                "pool_manifest_sha256": publication["manifest_sha256"],
-                "apt_closure_sha256": closure_sha}
+                "apt_inputs_sha256": closure_sha}
             marker_line = "json.dump(" + repr(common_completion) + ",open('" + COMMON_COMPLETION + "','w'),sort_keys=True)\n"
             payload = staged / "swe-gym-build"
             _discard(payload)
@@ -1942,7 +1981,7 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 key = mapping[logical]["setup_cache"]
                 expected_relative = Path("setup-caches") / (key + ".tar.gz")
                 for old in historical_stages:
-                    if json.loads((old / "build-identity.json").read_bytes()).get("pool_manifest_sha256") != identity["pool_manifest_sha256"]:
+                    if json.loads(safe(old / "build-identity.json", immutable=True).read_bytes()).get("pool_inputs_sha256") != identity["pool_inputs_sha256"]:
                         continue
                     old_checkpoints = [old / ".checkpoints" / ckpt_name]
                     prefix = ckpt_name.removesuffix(".json") + "-"

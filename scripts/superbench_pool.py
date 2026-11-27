@@ -4887,7 +4887,11 @@ def _signed_header_providers(pool, apt, ring, uri, suite, components, deb_arch, 
         rows = json.loads(_native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'contents-file', path, query, relative]))
         for header, providers in rows.items():
             matches[header].update(tuple(row) for row in providers)
-    return module.unique_providers(matches, roots)
+    providers = module.unique_providers(matches, roots)
+    if 'candidate_paths' in native_headers:
+        for identity, row in providers.items():
+            row['observed_paths'] = sorted(candidates[identity])
+    return providers
 
 
 def _native_requirement_paths(requirements):
@@ -9997,7 +10001,8 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
                 requests = _native_requirement_paths(discovery['candidate_paths'])
                 if (discovery.get('schema') != 2 or set(providers) != set(requests)
                         or sorted(providers) != discovery['missing']
-                        or any(not set(row['paths']) <= set(requests[key]) for key, row in providers.items())):
+                        or any(row.get('observed_paths') != requests[key] or not set(row['paths']) <= set(requests[key])
+                               for key, row in providers.items())):
                     raise ValueError('incomplete target native provider plan')
             elif (not discovery.get('rounds') or discovery['rounds'][-1]['unresolved'] or
                     any(row.get('final_missing') != [] for row in discovery['interpreters'].values()) or

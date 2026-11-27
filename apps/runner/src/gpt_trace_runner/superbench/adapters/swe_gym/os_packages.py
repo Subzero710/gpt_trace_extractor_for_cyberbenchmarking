@@ -9,6 +9,8 @@ import re
 import runpy
 import signal
 import subprocess
+import shutil
+import tempfile
 from pathlib import Path
 
 @contextlib.contextmanager
@@ -145,6 +147,56 @@ def native_requirement_paths(requirements):
         result[key] = paths
     return dict(sorted(result.items()))
 
+def report_native_requirements(requirements, root):
+    requirements = native_requirement_paths(requirements)
+    if not requirements:
+        raise RuntimeError('empty target native requirement report')
+    token = os.environ.get('GPT_TRACE_NATIVE_ROUND')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{64}', token):
+        raise RuntimeError('native requirement observation outside a bound preparation round')
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise RuntimeError('unsafe target native report directory')
+    path = root / 'native-requirements.json'
+    fd, temporary = tempfile.mkstemp(prefix='.native-requirements-', dir=root)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'schema': 1, 'round': token, 'requirements': requirements}, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(root, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    raise RuntimeError('target native dependency resolution required: ' + ', '.join(requirements))
+
+
+def require_build_tools(root):
+    requirements = {}
+    for name in ('ccache',):
+        if shutil.which(name) is not None:
+            continue
+        paths = set()
+        for directory in os.environ['PATH'].split(os.pathsep):
+            if not directory.startswith('/'):
+                continue
+            path = os.path.normpath(directory + '/' + name).lstrip('/')
+            if path.startswith(('usr/bin/', 'bin/', 'usr/sbin/', 'sbin/')):
+                paths.add(path)
+                if path.startswith(('bin/', 'sbin/')):
+                    paths.add('usr/' + path)
+        paths = sorted(paths)
+        identity = hashlib.sha256(json.dumps(paths, separators=(',', ':')).encode()).hexdigest()
+        requirements['tool:' + name + '@' + identity] = paths
+    if requirements:
+        report_native_requirements(requirements, root)
+
+
 def require_native_headers(providers, *, root=Path('/')):
     root = Path(root).resolve(strict=True)
     if not isinstance(providers, dict):
@@ -153,7 +205,14 @@ def require_native_headers(providers, *, root=Path('/')):
         if not isinstance(row, dict):
             raise RuntimeError('invalid native provider: ' + identity)
         key = identity if ':' in identity else 'header:' + identity
-        paths = native_requirement_paths({key: row.get('paths')})[key]
+        if '@' in key:
+            observed = native_requirement_paths({key: row.get('observed_paths')})[key]
+            unscoped = key.split('@', 1)[0]
+            paths = native_requirement_paths({unscoped: row.get('paths')})[unscoped]
+            if not set(paths) <= set(observed):
+                raise RuntimeError('installed native provider paths exceed their observed search paths')
+        else:
+            paths = native_requirement_paths({key: row.get('paths')})[key]
         if not any((root / relative).is_file() and
                    (root / relative).resolve(strict=True).is_relative_to(root) and
                    (not key.startswith('tool:') or os.access(root / relative, os.X_OK)) for relative in paths):

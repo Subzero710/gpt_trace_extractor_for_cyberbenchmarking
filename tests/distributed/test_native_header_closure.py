@@ -503,3 +503,54 @@ def test_loader_and_linker_paths_are_not_interchangeable(monkeypatch):
     loaded = runtime._native_requests(None, {('soname', 'libfixture.so.1')}, profile=profile)
     assert list(linked.values()) == [['usr/lib/compiler-fixture/libfixture.a', 'usr/lib/compiler-fixture/libfixture.so']]
     assert list(loaded.values()) == [['lib/loader-fixture/libfixture.so.1', 'usr/lib/loader-fixture/libfixture.so.1']]
+
+
+def test_provider_selected_paths_do_not_change_observation_identity(tmp_path):
+    paths = ['usr/include/fixture.h', 'usr/include/target/fixture.h']
+    identity = 'header:fixture.h@' + hashlib.sha256(json.dumps(paths, separators=(',', ':')).encode()).hexdigest()
+    target = write(tmp_path/'usr/lib/fixture/actual.h')
+    link(tmp_path/'usr/include/target/fixture.h', '../../lib/fixture/actual.h')
+    row = {'package': 'fixture-provider', 'observed_paths': paths,
+           'paths': ['usr/include/target/fixture.h']}
+    packages.require_native_headers({identity: row}, root=tmp_path)
+    with pytest.raises(RuntimeError, match='exceed'):
+        packages.require_native_headers({identity: {**row, 'paths': ['usr/include/other/fixture.h']}}, root=tmp_path)
+    with pytest.raises(RuntimeError, match='identity differs'):
+        packages.require_native_headers({identity: {**row, 'observed_paths': row['paths']}}, root=tmp_path)
+    target.unlink()
+    with pytest.raises(RuntimeError, match='unavailable'):
+        packages.require_native_headers({identity: row}, root=tmp_path)
+
+
+def test_build_tool_requirement_report_is_bound_to_the_guest_round(tmp_path, monkeypatch):
+    monkeypatch.setenv('PATH', '/usr/local/bin:/usr/bin:/bin')
+    monkeypatch.setenv('GPT_TRACE_NATIVE_ROUND', 'a'*64)
+    monkeypatch.setattr(packages.shutil, 'which', lambda name: None)
+    with pytest.raises(RuntimeError, match='target native dependency resolution required'):
+        packages.require_build_tools(tmp_path)
+    report = json.loads((tmp_path/'native-requirements.json').read_bytes())
+    assert report['round'] == 'a'*64
+    assert packages.native_requirement_paths(report['requirements']) == report['requirements']
+    assert list(report['requirements'].values()) == [['bin/ccache','usr/bin/ccache']]
+
+
+def test_effective_pool_identity_excludes_progress_but_not_payload():
+    builder = load(ROOT/'scripts/build_local_templates.py')
+    sha = hashlib.sha256(b'fixture').hexdigest()
+    row = {'path': 'objects/sha256/'+sha[:2]+'/'+sha, 'sha256': sha, 'size': 7}
+    inventory = {'provenance': {'conda': {'fixture': [sha]}}, 'objects': {sha: row},
+                 'url_index': {}, 'task_plan': {}, 'environment_plan': {}, 'git_plan': {},
+                 'conda_transactions': {}, 'conda_lock_sha256': sha,
+                 'files': [row, {'path': 'metadata/fetch-progress.json', 'sha256': sha, 'size': 7}]}
+    closure = {'requested': ['fixture'], 'resolved': [{'package': 'fixture', 'architecture': 'all', 'version': '1', 'sha256': sha}],
+               'golden_dpkg_status_sha256': sha, 'golden_package_inventory_sha256': sha}
+    first = builder.effective_pool_inputs(inventory, closure)
+    inventory['files'][-1]['size'] = 8
+    closure['historical_suites'] = ['changed transfer metadata']
+    assert builder.effective_pool_inputs(inventory, closure) == first
+    closure['resolved'][0]['version'] = '2'
+    second = builder.effective_pool_inputs(inventory, closure)
+    assert second['nonapt_inputs_sha256'] == first['nonapt_inputs_sha256']
+    assert second['pool_inputs_sha256'] != first['pool_inputs_sha256']
+    inventory['task_plan']['fixture'] = {'repo': 'owner/repo'}
+    assert builder.effective_pool_inputs(inventory, closure)['nonapt_inputs_sha256'] != second['nonapt_inputs_sha256']
