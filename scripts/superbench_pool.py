@@ -3859,7 +3859,7 @@ def salvage_verified_stage(old, new, *, conda_artifacts=None):
             # Disposable native build scratch is never salvaged. An aborted
             # worker may leave symlinks inside its isolated Conda environment;
             # examining those unrelated paths would incorrectly reject the CAS.
-            if parent == old and name.startswith('.native-pip-') and path.is_dir() and not path.is_symlink():
+            if parent == old and name.startswith(('.native-pip-', '.native-header-probe-')) and path.is_dir() and not path.is_symlink():
                 subdirs.remove(name)
                 continue
             if path.is_symlink() or path.is_mount() or not path.is_dir():
@@ -4456,23 +4456,6 @@ def _run_apt_downloads(arguments, *, progress=None):
         )
 
 
-def _apt_missing_packages(output, requested):
-    """Classify only explicit missing roots; all other APT failures remain fatal."""
-    missing = set()
-    errors = [line for line in output.splitlines() if re.match(r'^(?:E:|Error:)', line)]
-    for line in errors:
-        match = re.fullmatch(
-            r"(?:E:|Error:) (?:Unable to locate package ([A-Za-z0-9+._:-]+)|"
-            r"Package '([A-Za-z0-9+._:-]+)' has no installation candidate)", line)
-        if match is None:
-            return set()
-        name = match.group(1) or match.group(2)
-        if name not in requested:
-            return set()
-        missing.add(name)
-    return missing
-
-
 def _apt_simulate(opts, packages):
     command = ['apt-get', *opts, '--simulate', '--reinstall', '-y', '--no-remove',
                'install', *sorted(packages)]
@@ -4507,6 +4490,38 @@ def _apt_simulate(opts, packages):
                 raise RuntimeError('APT resolution would downgrade ' + name)
         plan[name] = version
     return plan
+
+
+def _apt_missing_roots(opts, packages):
+    if not packages:
+        return set()
+    names = {name.split(':')[0]: name for name in packages}
+    if len(names) != len(packages):
+        raise RuntimeError('ambiguous APT root architecture')
+    with _registered_operation('APT root candidate availability'):
+        output = subprocess.check_output(['apt-cache', *opts, 'policy', *sorted(packages)],
+            env={**os.environ, 'LC_ALL': 'C'}, text=True, timeout=_operation_timeout())
+    current = None
+    seen = set()
+    candidates = {}
+    for line in output.splitlines():
+        if line and not line[0].isspace():
+            if not line.endswith(':') or line[:-1].split(':')[0] not in names:
+                raise RuntimeError('unexpected APT candidate policy: ' + line)
+            current = line[:-1].split(':')[0]
+            if current in seen:
+                raise RuntimeError('duplicate APT candidate policy: ' + current)
+            seen.add(current)
+        elif line.strip().startswith('Candidate:'):
+            if current is None or current in candidates:
+                raise RuntimeError('ambiguous APT candidate policy')
+            candidate = line.strip().partition(':')[2].strip()
+            if not candidate:
+                raise RuntimeError('empty APT candidate version')
+            candidates[current] = candidate
+    if seen != candidates.keys():
+        raise RuntimeError('incomplete APT candidate policy')
+    return {name for base, name in names.items() if candidates.get(base) in (None, '(none)')}
 
 
 def _apt_historical_sources(pool, apt, architecture):
@@ -4559,9 +4574,67 @@ def _apt_historical_sources(pool, apt, architecture):
     return ''.join(sources), ''.join(pins), identities
 
 
+def _reuse_signed_apt_artifact(pool, sha, size, destination, *, archive_name=None):
+    destination = Path(destination)
+    if not SHA.fullmatch(str(sha)) or type(size) is not int or size < 0:
+        raise RuntimeError('invalid signed APT artifact identity')
+    if archive_name is not None and (not isinstance(archive_name, str) or not re.fullmatch(r'[A-Za-z0-9+._:%~\-]+\.deb', archive_name)):
+        raise RuntimeError('invalid signed APT archive name')
+    current = pool.objects/sha[:2]/sha
+    if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents):
+        raise RuntimeError('unsafe signed APT cache destination')
+    if destination.is_file():
+        if destination.stat().st_size != size or digest(destination) != sha:
+            raise RuntimeError('signed APT cache destination differs: '+str(destination))
+        return True
+    retained = getattr(pool, 'apt_reuse_sources', ())
+    donor = getattr(pool, 'apt_repair_source', None)
+    # A current or retained CAS name is already a SHA-256 identity. A historical
+    # apt archive filename is not, and may legitimately belong to another plan.
+    candidates = [(current, True, True)]
+    if archive_name is not None:
+        candidates.append((pool.stage/'apt'/'retained'/sha/archive_name, True, True))
+    for stage in retained:
+        candidates.append((stage/'objects'/'sha256'/sha[:2]/sha, True, True))
+        if archive_name is not None:
+            candidates.append((stage/'apt'/'archives'/archive_name, False, False))
+            candidates.append((stage/'apt'/'retained'/sha/archive_name, True, True))
+    if donor is not None:
+        candidates.append((donor/'objects'/'sha256'/sha[:2]/sha, True, False))
+    for source, content_addressed, same_account in candidates:
+        if source == destination:
+            continue
+        if source.is_symlink() or any(parent.is_symlink() for parent in source.parents):
+            raise RuntimeError('unsafe retained signed APT artifact: '+str(source))
+        if not source.exists():
+            continue
+        if not source.is_file():
+            raise RuntimeError('non-file retained signed APT artifact: '+str(source))
+        if source == current:
+            actual_size = pool.verify_object(sha)
+            matches = actual_size == size
+        else:
+            matches = source.stat().st_size == size and digest(source) == sha
+        if not matches:
+            if content_addressed:
+                raise RuntimeError('retained signed APT CAS object differs: '+sha)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with _registered_operation('reuse signed APT artifact'):
+            # APT's mutable archive cache must not share inodes with a CAS.
+            if destination == current and same_account:
+                os.link(source, destination)
+            else:
+                shutil.copyfile(source, destination)
+        if destination.stat().st_size != size or digest(destination) != sha:
+            raise RuntimeError('reused signed APT artifact differs: '+sha)
+        return True
+    return False
+
+
 def _apt_archive_volume(pool, opts, packages, apt):
     measurement_cache=apt/'measurement-archives'
-    measurement_cache.mkdir()
+    measurement_cache.mkdir(exist_ok=True)
     command=['apt-get',*opts,'-o','Dir::Cache::Archives='+str(measurement_cache),
              '-o','Acquire::ForceHash=SHA256','--print-uris',
              '--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
@@ -4596,15 +4669,13 @@ def _apt_archive_volume(pool, opts, packages, apt):
                 prior=apt/'retained'/digest(destination)
                 prior.mkdir(parents=True,exist_ok=True)
                 destination.rename(prior/name)
-        donor=getattr(pool,'apt_repair_source',None)
-        if retained!=size and donor is not None:
-            cached=donor/'objects'/'sha256'/sha[:2]/sha
-            if cached.is_file() and not cached.is_symlink() and cached.stat().st_size==size and digest(cached)==sha:
-                with _registered_operation('reuse signed APT archive'):
-                    shutil.copyfile(cached,destination)
-                retained=size
+        if retained != size and _reuse_signed_apt_artifact(pool, sha, size, destination, archive_name=name):
+            retained = size
         volume[sha]={'size':size,'cached':False,'retained_bytes':retained}
-    _begin_download_phase(pool,'APT archives',volume)
+    if _POOL_PROGRESS is not None:
+        _begin_download_phase(pool,'APT archives',volume)
+    elif getattr(pool,'download_budget',None) is not None:
+        pool.download_budget(sum(row['size']-row['retained_bytes'] for row in volume.values()))
     return filenames
 
 
@@ -4614,10 +4685,10 @@ def _observe_apt_archives(apt, filenames):
             final=apt/'archives'/name
             partial=apt/'archives'/'partial'/name
             try:
-                size=partial.stat().st_size
+                size=final.stat().st_size
             except FileNotFoundError:
                 try:
-                    size=final.stat().st_size
+                    size=partial.stat().st_size
                 except FileNotFoundError:
                     size=0
             current,total=_POOL_PROGRESS.phase_artifacts[sha]
@@ -4687,7 +4758,18 @@ def _native_discovery_command(argv):
     return output
 
 
-def _discover_native_headers(pool, lock, *, donor=None):
+def _native_deb_index(pool, sha, path):
+    module = _native_requirements_module()
+    if not hasattr(pool, 'native_deb_indexes'):
+        pool.native_deb_indexes = {}
+    if sha not in pool.native_deb_indexes:
+        pool.native_deb_indexes[sha] = json.loads(_native_discovery_command([
+            sys.executable, '-I', '-B', module.__file__, 'deb-index', path]))
+    return pool.native_deb_indexes[sha]
+
+
+@contextlib.contextmanager
+def _native_header_context(pool, lock, *, donor=None):
     module = _native_requirements_module()
     tools = {name: shutil.which(name, path='/usr/bin:/bin') for name in ('gcc', 'unzip', 'zstd')}
     if not all(tools.values()):
@@ -4704,12 +4786,11 @@ def _discover_native_headers(pool, lock, *, donor=None):
         raise RuntimeError('no locked CPython artifact found')
     evidence = {'schema': 1, 'scope': 'locked-cpython-public-headers', 'golden_include_sha256': digest(golden),
                 'compiler_profile': profile, 'interpreters': {}}
-    with tempfile.TemporaryDirectory(prefix='.native-pip-headers-', dir=pool.stage) as scratch:
+    with tempfile.TemporaryDirectory(prefix='.native-header-probe-', dir=pool.stage) as scratch:
         directory = Path(scratch)
-        system = directory/'system'
-        _native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'golden-headers', golden, system])
-        _pool_progress('Native header discovery', 0, len(python), 'interpreters')
-        for index, (sha, item) in enumerate(sorted(python.items()), 1):
+        system = directory/'golden'
+        golden_metadata = json.loads(_native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'golden-headers', golden, system]))
+        for sha, item in sorted(python.items()):
             source = (donor/'objects'/'sha256' if donor is not None else pool.objects)/sha[:2]/sha
             if source.is_symlink() or not source.is_file():
                 raise RuntimeError('locked native discovery input missing: ' + sha)
@@ -4718,147 +4799,81 @@ def _discover_native_headers(pool, lock, *, donor=None):
                     raise RuntimeError('retained CPython archive digest differs: ' + sha)
             else:
                 pool.verify_object(sha)
-            target = directory/sha
             filename = urllib.parse.urlsplit(item['url']).path.rsplit('/', 1)[-1]
-            _native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'conda-headers', source, target, filename])
-            with _registered_operation('CPython public header dependency probe'):
-                probe = module.missing_python_headers(target, system, profile, timeout=_operation_timeout())
-            evidence['interpreters'][sha] = {**probe, 'version': item['version'], 'build': item['build']}
-            _pool_progress('Native header discovery', index, len(python), 'interpreters')
-    evidence['missing'] = sorted({header for row in evidence['interpreters'].values() for header in row['missing']})
-    return evidence
-
-
-def _inspect_native_pip(pool, lock, profile, *, donor=None):
-    """Inspect each exact acquired artifact once, after the pip graph is frozen.
-
-    No declaration candidate is promoted to an APT root without a build proof.
-    This is a source/binary inspection, not a claim of complete build coverage.
-    """
-    module = _native_requirements_module()
-    source_root = donor if donor is not None else pool.stage
-    objects = source_root/'objects'/'sha256'
-    verified = {}
-    if donor is not None:
-        inventory = json.loads((donor/'inventory.json').read_bytes())
-        verified = {row['path']: row['sha256'] for row in inventory['files']}
-    artifacts = {}
-    targets = defaultdict(set)
-    plans = sorted((source_root/'metadata').glob('pip-plan-*.json'))
-    for path in plans:
-        if path.is_symlink():
-            raise RuntimeError('unsafe native Pip plan')
-        if donor is not None and digest(path) != verified.get(path.relative_to(donor).as_posix()):
-            raise RuntimeError('retained native Pip plan differs from publication')
-        plan = json.loads(path.read_bytes())
-        if plan.get('optional_failed'):
-            continue
-        _pip_plan_artifact_shas(plan)
-        target = json.dumps(plan['target'], sort_keys=True, separators=(',', ':'))
-        for row in plan['packages']:
-            sha = row['sha256']
-            identity = (row['filename'], row['kind'])
-            if artifacts.setdefault(sha, identity) != identity:
-                raise RuntimeError('native Pip artifact has inconsistent identity')
-            targets[sha].add(target)
-    observations = {}
-    _pool_progress('Native Pip artifact inspection', 0, len(artifacts), 'archives')
-    for index, (sha, (filename, kind)) in enumerate(sorted(artifacts.items()), 1):
-        source = objects/sha[:2]/sha
-        if source.is_symlink() or not source.is_file():
-            raise RuntimeError('missing native Pip artifact: ' + sha)
-        if donor is not None:
-            if digest(source) != sha:
-                raise RuntimeError('retained native Pip archive digest differs: ' + sha)
-        else:
-            pool.verify_object(sha)
-        result = json.loads(_native_discovery_command([sys.executable, '-I', '-B', module.__file__,
-                                                      'inspect-pip', source, filename, kind]))
-        observations[sha] = {'filename': filename, 'kind': kind,
-                             'targets': [json.loads(value) for value in sorted(targets[sha])], **result}
-        _pool_progress('Native Pip artifact inspection', index, len(artifacts), 'archives')
-    candidates = module.native_candidates(observations, profile['multiarch'])
-    wheel_providers = defaultdict(list)
-    for sha, row in observations.items():
-        for filename, elf in row.get('elf', {}).items():
-            for name in {Path(filename).name, *elf['soname']}:
-                key = 'soname:' + name
-                if key in candidates['origins']:
-                    consumers = {target for consumer, _ in candidates['origins'][key] for target in targets[consumer]}
-                    if consumers & targets[sha]:
-                        wheel_providers[key].append({'sha256': sha, 'path': filename,
-                                                     'machine': elf['machine'], 'bits': elf['bits']})
-    # Match candidates against the exact transactions of each consumer.  A
-    # provider path is evidence of availability, not proof of loader reachability.
-    transactions = {json.dumps(_locked_target(lock, env, row['key']).as_dict(), sort_keys=True, separators=(',', ':')): set(row['packages'])
-                    for env, record in lock['environments'].items() for row in record['transactions']}
-    needed_by_artifact = defaultdict(set)
-    for key, origins in candidates['origins'].items():
-        for sha, _ in origins:
-            for target in targets[sha]:
-                needed_by_artifact[key].update(transactions.get(target, ()))
-    wanted = defaultdict(set)
-    for key, shas in needed_by_artifact.items():
-        for sha in shas:
-            wanted[sha].add(key)
-    conda_matches = defaultdict(list)
-    _pool_progress('Native Conda file inventory', 0, len(wanted), 'archives')
-    for index, (sha, keys) in enumerate(sorted(wanted.items()), 1):
-        source = objects/sha[:2]/sha
-        if source.is_symlink() or not source.is_file():
-            raise RuntimeError('missing native Conda inventory artifact: ' + sha)
-        if donor is not None:
-            if digest(source)!=sha:
-                raise RuntimeError('retained Conda inventory archive digest differs: ' + sha)
-        else:
-            pool.verify_object(sha)
-        filename = urllib.parse.urlsplit(lock['artifacts'][sha]['url']).path.rsplit('/', 1)[-1]
-        files = set(json.loads(_native_discovery_command([sys.executable, '-I', '-B', module.__file__,
-                                                         'conda-inventory', source, filename])))
-        for key in keys:
-            paths = sorted(files.intersection(candidates['conda'][key]))
-            if paths:
-                conda_matches[key].append({'sha256': sha, 'paths': paths})
-        _pool_progress('Native Conda file inventory', index, len(wanted), 'archives')
-    golden_include = Path(__file__).resolve().parents[1]/'golden-include.tar'
-    with _registered_operation('Golden header inventory for native Pip inspection'):
-        with tarfile.open(golden_include, 'r|*') as archive:
-            golden_headers = {'usr/include/'+module._relative(row.name).as_posix() for row in archive if row.isfile() or row.issym()}
-    # Only the real exported header tree is asserted present here.  Runtime
-    # library availability and symbol ABI still require target-side checking.
-    golden_matches = {key: sorted(golden_headers.intersection(paths))
-                      for key, paths in candidates['apt'].items() if key.startswith('header:')}
-    report = {'schema': 1, 'scope': 'selected-pip-source-and-elf-candidates',
-              'artifacts': observations, 'candidates': candidates,
-              'conda_provider_candidates': dict(conda_matches), 'golden_header_candidates': golden_matches,
-              'wheel_provider_candidates': dict(wheel_providers),
-              'conda_consumer_archive_shas': {key: sorted(shas) for key, shas in needed_by_artifact.items()},
-              'limits': ['dynamic-build-requirements-not-proven', 'elf-symbol-abi-and-loader-reachability-not-proven',
-                         'runtime-usage-of-elf-members-not-proven']}
-    return report
+            _native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'conda-headers', source, directory/sha, filename])
+        indexes = {}
+        def probe(archives):
+            paths = {row['sha256']: pool.objects/row['sha256'][:2]/row['sha256'] for row in archives}
+            if archives:
+                for sha, path in sorted(paths.items()):
+                    if sha not in indexes:
+                        indexes[sha] = _native_deb_index(pool, sha, path)
+                with _registered_operation('native APT header namespace'):
+                    replaced = {name for row in archives for name in
+                                (row['package'], row['package'] + ':' + row['architecture'])}
+                    visible = module.merge_header_namespace(golden_metadata, {sha:indexes[sha] for sha in paths},
+                        replaced_packages=replaced)
+                    needed = defaultdict(set)
+                    for sha, actual in visible.values():
+                        if sha is not None and not (directory/'deb-files'/sha/actual).is_file():
+                            needed[sha].add(actual)
+                for sha, names in sorted(needed.items()):
+                    cache = directory/'deb-files'/sha
+                    cache.mkdir(parents=True, exist_ok=True)
+                    query = directory/'extract-query.json'
+                    query.write_text(json.dumps(sorted(names)))
+                    _native_discovery_command([sys.executable, '-I', '-B', module.__file__,
+                                               'deb-extract-files', paths[sha], cache, query])
+                with tempfile.TemporaryDirectory(prefix='view-', dir=directory) as raw:
+                    view = Path(raw)
+                    with _registered_operation('materialize native header namespace'):
+                        for alias, (sha, actual) in sorted(visible.items()):
+                            source = directory/'deb-files'/sha/actual if sha is not None else system/actual.removeprefix('usr/include/')
+                            target = view/alias
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            os.link(source, target)
+                    return probe_tree(view)
+            return probe_tree(system)
+        def probe_tree(view):
+            results = {}
+            _pool_progress('Native header discovery', 0, len(python), 'interpreters')
+            for index, (sha, item) in enumerate(sorted(python.items()), 1):
+                with _registered_operation('CPython public header dependency probe'):
+                    result = module.missing_python_headers(directory/sha, view, profile, timeout=_operation_timeout())
+                results[sha] = {**result, 'version': item['version'], 'build': item['build']}
+                _pool_progress('Native header discovery', index, len(python), 'interpreters')
+            return results
+        evidence['interpreters'] = probe(())
+        evidence['missing'] = sorted({header for row in evidence['interpreters'].values() for header in row['missing']})
+        yield evidence, probe
 
 
 def _signed_header_providers(pool, apt, ring, uri, suite, components, deb_arch, native_headers, roots):
     module = _native_requirements_module()
-    candidates = module.candidate_paths(native_headers['missing'], native_headers['compiler_profile']['multiarch'])
-    required = set(candidates)
-    pip_report = getattr(pool, 'native_pip_report', None)
-    if pip_report is not None:
-        candidates.update({key: set(paths) for key, paths in pip_report['candidates']['apt'].items()})
+    if 'candidate_paths' in native_headers:
+        candidates = {name: set(paths) for name, paths in native_headers['candidate_paths'].items()}
+        if set(candidates) != set(native_headers['missing']):
+            raise RuntimeError('native observation paths differ from requested identities')
+    else:
+        candidates = module.candidate_paths(native_headers['missing'], native_headers['compiler_profile']['multiarch'])
     if not candidates:
         return {}
-    releases = sorted((apt/'lists').glob('*_InRelease'))
-    if len(releases)!=1 or releases[0].is_symlink():
-        raise RuntimeError('missing unique authenticated Kali InRelease')
-    release = _native_discovery_command(['gpgv', '--keyring', ring, '--output', '-', releases[0]]).decode('utf-8')
+    endpoint = urllib.parse.urlsplit(uri)
+    release_path = apt/'lists'/(endpoint.netloc + endpoint.path.rstrip('/').replace('/', '_') + '_dists_' + suite + '_InRelease')
+    if release_path.is_symlink() or not release_path.is_file():
+        raise RuntimeError('missing authenticated Kali InRelease: ' + str(release_path))
+    release = _native_discovery_command(['gpgv', '--keyring', ring, '--output', '-', release_path]).decode('utf-8')
     indexes = module.signed_contents(release, suite, components, deb_arch)
     matches = {header: set() for header in candidates}
     query = apt/'native-contents-query.json'
-    write_new(query, json.dumps({header: sorted(paths) for header, paths in candidates.items()}))
+    query.write_text(json.dumps({header: sorted(paths) for header, paths in candidates.items()}))
     native_headers['contents_indexes'] = indexes
     entries = {row['sha256']: (uri+'/dists/'+suite+'/'+relative,
                pool.stage/'downloads'/hashlib.sha256((uri+'/dists/'+suite+'/'+relative).encode()).hexdigest())
                for relative, row in indexes.items()}
+    for row in indexes.values():
+        sha = row['sha256']
+        _reuse_signed_apt_artifact(pool, sha, row['size'], pool.objects/sha[:2]/sha)
     if _POOL_PROGRESS is not None:
         measured = {row['sha256']: {'size': row['size']} for row in indexes.values()}
         volume = _sha_archive_plan(pool, entries, 'Signed native Contents indexes', measured=measured)
@@ -4872,14 +4887,17 @@ def _signed_header_providers(pool, apt, ring, uri, suite, components, deb_arch, 
         rows = json.loads(_native_discovery_command([sys.executable, '-I', '-B', module.__file__, 'contents-file', path, query, relative]))
         for header, providers in rows.items():
             matches[header].update(tuple(row) for row in providers)
-    if pip_report is not None:
-        pip_report['apt_provider_candidates'] = {key: sorted(rows) for key, rows in matches.items() if key not in required}
-        pip_report['contents_indexes'] = indexes
-    return module.unique_providers({key: matches[key] for key in required}, roots)
+    return module.unique_providers(matches, roots)
 
 
-def apt_closure(pool,packages, *, native_headers=None, base_roots=()):
-    """Native Kali APT resolution, with a restricted historical retry for missing roots.
+def _native_requirement_paths(requirements):
+    adapter = Path(__file__).resolve().parents[1]/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
+    import runpy
+    return runpy.run_path(str(adapter/'os_packages.py'))['native_requirement_paths'](requirements)
+
+
+def apt_closure(pool,packages, *, native_headers=None, native_probe=None, base_roots=(), native_requests=None):
+    """One authenticated APT source policy and an iterative native header closure.
 
     Uses an isolated APT state/list/archive directory and only download-only
     operations. Ubuntu's installed status and package lists never participate.
@@ -4901,7 +4919,7 @@ def apt_closure(pool,packages, *, native_headers=None, base_roots=()):
     sources=apt/'sources.list'
     uri, suite = 'https://http.kali.org/kali', 'kali-last-snapshot'
     components = ('main', 'contrib', 'non-free', 'non-free-firmware')
-    write_new(sources,'deb [arch='+deb_arch+' signed-by='+str(ring)+'] '+uri+' '+suite+' '+' '.join(components)+'\n')
+    write_new(sources,'deb [arch='+deb_arch+' signed-by='+str(ring)+','+KALI_SIGNING_FPR+'] '+uri+' '+suite+' '+' '.join(components)+'\n')
     golden=Path(__file__).resolve().parents[1]/'golden-packages.txt'
     if golden.is_symlink() or not golden.is_file():
         raise RuntimeError('authenticated golden package inventory is missing')
@@ -4932,106 +4950,71 @@ def apt_closure(pool,packages, *, native_headers=None, base_roots=()):
           '-o','APT::Architecture='+deb_arch,'-o','APT::Architectures='+deb_arch,'-o','APT::Get::Assume-Yes=true']
     opts.extend(('-o', 'Acquire::Retries=' + str(_network_retries()[0] - 1)))
     _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
+    target_requests = native_requests is not None
+    if target_requests:
+        if native_headers is not None or native_probe is not None:
+            raise RuntimeError('target observations and host header simulation cannot be combined')
+        native_requests = _native_requirement_paths(native_requests)
+        native_headers = {'schema': 2, 'scope': 'target-native-observations',
+                          'missing': sorted(native_requests), 'candidate_paths': native_requests}
+    elif (native_headers is None) != (native_probe is None):
+        raise RuntimeError('native header discovery requires its live probe context')
+    pending = set(native_headers['missing']) if native_headers is not None else set()
+    rounds = []
+    historical = []
+    missing = set()
+    while True:
+        if native_headers is not None:
+            query = {**native_headers, 'missing': sorted(pending)}
+            discovered = _signed_header_providers(pool, apt, ring, uri, suite, components, deb_arch,
+                                                   query, requested)
+            if set(discovered) != pending or set(discovered) & set(providers):
+                raise RuntimeError('native header provider closure did not advance')
+            providers.update(discovered)
+            if 'contents_indexes' in query:
+                native_headers['contents_indexes'] = query['contents_indexes']
+            roots = {row['package'] for row in discovered.values()}
+            requested.update(roots)
+            packages.update(roots)
+        if not rounds:
+            missing = _apt_missing_roots(opts, packages)
+            if missing:
+                extra_sources, extra_pins, historical = _apt_historical_sources(pool, apt, deb_arch)
+                combined = apt/'sources-historical.list'
+                combined_preferences = apt/'preferences-historical'
+                write_new(combined, sources.read_text()+extra_sources)
+                write_new(combined_preferences, extra_pins)
+                opts = [('Dir::Etc::sourcelist='+str(combined) if value.startswith('Dir::Etc::sourcelist=')
+                         else 'Dir::Etc::preferences='+str(combined_preferences) if value.startswith('Dir::Etc::preferences=')
+                         else value) for value in opts]
+                _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
+                absent = _apt_missing_roots(opts, packages)
+                if absent:
+                    raise RuntimeError('configured APT sources lack requested roots: ' + ', '.join(sorted(absent)))
+        meta = _download_apt_transaction(pool, apt, opts, packages, deb_arch, providers)
+        if native_probe is None:
+            break
+        observed = native_probe(meta)
+        if set(observed) != set(native_headers['interpreters']):
+            raise RuntimeError('native probe interpreter identity changed')
+        unresolved = {header for row in observed.values() for header in row['missing']}
+        for sha, row in observed.items():
+            prior = native_headers['interpreters'][sha]
+            if any(prior[key] != row[key] for key in ('version', 'build', 'public_header')):
+                raise RuntimeError('native probe interpreter changed: ' + sha)
+            prior['missing'] = sorted(set(prior['missing']) | set(row['missing']))
+            prior['final_missing'] = row['missing']
+        rounds.append({'requested': sorted(packages), 'unresolved': sorted(unresolved)})
+        if not unresolved:
+            break
+        pending = unresolved - set(providers)
+        if not pending:
+            raise RuntimeError('native header closure made no progress: ' + ', '.join(sorted(unresolved)))
     if native_headers is not None:
-        providers = _signed_header_providers(pool, apt, ring, uri, suite, components, deb_arch, native_headers, requested)
-        native_roots = {row['package'] for row in providers.values()}
-        requested.update(native_roots)
-        packages.update(native_roots)
-    missing=set()
-    historical=[]
-    try:
-        plan=_apt_simulate(opts,packages)
-    except subprocess.CalledProcessError as exc:
-        if exc.returncode != 100:
-            raise
-        missing=_apt_missing_packages(exc.output,packages)
-        if not missing:
-            raise
-        print('[pool] APT missing in Kali: '+', '.join(sorted(missing)),flush=True)
-        native_plan=_apt_simulate(opts,packages-missing) if packages-missing else {}
-        extra_sources,extra_pins,historical=_apt_historical_sources(pool,apt,deb_arch)
-        combined=apt/'sources-historical.list'
-        combined_preferences=apt/'preferences-historical'
-        write_new(combined,sources.read_text()+extra_sources)
-        write_new(combined_preferences,extra_pins)
-        opts=[('Dir::Etc::sourcelist='+str(combined) if value.startswith('Dir::Etc::sourcelist=')
-               else 'Dir::Etc::preferences='+str(combined_preferences) if value.startswith('Dir::Etc::preferences=')
-               else value) for value in opts]
-        _run_apt_downloads(['apt-get',*opts,'-o','APT::Update::Error-Mode=any','update'])
-        # Resolve one combined transaction: never install two independent closures.
-        # Compare for diagnostics, not equality: dependencies may be recalculated.
-        plan=_apt_simulate(opts,packages)
-        if not {name.split(':')[0] for name in missing} <= {name.split(':')[0] for name in plan}:
-            raise RuntimeError('historical APT resolution did not select every missing package by name')
-        for name in sorted(native_plan.keys() | plan.keys()):
-            before, after = native_plan.get(name), plan.get(name)
-            if before != after:
-                print('[pool] APT plan change: '+name+' | '+str(before)+' -> '+str(after),flush=True)
-        print('[pool] APT historical resolution: '+', '.join(historical),flush=True)
-    command=['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
-    expected_archives = _apt_archive_volume(pool,opts,packages,apt) if _POOL_PROGRESS is not None else None
-    if expected_archives is None:
-        _run_apt_downloads(command)
-    else:
-        _run_apt_downloads(command,progress=lambda: _observe_apt_archives(apt,expected_archives))
-    debs=sorted((apt/'archives').glob('*.deb'))
-    if not debs:
-        raise RuntimeError('signed Kali resolution lacks any required new Debian archives')
-    meta=[]
-    selected={(name.split(':')[0],version) for name,version in plan.items()}
-    received=set()
-    for path in debs:
-        control=subprocess.check_output(['dpkg-deb','-f',str(path)],text=True,timeout=90)
-        fields={}
-        for field in ('Package','Version','Architecture'):
-            found=re.search(r'^'+field+r':\s*(\S+)\s*$',control,flags=re.M)
-            if not found:raise RuntimeError('APT archive missing '+field+': '+path.name)
-            fields[field]=found.group(1)
-        identity=(fields['Package'],fields['Version'])
-        if identity not in selected:
-            # A prior attempt may have retained a different archive version.
-            # Preserve its bytes, but never publish it as part of the new closure.
-            retained=apt/'retained'/digest(path)
-            retained.mkdir(parents=True,exist_ok=True)
-            path.rename(retained/path.name)
-            continue
-        if identity in received or fields['Architecture'] not in ('all',deb_arch):
-            raise RuntimeError('duplicate or foreign APT archive: '+path.name)
-        received.add(identity)
-        sha=pool.put(path,'apt','signed-historical-closure' if historical else 'kali-last-snapshot')
-        if expected_archives is not None and path.name in expected_archives and sha != expected_archives[path.name]:
-            raise RuntimeError('APT archive SHA-256 differs from signed index: '+path.name)
-        meta.append({'sha256':sha,'package':fields['Package'],
-                     'version':fields['Version'],'architecture':fields['Architecture']})
-        needs = [row for row in providers.values() if row['package']==fields['Package']]
-        if needs:
-            listing = _native_discovery_command(['dpkg-deb', '--contents', path]).decode('utf-8')
-            contained = {line.split(maxsplit=5)[5].removeprefix('./') for line in listing.splitlines()
-                         if line.startswith('-') and len(line.split(maxsplit=5))==6}
-            for row in needs:
-                actual = sorted(set(row['paths']) & contained)
-                if not actual:
-                    raise RuntimeError('selected native header provider does not contain the indexed file: '+row['package'])
-                row['paths'] = actual
-                row['archive_sha256'] = sha
-    if expected_archives is not None and not set(expected_archives)<= {path.name for path in debs if path.is_file()}:
-        raise RuntimeError('APT did not materialize every signed archive URI')
-    if received!=selected or not meta:
-        raise RuntimeError('downloaded APT archives differ from the simulated closure')
-    # Simulate the same explicit local archives as the network-disabled guest.
-    # The signed online plan alone does not prove that this replay is solvable.
-    offline_lists=apt/'offline-lists'
-    offline_lists.mkdir()
-    offline_opts=_apt_offline_options(opts,offline_lists)
-    replay=_apt_simulate(offline_opts,{str(path.absolute()) for path in debs if path.is_file()})
-    if {(name.split(':')[0],version) for name,version in replay.items()}!=selected:
-        raise RuntimeError('offline APT replay differs from signed transaction')
-    if any('archive_sha256' not in row for row in providers.values()):
-        raise RuntimeError('native provider archive is absent from signed transaction')
-    pip_report = getattr(pool, 'native_pip_report', None)
-    if pip_report is not None:
-        pip_report.setdefault('apt_provider_candidates', {})
-        write_new(stage/'metadata'/'native-pip-inspection.json', json.dumps(pip_report, sort_keys=True))
+        native_headers['missing'] = sorted(providers)
+        if not target_requests:
+            native_headers['rounds'] = rounds
+    native_roots = {row['package'] for row in providers.values()}
     write_new(stage/'metadata'/'apt-closure.json',json.dumps({
         'requested':sorted(requested),'resolved':meta,
         **({'native_discovery': {**native_headers, 'providers': providers},
@@ -5039,6 +5022,81 @@ def apt_closure(pool,packages, *, native_headers=None, base_roots=()):
         'missing_in_kali':sorted(missing),'historical_suites':historical,
         'golden_package_inventory_sha256':expected,
         'golden_dpkg_status_sha256':hashlib.sha256(status_bytes).hexdigest()},sort_keys=True))
+
+
+def _download_apt_transaction(pool, apt, opts, packages, deb_arch, providers):
+    plan = _apt_simulate(opts, packages)
+    installed = _native_requirements_module().installed_packages((apt/'status').read_bytes())
+    selected_roots = {name.split(':')[0] for name in plan} | set(plan) | installed
+    if not set(packages) <= selected_roots:
+        raise RuntimeError('APT transaction omitted requested roots: ' + ', '.join(sorted(set(packages)-selected_roots)))
+    command=['apt-get',*opts,'--download-only','--reinstall','-y','--no-remove','install',*sorted(packages)]
+    expected_archives = _apt_archive_volume(pool,opts,packages,apt)
+    if _POOL_PROGRESS is None:
+        _run_apt_downloads(command)
+    else:
+        _run_apt_downloads(command,progress=lambda: _observe_apt_archives(apt,expected_archives))
+    debs=sorted((apt/'archives').glob('*.deb'))
+    meta=[]
+    native_archives=[]
+    selected={(name.split(':')[0],version) for name,version in plan.items()}
+    received=set()
+    for path in debs:
+        control=subprocess.check_output(['dpkg-deb','-f',str(path)],text=True,timeout=_operation_timeout())
+        fields={}
+        for field in ('Package','Version','Architecture'):
+            found=re.search(r'^'+field+r':\s*(\S+)\s*$',control,flags=re.M)
+            if not found:raise RuntimeError('APT archive missing '+field+': '+path.name)
+            fields[field]=found.group(1)
+        identity=(fields['Package'],fields['Version'])
+        if identity not in selected or path.name not in expected_archives:
+            retained=apt/'retained'/digest(path)
+            retained.mkdir(parents=True,exist_ok=True)
+            path.rename(retained/path.name)
+            continue
+        if identity in received or fields['Architecture'] not in ('all',deb_arch):
+            raise RuntimeError('duplicate or foreign APT archive: '+path.name)
+        received.add(identity)
+        sha=expected_archives[path.name]
+        object_path=pool.objects/sha[:2]/sha
+        if object_path.is_file() and path.samefile(object_path):
+            pool.verify_object(sha)
+        elif digest(path) != sha:
+            raise RuntimeError('APT archive SHA-256 differs from signed index: '+path.name)
+        pool.put(path,'apt','signed-apt-closure',verified_sha=sha)
+        meta.append({'sha256':sha,'package':fields['Package'],
+                     'version':fields['Version'],'architecture':fields['Architecture']})
+        needs = {header: row for header, row in providers.items() if row['package']==fields['Package']}
+        if needs:
+            native_archives.append((path, sha, fields, needs))
+    if set(expected_archives) != {path.name for path in debs if path.is_file()} or received!=selected or not meta:
+        raise RuntimeError('downloaded APT archives differ from signed transaction')
+    for row in providers.values():
+        row.pop('archive_sha256', None)
+        row.pop('archive_entries', None)
+    for path, sha, fields, needs in native_archives:
+        module = _native_requirements_module()
+        index = _native_deb_index(pool, sha, path)
+        with _registered_operation('verify signed native provider paths'):
+            contained = module.header_entries_from_index(index,
+                {name for row in needs.values() for name in row['paths']})
+        for header, row in needs.items():
+            actual = sorted(set(row['paths']) & contained.keys())
+            if not actual:
+                raise RuntimeError('selected native header provider does not own an indexed path: '
+                                   + fields['Package'] + ' ' + fields['Version'] + ': ' + header + ' (' + ', '.join(row['paths']) + ')')
+            row['paths'] = actual
+            row['archive_sha256'] = sha
+            row['archive_entries'] = {name: contained[name] for name in actual}
+    offline_lists=apt/'offline-lists'
+    offline_lists.mkdir(exist_ok=True)
+    offline_opts=_apt_offline_options(opts,offline_lists)
+    replay=_apt_simulate(offline_opts,{str(path.absolute()) for path in debs if path.is_file()})
+    if {(name.split(':')[0],version) for name,version in replay.items()}!=selected:
+        raise RuntimeError('offline APT replay differs from signed transaction')
+    if any('archive_sha256' not in row for row in providers.values()):
+        raise RuntimeError('native provider archive is absent from signed transaction')
+    return meta
 
 
 def _packaging_symbols():
@@ -9926,22 +9984,6 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         except (OSError,ValueError,TypeError,RuntimeError) as exc:
             reject(logical,'invalid environment pip phase: '+str(exc))
 
-    if getattr(pool, 'native_pip_report', None) is not None:
-        report_path = stage/'metadata'/'native-pip-inspection.json'
-        try:
-            report = json.loads(report_path.read_bytes())
-            if report.get('schema') != 1 or report.get('scope') != pool.native_pip_report['scope']:
-                raise ValueError('invalid native Pip inspection scope')
-            expected_shas = set()
-            for path in (stage/'metadata').glob('pip-plan-*.json'):
-                plan = json.loads(path.read_bytes())
-                if not plan.get('optional_failed'):
-                    expected_shas.update(_pip_plan_artifact_shas(plan))
-            if set(report['artifacts']) != expected_shas:
-                raise ValueError('native Pip report omits selected artifacts')
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            reject('native-Pip', str(exc))
-
     apt_path=stage/'metadata'/'apt-closure.json'
     apt={}
     try:
@@ -9951,11 +9993,20 @@ def audit_inventory(pool,task_plan,envplan,gitplan,operation_id, *, contract_tas
         if 'native_discovery' in apt:
             discovery = apt['native_discovery']
             providers = discovery['providers']
-            if (set(providers) != set(discovery['missing']) or
+            if discovery.get('scope') == 'target-native-observations':
+                requests = _native_requirement_paths(discovery['candidate_paths'])
+                if (discovery.get('schema') != 2 or set(providers) != set(requests)
+                        or sorted(providers) != discovery['missing']
+                        or any(not set(row['paths']) <= set(requests[key]) for key, row in providers.items())):
+                    raise ValueError('incomplete target native provider plan')
+            elif (not discovery.get('rounds') or discovery['rounds'][-1]['unresolved'] or
+                    any(row.get('final_missing') != [] for row in discovery['interpreters'].values()) or
+                    set(providers) != set(discovery['missing']) or
                     {header for row in discovery['interpreters'].values() for header in row['missing']} != set(providers)):
                 raise ValueError('incomplete native header provider closure')
             resolved = {(item['package'], item['sha256']) for item in apt['resolved']}
             if any((row['package'], row['archive_sha256']) not in resolved or row['package'] not in apt['requested']
+                   or not row['paths'] or set(row['paths']) != set(row['archive_entries'])
                    for row in providers.values()):
                 raise ValueError('native header provider absent from signed archive plan')
         for item in apt['resolved']:
@@ -10121,6 +10172,7 @@ def main(argv=None):
     p.add_argument('--operation-id',required=True)
     p.add_argument('--operation-events-fd', required=True, type=int)
     p.add_argument('--reuse-from',type=Path)
+    p.add_argument('--reuse-apt-from',type=Path,action='append',default=[])
     p.add_argument('--repair-apt-from',type=Path)
     p.add_argument('--network-rx-baseline',required=True,type=json.loads)
     args=p.parse_args(argv)
@@ -10133,6 +10185,10 @@ def main(argv=None):
     os.set_blocking(_OPERATION_EVENT_FD, False)
     if args.stage.exists() or args.stage.is_symlink():raise RuntimeError('candidate stage already exists; refusing overwrite')
     repo_root=args.repo_root.resolve(strict=True)
+    request_file = repo_root/'native-requests.json'
+    if request_file.is_symlink() or not request_file.is_file() or request_file.stat().st_uid != 0 or request_file.stat().st_mode & 0o222:
+        raise RuntimeError('unsealed native requirement input')
+    native_requests = _native_requirement_paths(json.loads(request_file.read_bytes()))
     adapter=repo_root/'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
     pins=json.loads((adapter/'pins.json').read_bytes())
     if digest(adapter/'contract.json')!=pins['contract_sha256']:
@@ -10148,6 +10204,12 @@ def main(argv=None):
     if not tasks or not environments or not {r['repo'] for r in tasks.values()}:
         raise RuntimeError('unexpected SWE-Gym Lite coverage')
     stage=args.stage
+    apt_reuse_sources = tuple(sorted(set(args.reuse_apt_from)))
+    for retained in apt_reuse_sources:
+        if (retained == stage or retained.parent != stage.parent or retained.is_symlink()
+                or not retained.is_dir() or (retained/'STAGING').is_symlink()
+                or not (retained/'STAGING').is_file()):
+            raise RuntimeError('invalid retained APT acquisition stage')
     stage.mkdir(mode=0o700)
     for name in ('git','git-extra','conda','wheels','metadata','downloads','npm','apt','objects'):
         (stage/name).mkdir(exist_ok=True)
@@ -10182,6 +10244,7 @@ def main(argv=None):
         pool=Pool(stage)
         pool.download_budget=budget
         pool.apt_repair_source=args.repair_apt_from
+        pool.apt_reuse_sources=apt_reuse_sources
         retained_shas={sha for category,groups in previous['provenance'].items() if category!='apt'
                        for hashes in groups.values() for sha in hashes}
         for sha in retained_shas:
@@ -10209,10 +10272,8 @@ def main(argv=None):
             if not direct-environment_roots <= set(prior_apt['requested']):
                 raise RuntimeError('retained task APT roots differ from predecessor closure')
             _write_apt_policy(stage, base, direct, suppressed)
-            evidence = _discover_native_headers(pool, conda_lock, donor=args.repair_apt_from)
-            pool.native_pip_report = _inspect_native_pip(pool, conda_lock, evidence['compiler_profile'], donor=args.repair_apt_from)
-            _pool_progress('Signed Kali APT resolution',details='Resolving declared and native requirements')
-            apt_closure(pool, base | direct, native_headers=evidence, base_roots=base-direct)
+            _pool_progress('Signed Kali APT resolution',details='Resolving declared and target-observed requirements')
+            apt_closure(pool, base | direct, native_requests=native_requests, base_roots=base-direct)
         else:
             raise RuntimeError('predecessor must have the verified Golden dpkg status; apply the historical APT repair first')
         _apt_repair_inventory(pool,previous,args.operation_id)
@@ -10223,6 +10284,7 @@ def main(argv=None):
     pool=Pool(stage)
     pool.operation_id = args.operation_id
     pool.resume_from = args.reuse_from
+    pool.apt_reuse_sources = apt_reuse_sources
     pool.download_budget = budget
     pool.conda_lock=conda_lock
     pool.verified_objects.update(verified)
@@ -10790,10 +10852,8 @@ def main(argv=None):
     acquired_transactions,_locked_base_python=acquire_locked_conda(pool,conda_lock)
     if acquired_transactions!=conda_transaction_plan:
         raise RuntimeError('acquired Conda transaction identities differ from prevalidated lock')
-    native_headers = _discover_native_headers(pool, conda_lock)
-    pool.native_pip_report = _inspect_native_pip(pool, conda_lock, native_headers['compiler_profile'])
     _pool_progress('Signed Kali APT resolution', details=f'{len(apt_requested)} declared packages')
-    apt_closure(pool, apt_requested, native_headers=native_headers, base_roots=base_roots-direct_roots)
+    apt_closure(pool, apt_requested, native_requests=native_requests, base_roots=base_roots-direct_roots)
     _native_close(pool)
     with (Path(__file__).resolve().parents[1] / 'config/preparation.toml').open('rb') as stream:
         bootstrap=tomllib.load(stream)['bootstrap']

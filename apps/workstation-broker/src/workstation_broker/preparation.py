@@ -93,7 +93,7 @@ def trusted_fetch_python():
     return interpreter
 
 
-def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, golden_dependency=None, *, expected_sources=None):
+def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, golden_dependency=None, *, expected_sources=None, native_requests=None):
     """Copy exact worker inputs plus the verified dependency target into a sealed snapshot."""
     repository = manager.source_root.resolve(strict=True)
     expected_sources = pool_contract(repository)['fetch_sources'] if expected_sources is None else expected_sources
@@ -183,22 +183,17 @@ def stage_fetch_sources(manager, pool_root, operation_id=None, attempt=None, gol
     limit = controls['timeout_seconds']
     if type(limit) is not int or not 1 <= limit <= 180:
         raise RuntimeError('invalid golden dpkg status extraction deadline')
-    status = subprocess.check_output(['virt-cat', '-a', str(safe(manager.base, immutable=True)),
-                                      '/var/lib/dpkg/status'], timeout=limit)
+    status = subprocess.check_output(['virt-cat', '--format=qcow2', '-a',
+        str(safe(manager.base, immutable=True)), '/var/lib/dpkg/status'], timeout=limit)
     if not status:
-        raise RuntimeError('golden dpkg database is empty')
-    status_path = snapshot / 'golden-dpkg-status'
-    status_path.write_bytes(status)
-    os.chown(status_path, 0, 0)
-    status_path.chmod(0o444)
-    # Export the real Golden include tree without starting a target VM.
-    headers = snapshot / 'golden-include.tar'
-    subprocess.run(['guestfish', '--ro', '--format=qcow2', '-a', str(safe(manager.base, immutable=True)),
-                    '-i', 'tar-out', '/usr/include', str(headers)], check=True, timeout=limit)
-    if headers.is_symlink() or not headers.is_file() or not headers.stat().st_size:
-        raise RuntimeError('Golden header export is empty')
-    os.chown(headers, 0, 0)
-    headers.chmod(0o444)
+        raise RuntimeError('empty Golden dpkg status')
+    for name, data in (('golden-dpkg-status', status),
+                       ('native-requests.json', canonical(native_requests if native_requests is not None else {}) + b"\n")):
+        exported = snapshot / name
+        with exported.open('xb') as stream:
+            stream.write(data)
+        os.chown(exported, 0, 0)
+        exported.chmod(0o444)
     for directory in sorted((p for p in snapshot.rglob("*") if p.is_dir()),
                             key=lambda p: len(p.parts), reverse=True):
         os.chown(directory, 0, 0)
@@ -749,6 +744,13 @@ class PreparationManager:
         # published result. Only its small inventory is rehashed; no downloads,
         # process restart or full CAS scan is performed by status.
         proof = state.get('publication_verified')
+        if state.get('native_publication') is not None:
+            # A recorded two-rename transition belongs to the next explicit
+            # attempt. Status cannot treat the old or new bytes as READY.
+            closed = JobScope.close({**state, 'phase': 'interrupted',
+                                     'error': 'verified native publication transition remains pending'})
+            self._write(closed)
+            return closed
         if state['phase'] in {'running', 'validating', 'interrupted', 'canceled'} and isinstance(proof, dict):
             ready = self.base.parent / 'dependency-pool' / 'ready'
             retired = _retired_pool(ready.parent,state['operation_id'])
@@ -916,7 +918,9 @@ class PreparationManager:
                     "publication_verified": previous.get("publication_verified") if previous else None,
                     **({"publication_attempt": previous.get("publication_attempt", previous["attempt"])}
                        if previous and previous.get("publication_verified") else {}),
-                    "built_generation": previous.get("built_generation") if previous else None}
+                    "built_generation": previous.get("built_generation") if previous else None,
+                    **({key: previous[key] for key in ('native_requests', 'native_pending', 'native_publication')
+                        if key in previous} if previous else {})}
                 self._write(state)
                 environment = dict(os.environ, GPT_TRACE_PREPARATION_ID=operation_id, LIBGUESTFS_BACKEND="direct")
                 python = self.source_root / ".venv-workstation-broker/bin/python"
@@ -1118,7 +1122,7 @@ def _retained_stage_score(path):
     return (count,size,path.stat().st_mtime_ns,str(path))
 
 
-def retained_dependency_stage(manager, pool_root, state, account):
+def retained_dependency_stage(manager, pool_root, state, account, *, all_stages=False):
     # Recovery copies only SHA-verified CAS bytes and mutable Git mirrors into a
     # fresh stage. Logical plans remain separately schema/target/requirement keyed.
     wanted=_salvage_identity(state['compatibility'])
@@ -1140,7 +1144,8 @@ def retained_dependency_stage(manager, pool_root, state, account):
             histories.append(previous)
         for previous in histories:
             if (previous['phase'] not in TERMINAL or previous.get('result') is not None
-                    or previous.get('publication_verified') or
+                    or previous.get('native_publication') is not None
+                    or (previous.get('publication_verified') and not previous.get('native_pending')) or
                     _salvage_identity(previous['compatibility']) != wanted):
                 continue
             if JobScope.members(previous) or manager._containers(previous):
@@ -1163,8 +1168,10 @@ def retained_dependency_stage(manager, pool_root, state, account):
                 if hashlib.sha256(snapshot.read_bytes()).hexdigest()!=previous['compatibility']['fetcher_sha256']:
                     continue
         matches.append(path)
-    if not matches:return None
-    return max(set(matches),key=_retained_stage_score)
+    matches = tuple(sorted(set(matches)))
+    if all_stages:
+        return matches
+    return max(matches, key=_retained_stage_score) if matches else None
 
 def verify_published_inventory(folder, state, proof):
     """Bind every reused publication to its durable byte and operation identity."""
@@ -1353,6 +1360,57 @@ def _integration_progress(prior, stage, completed=None, total=None, unit='', det
             'pip_active': 0}
 
 
+class NativeResolutionRequired(RuntimeError):
+    def __init__(self, requirements):
+        super().__init__('target native requirements require another signed acquisition round')
+        self.requirements = requirements
+
+
+def _native_requirements(manager, requirements):
+    import runpy
+    adapter = manager.source_root / 'apps/runner/src/gpt_trace_runner/superbench/adapters/swe_gym'
+    return runpy.run_path(str(adapter/'os_packages.py'))['native_requirement_paths'](requirements)
+
+
+def _native_retired(root, state, proof):
+    return root / ('native-retired-' + identifier(state['operation_id']) + '-' + identifier(proof['manifest_sha256']))
+
+
+def _finish_native_publication(manager, state, ready):
+    """Replay the two renames from an fsynced journal, including interrupted rounds."""
+    pending = state['native_publication']
+    if not isinstance(pending, dict) or set(pending) != {'proof', 'attempt'}:
+        raise RuntimeError('invalid native publication journal')
+    old = state['publication_verified']
+    new = pending['proof']
+    attempt = pending['attempt']
+    if type(attempt) is not int or not 1 <= attempt <= state['attempt']:
+        raise RuntimeError('invalid native acquisition publication attempt')
+    stage = ready.parent / ('incoming-' + identifier(state['operation_id']) + '-' + str(attempt))
+    retired = _native_retired(ready.parent, state, old)
+    if retired.is_symlink() or stage.is_symlink() or ready.is_symlink():
+        raise RuntimeError('unsafe native publication path')
+    if not retired.exists():
+        verify_published_inventory(ready, state, old)
+        verify_published_inventory(stage, state, new)
+        os.rename(ready, retired)
+        sync_directory(ready.parent)
+    else:
+        verify_published_inventory(retired, state, old)
+    if stage.exists():
+        if ready.exists() or ready.is_symlink():
+            raise RuntimeError('native acquisition publication has two candidates')
+        verify_published_inventory(stage, state, new)
+        os.rename(stage, ready)
+        sync_directory(ready.parent)
+    verify_published_inventory(ready, state, new)
+    updated = {**state, 'phase': 'validating', 'publication_verified': new,
+               'publication_attempt': attempt, 'native_pending': False}
+    updated.pop('native_publication')
+    manager._write(updated)
+    return updated
+
+
 def _integrate_published_pool(manager, state, ready, result):
     """Build/validate templates from an already sealed pool after a crash."""
     operation_id = state['operation_id']
@@ -1384,7 +1442,25 @@ def _integrate_published_pool(manager, state, ready, result):
         operation_id=operation_id, virtual_gib=builder.VIRTUAL_GIB,
         free_space_gib=builder.FREE_SPACE_GIB,
     )
-    final = builder.build(args, progress=report)
+    try:
+        final = builder.build(args, progress=report)
+    except NativeResolutionRequired as demand:
+        discovered = _native_requirements(manager, demand.requirements)
+        with manager.lock():
+            current = manager._read(operation_id)
+            if current['attempt'] != state['attempt'] or current['publication_verified'] != result:
+                raise RuntimeError('native requirement belongs to a different publication') from demand
+            if any(member['pid'] != os.getpid() for member in JobScope.members(current)) or manager._containers(current):
+                raise RuntimeError('native resolution requires a stopped guest and no remaining build descendants') from demand
+            prior = _native_requirements(manager, current.get('native_requests', {}))
+            merged = {**prior, **discovered}
+            if not discovered or merged == prior:
+                raise RuntimeError('target native resolution cannot progress: ' + ', '.join(sorted(discovered))) from demand
+            updated = {**current, 'phase': 'running', 'native_pending': True,
+                       'native_requests': merged}
+            updated.pop('integration_progress', None)
+            manager._write(updated)
+        return None
     generation = Path(final).name
     integrated = {**result, "runtime_integrated": True, "generation": generation,
                   "prepared_setups": True, "pool_directory": str(ready)}
@@ -1542,7 +1618,12 @@ def _prepare(manager, state):
     ready = root / "ready"
     stage = root / ('incoming-'+state['operation_id']+'-'+str(state['attempt']))
     pending = state.get("publication_verified")
-    if isinstance(pending, dict) and pending.get("runtime_integrated") != True:
+    if state.get('native_publication') is not None:
+        with manager.lock():
+            state = _finish_native_publication(manager, state, ready)
+        return _integrate_published_pool(manager, state, ready, state['publication_verified'])
+    native_round = state.get('native_pending') is True
+    if isinstance(pending, dict) and pending.get("runtime_integrated") != True and not native_round:
         if not ready.exists() and not ready.is_symlink():
             acquisition_attempt = state.get('publication_attempt', state['attempt'])
             if type(acquisition_attempt) is not int or not 1 <= acquisition_attempt <= state['attempt']:
@@ -1553,12 +1634,17 @@ def _prepare(manager, state):
             sync_directory(root)
         verify_published_inventory(ready, state, pending)
         return _integrate_published_pool(manager, state, ready, pending)
-    migration = _apt_repair_source(manager,root,state)
+    if native_round:
+        previous = verify_published_inventory(ready, state, pending)
+        migration = (ready, state, previous)
+    else:
+        migration = _apt_repair_source(manager,root,state)
     if (ready.exists() or ready.is_symlink()) and (migration is None or migration[0]!=ready):
         raise RuntimeError("dependency pool already published; manual version migration required")
     if stage.exists() or stage.is_symlink():
         raise RuntimeError('candidate stage already exists; preserve for manual reconciliation')
-    reuse = retained_dependency_stage(manager,root,state,account) if migration is None else None
+    retained = retained_dependency_stage(manager, root, state, account, all_stages=True)
+    reuse = max(retained, key=_retained_stage_score) if retained and migration is None else None
     source_program = manager.source_root / "scripts/superbench_pool.py"
     if source_program.is_symlink() or not source_program.is_file():
         raise RuntimeError("missing/untrusted download-only fetch worker")
@@ -1568,9 +1654,16 @@ def _prepare(manager, state):
         raise RuntimeError("preparation dependency identity changed after admission")
     # The legacy call shape ``stage_fetch_sources(manager, root)`` remains a
     # documented read-only fixture; production passes the durable identity.
-    source_root, program = stage_fetch_sources(
-        manager, root, state['operation_id'], state['attempt'],
-        state['compatibility']['golden_dependency'], expected_sources=current['fetch_sources'])
+    try:
+        source_root, program = stage_fetch_sources(
+            manager, root, state['operation_id'], state['attempt'],
+            state['compatibility']['golden_dependency'], expected_sources=current['fetch_sources'],
+            native_requests=_native_requirements(manager, state.get('native_requests', {})))
+    except BaseException:
+        controls = tomllib.loads((manager.source_root / 'config/preparation.toml').read_text())['acquisition']
+        _kill_verified_fetch_descendants(state, _broker_cleanup_timeout(manager.source_root),
+                                         controls['progress_interval_seconds'])
+        raise
     # Strict allowlist: administrative bearer tokens, service credentials,
     # cloud tunnel configuration and deployment secrets must never reach the
     # unprivileged downloader or any of its subprocesses. No proxy/auth env.
@@ -1610,7 +1703,12 @@ def _prepare(manager, state):
             result = subprocess.run(['ip', 'netns', 'exec', source_network(), 'cat', '/proc/net/dev'],
                                     capture_output=True, text=True, check=True, timeout=cleanup_timeout)
         return namespace_rx_bytes(result.stdout)
-    baseline = received()
+    baseline = state.get('native_rx_baseline')
+    if baseline is None:
+        baseline = received()
+        with manager.lock():
+            state = {**manager._read(state['operation_id']), 'native_rx_baseline': baseline}
+            manager._write(state)
     def enforce_download_limit():
         amount = namespace_rx_delta(baseline, received())
         if amount >= download_limit:
@@ -1624,6 +1722,7 @@ def _prepare(manager, state):
                              "--operation-id", state["operation_id"], "--operation-events-fd", str(write_fd),
                              "--network-rx-baseline", json.dumps(baseline, sort_keys=True),
                              *(["--reuse-from", str(reuse)] if reuse is not None else []),
+                             *(value for retained_stage in retained for value in ("--reuse-apt-from", str(retained_stage))),
                              *(["--repair-apt-from", str(migration[0])] if migration is not None else [])]),
                            cwd=source_root, env=env, pass_fds=(write_fd,),
                            stdin=subprocess.DEVNULL, start_new_session=True,
@@ -1806,14 +1905,19 @@ def _prepare(manager, state):
               "pool_directory": str(ready), "runtime_integrated": "pending"}
     state = {**state, "publication_attempt": state['attempt']}
     with manager.lock():
-        if migration is not None and migration[0]==ready:
+        if native_round:
+            state = {**state, 'native_publication': {'proof': result, 'attempt': state['attempt']}}
+            manager._write(state)
+            state = _finish_native_publication(manager, state, ready)
+        elif migration is not None and migration[0]==ready:
             retired=_retired_pool(root,migration[1]['operation_id'])
             if retired.exists() or retired.is_symlink():
                 raise RuntimeError('APT repair predecessor archive already exists')
             os.rename(ready,retired)
             sync_directory(root)
-        manager._write({**state, "phase": "validating", "publication_verified": result})
-        os.rename(stage, ready)
+        if not native_round:
+            manager._write({**state, "phase": "validating", "publication_verified": result})
+            os.rename(stage, ready)
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try: os.fsync(descriptor)
     finally: os.close(descriptor)
@@ -1860,6 +1964,11 @@ def worker(operation_id, slot_fd):
     try:
         state = verify_worker_claim(operation_id)
         result = _prepare(manager, state)
+        while result is None:
+            state = verify_worker_claim(operation_id)
+            if state.get('native_pending') is not True:
+                raise RuntimeError('native resolution iteration lacks its durable request')
+            result = _prepare(manager, state)
         state = verify_worker_claim(operation_id)
         manager._write({**state, "phase": "ready", "result": result, "error": None})
     except BaseException as exc:

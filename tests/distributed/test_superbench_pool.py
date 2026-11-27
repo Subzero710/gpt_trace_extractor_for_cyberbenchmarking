@@ -605,6 +605,7 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                     pool._golden_dependency()
 
     def test_apt_key_uses_downloaded_content_address(self):
+        pool._native_requirements_module()
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)
@@ -637,6 +638,10 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                     self.assertIn('APT::Update::Error-Mode=any', args)
             def dpkg(args, **kwargs):
                 if args[0]=='dpkg-query':return golden_package_list
+                if args[0]=='apt-cache':return 'testpkg:\n  Installed: 1\n  Candidate: 1\n'
+                if '--print-uris' in args:
+                    raw=b'fixture .deb'
+                    return f"'https://example.invalid/testpkg.deb' testpkg_1_all.deb {len(raw)} SHA256:{hashlib.sha256(raw).hexdigest()}\n"
                 return 'Package: testpkg\nVersion: 1\nArchitecture: all\n'
             with patch.object(candidate, 'download', side_effect=network), \
                  patch.object(pool, 'invoke', side_effect=commands), \
@@ -653,18 +658,15 @@ class TestAcquisitionFallbacks(unittest.TestCase):
             self.assertEqual(json.loads((stage / 'metadata/apt-closure.json').read_text())['requested'], ['testpkg'])
 
 
-    def test_apt_missing_classification(self):
-        requested = {'native', 'old-dev', 'old-runtime'}
-        absent = ("Reading package lists...\nE: Unable to locate package old-dev\n"
-                  "E: Package 'old-runtime' has no installation candidate\n")
-        self.assertEqual(pool._apt_missing_packages(absent, requested), {'old-dev', 'old-runtime'})
-        self.assertEqual(pool._apt_missing_packages('Error: Unable to locate package old-dev', requested),
-                         {'old-dev'})
-        for diagnostic in ('E: Failed to fetch archive', 'E: Unmet dependencies',
-                           'E: Unable to locate package not-requested'):
-            with self.subTest(diagnostic=diagnostic):
-                self.assertEqual(pool._apt_missing_packages(absent + diagnostic, requested), set())
-        self.assertEqual(pool._apt_missing_packages('no diagnostics', requested), set())
+    def test_apt_root_availability_from_candidate_policy(self):
+        output = ('native:\n  Installed: 2\n  Candidate: 2\n  Version table:\n'
+                  'unavailable:\n  Installed: (none)\n  Candidate: (none)\n')
+        with patch.object(pool.subprocess, 'check_output', return_value=output):
+            self.assertEqual(pool._apt_missing_roots([], {'native','unavailable','unknown'}),
+                             {'unavailable','unknown'})
+        with patch.object(pool.subprocess, 'check_output', return_value='native:\n  Candidate: \n'):
+            with self.assertRaisesRegex(RuntimeError, 'empty APT candidate'):
+                pool._apt_missing_roots([], {'native'})
 
     def test_apt_simulation_rejects_downgrades_and_removals(self):
         for output in ('The following packages will be DOWNGRADED:', 'Remv native [2]', 'Purg native [2]'):
@@ -681,7 +683,8 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                 [], 0, stdout='Inst old-dev (1:2-3 archive [amd64])\nInst native [2] (2 archive [amd64])', stderr='')):
             self.assertEqual(pool._apt_simulate([], {'native', 'old-dev'}), {'native': '2', 'old-dev': '1:2-3'})
 
-    def test_apt_historical_retry_only_for_missing_roots(self):
+    def test_apt_historical_sources_are_planned_before_the_first_solve(self):
+        pool._native_requirements_module()
         for mode in ('success', 'other-error', 'changed-native', 'still-missing', 'update-error', 'wrong-key', 'provider-only'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 stage = Path(tmp)
@@ -725,15 +728,10 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                         return combined
                     extra = any('sources-historical.list' in arg for arg in opts)
                     calls.append(('simulate', extra, set(packages)))
-                    if extra and mode != 'still-missing':
-                        return combined
-                    if packages == {'native'}:
-                        return native
-                    output = ("E: Unable to locate package old-dev\n"
-                              "E: Package 'old-runtime' has no installation candidate\n")
+                    self.assertTrue(extra)
                     if mode == 'other-error':
-                        output += 'E: Unmet dependencies\n'
-                    raise subprocess.CalledProcessError(100, ['apt-get'], output=output)
+                        raise subprocess.CalledProcessError(100, ['apt-get'], output='E: Unmet dependencies')
+                    return combined
                 def transfer(args):
                     extra = any('sources-historical.list' in arg for arg in args)
                     calls.append(('transfer', extra, 'update' if 'update' in args else 'install'))
@@ -746,6 +744,12 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                             (stage / 'apt/archives' / (name + '.deb')).write_bytes((name+'='+version).encode())
                 def dpkg(args, **kwargs):
                     if args[0]=='dpkg-query':return golden
+                    if args[0]=='apt-cache':
+                        extra = any('sources-historical.list' in arg for arg in args)
+                        available = {'native'} | ({'old-dev','old-runtime'} if extra and mode!='still-missing' else set())
+                        return ''.join(f'{name}:\n  Candidate: {combined.get(name,"1")}\n' for name in sorted(available))
+                    if '--print-uris' in args:
+                        return ''.join(f"'https://example.invalid/{name}.deb' {name}.deb {len((name+'='+version).encode())} SHA256:{hashlib.sha256((name+'='+version).encode()).hexdigest()}\n" for name,version in combined.items())
                     name = Path(args[-1]).stem
                     return 'Package: '+name+'\nVersion: '+combined[name]+'\nArchitecture: all\n'
                 with patch.object(candidate, 'download', side_effect=download), \
@@ -763,15 +767,15 @@ class TestAcquisitionFallbacks(unittest.TestCase):
                     else:
                         with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
                             pool.apt_closure(candidate, requested)
-                if mode in ('other-error', 'update-error'):
+                if mode == 'update-error':
                     self.assertFalse(any(call[0] == 'key' and call[1] in {row['key_url'] for row in historical}
                                          for call in calls))
                 if mode not in ('success','changed-native'):
                     self.assertFalse(any(call[0] == 'transfer' and call[2] == 'install' for call in calls))
                     self.assertFalse((stage / 'metadata/apt-closure.json').exists())
                     continue
-                self.assertIn(('simulate', False, {'native'}), calls)
-                self.assertIn(('simulate', True, requested), calls)
+                self.assertEqual([call for call in calls if call[0] == 'simulate'],
+                                 [('simulate', True, requested)])
                 self.assertEqual([call for call in calls if call[0] == 'transfer'],
                                  [('transfer', False, 'update'), ('transfer', True, 'update'),
                                   ('transfer', True, 'install')])

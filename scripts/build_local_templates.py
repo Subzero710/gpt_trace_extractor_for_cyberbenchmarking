@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -108,7 +109,7 @@ COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 5
+TASK_RUNTIME_SCHEMA = 6
 
 
 class RecoverableBuildError(RuntimeError):
@@ -453,7 +454,8 @@ def bind_os_archives(folder, manifest, closure, packages):
     from gpt_trace_transport.local_templates import safe
     safe(folder, directory=True)
     if (manifest.get("schema_version") != 1 or manifest.get("requested") != closure["requested"]
-            or manifest.get("artifacts") != {name: record for name, (_, record) in packages.items()}):
+            or manifest.get("artifacts") != {name: record for name, (_, record) in packages.items()}
+            or manifest.get("native_headers", {}) != closure.get("native_discovery", {}).get("providers", {})):
         raise RuntimeError("completed OS manifest differs from signed APT closure")
     if set(path.name for path in folder.glob("*.deb")) - packages.keys():
         raise RuntimeError("unexpected OS archive in resolved closure")
@@ -963,7 +965,8 @@ def build(args, *, progress=None):
             progress(stage, completed, total, unit, details)
     if os.geteuid() != 0:
         raise RuntimeError("local preparation requires the execution host root execution broker")
-    from workstation_broker.preparation import verify_worker_claim, verify_published_inventory
+    from workstation_broker.preparation import (verify_worker_claim, verify_published_inventory,
+                                                NativeResolutionRequired)
     job = verify_worker_claim(args.operation_id)
     pool_compatibility = job["compatibility"]
     dependency_pool = BASE.parent / "dependency-pool" / "ready"
@@ -1012,9 +1015,18 @@ def build(args, *, progress=None):
         # One deterministic resumable stage per *template identity*, not per
         # checkout/build implementation.  The operation ID is the hash of the
         # stable compatibility record, so code-only changes reuse this path.
-        staged = target_root / (".build-resumable-v3-" + args.operation_id)
         identity = {"schema": 3, "compatibility": job["compatibility"],
                     "pool_manifest_sha256": publication["manifest_sha256"]}
+        staged = target_root / (".build-resumable-v3-" + args.operation_id + "-" + publication["manifest_sha256"])
+        previous_stage = target_root / (".build-resumable-v3-" + args.operation_id)
+        if previous_stage.exists() or previous_stage.is_symlink():
+            safe(previous_stage, directory=True)
+            prior = json.loads(safe(previous_stage / "build-identity.json", immutable=True).read_bytes())
+            if prior.get("pool_manifest_sha256") == publication["manifest_sha256"]:
+                if staged.exists() or staged.is_symlink():
+                    raise RuntimeError("two template stages claim the same publication")
+                # The existing stage may be referenced by retained QCOW2 backing paths.
+                staged = previous_stage
         if staged.exists():
             from gpt_trace_transport.local_templates import safe
             safe(staged, directory=True)
@@ -1150,6 +1162,9 @@ def build(args, *, progress=None):
                     scratch_root, guest_json(BASE, "/opt/gpt-trace/bundle/guest-contract.json"),
                     golden.guest_contract())
             boot_file = staged / "firstboot.sh"
+            token = hashlib.sha256((publication["manifest_sha256"] + uuid.uuid4().hex).encode()).hexdigest()
+            boot = ("export GPT_TRACE_NATIVE_ROUND=" + shlex.quote(token) + "\n"
+                    "rm -f /opt/swe-gym-lite/native-requirements.json\n" + boot)
             boot_file.write_text(firstboot(boot, trim=trim, shared_warm_cache=cache_disk is not None))
             argv = ["virt-customize", "--no-network", "-a", str(image)]
             if payload is not None:
@@ -1173,12 +1188,24 @@ def build(args, *, progress=None):
             print("live guest phase log: " + str(serial_log), flush=True)
             watch = golden._GuestProvisionWatch(_versioned_host_subprocess_timeout(),
                 prefix=b"GPTTRACE_TEMPLATE ", description="template guest", allow_pause=True)
+            def check_native_request():
+                request = guest_json_optional(image, "/opt/swe-gym-lite/native-requirements.json")
+                if request is None:
+                    return
+                if (not isinstance(request, dict) or set(request) != {"schema", "round", "requirements"}
+                        or request["schema"] != 1):
+                    raise RuntimeError("invalid target native requirement report")
+                if request["round"] != token:
+                    return
+                raise NativeResolutionRequired(request["requirements"])
             try:
                 cmd(*argv, "-device", "virtio-rng-pci", "-display", "none", "-serial", "file:" + str(serial_log),
                     "-monitor", "none", "-no-reboot", tail_file=serial_log, watch=watch)
             except (RuntimeError, TimeoutError, ValueError) as exc:
+                check_native_request()
                 raise RuntimeError(str(exc) + "\nfirstboot diagnostics:\n" + guest_failure_diagnostics(image)) from exc
             if not generic_guest_complete(image):
+                check_native_request()
                 raise RuntimeError("guest build completion proof is missing; "
                                    "firstboot diagnostics:\n" + guest_failure_diagnostics(image))
             if completion is not None:
@@ -1532,7 +1559,8 @@ def build(args, *, progress=None):
                         os.link(archive, artifact_root / name)
                     packages = {name: record for name, (_, record) in apt_packages.items()}
                     (artifact_root / "acquired.json").write_text(json.dumps({
-                        "requested":rows["requested"], "artifacts":packages},sort_keys=True))
+                        "requested":rows["requested"], "artifacts":packages,
+                        "native_headers":rows.get("native_discovery", {}).get("providers", {})},sort_keys=True))
                     resolver_boot = "/usr/bin/python3 - <<'PY_GUEST'\nimport runpy,json\n"
                     resolver_boot += "runpy.run_path('/opt/swe-gym-os-helper/os_packages.py')['resolve_from_pool']('/opt/swe-gym-os','/opt/swe-gym-os-helper/artifacts')\n"
                     resolver_boot += "json.dump(" + repr(resolver_completion) + ",open('" + RESOLVER_COMPLETION + "','w'),sort_keys=True)\nPY_GUEST\n"
@@ -2017,6 +2045,7 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 (incoming / 'vcs-index.json').write_text(json.dumps(index, sort_keys=True))
 
             prepared_proofs, vcs_provenance, task_inventories = {}, {}, {}
+            native_demands = {}
             incoming = scratch_root / "swe-gym-task"
             scratch_tasks_root = scratch_root / "tasks"
             scratch_tasks_root.mkdir(mode=0o700, exist_ok=True)
@@ -2083,24 +2112,32 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 warm_ready = (warm_matches_item and
                               completion_matches(warm, TASK_COMPLETION, warm_completion))
                 warm_serial = audit / ("task-" + tools.artifact_id("task_source", logical) + ".warm.serial.log")
-                if warm_ready:
-                    print("reused completed task warm scratch: " + logical, flush=True)
-                else:
-                    if warm_matches_item:
-                        recovery_boot, _ = task_boot(item, source_record, mode="warm-recover")
-                        print("recovering completed work from interrupted task warm scratch: " + logical, flush=True)
-                        provision(warm, recovery_boot, incoming, network=False,
-                                  cache_disk=warm_cache, trim=False,
-                                  serial_log=warm_serial, refresh_runtime=True)
-                        recovery = guest_json_optional(warm, "/opt/swe-gym-task/recovery.json")
-                        warm_ready = (recovery == {"reusable": True} and
-                                      completion_matches(warm, TASK_COMPLETION, warm_completion))
-                    if not warm_ready:
-                        warm = reset_scratch_overlay(warm, common)
-                        provision(warm, warm_boot, incoming, network=False,
-                                  completion=(TASK_COMPLETION, warm_completion),
-                                  cache_disk=warm_cache, trim=False, serial_log=warm_serial,
-                                  refresh_runtime=True)
+                try:
+                    if warm_ready:
+                        print("reused completed task warm scratch: " + logical, flush=True)
+                    else:
+                        if warm_matches_item:
+                            recovery_boot, _ = task_boot(item, source_record, mode="warm-recover")
+                            print("recovering completed work from interrupted task warm scratch: " + logical, flush=True)
+                            provision(warm, recovery_boot, incoming, network=False,
+                                      cache_disk=warm_cache, trim=False,
+                                      serial_log=warm_serial, refresh_runtime=True)
+                            recovery = guest_json_optional(warm, "/opt/swe-gym-task/recovery.json")
+                            warm_ready = (recovery == {"reusable": True} and
+                                          completion_matches(warm, TASK_COMPLETION, warm_completion))
+                        if not warm_ready:
+                            warm = reset_scratch_overlay(warm, common)
+                            provision(warm, warm_boot, incoming, network=False,
+                                      completion=(TASK_COMPLETION, warm_completion),
+                                      cache_disk=warm_cache, trim=False, serial_log=warm_serial,
+                                      refresh_runtime=True)
+                except NativeResolutionRequired as demand:
+                    native_tools = load_module("swegym_native_request_contract", GUEST.with_name("os_packages.py"))
+                    for key, paths in native_tools.native_requirement_paths(demand.requirements).items():
+                        if key in native_demands and native_demands[key] != paths:
+                            raise RuntimeError("conflicting target native observations") from demand
+                        native_demands[key] = paths
+                    continue
                 proof = guest_json(warm, "/opt/swe-gym-task/cache-proof.json")
                 wheels = import_wheel_cas(warm, logical, proof)
                 key = mapping[logical]["setup_cache"]
@@ -2137,6 +2174,8 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                 # Per-task scratch disks remain addressable and are never truncated.
                 # A later fetch can salvage interrupted setups without reinstallation.
                 shutil.rmtree(incoming)
+            if native_demands:
+                raise NativeResolutionRequired(native_demands)
             report("Préparation des tâches", len(inputs["tasks"]), len(inputs["tasks"]), "tâches")
             atomic_json(audit / "task-inventories.json", task_inventories)
             atomic_json(audit / "vcs-provenance.json", vcs_provenance)
@@ -2325,7 +2364,7 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
             # Preserve the single stable stage so a later explicit fetch continues
             # after a code/network/operator fix.  Only make throw_volumes can wipe it.
             print("build stopped; persistent resumable state retained: " + str(staged), file=sys.stderr)
-            if isinstance(exc, RecoverableBuildError):
+            if isinstance(exc, (RecoverableBuildError, NativeResolutionRequired)):
                 raise
             raise RecoverableBuildError(str(exc)) from exc
 

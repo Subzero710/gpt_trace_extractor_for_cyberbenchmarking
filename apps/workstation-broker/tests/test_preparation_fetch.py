@@ -90,20 +90,11 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path, monk
     original_check_output = jobs.subprocess.check_output
     def read_status(command, **kwargs):
         if command[0] == "virt-cat":
-            assert command == ["virt-cat", "-a", str(manager.base), "/var/lib/dpkg/status"]
+            assert command == ["virt-cat", "--format=qcow2", "-a", str(manager.base), "/var/lib/dpkg/status"]
+            assert 0 < kwargs['timeout'] <= 180
             return status
         return original_check_output(command, **kwargs)
     monkeypatch.setattr(jobs.subprocess, "check_output", read_status)
-    original_run = jobs.subprocess.run
-    header_archive = b"fixture header tar"
-    def export_headers(command, **kwargs):
-        if command[0] == "guestfish":
-            assert command[:-1] == ["guestfish", "--ro", "--format=qcow2", "-a", str(manager.base),
-                                    "-i", "tar-out", "/usr/include"]
-            Path(command[-1]).write_bytes(header_archive)
-            return subprocess.CompletedProcess(command, 0)
-        return original_run(command, **kwargs)
-    monkeypatch.setattr(jobs.subprocess, "run", export_headers)
     original_identity = jobs.golden_dependency_identity
     jobs.golden_dependency_identity = lambda *args, **kwargs: dependency
     try:
@@ -141,8 +132,9 @@ def test_fetch_sources_are_staged_outside_private_repo_and_sealed(tmp_path, monk
     assert stat.S_IMODE(staged_dependency.stat().st_mode) == 0o444
     assert (source_root / "golden-dpkg-status").read_bytes() == status
     assert stat.S_IMODE((source_root / "golden-dpkg-status").stat().st_mode) == 0o444
-    assert (source_root / "golden-include.tar").read_bytes() == header_archive
-    assert stat.S_IMODE((source_root / "golden-include.tar").stat().st_mode) == 0o444
+    assert not (source_root / "golden-include.tar").exists()
+    assert (source_root / "native-requests.json").read_bytes() == b"{}\n"
+    assert stat.S_IMODE((source_root / "native-requests.json").stat().st_mode) == 0o444
     assert stat.S_IMODE(source_root.stat().st_mode) == 0o555
 
 
@@ -228,3 +220,28 @@ def test_fetch_snapshot_rejects_stale_rust_build_attestation(tmp_path):
     source.write_bytes(source.read_bytes() + b"\nmodified after build attestation\n")
     with pytest.raises(RuntimeError, match="identity mismatch"):
         jobs.verify_fetch_runtime_build_identity(private)
+
+
+def test_retained_apt_sources_include_every_quiescent_matching_attempt(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    root = tmp_path / 'preparations'; root.mkdir()
+    pool = tmp_path / 'pool'; pool.mkdir()
+    common = {'fetch_kind': 'download-only-pool-v4', 'pool_schema': 4, 'platform': 'linux-x86_64'}
+    states = {}
+    expected = []
+    for index in range(1, 4):
+        operation = str(index) * 64
+        (root / operation).mkdir()
+        state = {'operation_id': operation, 'attempt': 1, 'phase': 'interrupted', 'result': None,
+                 'compatibility': {**common, 'pool_schema': 5 if index == 3 else 4}}
+        states[operation] = state
+        stage = pool / ('incoming-' + operation + '-1'); stage.mkdir(mode=0o700)
+        (stage/'STAGING').write_text('fixture')
+        if index != 3:
+            expected.append(stage)
+    manager = SimpleNamespace(root=root, _read=states.__getitem__, _containers=lambda state: [])
+    monkeypatch.setattr(jobs.JobScope, 'members', lambda state: [])
+    account = SimpleNamespace(pw_uid=os.getuid())
+    selected = jobs.retained_dependency_stage(manager, pool, {'compatibility': common}, account, all_stages=True)
+    assert selected == tuple(expected)
+    assert jobs.retained_dependency_stage(manager, pool, {'compatibility': common}, account) in expected

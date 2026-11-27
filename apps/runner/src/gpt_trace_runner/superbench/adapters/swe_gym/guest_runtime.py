@@ -14,6 +14,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import time
 import runpy
@@ -56,7 +58,7 @@ def run(*args, cwd=None, env=None, input=None):
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
 BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
-TASK_RUNTIME_SCHEMA = 5
+TASK_RUNTIME_SCHEMA = 6
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -144,6 +146,102 @@ def prime_shared_pip_cache(item):
         raise RuntimeError("unsafe native wheel cache context")
     path.mkdir(parents=True, exist_ok=True)
     return True
+
+
+def compiler_cache_exports():
+    shared = _shared_warm_cache()
+    if shared is None or not os.environ.get('CONDA_PREFIX'):
+        raise RuntimeError('compiler cache requires the active target prefix and builder cache mount')
+    prefix = Path(os.environ['CONDA_PREFIX'])
+    if Path(sys.prefix).resolve() != prefix.resolve():
+        raise RuntimeError('compiler cache was not configured by the active target interpreter')
+    ccache = shutil.which('ccache')
+    if ccache is None:
+        raise RuntimeError('verified compiler cache executable is missing')
+    folder = shared / 'compiler-objects'
+    if folder.is_symlink():
+        raise RuntimeError('unsafe shared compiler cache directory')
+    folder.mkdir(exist_ok=True)
+    def file_hash(path):
+        digest = hashlib.sha256()
+        with Path(path).open('rb') as stream:
+            for block in iter(lambda: stream.read(1048576), b''):
+                digest.update(block)
+        return digest.hexdigest()
+    metadata = prefix / 'conda-meta'
+    if metadata.is_symlink() or not metadata.is_dir():
+        raise RuntimeError('active target has no Conda package provenance')
+    packages = []
+    for path in sorted(metadata.glob('*.json')):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('unsafe target Conda package record')
+        row = json.loads(path.read_bytes())
+        packages.append({key: row.get(key) for key in ('name', 'version', 'build', 'sha256', 'md5', 'url')})
+    if not packages:
+        raise RuntimeError('empty target Conda package provenance')
+    identity = {'os_manifest': file_hash(ROOT / 'os-manifest.json'), 'conda': packages,
+                'compiler_cache': file_hash(ccache), 'compilers': {}}
+    variables = {}
+    for name in ('CC', 'CXX'):
+        arguments = shlex.split(os.environ.get(name) or sysconfig.get_config_var(name) or '')
+        if not arguments:
+            if name == 'CC':
+                raise RuntimeError('target interpreter has no configured C compiler')
+            continue
+        executable = shutil.which(arguments[0])
+        if executable is None:
+            raise RuntimeError('configured target compiler is missing: ' + arguments[0])
+        if Path(executable).resolve() == Path(ccache).resolve():
+            raise RuntimeError('nested compiler cache launcher')
+        # Keep argv[0] and arguments selected by Conda/CPython; the actual
+        # compiler and its GCC subprocesses are content-bound to the namespace.
+        command = [executable, *arguments[1:]]
+        toolchain = {'command': command, 'compiler': file_hash(executable), 'programs': {}}
+        for program in ('cc1', 'cc1plus', 'as'):
+            result = subprocess.check_output(command + ['-print-prog-name=' + program], text=True).strip()
+            selected = shutil.which(result) if result else None
+            if selected is not None:
+                toolchain['programs'][program] = {'path': selected, 'sha256': file_hash(selected)}
+            else:
+                toolchain['programs'][program] = {'reported': result}
+        identity['compilers'][name] = toolchain
+        variables[name] = shlex.join([ccache, *command])
+    namespace = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    variables.update(CCACHE_DIR=str(folder), CCACHE_NAMESPACE=namespace,
+                     CCACHE_COMPILERCHECK='content', CCACHE_NODIRECT='1',
+                     CCACHE_HASHDIR='1', CCACHE_SLOPPINESS='')
+    config = ROOT / 'compiler-cache.conf'
+    contents = 'compiler_check = content\ndirect_mode = false\nhash_dir = true\nsloppiness =\n'
+    if config.exists() or config.is_symlink():
+        if config.is_symlink() or not config.is_file() or config.read_text() != contents:
+            raise RuntimeError('compiler cache configuration differs')
+    else:
+        with config.open('x') as stream:
+            stream.write(contents)
+        config.chmod(0o444)
+    variables['CCACHE_CONFIGPATH'] = str(config)
+    # Do not inherit optional unsafe ccache modes from recipe environments.
+    commands = ['unset ' + key for key in sorted(os.environ) if key.startswith('CCACHE_')
+                and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)]
+    commands.extend('export ' + key + '=' + shlex.quote(value) for key, value in sorted(variables.items()))
+    return '\n'.join(commands)
+
+
+def _compiler_cache_shell(prefix):
+    code = "import runpy; print(runpy.run_path(" + repr(str(ROOT / 'runtime.py')) + ")['compiler_cache_exports']())"
+    invoke = shlex.join([str(Path(prefix) / 'bin/python'), '-I', '-c', code])
+    return 'cache_exports=$(' + invoke + '); eval "$cache_exports"; unset cache_exports'
+
+
+def _with_compiler_cache(commands, prefix):
+    if _shared_warm_cache() is None:
+        return list(commands)
+    result = []
+    for line in commands:
+        result.append(line)
+        if line.strip() in ('conda activate testbed', 'source ' + str(CONDA.with_name('activate')) + ' testbed'):
+            result.append(_compiler_cache_shell(prefix))
+    return result
 
 
 def _template_script(commands):
@@ -237,6 +335,7 @@ def python_version_from_recipe(script):
 def build_limits(env=None):
     """Use all four preparation vCPUs while keeping builders bounded."""
     result = dict(os.environ if env is None else env)
+    result.pop("GPT_TRACE_NATIVE_ROUND", None)
     workers = max(1, min(4, os.cpu_count() or 1))
     # Exact lock reconstruction has no live solver policy. These are only
     # transport/resource limits for commands that execute build recipes.
@@ -498,12 +597,14 @@ def prepare(item, *, artifact, offline=True, destination="/testbed", log=None):
     prefix = _timed(item, prefix_name + "_clone_env",
                     lambda: clone_env(item, offline=offline))
     commands = setup_commands(item, destination, prefix)
+    if not offline:
+        commands = _with_compiler_cache(commands, prefix)
     if destination != "/testbed":
         commands = relocate_checkout(commands, destination)
     pool_backed = (ROOT / "caches/pip-index").is_dir()
     _timed(item, prefix_name + "_repo_setup",
-           lambda: shell(commands, cwd=destination, env=runtime_environment(item, offline=offline),
-                         offline=offline or pool_backed, log=log))
+           lambda: _native_recipe(item, prefix, lambda: shell(commands, cwd=destination,
+                         env=runtime_environment(item, offline=offline), offline=offline or pool_backed, log=log), log))
     if offline:
         expected = json.loads((ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).read_text())
         if env_inventory(prefix) != expected:
@@ -760,7 +861,7 @@ def _capture_cache_identity(context, requirements, inventory, env):
                 "inventory": inventory,
                 "environment_sha256": hashlib.sha256(json.dumps(env, sort_keys=True,
                     separators=(",", ":")).encode()).hexdigest(),
-                "command": ["pip", "wheel", "--no-deps", "--no-index"]}
+                "command": ["conda", "run", "pip", "wheel", "--no-deps", "--no-index"]}
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -780,7 +881,35 @@ def _capture_object_path(objects, filename, record):
 
 
 def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
-    """Capture only wheels. Reuse a successful capture of identical inputs."""
+    """Commit one verified wheel receipt per exact requirement, not per batch."""
+    if any(wheelhouse.iterdir()):
+        raise RuntimeError("wheel capture destination must start empty")
+    requirements = requirements_file.read_text().splitlines()
+    if (not requirements or len(set(requirements)) != len(requirements)
+            or any(not row or row != row.strip() or row.startswith("-") for row in requirements)):
+        raise RuntimeError("invalid individual wheel capture requirements")
+    wheels = {}
+    with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix=".wheel-capture-") as raw:
+        scratch = Path(raw)
+        for requirement in requirements:
+            request = scratch / "requirement.txt"
+            request.write_text(requirement + "\n")
+            output = scratch / "wheel"
+            output.mkdir()
+            records = _capture_one_install_artifact(item, prefix, request, output, inventory)
+            if len(records) != 1:
+                raise RuntimeError("exact wheel requirement did not produce one artifact: " + requirement)
+            filename, record = next(iter(records.items()))
+            if filename in wheels:
+                raise RuntimeError("duplicate wheel from distinct capture requirements: " + filename)
+            os.link(output / filename, wheelhouse / filename)
+            wheels[filename] = record
+            shutil.rmtree(output)
+    return _wheel_files(wheels)
+
+
+def _capture_one_install_artifact(item, prefix, requirements_file, wheelhouse, inventory):
+    """Build or reuse one wheel under the exact activated target context."""
     env = runtime_environment(item, offline=False)
     if any(wheelhouse.iterdir()):
         raise RuntimeError("wheel capture destination must start empty")
@@ -788,7 +917,10 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
     # a source of capture artifacts.
     env["PIP_FIND_LINKS"] = str(ROOT / "caches/pip-index")
     shared = _shared_warm_cache()
-    command = (str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps", "--no-index",
+    activation = (str(CONDA), "run", "--prefix", str(prefix), "--no-capture-output")
+    compiler_cache = () if shared is None else ("/bin/bash", "-c",
+        "set -e; " + _compiler_cache_shell(prefix) + '; exec "$@"', "compiler-cache")
+    command = (*activation, *compiler_cache, str(prefix / "bin/python"), "-m", "pip", "wheel", "--no-deps", "--no-index",
                "--wheel-dir", str(wheelhouse), "--requirement", str(requirements_file))
     if shared is None:
         run(*command, env=env)
@@ -883,8 +1015,9 @@ def warm_task(item, artifact, *, common_identity=None):
     (ROOT / "task-provenance" / (item["instance_id"] + ".setup.json")).write_text(
         json.dumps(env_inventory(prefix), sort_keys=True))
     _timed(item, "warm_eval_setup",
-           lambda: shell(item["eval_setup_commands"], cwd="/testbed", env=runtime_environment(item, offline=False),
-                         offline=True, log=ROOT / "logs/eval-warm.log"))
+           lambda: _native_recipe(item, prefix, lambda: shell(_with_compiler_cache(item["eval_setup_commands"], prefix), cwd="/testbed",
+                         env=runtime_environment(item, offline=False), offline=True, log=ROOT / "logs/eval-warm.log"),
+                         ROOT / "logs/eval-warm.log"))
     wheelhouse = ROOT / "wheelhouse" / item["instance_id"]
     wheelhouse.mkdir(parents=True, exist_ok=True)
     inventory = env_inventory(prefix)
@@ -920,8 +1053,8 @@ print(json.dumps(result))
     requirements_file.write_text("\n".join(reqs) + "\n")
     if reqs:
         _timed(item, "warm_capture_wheels",
-               lambda: _capture_install_artifacts(
-                   item, prefix, requirements_file, wheelhouse, inventory))
+               lambda: _native_recipe(item, prefix, lambda: _capture_install_artifacts(
+                   item, prefix, requirements_file, wheelhouse, inventory)))
     requirements_file.unlink()
     _timed(item, "warm_freeze_vcs", lambda: freeze_vcs_dependencies(item, prefix))
     pool = ROOT / "caches/wheels"
@@ -1112,6 +1245,159 @@ def commit_common_inputs(checkpoint):
     _durable_json(ROOT / names[checkpoint["kind"]], checkpoint)
 
 
+def _native_profile(prefix, *, loader_needed=False):
+    """Read the real activated interpreter's build configuration in the guest."""
+    code = r'''import json, os, sys, sysconfig, shlex, subprocess, shutil, re
+from pathlib import Path
+cc = shlex.split(os.environ.get("CC") or sysconfig.get_config_var("CC") or "")
+if not cc or not shutil.which(cc[0]):
+    raise RuntimeError("configured target compiler is unavailable: " + repr(cc))
+flags = shlex.split(sysconfig.get_config_var("CFLAGS") or "")
+flags += shlex.split(os.environ.get("CFLAGS", "")) + shlex.split(os.environ.get("CPPFLAGS", ""))
+paths = list(dict.fromkeys(sysconfig.get_path(k) for k in ("include", "platinclude")))
+if not paths or not all(isinstance(p, str) and Path(p).is_dir() for p in paths):
+    raise RuntimeError("invalid target interpreter include paths")
+args = cc + flags + [arg for p in paths for arg in ("-I", p)]
+env = dict(os.environ, LC_ALL="C")
+search = subprocess.run(args + ["-E", "-v", "-x", "c", "-"], input="", text=True, env=env, capture_output=True, check=True)
+roots = []
+active = False
+for line in search.stderr.splitlines():
+    if line == "#include <...> search starts here:":
+        active = True
+    elif line == "End of search list.":
+        active = False
+    elif active and line.startswith(" "):
+        path = line.strip().split(" (framework directory)", 1)[0]
+        if not Path(path).is_absolute():
+            raise RuntimeError("nonabsolute target include directory")
+        roots.append(path)
+if not roots:
+    raise RuntimeError("target compiler did not report its include search list")
+libs = subprocess.check_output(cc + flags + ["-print-search-dirs"], text=True, env=env)
+libraries = [line.split("=", 1)[1].split(os.pathsep) for line in libs.splitlines() if line.startswith("libraries: =")]
+if len(libraries) != 1:
+    raise RuntimeError("target compiler did not report its library search list")
+probe = subprocess.run(args + ["-M", "-MG", "-MT", "native_probe", "-x", "c", "-"],
+    input="#include <Python.h>\n", capture_output=True, text=True, env=env, check=True)
+raw = probe.stdout.replace("\\\n", " ")
+if not raw.startswith("native_probe:"):
+    raise RuntimeError("invalid target compiler dependency output")
+missing = []
+for token in shlex.split(raw.split(":", 1)[1]):
+    if not Path(token).is_absolute() and not Path(token).is_file():
+        missing.append(token)
+loader_paths = []
+if sys.argv[1] == "loader":
+    program = subprocess.check_output(["readelf", "-lW", sys.executable], text=True, env=env)
+    interpreters = re.findall(r"\[Requesting program interpreter: ([^\]]+)\]", program)
+    if len(interpreters) != 1 or not Path(interpreters[0]).is_file():
+        raise RuntimeError("target interpreter has no unique executable ELF loader")
+    loader = subprocess.check_output([interpreters[0], "--list-diagnostics"], text=True, env=env)
+    for line in loader.splitlines():
+        if line.startswith("path.system_dirs["):
+            value = json.loads(line.split("=", 1)[1])
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                raise RuntimeError("invalid target ELF loader system directory")
+            loader_paths.append(value)
+    if not loader_paths:
+        raise RuntimeError("target loader did not report system library directories")
+    loader_paths += [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if Path(path).is_absolute()]
+print("GPTTRACE_NATIVE_PROFILE " + json.dumps({"headers": roots, "libraries": libraries[0],
+    "loader": loader_paths, "missing": sorted(set(missing))}))
+'''
+    output = run(str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output',
+                 str(Path(prefix) / 'bin/python'), '-I', '-c', code,
+                 'loader' if loader_needed else 'compiler', env=build_limits()).decode()
+    marker = 'GPTTRACE_NATIVE_PROFILE '
+    rows = [line[len(marker):] for line in output.splitlines() if line.startswith(marker)]
+    if len(rows) != 1:
+        raise RuntimeError('target native profile did not produce a unique record')
+    return json.loads(rows[0])
+
+
+def _native_paths(kind, name, profile):
+    if kind == 'tool':
+        roots, leaves = profile['tools'], [name]
+    elif kind == 'header':
+        roots, leaves = profile['headers'], [name]
+    else:
+        roots = profile['loader'] if kind == 'soname' else profile['libraries']
+        leaves = [name] if kind == 'soname' else ['lib' + name + '.so', 'lib' + name + '.a']
+    paths = set()
+    for root in roots:
+        if not isinstance(root, str) or not root.startswith('/'):
+            continue
+        absolute = os.path.normpath(root)
+        for leaf in leaves:
+            path = os.path.normpath(absolute + '/' + leaf).lstrip('/')
+            prefixes = ('usr/bin/', 'bin/', 'usr/sbin/', 'sbin/') if kind == 'tool' else ('usr/include/', 'usr/lib/', 'lib/', 'lib64/', 'usr/lib64/')
+            if path.startswith(prefixes):
+                paths.add(path)
+                # Debian usrmerge names both spellings of the same guest path.
+                if path.startswith(('lib/', 'lib64/', 'bin/', 'sbin/')):
+                    paths.add('usr/' + path)
+    return sorted(paths)
+
+
+def _native_diagnostics(text):
+    """Only definitive compiler, linker and runtime-loader failure diagnostics."""
+    patterns = {
+        'header': r'fatal error:\s*([A-Za-z0-9_.+/-]+): No such file or directory',
+        'library': r'(?:ld|ld\.gold|ld\.lld):[^\n]*?cannot find -l([A-Za-z0-9_.+-]+)(?=[:\s]|$)',
+        'soname': r'([A-Za-z0-9_.+-]+\.so(?:\.[A-Za-z0-9_.+-]+)*): cannot open shared object file: No such file or directory',
+    }
+    return {(kind, name) for kind, expression in patterns.items() for name in re.findall(expression, text)}
+
+
+def _native_requests(prefix, observations, *, profile=None):
+    if not observations:
+        return {}
+    if profile is None:
+        profile = _native_profile(prefix, loader_needed=any(kind == 'soname' for kind, _ in observations))
+    result = {}
+    for kind, name in sorted(observations):
+        paths = _native_paths(kind, name, profile)
+        if not paths:
+            raise RuntimeError('target did not expose a system search path for ' + kind + ':' + name)
+        identity = hashlib.sha256(json.dumps(paths, separators=(',', ':')).encode()).hexdigest()
+        result[kind + ':' + name + '@' + identity] = paths
+    return runpy.run_path(str(ROOT / 'os_packages.py'))['native_requirement_paths'](result)
+
+
+def _native_report(requirements):
+    requirements = runpy.run_path(str(ROOT / 'os_packages.py'))['native_requirement_paths'](requirements)
+    if not requirements:
+        raise RuntimeError('empty target native requirement report')
+    token = os.environ.get('GPT_TRACE_NATIVE_ROUND')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{64}', token):
+        raise RuntimeError('native requirement observation outside a bound preparation round')
+    _durable_json(ROOT / 'native-requirements.json', {'schema': 1, 'round': token, 'requirements': requirements})
+    raise RuntimeError('target native dependency resolution required: ' + ', '.join(requirements))
+
+
+def _native_recipe(item, prefix, callback, log=None):
+    try:
+        return callback()
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        text = str(exc)
+        for field in ('stdout', 'stderr'):
+            detail = getattr(exc, field, None)
+            if isinstance(detail, bytes):
+                text += '\n' + detail.decode(errors='replace')
+            elif isinstance(detail, str):
+                text += '\n' + detail
+        observations = _native_diagnostics(text)
+        if observations and os.environ.get('GPT_TRACE_NATIVE_ROUND'):
+            _native_report(_native_requests(prefix, observations))
+        raise
+
+
+def verify_native_python_headers(prefix):
+    profile = _native_profile(prefix)
+    return _native_requests(prefix, {('header', name) for name in profile['missing']}, profile=profile)
+
+
 def build_common(inputs):
     for folder in ("environments", "logs", "task-provenance", "wheelhouse", "caches/pip", "caches/npm", "caches/pdm", "caches/pipx"):
         (ROOT / folder).mkdir(parents=True, exist_ok=True)
@@ -1132,6 +1418,10 @@ def build_common(inputs):
     provenance = json.loads(provenance_path.read_bytes())
     if provenance.get("schema") != 1 or provenance.get("kind") != "verified-input-archives":
         raise RuntimeError("invalid common archive provenance")
+    native_requests = {}
+    if shutil.which('ccache') is None:
+        native_requests.update(_native_requests(None, {('tool', 'ccache')},
+            profile={'tools': os.environ['PATH'].split(os.pathsep)}))
     for env_hash, record in sorted(inputs["environments"].items()):
         commands = locked_environment_script(env_hash, record, lock)
         recipe_proof = {"lock_sha256": lock_sha256, "transactions": len(lock["environments"][env_hash]["transactions"])}
@@ -1140,6 +1430,8 @@ def build_common(inputs):
         recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
         expected_proof = json.dumps(recipe_proof, sort_keys=True)
         if common_environment_ready(prefix, inventory_file, recipe_file, expected_proof):
+            for key, paths in verify_native_python_headers(prefix).items():
+                native_requests[key] = sorted(set(native_requests.get(key, [])) | set(paths))
             print("SWE-Gym verified environment checkpoint: " + env_hash, flush=True)
             continue
         print("SWE-Gym environment " + env_hash + ": exact Conda lock transaction replay", flush=True)
@@ -1150,6 +1442,9 @@ def build_common(inputs):
                 shell(commands, cwd=ROOT, env=env, log=log)
                 break
             except RuntimeError as exc:
+                observed = _native_diagnostics(str(exc))
+                if observed and (prefix / 'bin/python').is_file():
+                    _native_report(_native_requests(prefix, observed))
                 # Retry only explicitly recognized transient transport failures;
                 # do not hide missing packages, bad hashes or solver conflicts.
                 transient = re.search(
@@ -1170,10 +1465,14 @@ def build_common(inputs):
                 time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
         # Persist proof only after all official commands and the exact installed
         # package inventory succeeded. Atomic rename avoids torn JSON checkpoints.
+        for key, paths in verify_native_python_headers(prefix).items():
+            native_requests[key] = sorted(set(native_requests.get(key, [])) | set(paths))
         inventory = env_inventory(prefix)
         run("sync", "-f", str(prefix))
         _durable_json(inventory_file, inventory)
         _durable_json(recipe_file, recipe_proof)
+    if native_requests:
+        _native_report(native_requests)
     # Task setup is performed only in disposable builder overlays. The common
     # image has never contained benchmark checkouts or source archives.
     validate_isolation()

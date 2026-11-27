@@ -24,7 +24,7 @@ RUNTIME = PINS.parent
 BUILDER = Path("scripts/build_local_templates.py")
 GOLDEN_BUILDER = Path("infra/workstation/image/build.py")
 TEMPLATE_ABI = 1
-TASK_RUNTIME_SCHEMA = 5
+TASK_RUNTIME_SCHEMA = 6
 FETCH_SOURCE_FILES = (
     "scripts/superbench_pool.py",
     "scripts/native_requirements.py",

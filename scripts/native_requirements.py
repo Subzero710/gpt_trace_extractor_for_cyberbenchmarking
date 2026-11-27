@@ -7,6 +7,8 @@ without the execution host's system include directories.
 from __future__ import annotations
 
 import ast
+import contextlib
+import sys
 import hashlib
 import gzip
 import lzma
@@ -52,102 +54,498 @@ def _relative(name):
     return path
 
 
-def _extract_headers(archive, destination, *, conda):
-    """Copy the actual header tree once; never follow an archive link on the host."""
+def archive_file_index(archive):
+    entries = {}
+    for item in archive:
+        name = _relative(item.name).as_posix()
+        if name == '.':
+            if not item.isdir():
+                raise RuntimeError('invalid archive root')
+            continue
+        if name in entries:
+            raise RuntimeError('duplicate archive member: ' + name)
+        kind = ('directory' if item.isdir() else 'file' if item.isfile() else
+                'symlink' if item.issym() else 'hardlink' if item.islnk() else 'other')
+        entries[name] = (kind, item.linkname if kind in ('symlink', 'hardlink') else '')
+    for name in tuple(entries):
+        for parent in PurePosixPath(name).parents:
+            if parent.as_posix() != '.':
+                entries.setdefault(parent.as_posix(), ('directory', ''))
+    return entries
+
+
+def archive_hardlink_target(entries, name):
+    # Hardlink names are archive-root member identities, not paths to resolve
+    # through another package's symlink namespace. The link copies the inode's
+    # type as well as its data; a hardlink to a symlink remains a symlink.
+    seen = set()
+    while name not in seen:
+        seen.add(name)
+        kind, target = entries.get(name, ('absent', ''))
+        if kind in ('file', 'symlink'):
+            if all(entries.get(parent.as_posix(), ('absent',))[0] == 'directory'
+                   for parent in PurePosixPath(name).parents if parent.as_posix() != '.'):
+                return name, kind, target
+            return None
+        if kind != 'hardlink' or not target or target.startswith('/') or '..' in PurePosixPath(target).parts or '\x00' in target:
+            return None
+        name = _relative(target).as_posix()
+    return None
+
+
+def resolve_archive_path(entries, name, *, absolute_links=True):
+    from collections import deque
+    pending = deque(_relative(name).parts)
+    prefix = []
+    followed = 0
+    while pending:
+        part = pending.popleft()
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            if not prefix:
+                return None
+            prefix.pop()
+            continue
+        path = '/'.join((*prefix, part))
+        kind, target = entries.get(path, ('absent', ''))
+        if kind == 'ambiguous':
+            raise RuntimeError('ambiguous ownership of native archive path: ' + path)
+        if kind == 'directory':
+            prefix.append(part)
+            continue
+        if kind == 'file':
+            return (path, kind) if not pending else None
+        if kind == 'hardlink':
+            linked = archive_hardlink_target(entries, path)
+            if linked is None:
+                return None
+            actual, kind, target = linked
+            if kind == 'file':
+                return (actual, kind) if not pending else None
+        if kind != 'symlink' or not target or '\x00' in target:
+            return None
+        followed += 1
+        if followed > 40:
+            return None
+        if target.startswith('/'):
+            if not absolute_links:
+                return None
+            prefix.clear()
+        pending.extendleft(reversed(target.split('/')))
+    path = '/'.join(prefix)
+    return (path, 'directory') if not path or entries.get(path, (None,))[0] == 'directory' else None
+
+
+def archive_header_paths(archive, candidates):
+    entries = archive_file_index(archive)
+    return {name: target[0] for name in sorted(set(candidates))
+            if (target := resolve_archive_path(entries, name)) is not None and target[1] == 'file'}
+
+
+def visible_header_files(entries, prefix, *, absolute_links=True):
+    from collections import defaultdict
+    children = defaultdict(list)
+    for name in entries:
+        children[posixpath.dirname(name)].append(posixpath.basename(name))
+    result = {}
+    def walk(logical, physical, ancestors):
+        for child in sorted(children[physical]):
+            name = posixpath.join(physical, child)
+            alias = posixpath.join(logical, child)
+            target = resolve_archive_path(entries, name, absolute_links=absolute_links)
+            if target is None:
+                if entries[name][0] in ('symlink', 'hardlink'):
+                    print('unavailable archived header link: ' + name, file=sys.stderr)
+                continue
+            actual, kind = target
+            if kind == 'file':
+                result[alias] = actual
+            elif actual in ancestors:
+                raise RuntimeError('cyclic archived header directory: ' + name)
+            else:
+                walk(alias, actual, ancestors | {actual})
+    root = resolve_archive_path(entries, prefix, absolute_links=absolute_links) if prefix else ('', 'directory')
+    if root is None or root[1] != 'directory':
+        raise RuntimeError('archive header root is missing')
+    walk('', root[0], {root[0]})
+    return result
+
+
+def _extract_headers(open_archive, destination, *, prefix, absolute_links=True):
     destination = Path(destination)
     destination.mkdir(parents=True)
-    links = []
-    with archive:
+    with open_archive() as archive:
+        entries = archive_file_index(archive)
+    visible = visible_header_files(entries, prefix, absolute_links=absolute_links)
+    targets = {}
+    for alias, actual in visible.items():
+        targets.setdefault(actual, []).append(alias)
+    with open_archive() as archive:
         for item in archive:
-            name = _relative(item.name)
-            if conda:
-                if not name.parts or name.parts[0] != 'include':
-                    continue
-                name = PurePosixPath(*name.parts[1:])
-            if not name.parts:
+            name = _relative(item.name).as_posix()
+            aliases = targets.pop(name, None)
+            if aliases is None:
                 continue
-            target = destination.joinpath(*name.parts)
-            if item.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            elif item.isfile():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.extractfile(item) as src, target.open('xb') as dst:
-                    shutil.copyfileobj(src, dst)
-            elif item.issym() or item.islnk():
-                links.append((name, item.linkname, item.islnk()))
-            else:
-                raise RuntimeError('unsupported header archive member: ' + item.name)
-    # Rebase guest-absolute links and refuse to follow links outside this tree.
-    # External symlinks are represented as unavailable, not resolved via the host.
-    for name, raw, hard in links:
-        target = destination.joinpath(*name.parts)
-        if hard:
-            source = _relative(raw)
-            if conda:
-                if not source.parts or source.parts[0] != 'include':
-                    continue
-                source = PurePosixPath(*source.parts[1:])
-            relative = source.as_posix()
-        elif raw.startswith('/'):
-            if conda or not raw.startswith('/usr/include/'):
-                continue
-            relative = raw.removeprefix('/usr/include/')
-        else:
-            relative = posixpath.normpath(posixpath.join(name.parent.as_posix(), raw))
-        if relative == '..' or relative.startswith('../') or relative.startswith('/'):
-            continue
-        source = destination.joinpath(*_relative(relative).parts)
-        if any(parent.is_symlink() for parent in target.parents if parent != destination.parent):
-            raise RuntimeError('symlink ancestor of header link: ' + name.as_posix())
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            raise RuntimeError('duplicate header archive member: ' + name.as_posix())
-        if hard:
-            if not source.is_file() or source.is_symlink():
-                raise RuntimeError('missing header hardlink source: ' + raw)
-            os.link(source, target)
-        else:
-            target.symlink_to(os.path.relpath(source, target.parent))
+            if not item.isfile():
+                raise RuntimeError('resolved header is not a regular archive member: ' + name)
+            target = destination.joinpath(*_relative(aliases[0]).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(item) as src, target.open('xb') as dst:
+                shutil.copyfileobj(src, dst)
+            for alias in aliases[1:]:
+                link = destination.joinpath(*_relative(alias).parts)
+                link.parent.mkdir(parents=True, exist_ok=True)
+                os.link(target, link)
+    if targets:
+        raise RuntimeError('archive changed between header inventory and extraction')
 
 
 def extract_golden(archive, destination):
-    with tarfile.open(archive, 'r:*') as source:
-        _extract_headers(source, destination, conda=False)
+    # The broker emits a flattened, regular-file snapshot with backwards
+    # hardlinks. Extract and read ownership in a single sequential pass.
+    destination = Path(destination)
+    destination.mkdir(parents=True)
+    metadata = {}
+    with tarfile.open(archive, 'r|*') as source:
+        for item in source:
+            name = _relative(item.name).as_posix()
+            if name == '.' or name in metadata or not (item.isfile() or item.islnk()):
+                raise RuntimeError('invalid Golden header snapshot member: ' + name)
+            record = golden_header_record(item)
+            target = destination/name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if item.islnk():
+                linked = _relative(item.linkname).as_posix()
+                if linked not in metadata:
+                    raise RuntimeError('unresolved Golden snapshot hardlink: ' + name)
+                os.link(destination/linked, target)
+            else:
+                with source.extractfile(item) as stream, target.open('xb') as output:
+                    shutil.copyfileobj(stream, output)
+            metadata[name] = record
+    if not metadata:
+        raise RuntimeError('Golden header snapshot is empty')
+    return metadata
+
+
+@contextlib.contextmanager
+def _conda_payload(archive, filename):
+    if filename.endswith('.tar.bz2'):
+        with tarfile.open(archive, 'r|bz2') as source:
+            yield source
+        return
+    if not filename.endswith('.conda'):
+        raise RuntimeError('unsupported locked Conda archive format: ' + filename)
+    with zipfile.ZipFile(archive) as package:
+        members = [name for name in package.namelist() if name.startswith('pkg-') and name.endswith('.tar.zst')]
+        if len(members) != 1:
+            raise RuntimeError('missing unique Conda payload stream')
+    with subprocess.Popen(['unzip', '-p', str(archive), members[0]], stdout=subprocess.PIPE) as unzip:
+        try:
+            with subprocess.Popen(['zstd', '-dc'], stdin=unzip.stdout, stdout=subprocess.PIPE) as zstd:
+                unzip.stdout.close()
+                try:
+                    with tarfile.open(fileobj=zstd.stdout, mode='r|') as source:
+                        yield source
+                    while zstd.stdout.read(1024 * 1024):
+                        pass
+                except BaseException:
+                    zstd.kill()
+                    raise
+            if zstd.returncode:
+                raise RuntimeError('Conda zstd payload decompression failed')
+        except BaseException:
+            if unzip.poll() is None:
+                unzip.kill()
+            raise
+    if unzip.returncode:
+        raise RuntimeError('Conda zip payload extraction failed')
 
 
 def extract_conda(archive, destination, *, filename):
-    if filename.endswith('.tar.bz2'):
-        with tarfile.open(archive, 'r|bz2') as source:
-            _extract_headers(source, destination, conda=True)
-    elif filename.endswith('.conda'):
-        # unzip and zstd stream the payload without writing a second archive.
-        with zipfile.ZipFile(archive) as package:
-            members = [name for name in package.namelist() if name.startswith('pkg-') and name.endswith('.tar.zst')]
-            if len(members) != 1:
-                raise RuntimeError('missing unique Conda payload stream')
-        with subprocess.Popen(['unzip', '-p', str(archive), members[0]], stdout=subprocess.PIPE) as unzip:
+    _extract_headers(lambda: _conda_payload(archive, filename), destination, prefix='include', absolute_links=False)
+
+
+@contextlib.contextmanager
+def deb_payload(path):
+    import tempfile
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(['dpkg-deb', '--fsys-tarfile', str(path)], stdout=subprocess.PIPE, stderr=errors) as process:
             try:
-                with subprocess.Popen(['zstd', '-dc'], stdin=unzip.stdout, stdout=subprocess.PIPE) as zstd:
-                    unzip.stdout.close()
-                    try:
-                        with tarfile.open(fileobj=zstd.stdout, mode='r|') as source:
-                            _extract_headers(source, destination, conda=True)
-                        # Drain tar padding and any remaining payload before checking exit status.
-                        while zstd.stdout.read(1024 * 1024):
-                            pass
-                    except BaseException:
-                        zstd.kill()
-                        raise
-                if zstd.returncode:
-                    raise RuntimeError('Conda zstd payload decompression failed')
+                with tarfile.open(fileobj=process.stdout, mode='r|') as archive:
+                    yield archive
+                while process.stdout.read(1024 * 1024):
+                    pass
             except BaseException:
-                if unzip.poll() is None:
-                    unzip.kill()
+                process.kill()
                 raise
-        if unzip.returncode:
-            raise RuntimeError('Conda zip payload extraction failed')
-    else:
-        raise RuntimeError('unsupported locked Conda archive format: ' + filename)
+            if process.wait():
+                errors.seek(0)
+                raise RuntimeError('Debian payload inspection failed: ' + errors.read().decode(errors='replace'))
+
+
+def deb_index(path):
+    with deb_payload(path) as archive:
+        return archive_file_index(archive)
+
+
+def deb_extract_files(path, destination, names):
+    destination = Path(destination)
+    remaining = set(names)
+    for name in remaining:
+        _relative(name)
+    with deb_payload(path) as archive:
+        for item in archive:
+            name = _relative(item.name).as_posix()
+            if name not in remaining:
+                continue
+            if not item.isfile():
+                raise RuntimeError('native overlay source is not a regular file: ' + name)
+            target = destination.joinpath(*_relative(name).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.extractfile(item) as source, target.open('xb') as output:
+                shutil.copyfileobj(source, output)
+            remaining.remove(name)
+    if remaining:
+        raise RuntimeError('native overlay archive entries missing: ' + repr(sorted(remaining)))
+
+
+def merge_header_namespace(golden_metadata, archives, *, replaced_packages=()):
+    # A tar hardlink is bound to an inode in its own payload, not a symlink
+    # that follows later replacements in the installed namespace.
+    entries = {'usr': ('directory', ''), 'usr/include': ('directory', '')}
+    sources = {}
+    owners = {}
+    replaced = set(replaced_packages)
+
+    def replaced_path(packages):
+        return bool(packages) and set(packages) <= replaced
+
+    def parent_directories(name):
+        for parent in PurePosixPath(name).parents:
+            if parent.as_posix() != '.':
+                entries.setdefault(parent.as_posix(), ('directory', ''))
+
+    for name, row in sorted(golden_metadata.items()):
+        full = 'usr/include/' + name
+        physical = row['source']
+        _relative(physical)
+        if not replaced_path(row['source_owners']):
+            parent_directories(physical)
+            entries[physical] = ('file', '')
+            sources.setdefault(physical, (None, full))
+        if physical != full and not any(replaced_path(group) for group in row['alias_owners']):
+            parent_directories(full)
+            entries[full] = ('symlink', '/' + physical)
+    for sha, index in sorted(archives.items()):
+        for name, row in index.items():
+            kind, target = row
+            previous = owners.get(name)
+            if previous is not None and (kind != 'directory' or entries[name][0] != 'directory'):
+                entries[name] = ('ambiguous', '')
+                sources.pop(name, None)
+            elif kind == 'hardlink':
+                resolved = archive_hardlink_target(index, name)
+                if resolved is None:
+                    entries[name] = ('other', '')
+                    sources.pop(name, None)
+                elif resolved[1] == 'file':
+                    entries[name] = ('file', '')
+                    sources[name] = (sha, resolved[0])
+                else:
+                    entries[name] = ('symlink', resolved[2])
+                    sources.pop(name, None)
+            else:
+                entries[name] = (kind, target)
+                if kind == 'file':
+                    sources[name] = (sha, name)
+                else:
+                    sources.pop(name, None)
+            owners[name] = sha
+    visible = visible_header_files(entries, 'usr/include')
+    return {name: sources[actual] for name, actual in visible.items()}
+
+
+def package_identity(name):
+    package, sep, architecture = name.partition(':')
+    return bool(_PACKAGE.fullmatch(package) and (not sep or re.fullmatch(r'[a-z0-9][a-z0-9-]*', architecture)))
+
+
+def dpkg_file_owners(archive, installed):
+    from collections import defaultdict
+    owners = defaultdict(set)
+    for item in archive:
+        path = _relative(item.name)
+        if not item.isfile() or path.suffix != '.list':
+            continue
+        package = path.stem
+        if not package_identity(package):
+            raise RuntimeError('invalid Golden dpkg file list: ' + path.as_posix())
+        if package not in installed:
+            continue
+        with archive.extractfile(item) as stream:
+            for line in stream.read().decode('utf-8').splitlines():
+                if not line.startswith('/') or '..' in PurePosixPath(line).parts or '\x00' in line:
+                    raise RuntimeError('invalid installed package path: ' + line)
+                owners[posixpath.normpath(line)].add(package)
+    return owners
+
+
+def golden_header_record(item):
+    import json
+    name = _relative(item.name).as_posix()
+    raw = item.pax_headers.get('gpttrace.header')
+    if raw is None:
+        raise RuntimeError('Golden header snapshot lacks source ownership: ' + name)
+    row = json.loads(raw)
+    if (not isinstance(row, dict) or set(row) != {'source', 'source_owners', 'alias_owners'}
+            or not isinstance(row['source'], str) or row['source'] == '.'
+            or not isinstance(row['source_owners'], list) or not isinstance(row['alias_owners'], list)
+            or any(not isinstance(group, list) or any(not isinstance(value, str) or not package_identity(value)
+                   for value in group) for group in [row['source_owners'], *row['alias_owners']])):
+        raise RuntimeError('invalid Golden header source ownership: ' + name)
+    if _relative(row['source']).as_posix() != row['source']:
+        raise RuntimeError('noncanonical Golden header path: ' + name)
+    return row
+
+
+def golden_header_metadata(archive):
+    result = {}
+    for item in archive:
+        name = _relative(item.name).as_posix()
+        if name == '.' or name in result or not (item.isfile() or item.islnk()):
+            raise RuntimeError('invalid Golden header snapshot member: ' + name)
+        result[name] = golden_header_record(item)
+    return result
+
+
+def deb_header_entries(path, candidates):
+    return header_entries_from_index(deb_index(path), candidates)
+
+
+def header_entries_from_index(entries, candidates):
+    result = {}
+    for name in sorted(set(candidates)):
+        _relative(name)
+        for candidate in (PurePosixPath(name), *PurePosixPath(name).parents):
+            kind, target = entries.get(candidate.as_posix(), ('absent', ''))
+            if ((candidate.as_posix() == name and kind in ('file', 'hardlink', 'symlink'))
+                    or kind == 'symlink'):
+                resolved = resolve_archive_path(entries, name)
+                result[name] = {'member': candidate.as_posix(), 'kind': kind,
+                                'link_target': target, 'archive_target': resolved[0] if resolved and resolved[1] == 'file' else None}
+                break
+    return result
+
+
+def export_golden_headers(guest, destination, *, owners):
+    import tempfile
+    import json
+    destination = Path(destination)
+    with tempfile.TemporaryDirectory(prefix='.golden-header-export-', dir=destination.parent) as raw:
+        directory = Path(raw)
+        with tarfile.open(destination, 'x') as output:
+            emitted = set()
+            canonical_files = {}
+            def emit_file(name, stream, size, canonical, alias_links):
+                if name in emitted:
+                    raise RuntimeError('duplicate exported Golden header: ' + name)
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.pax_headers['gpttrace.header'] = json.dumps({
+                    'source': _relative(canonical.lstrip('/')).as_posix(),
+                    'source_owners': sorted(owners.get(canonical, ())),
+                    'alias_owners': [sorted(owners.get(link, ())) for link in alias_links],
+                }, sort_keys=True, separators=(',', ':'))
+                if canonical in canonical_files:
+                    member.type = tarfile.LNKTYPE
+                    member.linkname = canonical_files[canonical]
+                    output.addfile(member)
+                else:
+                    member.size = size
+                    output.addfile(member, stream)
+                    canonical_files[canonical] = name
+                emitted.add(name)
+            def tree(guest_path, prefix, ancestors, alias_links):
+                archive_path = directory / ('tree-' + str(len(ancestors)) + '.tar')
+                guest.tar_out(guest_path, str(archive_path))
+                try:
+                    with tarfile.open(archive_path, 'r:*') as source:
+                        seen = set()
+                        for item in source:
+                            relative = _relative(item.name).as_posix()
+                            if relative == '.':
+                                if not item.isdir():
+                                    raise RuntimeError('invalid Golden archive root')
+                                continue
+                            if relative in seen:
+                                raise RuntimeError('duplicate Golden archive entry: ' + relative)
+                            seen.add(relative)
+                            name = posixpath.join(prefix, relative)
+                            logical = posixpath.join(guest_path, relative)
+                            if item.isdir():
+                                continue
+                            if item.isfile() or item.islnk():
+                                with source.extractfile(item) as stream:
+                                    size = item.size if item.isfile() else stream.seek(0, os.SEEK_END)
+                                    stream.seek(0)
+                                    emit_file(name, stream, size, logical, alias_links)
+                            elif item.issym():
+                                if guest.is_file(logical, followsymlinks=True):
+                                    canonical = guest.realpath(logical)
+                                    if canonical in canonical_files:
+                                        emit_file(name, None, 0, canonical, (*alias_links, logical))
+                                        continue
+                                    target = directory / 'link-file'
+                                    guest.download(canonical, str(target))
+                                    try:
+                                        with target.open('rb') as stream:
+                                            emit_file(name, stream, target.stat().st_size, canonical, (*alias_links, logical))
+                                    finally:
+                                        target.unlink()
+                                elif guest.is_dir(logical, followsymlinks=True):
+                                    actual = guest.realpath(logical)
+                                    if actual in ancestors:
+                                        raise RuntimeError('cyclic Golden header directory: ' + logical)
+                                    tree(actual, name, ancestors | {actual}, (*alias_links, logical))
+                                else:
+                                    print('unavailable Golden header link: ' + logical, file=sys.stderr)
+                            else:
+                                raise RuntimeError('unsupported Golden header member: ' + logical)
+                finally:
+                    archive_path.unlink()
+            include = guest.realpath('/usr/include')
+            tree(include, '', {include}, ('/usr/include',) if include != '/usr/include' else ())
+            if not emitted:
+                raise RuntimeError('Golden header export is empty')
+
+
+def export_golden_image(image, destination, status):
+    import guestfs
+    guest = guestfs.GuestFS(python_return_dict=True)
+    try:
+        guest.set_network(False)
+        guest.add_drive_opts(str(image), readonly=True, format='qcow2')
+        guest.launch()
+        roots = guest.inspect_os()
+        if len(roots) != 1:
+            raise RuntimeError('missing unique Golden operating system')
+        mounts = guest.inspect_get_mountpoints(roots[0])
+        for mount, device in sorted(mounts.items(), key=lambda item: (len(PurePosixPath(item[0]).parts), item[0])):
+            guest.mount_ro(device, mount)
+        guest.download('/var/lib/dpkg/status', str(status))
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='.golden-dpkg-owners-', dir=Path(destination).parent) as raw:
+            metadata = Path(raw) / 'dpkg-info.tar'
+            guest.tar_out('/var/lib/dpkg/info', str(metadata))
+            with tarfile.open(metadata, 'r|*') as archive:
+                owners = dpkg_file_owners(archive, installed_packages(Path(status).read_bytes()))
+            if not owners:
+                raise RuntimeError('Golden dpkg file ownership is empty')
+        export_golden_headers(guest, destination, owners=owners)
+    finally:
+        guest.close()
 
 
 def compiler_profile(compiler, architecture, *, timeout):
@@ -584,7 +982,15 @@ if __name__ == '__main__':
     if command == 'conda-headers' and len(args) == 3:
         extract_conda(args[0], args[1], filename=args[2])
     elif command == 'golden-headers' and len(args) == 2:
-        extract_golden(*args)
+        print(json.dumps(extract_golden(*args), sort_keys=True))
+    elif command == 'golden-export' and len(args) == 3:
+        export_golden_image(*args)
+    elif command == 'deb-index' and len(args) == 1:
+        print(json.dumps(deb_index(args[0]), sort_keys=True))
+    elif command == 'deb-extract-files' and len(args) == 3:
+        deb_extract_files(args[0], args[1], json.loads(Path(args[2]).read_bytes()))
+    elif command == 'deb-header-entries' and len(args) == 2:
+        print(json.dumps(deb_header_entries(args[0], json.loads(Path(args[1]).read_bytes())), sort_keys=True))
     elif command == 'contents' and len(args) == 3:
         print(json.dumps(query_index(args[0], {name: set(paths) for name, paths in json.loads(args[1]).items()}, args[2])))
     elif command == 'conda-inventory' and len(args) == 2:

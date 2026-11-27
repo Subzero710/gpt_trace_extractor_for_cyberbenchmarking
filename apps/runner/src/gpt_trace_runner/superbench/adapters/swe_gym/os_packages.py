@@ -110,6 +110,57 @@ def require_requested(requested, inventory):
         raise RuntimeError('offline APT replay omitted requested packages: '+', '.join(sorted(missing)))
 
 
+def native_requirement_paths(requirements):
+    """Validate observed system-file lookup identities without accepting shell input."""
+    if not isinstance(requirements, dict):
+        raise RuntimeError('invalid native requirement set')
+    result = {}
+    for key, paths in requirements.items():
+        if not isinstance(key, str) or ':' not in key:
+            raise RuntimeError('invalid native requirement identity')
+        kind, lookup = key.split(':', 1)
+        name, separator, observation = lookup.partition('@')
+        if (kind not in {'header', 'library', 'soname', 'tool'} or not name
+                or not re.fullmatch(r'[A-Za-z0-9_.+/-]+', name)
+                or name.startswith('/') or any(part in {'', '.', '..'} for part in name.split('/'))
+                or (kind != 'header' and '/' in name)
+                or not isinstance(paths, list) or not paths
+                or not all(isinstance(path, str) for path in paths)):
+            raise RuntimeError('invalid native requirement: ' + key)
+        suffixes = {name} if kind != 'library' else {'lib' + name + '.so', 'lib' + name + '.a'}
+        valid = set()
+        roots = ('usr/bin/', 'bin/', 'usr/sbin/', 'sbin/') if kind == 'tool' else ('usr/include/', 'usr/lib/', 'lib/', 'lib64/', 'usr/lib64/')
+        for path in paths:
+            if (not re.fullmatch(r'[A-Za-z0-9_.+/-]+', path)
+                    or path.startswith('/') or any(part in {'', '.', '..'} for part in path.split('/'))
+                    or not path.startswith(roots)
+                    or not any(path.endswith('/' + suffix) for suffix in suffixes)):
+                raise RuntimeError('invalid native provider path: ' + path)
+            valid.add(path)
+        paths = sorted(valid)
+        if separator:
+            expected = hashlib.sha256(json.dumps(paths, separators=(',', ':')).encode()).hexdigest()
+            if observation != expected:
+                raise RuntimeError('native observation identity differs from its paths')
+        result[key] = paths
+    return dict(sorted(result.items()))
+
+def require_native_headers(providers, *, root=Path('/')):
+    root = Path(root).resolve(strict=True)
+    if not isinstance(providers, dict):
+        raise RuntimeError('invalid native provider manifest')
+    for identity, row in sorted(providers.items()):
+        if not isinstance(row, dict):
+            raise RuntimeError('invalid native provider: ' + identity)
+        key = identity if ':' in identity else 'header:' + identity
+        paths = native_requirement_paths({key: row.get('paths')})[key]
+        if not any((root / relative).is_file() and
+                   (root / relative).resolve(strict=True).is_relative_to(root) and
+                   (not key.startswith('tool:') or os.access(root / relative, os.X_OK)) for relative in paths):
+            raise RuntimeError('installed native header unavailable: ' + identity + ' from ' + row['package']
+                               + ' (' + ', '.join(paths) + ')')
+
+
 def install(folder, manifest, *, compare_final=True):
     folder = Path(folder)
     verify_artifacts(folder, manifest)
@@ -127,6 +178,14 @@ def install(folder, manifest, *, compare_final=True):
         _install_archives(command, log)
     actual = installed()
     require_requested(manifest['requested'], actual)
+    providers = manifest.get('native_headers', {})
+    if not isinstance(providers, dict):
+        raise RuntimeError('invalid native header provider manifest')
+    identities = {(row['package'], row['sha256']) for row in manifest['artifacts'].values()}
+    if any(not isinstance(row, dict) or (row.get('package'), row.get('archive_sha256')) not in identities
+           for row in providers.values()):
+        raise RuntimeError('native header provider is not part of the exact installed APT archive closure')
+    require_native_headers(providers)
     if compare_final and actual != manifest["installed_after"]:
         raise RuntimeError("installed OS inventory differs from resolved artifact closure")
     return actual
@@ -165,7 +224,8 @@ def resolve_from_pool(folder, source):
             shutil.copyfile(original, folder / filename)
     manifest = {'schema_version': 1, 'requested': requested,
                 'installed_before': before, 'artifacts': records,
-                'repository_metadata': evidence.get('repository_metadata', {})}
+                'repository_metadata': evidence.get('repository_metadata', {}),
+                **({'native_headers': evidence['native_headers']} if 'native_headers' in evidence else {})}
     manifest['installed_after'] = install(folder, manifest, compare_final=False)
     (folder / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, separators=(',',':')))
     return manifest
