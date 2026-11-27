@@ -224,6 +224,7 @@ def test_shared_capture_reuses_verified_wheel_and_no_source_fallback(tmp_path, m
         folder = Path(args[args.index('--wheel-dir')+1])
         write_fixture_wheel(folder/name, 'fixture', '1')
     monkeypatch.setattr(runtime, '_activated_capture_environment', lambda prefix, env, **kwargs: env)
+    monkeypatch.setattr(runtime, '_installed_wheel_evidence', lambda *args: {'distributions': {}, 'tags': []})
     monkeypatch.setattr(runtime, 'run', wheel)
     item = {'instance_id': 'fixture'}
     env = {'pip_freeze': 'fixture==1', 'conda_explicit': 'fixture'}
@@ -283,6 +284,7 @@ def test_independent_capture_persists_exact_successes_before_reporting_failure(t
             raise subprocess.CalledProcessError(1, args)
         write_fixture_wheel(folder/'beta-2-py3-none-any.whl', 'beta', '2')
     monkeypatch.setattr(runtime, '_activated_capture_environment', lambda prefix, env, **kwargs: env)
+    monkeypatch.setattr(runtime, '_installed_wheel_evidence', lambda *args: {'distributions': {}, 'tags': []})
     monkeypatch.setattr(runtime, 'run', wheel)
     env = {'pip_freeze': 'alpha==1\nbeta==2', 'conda_explicit': 'fixture'}
     item = {'instance_id': 'fixture'}
@@ -354,3 +356,62 @@ def test_full_recipe_log_discovers_only_failing_command(tmp_path):
     data = (marker+'0\nfatal error: optional.h: No such file or directory\n'+marker+'1\n'
             'fatal error: required.h: No such file or directory\n'+'x'*20000+'\n').encode()
     assert runtime._recipe_observations(io.BytesIO(data), marker) == {('header','required.h')}
+
+
+def test_cross_context_wheel_reuse_requires_exact_installed_payload(tmp_path, monkeypatch):
+    import csv
+    import io
+    import zipfile
+    from packaging.requirements import Requirement
+    runtime = load(ADAPTER/'guest_runtime.py')
+    wheel = tmp_path/'alpha-1-py3-none-any.whl'
+    write_fixture_wheel(wheel, 'alpha', '1')
+    root = tmp_path/'installed'; root.mkdir()
+    with zipfile.ZipFile(wheel) as archive:
+        archive.extractall(root)
+        record_name, = [name for name in archive.namelist() if name.endswith('/RECORD')]
+        rows = {row[0]: row[1:] for row in csv.reader(io.StringIO(archive.read(record_name).decode()))}
+    evidence = {'root': str(root), 'version': '1', 'record': rows}
+    requirement = Requirement('alpha==1')
+    assert runtime._matches_installed_wheel(wheel, wheel.name, requirement, evidence, {'py3-none-any'})
+    assert not runtime._matches_installed_wheel(wheel, wheel.name, requirement, evidence, {'cp38-cp38-linux_x86_64'})
+    payload = next(name for name in rows if not name.endswith('/RECORD') and not '.dist-info/' in name)
+    target = root/payload
+    original = target.read_bytes(); target.write_bytes(b'X'*len(original))
+    assert not runtime._matches_installed_wheel(wheel, wheel.name, requirement, evidence, {'py3-none-any'})
+    target.write_bytes(original)
+    evidence['record']['unexpected.py'] = ['', '']
+    assert not runtime._matches_installed_wheel(wheel, wheel.name, requirement, evidence, {'py3-none-any'})
+
+
+def test_target_elf_loader_resolves_transitive_rpath_and_reports_missing(tmp_path):
+    import sys
+    import os
+    runtime = load(ADAPTER/'guest_runtime.py')
+    python = Path(sys.executable)
+    program = runtime._elf_program(python)
+    assert program['interpreter'] and program['dynamic']
+    (tmp_path/'leaf.c').write_text('int leaf(void) { return 1; }')
+    (tmp_path/'parent.c').write_text('extern int leaf(void); int parent(void) { return leaf(); }')
+    (tmp_path/'root.c').write_text('extern int parent(void); void *PyInit_fixture(void) { parent(); return 0; }')
+    leaf = tmp_path/'libfixture_leaf.so.1'
+    parent = tmp_path/'libfixture_parent.so.1'
+    module = tmp_path/'fixture.so'
+    subprocess.run(['gcc','-shared','-fPIC',str(tmp_path/'leaf.c'),'-Wl,-soname,'+leaf.name,'-o',str(leaf)],check=True)
+    subprocess.run(['gcc','-shared','-fPIC',str(tmp_path/'parent.c'),'-L'+str(tmp_path),'-l:'+leaf.name,
+                    '-Wl,-soname,'+parent.name,'-Wl,-rpath,$ORIGIN','-o',str(parent)],check=True)
+    subprocess.run(['gcc','-shared','-fPIC',str(tmp_path/'root.c'),'-L'+str(tmp_path),'-l:'+parent.name,
+                    '-Wl,-rpath,$ORIGIN','-o',str(module)],check=True)
+    assert runtime._elf_exports_python_module(module)
+    assert not runtime._elf_exports_python_module(parent)
+    env = {key: value for key, value in os.environ.items() if not key.startswith('LD_')}
+    assert runtime._elf_loader_missing(program['interpreter'], python, env, extension=module) == set()
+    leaf.unlink()
+    assert runtime._elf_loader_missing(program['interpreter'], python, env, extension=module) == {('soname', leaf.name)}
+
+    requests = runtime._elf_loader_missing(program['interpreter'], python, env, extension=module, search_paths=True)
+    assert len(requests) == 1
+    key, = requests
+    assert key.startswith('soname:' + leaf.name + '@')
+    assert all(path.endswith('/' + leaf.name) for path in requests[key])
+    assert load(ADAPTER/'os_packages.py').native_requirement_paths(requests) == requests

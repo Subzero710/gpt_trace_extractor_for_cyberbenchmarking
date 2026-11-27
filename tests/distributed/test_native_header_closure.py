@@ -558,3 +558,73 @@ def test_effective_pool_identity_excludes_progress_but_not_payload():
     assert second['pool_inputs_sha256'] != first['pool_inputs_sha256']
     inventory['task_plan']['fixture'] = {'repo': 'owner/repo'}
     assert builder.effective_pool_inputs(inventory, closure)['nonapt_inputs_sha256'] != second['nonapt_inputs_sha256']
+
+
+def _additive_manifest_fixture():
+    base = {'base': {'version': '1', 'architecture': 'all'}}
+    one = {'package': 'first', 'version': '1', 'architecture': 'all', 'sha256': 'a'*64, 'size': 1}
+    two = {'package': 'second', 'version': '1', 'architecture': 'all', 'sha256': 'b'*64, 'size': 2}
+    prior = {'schema_version': 1, 'requested': ['first'], 'installed_before': base,
+             'installed_after': {**base, 'first': {'version': '1', 'architecture': 'all'}},
+             'artifacts': {'first.deb': one}}
+    current = {**prior, 'requested': ['first', 'second'], 'artifacts': {**prior['artifacts'], 'second.deb': two},
+               'installed_after': {**prior['installed_after'], 'second': {'version': '1', 'architecture': 'all'}}}
+    return prior, current
+
+
+def test_common_native_additive_transaction_is_exact_and_idempotent(tmp_path, monkeypatch):
+    prior, current = _additive_manifest_fixture()
+    delta = {'second.deb': current['artifacts']['second.deb']}
+    assert packages.additive_os_delta(prior, current) == delta
+    assert packages.additive_os_delta(prior, {**current, 'installed_after': {
+        **current['installed_after'], 'first': {'version':'2','architecture':'all'}}}) is None
+    assert packages.additive_os_delta(prior, {**current, 'artifacts': {
+        **current['artifacts'], 'first.deb': {**current['artifacts']['first.deb'], 'sha256': 'c'*64}}}) is None
+    assert packages.additive_os_delta(prior, {**current, 'installed_after': {
+        name: row for name,row in current['installed_after'].items() if name != 'first'}}) is None
+    state = [prior['installed_after']]
+    installs = []
+    monkeypatch.setattr(packages, 'installed', lambda: state[0])
+    def verify(folder, manifest):
+        assert folder == tmp_path and manifest['artifacts'] == delta
+    def install(folder, manifest):
+        assert folder == tmp_path and manifest['artifacts'] == delta
+        installs.append(manifest)
+        state[0] = current['installed_after']
+    monkeypatch.setattr(packages, 'verify_artifacts', verify)
+    monkeypatch.setattr(packages, '_install_verified', install)
+    assert packages.extend(tmp_path, prior, current) == current['installed_after']
+    assert packages.extend(tmp_path, prior, current) == current['installed_after']
+    assert len(installs) == 1
+    state[0] = {'unexpected': {'version':'1','architecture':'all'}}
+    with pytest.raises(RuntimeError, match='uncommitted package transaction'):
+        packages.extend(tmp_path, prior, current)
+
+
+def test_native_common_stage_requires_exact_incomplete_image_proof(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip('real trusted root-owned stage fixture required')
+    from gpt_trace_transport.local_templates import file_signature
+    builder = load(ROOT/'scripts/build_local_templates.py')
+    prior, current = _additive_manifest_fixture()
+    stage = tmp_path/'.build-native'; stage.mkdir()
+    checkpoints = stage/'.checkpoints'; checkpoints.mkdir()
+    manifest = stage/'os/swe-gym-os/manifest.json'
+    manifest.parent.mkdir(parents=True)
+    image = stage/'common.qcow2'; image.write_bytes(b'incomplete image fixture')
+    identity = {'nonapt_inputs_sha256': 'd'*64, 'pool_inputs_sha256': 'e'*64, 'apt_inputs_sha256':'f'*64}
+    builder.atomic_json(stage/'build-identity.json', identity)
+    builder.atomic_json(manifest, prior)
+    receipt = {'schema':1,'pool_inputs_sha256': identity['pool_inputs_sha256'],
+               'image': list(file_signature(image)), 'os_manifest_sha256': builder.digest(manifest)}
+    builder.atomic_json(checkpoints/'common-native-pending.json', receipt)
+    next_identity = {**identity, 'pool_inputs_sha256':'1'*64, 'apt_inputs_sha256':'2'*64}
+    archives = {name: (tmp_path/name, record) for name,record in current['artifacts'].items()}
+    assert builder.select_native_common_stage([stage],next_identity,current,archives) == (stage,identity,prior)
+    assert builder.select_native_common_stage([stage],{**next_identity,'nonapt_inputs_sha256':'3'*64},current,archives) is None
+    (checkpoints/('task-v' + str(builder.TASK_RUNTIME_SCHEMA) + '-proof.json')).write_text('{}')
+    with pytest.raises(RuntimeError, match='dependent task'):
+        builder.select_native_common_stage([stage],next_identity,current,archives)
+    (checkpoints/('task-v' + str(builder.TASK_RUNTIME_SCHEMA) + '-proof.json')).unlink()
+    image.write_bytes(b'changed image')
+    assert builder.select_native_common_stage([stage],next_identity,current,archives) is None

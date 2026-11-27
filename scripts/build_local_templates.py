@@ -109,7 +109,7 @@ COMMON_BOOTSTRAP_COMPLETION = "/opt/swe-gym-lite/common-bootstrap-complete.json"
 REPO_COMPLETION = "/opt/swe-gym-lite/repository-template-complete.json"
 TASK_COMPLETION = "/opt/swe-gym-task/build-complete.json"
 RESOLVER_COMPLETION = "/opt/swe-gym-os-resolver-complete.json"
-TASK_RUNTIME_SCHEMA = 7
+TASK_RUNTIME_SCHEMA = 8
 
 
 class RecoverableBuildError(RuntimeError):
@@ -469,6 +469,50 @@ def os_validation_matches(manifest, closure, packages):
             and manifest.get('requested') == closure['requested']
             and manifest.get('artifacts') == {name: record for name, (_, record) in packages.items()}
             and manifest.get('native_headers', {}) == closure.get('native_discovery', {}).get('providers', {}))
+
+
+def common_additive_candidate(previous, closure, packages):
+    """Reject any update or replacement before selecting an old common volume.
+
+    The new resolver later proves the exact installed inventory independently;
+    this admission is based solely on signed archive identities.
+    """
+    old = previous['artifacts']
+    current = {name: record for name, (_, record) in packages.items()}
+    if not set(previous['requested']) <= set(closure['requested']):
+        return False
+    if any(current.get(name) != record for name, record in old.items()):
+        return False
+    installed = {(name.split(':')[0], row['architecture']) for name, row in previous['installed_after'].items()}
+    delta = [record for name, record in current.items() if name not in old]
+    return bool(delta) and all((row['package'], row['architecture']) not in installed for row in delta)
+
+
+def select_native_common_stage(candidates, identity, closure, packages):
+    from gpt_trace_transport.local_templates import safe, file_signature
+    eligible = []
+    for stage in candidates:
+        receipt_path = stage / '.checkpoints/common-native-pending.json'
+        if not receipt_path.is_file():
+            continue
+        prior = json.loads(safe(stage / 'build-identity.json', immutable=True).read_bytes())
+        if prior.get('nonapt_inputs_sha256') != identity['nonapt_inputs_sha256']:
+            continue
+        if (stage / 'local-validation.json').exists():
+            continue
+        common = safe(stage / 'common.qcow2')
+        previous = safe(stage / 'os/swe-gym-os/manifest.json', immutable=True)
+        receipt = json.loads(safe(receipt_path, immutable=True).read_bytes())
+        if receipt != {'schema': 1, 'pool_inputs_sha256': prior['pool_inputs_sha256'],
+                        'image': list(file_signature(common)), 'os_manifest_sha256': digest(previous)}:
+            # A stale receipt is never authority to mutate another image.
+            continue
+        if ((stage / 'repos').exists() or any((stage / '.checkpoints').glob('task-*.json'))):
+            raise RuntimeError('native common continuation has dependent task or repository state; preserved')
+        manifest = json.loads(previous.read_bytes())
+        if common_additive_candidate(manifest, closure, packages):
+            eligible.append((stage, prior, manifest))
+    return max(eligible, key=lambda row: _stage_score(row[0])) if eligible else None
 
 
 def published_apt_archives(archives, closure):
@@ -1024,6 +1068,7 @@ def build(args, *, progress=None):
     closure_relative = "metadata/apt-closure.json"
     rows = archives.metadata(closure_relative)
     payload_identity = effective_pool_inputs(pool_record, rows)
+    apt_packages = published_apt_archives(archives, rows)
     from workstation_broker.preparation_resources import source_container_arguments
     if (args.virtual_gib, args.free_space_gib) != (VIRTUAL_GIB, FREE_SPACE_GIB):
         raise RuntimeError("local preparation capacity/deadline differs from the versioned recipe")
@@ -1063,6 +1108,7 @@ def build(args, *, progress=None):
         staged = target_root / (".build-resumable-v4-" + args.operation_id + "-" + identity["pool_inputs_sha256"])
         # Keep absolute scratch backing paths valid: select a compatible stage
         # in place rather than renaming it to the new publication's name.
+        migration = None
         if not staged.exists() and not staged.is_symlink():
             candidates = []
             for candidate in _compatible_stage_candidates(target_root, staged, identity):
@@ -1072,6 +1118,17 @@ def build(args, *, progress=None):
                     candidates.append(candidate)
             if candidates:
                 staged = max(candidates, key=_stage_score)
+            else:
+                migration = select_native_common_stage(
+                    _compatible_stage_candidates(target_root, staged, identity), identity, rows, apt_packages)
+                if migration is not None:
+                    staged, prior, previous_os = migration
+                    journal = {'schema': 1, 'from': prior['pool_inputs_sha256'],
+                               'to': identity['pool_inputs_sha256'], 'previous_apt_inputs_sha256': prior['apt_inputs_sha256'],
+                               'previous_os': previous_os}
+                    atomic_json(staged / '.checkpoints/common-native-migration.json', journal)
+                    atomic_json(staged / 'build-identity.json', identity)
+                    print('continuing uncommitted common across additive native APT round', flush=True)
         if staged.exists() and (staged / "local-validation.json").exists():
             prior = json.loads(safe(staged / "build-identity.json", immutable=True).read_bytes())
             if prior.get("pool_manifest_sha256") != publication["manifest_sha256"]:
@@ -1125,6 +1182,15 @@ def build(args, *, progress=None):
         from gpt_trace_transport.local_templates import safe
         safe(checkpoints, directory=True)
         historical_stages = _compatible_stage_candidates(target_root, staged, identity)
+        migration_path = checkpoints / 'common-native-migration.json'
+        common_migration = None
+        if migration_path.exists() or migration_path.is_symlink():
+            record = json.loads(safe(migration_path, immutable=True).read_bytes())
+            if (set(record) != {'schema', 'from', 'to', 'previous_apt_inputs_sha256', 'previous_os'}
+                    or record.get('schema') != 1 or record.get('to') != identity['pool_inputs_sha256']
+                    or any(SHA.fullmatch(str(record.get(key))) is None for key in ('from', 'previous_apt_inputs_sha256'))):
+                raise RuntimeError('invalid common native migration journal')
+            common_migration = record
         if job["compatibility"].get("task_runtime_schema") != TASK_RUNTIME_SCHEMA:
             raise RuntimeError("task runtime schema differs between preparation contract and builder")
         scratch_root = target_root / ".scratch"
@@ -1561,7 +1627,6 @@ def build(args, *, progress=None):
             # resolver volume; never recreate it merely because a host copy-out
             # was interrupted.
             closure_sha = identity["apt_inputs_sha256"]
-            apt_packages = published_apt_archives(archives, rows)
             status_sha = rows["golden_dpkg_status_sha256"]
             if SHA.fullmatch(status_sha) is None:
                 raise RuntimeError("invalid golden dpkg status identity in APT closure")
@@ -1574,7 +1639,8 @@ def build(args, *, progress=None):
             prior_os = (json.loads(safe(os_folder / "manifest.json").read_text())
                         if (os_folder / "manifest.json").is_file() else None)
             if prior_os is not None and prior_os.get('artifacts') != {name: record for name, (_, record) in apt_packages.items()}:
-                raise RuntimeError('persistent stage OS archive identities differ; preserved')
+                if common_migration is None or prior_os != common_migration['previous_os']:
+                    raise RuntimeError('persistent stage OS archive identities differ; preserved')
             if prior_os is not None and os_validation_matches(prior_os, rows, apt_packages):
                 os_manifest = prior_os
                 bind_os_archives(os_folder, os_manifest, rows, apt_packages)
@@ -1630,7 +1696,10 @@ def build(args, *, progress=None):
                 if not os_validation_matches(os_manifest, rows, apt_packages):
                     raise RuntimeError('resolver manifest differs from current signed provider evidence')
                 if prior_os is not None and os_replay_identity(prior_os) != os_replay_identity(os_manifest):
-                    raise RuntimeError('identical OS inputs produced different installed inventories; preserved')
+                    native_tools = load_module('swegym_os_additive_contract', GUEST.with_name('os_packages.py'))
+                    if (common_migration is None or prior_os != common_migration['previous_os']
+                            or native_tools.additive_os_delta(prior_os, os_manifest) is None):
+                        raise RuntimeError('identical OS inputs produced different installed inventories; preserved')
                 os_parent.mkdir(exist_ok=True)
                 os_folder.mkdir(exist_ok=True)
                 bind_os_archives(os_folder, os_manifest, rows, apt_packages)
@@ -1821,10 +1890,52 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                             raise RuntimeError("historical archive provenance differs; preserved")
                     return True
 
-                mode = common_input_mode(common, input_completion, list_directory=guest_directory,
-                                         read_json=guest_json, legacy_ready=legacy_inputs_ready)
+                migration_needed = False
+                if common_migration is not None:
+                    previous_os = common_migration['previous_os']
+                    native_tools = load_module('swegym_os_additive_replay', GUEST.with_name('os_packages.py'))
+                    delta = native_tools.additive_os_delta(previous_os, os_manifest)
+                    if delta is None:
+                        raise RuntimeError('new installed OS closure is not a strict additive continuation')
+                    old_input = guest_json(common, COMMON_INPUTS_COMPLETION)
+                    old_manifest = guest_json(common, '/opt/swe-gym-lite/os-manifest.json')
+                    expected_old_input = {**input_completion, 'pool_inputs_sha256': common_migration['from']}
+                    expected_old_input['apt_inputs_sha256'] = common_migration['previous_apt_inputs_sha256']
+                    if old_input == input_completion and os_replay_identity(old_manifest) == os_replay_identity(os_manifest):
+                        pass
+                    elif (old_input == expected_old_input and
+                          os_replay_identity(old_manifest) in (os_replay_identity(previous_os), os_replay_identity(os_manifest))):
+                        migration_needed = True
+                    else:
+                        raise RuntimeError('common guest migration identity differs; preserved')
+                mode = ('native-additive' if migration_needed else common_input_mode(
+                    common, input_completion, list_directory=guest_directory,
+                    read_json=guest_json, legacy_ready=legacy_inputs_ready))
                 uploads = ()
-                if mode in {"prepared", "legacy-prepared", "bootstrap-prepared"}:
+                if mode == 'native-additive':
+                    if guest_json(common, '/opt/swe-gym-lite/environment-cache-provenance.json') != archive_provenance:
+                        raise RuntimeError('common native migration changed non-APT archive provenance')
+                    payload.mkdir()
+                    os_payload = payload / 'os-artifacts'
+                    os_payload.mkdir()
+                    atomic_json(os_payload / 'previous.json', previous_os)
+                    atomic_json(os_payload / 'manifest.json', os_manifest)
+                    for name in sorted(delta):
+                        os.link(apt_packages[name][0], os_payload / name)
+                    selected_boot = """/usr/bin/python3 - <<'PY_APT_DELTA'
+import json,runpy
+from pathlib import Path
+folder=Path('/opt/swe-gym-build/os-artifacts')
+previous=json.loads((folder/'previous.json').read_bytes())
+current=json.loads((folder/'manifest.json').read_bytes())
+runpy.run_path('/opt/swe-gym-lite/os_packages.py')['extend'](folder,previous,current)
+runpy.run_path('/opt/swe-gym-lite/runtime.py')['_durable_json'](Path('/opt/swe-gym-lite/os-manifest.json'),current)
+PY_APT_DELTA
+""" + input_marker + common_tail
+                    cmd('virt-customize', '--no-network', '-a', str(common),
+                        '--run-command', 'rm -rf /opt/swe-gym-build')
+                    selected_payload = payload
+                elif mode in {"prepared", "legacy-prepared", "bootstrap-prepared"}:
                     if mode != "legacy-prepared":
                         if guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json") != archive_provenance:
                             raise RuntimeError("common input provenance differs from verified pool")
@@ -1893,11 +2004,23 @@ cp /opt/swe-gym-build/environment-cache-provenance.json /opt/swe-gym-lite/
                     provision(common, selected_boot, selected_payload, network=False,
                               completion=(COMMON_COMPLETION, common_completion),
                               refresh_runtime=mode != "bootstrap", extra_uploads=uploads)
+                except NativeResolutionRequired:
+                    from gpt_trace_transport.local_templates import file_signature
+                    if (guest_json_optional(common, COMMON_INPUTS_COMPLETION) != input_completion
+                            or guest_json_optional(common, COMMON_COMPLETION) is not None):
+                        raise RuntimeError('native request did not leave a committed incomplete common; preserved')
+                    write_checkpoint('common-native-pending.json', {
+                        'schema': 1, 'pool_inputs_sha256': identity['pool_inputs_sha256'],
+                        'image': list(file_signature(common)),
+                        'os_manifest_sha256': digest(os_folder / 'manifest.json')})
+                    raise
                 except RuntimeError as exc:
                     if _transient_failure(exc):
                         raise RecoverableBuildError("transient guest download; common checkpoint retained: " + str(exc)) from exc
                     raise
             common.chmod(0o444)
+            if payload.exists():
+                _discard(payload)
             environments = {key: guest_json(common, "/opt/swe-gym-lite/environments/" + key + ".json") for key in inputs["environments"]}
             common_cache = guest_json(common, "/opt/swe-gym-lite/environment-cache-provenance.json")
             if not common_ready and common_cache != archive_provenance:

@@ -220,11 +220,8 @@ def require_native_headers(providers, *, root=Path('/')):
                                + ' (' + ', '.join(paths) + ')')
 
 
-def install(folder, manifest, *, compare_final=True):
+def _install_verified(folder, manifest):
     folder = Path(folder)
-    verify_artifacts(folder, manifest)
-    if installed() != manifest["installed_before"]:
-        raise RuntimeError("OS artifact replay does not start from the exact golden package inventory")
     empty = folder / "empty-lists"
     empty.mkdir(exist_ok=True)
     # No lists and no network: APT may resolve only the exact local .debs and
@@ -235,6 +232,9 @@ def install(folder, manifest, *, compare_final=True):
     command += [str(folder / name) for name in sorted(manifest["artifacts"])]
     with (folder / "install.log").open("wb") as log:
         _install_archives(command, log)
+
+
+def _validate_installed_manifest(manifest, *, compare_final):
     actual = installed()
     require_requested(manifest['requested'], actual)
     providers = manifest.get('native_headers', {})
@@ -248,6 +248,57 @@ def install(folder, manifest, *, compare_final=True):
     if compare_final and actual != manifest["installed_after"]:
         raise RuntimeError("installed OS inventory differs from resolved artifact closure")
     return actual
+
+
+
+def install(folder, manifest, *, compare_final=True):
+    folder = Path(folder)
+    verify_artifacts(folder, manifest)
+    if installed() != manifest['installed_before']:
+        raise RuntimeError('OS artifact replay does not start from the exact golden package inventory')
+    _install_verified(folder, manifest)
+    return _validate_installed_manifest(manifest, compare_final=compare_final)
+
+
+def additive_os_delta(previous, current):
+    """Only append new packages; never reuse a checkpoint across changed inputs."""
+    if (previous.get('schema_version') != 1 or current.get('schema_version') != 1
+            or previous.get('installed_before') != current.get('installed_before')):
+        return None
+    old, new = previous['artifacts'], current['artifacts']
+    before, after = previous['installed_after'], current['installed_after']
+    if any(new.get(name) != record for name, record in old.items()):
+        return None
+    if any(after.get(name) != record for name, record in before.items()):
+        return None
+    delta = {name: record for name, record in new.items() if name not in old}
+    if not delta or not set(previous['requested']) <= set(current['requested']):
+        return None
+    prior_packages = {(name.split(':')[0], row['architecture']) for name, row in before.items()}
+    if any((row['package'], row['architecture']) in prior_packages for row in delta.values()):
+        return None
+    added = {(name.split(':')[0], row['architecture'], row['version'])
+             for name, row in after.items() if name not in before}
+    expected = {(row['package'], row['architecture'], row['version']) for row in delta.values()}
+    if added != expected or len(expected) != len(delta):
+        return None
+    return delta
+
+
+def extend(folder, previous, current):
+    """Replay a proved additive APT transaction in an uncommitted common image."""
+    folder = Path(folder)
+    delta = additive_os_delta(previous, current)
+    if delta is None:
+        raise RuntimeError('common APT migration is not a strict additive transaction')
+    delta_manifest = {**current, 'artifacts': delta}
+    verify_artifacts(folder, delta_manifest)
+    actual = installed()
+    if actual == previous['installed_after']:
+        _install_verified(folder, delta_manifest)
+    elif actual != current['installed_after']:
+        raise RuntimeError('common APT migration has an uncommitted package transaction; preserved')
+    return _validate_installed_manifest(current, compare_final=True)
 
 
 def resolve_from_pool(folder, source):

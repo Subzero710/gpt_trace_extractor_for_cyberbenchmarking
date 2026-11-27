@@ -154,7 +154,7 @@ def run(*args, cwd=None, env=None, input=None, elementary=False):
 SHARED_WARM_CACHE_ROOT = Path("/mnt/gpt-trace-warm-cache")
 TASK_INPUT_ROOT = Path("/opt/swe-gym-task")
 BUILDER_WHEEL_STORE = TASK_INPUT_ROOT / "wheel-cas"
-TASK_RUNTIME_SCHEMA = 7
+TASK_RUNTIME_SCHEMA = 8
 
 
 def _phase(item, phase, state, elapsed=None):
@@ -1106,7 +1106,7 @@ def _capture_wheel_name(filename, requirements):
     return name
 
 
-def _validate_captured_wheel(path, requirements):
+def _validate_captured_wheel(path, requirements, *, filename=None):
     import base64
     import csv
     import io
@@ -1115,34 +1115,35 @@ def _validate_captured_wheel(path, requirements):
     from packaging.utils import canonicalize_name, parse_wheel_filename
     from packaging.version import Version
     from pathlib import PurePosixPath
-    name = _capture_wheel_name(path.name, requirements)
-    _, version, _, _ = parse_wheel_filename(path.name)
+    filename = path.name if filename is None else filename
+    name = _capture_wheel_name(filename, requirements)
+    _, version, _, _ = parse_wheel_filename(filename)
     with zipfile.ZipFile(path) as archive:
         members = archive.namelist()
         if len(members) != len(set(members)):
-            raise RuntimeError('duplicate wheel archive entries: ' + path.name)
+            raise RuntimeError('duplicate wheel archive entries: ' + filename)
         for entry in members:
             if (not entry or PurePosixPath(entry).is_absolute() or '..' in PurePosixPath(entry).parts
                     or '\\' in entry or PurePosixPath(entry).as_posix() != entry.rstrip('/')):
                 raise RuntimeError('unsafe wheel archive entry: ' + entry)
         metadata = [entry for entry in members if entry.count('/') == 1 and entry.endswith('.dist-info/METADATA')]
         if len(metadata) != 1:
-            raise RuntimeError('captured wheel has no unique metadata: ' + path.name)
+            raise RuntimeError('captured wheel has no unique metadata: ' + filename)
         directory = metadata[0].rsplit('/', 1)[0]
         record_name = directory + '/RECORD'
         if not {directory + '/WHEEL', record_name} <= set(members):
-            raise RuntimeError('captured wheel is incomplete: ' + path.name)
+            raise RuntimeError('captured wheel is incomplete: ' + filename)
         record = {}
         with archive.open(record_name) as raw:
             for row in csv.reader(io.TextIOWrapper(raw, encoding='utf-8', newline='')):
                 if len(row) != 3 or row[0] in record:
-                    raise RuntimeError('invalid wheel RECORD: ' + path.name)
+                    raise RuntimeError('invalid wheel RECORD: ' + filename)
                 record[row[0]] = row[1:]
         signatures = {record_name + '.jws', record_name + '.p7s'}
         files = {entry for entry in members if not archive.getinfo(entry).is_dir()}
         if (set(record) != files - signatures or record[record_name][0]
                 or record[record_name][1] not in ('', str(archive.getinfo(record_name).file_size))):
-            raise RuntimeError('wheel RECORD does not cover exact archive contents: ' + path.name)
+            raise RuntimeError('wheel RECORD does not cover exact archive contents: ' + filename)
         for entry in sorted(files - {record_name}):
             if entry in signatures:
                 with archive.open(entry) as stream:
@@ -1165,7 +1166,7 @@ def _validate_captured_wheel(path, requirements):
                 raise RuntimeError('wheel RECORD content differs: ' + entry)
         row = BytesParser().parsebytes(archive.read(metadata[0]))
         if canonicalize_name(row['Name']) != name or Version(row['Version']) != version:
-            raise RuntimeError('captured wheel metadata differs from filename: ' + path.name)
+            raise RuntimeError('captured wheel metadata differs from filename: ' + filename)
     return name
 
 
@@ -1220,6 +1221,188 @@ def _publish_capture_object(objects, filename, record, source):
             os.close(fd)
 
 
+def _installed_wheel_evidence(prefix, requirements, env):
+    code = r'''import csv, importlib.metadata, io, json, sys
+from pip._vendor.packaging.tags import sys_tags
+from pip._vendor.packaging.utils import canonicalize_name
+wanted = set(json.loads(sys.argv[1]))
+result = {}
+for dist in importlib.metadata.distributions():
+    name = canonicalize_name(dist.metadata['Name'])
+    if name not in wanted:
+        continue
+    if name in result:
+        raise RuntimeError('ambiguous installed distribution: ' + name)
+    raw = dist.read_text('RECORD')
+    if raw is None:
+        continue
+    rows = list(csv.reader(io.StringIO(raw)))
+    if any(len(row) != 3 for row in rows) or len({row[0] for row in rows}) != len(rows):
+        raise RuntimeError('invalid installed distribution RECORD: ' + name)
+    result[name] = {'root': str(dist.locate_file('')), 'version': dist.version,
+                    'record': {row[0]: row[1:] for row in rows}}
+print(json.dumps({'distributions': result, 'tags': [str(tag) for tag in sys_tags()]}))
+'''
+    return json.loads(run(str(Path(prefix) / 'bin/python'), '-I', '-c', code,
+                          json.dumps(sorted(requirements)), env=env).decode())
+
+
+def _matches_installed_wheel(path, filename, requirement, evidence, tags):
+    """A reusable artifact must represent the actual installed payload, not just its version.
+
+    Wheel data relocation and script rewriting are not inferred. Such wheels are
+    admitted only by the normal exact build-context receipt. This predicate is
+    deliberately conservative: an unproved match is a cache miss, not a substitute.
+    """
+    import base64
+    import csv
+    import io
+    import zipfile
+    from packaging.utils import parse_wheel_filename
+    from packaging.version import Version
+    from pathlib import PurePosixPath
+    name, version, _, wheel_tags = parse_wheel_filename(filename)
+    if requirement.url is not None or Version(evidence['version']) != version:
+        return False
+    if not requirement.specifier.contains(version, prereleases=True) or not {str(tag) for tag in wheel_tags}.intersection(tags):
+        return False
+    root = Path(evidence['root']).resolve(strict=True)
+    with zipfile.ZipFile(path) as archive:
+        members = [entry.filename for entry in archive.infolist() if not entry.is_dir()]
+        records = [entry for entry in members if entry.count('/') == 1 and entry.endswith('.dist-info/RECORD')]
+        if len(records) != 1:
+            raise RuntimeError('invalid reusable wheel RECORD: ' + filename)
+        record_name, = records
+        if any(not PurePosixPath(entry).parts or PurePosixPath(entry).parts[0].endswith('.data') for entry in members):
+            return False
+        info = record_name.rsplit('/', 1)[0]
+        rows = list(csv.reader(io.StringIO(archive.read(record_name).decode('utf-8'))))
+        if any(len(row) != 3 for row in rows) or len({row[0] for row in rows}) != len(rows):
+            raise RuntimeError('invalid reusable wheel RECORD: ' + filename)
+        expected = {row[0]: row[1:] for row in rows}
+    installed = evidence['record']
+    generated = {info + '/' + leaf for leaf in ('INSTALLER', 'REQUESTED', 'direct_url.json')}
+    for extra in installed.keys() - expected.keys():
+        if extra in generated:
+            continue
+        # Pip generates bytecode from an existing source. Other extra entries,
+        # including relocated scripts and data, are not assumed to be equivalent.
+        try:
+            from importlib.util import source_from_cache
+            source = source_from_cache(extra)
+        except ValueError:
+            return False
+        if source not in expected:
+            return False
+    for entry, fields in expected.items():
+        if entry == record_name:
+            continue
+        relative = PurePosixPath(entry)
+        if relative.is_absolute() or '..' in relative.parts or relative.as_posix() != entry or '\\' in entry:
+            raise RuntimeError('unsafe reusable wheel path: ' + entry)
+        if installed.get(entry) != fields:
+            return False
+    # Validate every archived byte and compare the current installed bytes with
+    # the recorded payload. RECORD alone is not evidence after a recipe ran.
+    with _template_operation('validate-reused-wheel'):
+        _validate_captured_wheel(path, {name: (str(requirement), requirement)}, filename=filename)
+    for entry, fields in expected.items():
+        if entry == record_name:
+            continue
+        actual = root / entry
+        if not actual.is_file() or actual.is_symlink() or not actual.resolve().is_relative_to(root):
+            return False
+        algorithm, _, digest = fields[0].partition('=')
+        if actual.stat().st_size != int(fields[1]):
+            return False
+        value = hashlib.new(algorithm)
+        with _template_operation('verify-installed-wheel-member'), actual.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1048576), b''):
+                value.update(chunk)
+        if base64.urlsafe_b64encode(value.digest()).decode().rstrip('=') != digest:
+            return False
+    return True
+
+
+def _wheel_distribution_key(requirement):
+    from packaging.utils import canonicalize_name
+    return hashlib.sha256(canonicalize_name(requirement.name).encode()).hexdigest()
+
+
+def _matching_capture_candidates(requirement, evidence, tags, pip_candidates, *, cache=None):
+    from packaging.utils import canonicalize_name, parse_wheel_filename
+    if requirement.url is not None:
+        return None
+    # Only wheels actually built by Pip from this task's frozen local archive
+    # index, or independently verified CAS objects from previous captures.
+    candidates = []
+    for path in pip_candidates.get(canonicalize_name(requirement.name), ()):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('unsafe Pip wheel cache entry')
+        name, version, _, _ = parse_wheel_filename(path.name)
+        if name != canonicalize_name(requirement.name) or not requirement.specifier.contains(version, prereleases=True):
+            continue
+        origin = path.parent / 'origin.json'
+        if origin.is_symlink() or not origin.is_file():
+            continue
+        row = json.loads(origin.read_bytes())
+        import urllib.parse
+        url = urllib.parse.urlsplit(row.get('url', ''))
+        source = Path(urllib.parse.unquote(url.path))
+        if (url.scheme != 'file' or url.netloc or url.query or url.fragment
+                or source.parent != ROOT / 'caches/pip-index' or source.is_symlink() or not source.is_file()):
+            continue
+        sha = row.get('archive_info', {}).get('hashes', {}).get('sha256')
+        if not re.fullmatch(r'[a-f0-9]{64}', str(sha)):
+            continue
+        provenance = json.loads((ROOT / 'environment-cache-provenance.json').read_bytes())
+        if provenance['pip'].get(source.name, {}).get('sha256') != sha or stream_digest(source) != sha:
+            raise RuntimeError('cached wheel source differs from the frozen acquisition')
+        candidates.append((path.name, path, None))
+    if cache is not None:
+        by_name = cache / 'distributions' / _wheel_distribution_key(requirement)
+        if by_name.is_symlink() or by_name.parent.is_symlink():
+            raise RuntimeError('unsafe distribution wheel index')
+        for receipt in sorted(by_name.glob('*.json')):
+            if receipt.is_symlink() or not receipt.is_file():
+                raise RuntimeError('unsafe distribution wheel receipt')
+            row = json.loads(receipt.read_bytes())
+            filename, record = row['filename'], row['record']
+            checked = _wheel_files({filename: record})
+            if receipt.stem != record['sha256']:
+                raise RuntimeError('distribution wheel receipt identity differs')
+            name, version, _, _ = parse_wheel_filename(filename)
+            if name != canonicalize_name(requirement.name):
+                raise RuntimeError('distribution wheel index contains an unrelated package')
+            if not requirement.specifier.contains(version, prereleases=True):
+                continue
+            source = cache / 'objects' / record['sha256']
+            _verified_capture_object(source, checked[filename])
+            candidates.append((filename, source, record))
+    for filename, source, record in candidates:
+        if _matches_installed_wheel(source, filename, requirement, evidence, tags):
+            if record is None:
+                record = {'sha256': stream_digest(source), 'size': source.stat().st_size}
+            return filename, source, record
+    return None
+
+
+def _index_captured_wheel(cache, requirement, filename, record):
+    if requirement.url is not None or not (cache / 'objects' / record['sha256']).is_file():
+        return
+    folder = cache / 'distributions' / _wheel_distribution_key(requirement)
+    if any(path.is_symlink() for path in (folder, folder.parent)):
+        raise RuntimeError('unsafe distribution wheel index')
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (record['sha256'] + '.json')
+    value = {'filename': filename, 'record': record}
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or json.loads(path.read_bytes()) != value:
+            raise RuntimeError('conflicting distribution wheel receipt')
+    else:
+        _durable_json(path, value)
+
+
 def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inventory):
     """One target activation, independent Pip transactions and durable receipts."""
     if any(wheelhouse.iterdir()):
@@ -1270,6 +1453,41 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             del pending[name]
     if not pending:
         return _wheel_files(wheels)
+    if pending:
+        from packaging.utils import parse_wheel_filename
+        pip_candidates = {}
+        for path in sorted((Path(env['PIP_CACHE_DIR']) / 'wheels').rglob('*.whl')):
+            name, _, _, _ = parse_wheel_filename(path.name)
+            if name in pending:
+                pip_candidates.setdefault(name, []).append(path)
+        eligible = {name: pair for name, pair in pending.items()
+                    if pair[1].url is None and (name in pip_candidates or
+                        (shared is not None and (cache / 'distributions' /
+                            _wheel_distribution_key(pair[1])).is_dir()))}
+        evidence = (_installed_wheel_evidence(prefix, eligible, env) if eligible else
+                    {'distributions': {}, 'tags': []})
+        tags = set(evidence['tags'])
+        for name, (line, requirement) in eligible.items():
+            installed = evidence['distributions'].get(name)
+            if installed is None or requirement.url is not None:
+                continue
+            matched = _matching_capture_candidates(requirement, installed, tags, pip_candidates,
+                                                    cache=cache if shared is not None else None)
+            if matched is None:
+                continue
+            filename, source, record = matched
+            if shared is not None:
+                _publish_capture_object(objects, filename, record, source)
+                _index_captured_wheel(cache, requirement, filename, record)
+                key, receipt = receipt_keys[name]
+                _durable_json(receipt, {'schema': 2, 'key': key, 'wheels': {filename: record}})
+            target = wheelhouse / filename
+            with _template_operation('reuse-installed-wheel'):
+                with source.open('rb') as src, target.open('xb') as dst:
+                    shutil.copyfileobj(src, dst)
+                _verified_capture_object(target, record)
+            wheels[filename] = record
+            del pending[name]
     for name, (line, requirement) in pending.items():
         with tempfile.TemporaryDirectory(dir=wheelhouse.parent, prefix='.wheel-capture-') as raw:
             scratch = Path(raw)
@@ -1293,6 +1511,7 @@ def _capture_install_artifacts(item, prefix, requirements_file, wheelhouse, inve
             record = {'sha256': stream_digest(path), 'size': path.stat().st_size}
             if shared is not None:
                 _publish_capture_object(objects, path.name, record, path)
+                _index_captured_wheel(cache, requirement, path.name, record)
                 key, receipt = receipt_keys[name]
                 _durable_json(receipt, {'schema': 2, 'key': key, 'wheels': {path.name: record}})
             os.link(path, wheelhouse / path.name)
@@ -1335,6 +1554,9 @@ for dist in importlib.metadata.distributions():
 print(json.dumps(result))
 """).decode())
     reqs = []
+    native = _timed(item, 'warm_elf_closure', lambda: verify_native_elf(prefix))
+    if native:
+        _native_report(native)
     for entry in packages:
         name = entry["name"].lower().replace("_", "-")
         if name in excluded or baseline.get(name) == entry["version"]:
@@ -1689,6 +1911,204 @@ def _native_recipe(item, prefix, callback, log=None):
         raise
 
 
+def _elf_program(path):
+    import struct
+    with Path(path).open('rb') as stream:
+        ident = stream.read(16)
+        if not ident.startswith(b'\x7fELF'):
+            return None
+        if len(ident) != 16 or ident[4] not in (1, 2) or ident[5] not in (1, 2):
+            raise RuntimeError('invalid installed ELF identification: ' + str(path))
+        wide = ident[4] == 2
+        endian = '<' if ident[5] == 1 else '>'
+        header = struct.Struct(endian + ('HHIQQQIHHHHHH' if wide else 'HHIIIIIHHHHHH'))
+        row = header.unpack(stream.read(header.size))
+        kind, machine, phoff, entsize, count = row[0], row[1], row[4], row[8], row[9]
+        entry = struct.Struct(endian + ('IIQQQQQQ' if wide else 'IIIIIIII'))
+        size = os.fstat(stream.fileno()).st_size
+        if count == 65535 or (count and entsize != entry.size) or phoff + count * entsize > size:
+            raise RuntimeError('unsupported installed ELF program table: ' + str(path))
+        interpreter = None
+        dynamic = False
+        for index in range(count):
+            stream.seek(phoff + index * entsize)
+            segment = entry.unpack(stream.read(entry.size))
+            if segment[0] == 2:
+                dynamic = True
+            elif segment[0] == 3:
+                offset, length = (segment[2], segment[5]) if wide else (segment[1], segment[4])
+                if interpreter is not None or not 1 < length <= size - offset:
+                    raise RuntimeError('invalid installed ELF interpreter: ' + str(path))
+                stream.seek(offset)
+                raw = stream.read(length)
+                if not raw.endswith(b'\0') or b'\0' in raw[:-1]:
+                    raise RuntimeError('invalid installed ELF interpreter path: ' + str(path))
+                interpreter = os.fsdecode(raw[:-1])
+                if not Path(interpreter).is_absolute():
+                    raise RuntimeError('nonabsolute ELF interpreter: ' + str(path))
+        return {'abi': (ident[4], ident[5], machine), 'kind': kind,
+                'interpreter': interpreter, 'dynamic': dynamic}
+
+
+def _elf_exports_python_module(path):
+    output = run('readelf', '--dyn-syms', '--wide', str(path)).decode(errors='strict')
+    for line in output.splitlines():
+        fields = line.split()
+        if (len(fields) >= 8 and fields[0].endswith(':') and fields[0][:-1].isdigit()
+                and fields[4] in ('GLOBAL', 'WEAK') and fields[6] != 'UND'
+                and fields[7].startswith('PyInit_')):
+            return True
+    return False
+
+
+def _elf_loader_missing(loader, program, env, *, extension=None, search_paths=False):
+    # Use the actual target loader. LD_TRACE_LOADED_OBJECTS maps dependencies
+    # and reports missing transitive DSOs without executing constructors/main.
+    # The Python executable supplies the extension's interpreter context.
+    if not Path(loader).is_file():
+        raise RuntimeError('target ELF interpreter is absent: ' + str(loader))
+    if env.get('LD_AUDIT'):
+        raise RuntimeError('ELF trace cannot execute a loader audit module')
+    environment = dict(env, LC_ALL='C', LD_TRACE_LOADED_OBJECTS='1')
+    environment.pop('LD_DEBUG_OUTPUT', None)
+    environment.pop('LD_DEBUG', None)
+    if extension is not None:
+        if any(character.isspace() or character == ':' for character in str(extension)):
+            raise RuntimeError('unsupported ELF preload path: ' + str(extension))
+        argv = [str(loader), '--preload', str(extension), str(program)]
+    else:
+        argv = [str(loader), str(program)]
+    with _template_operation('elf-loader-closure'):
+        result = subprocess.run(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = result.stdout.decode(errors='replace') + '\n' + result.stderr.decode(errors='replace')
+    unresolved = re.findall(r'^\s*(\S+)\s+=>\s+not found\s*$', output, re.M)
+    if any(not re.fullmatch(r'[A-Za-z0-9_.+-]+', name) for name in unresolved):
+        raise RuntimeError('ELF loader reported a non-system library lookup: ' + repr(unresolved))
+    missing = set(unresolved)
+    missing.update(name for kind, name in _native_diagnostics(output) if kind == 'soname')
+    # Missing ABI versions, invalid ELF files, and loader failures must not
+    # become requests to install a same-named but incompatible library.
+    if re.search(r"version [`'\"][^\n]+?not found|wrong ELF class|invalid ELF header", output):
+        raise RuntimeError('incompatible target ELF closure for ' + str(extension or program) + ': ' + output[-2000:])
+    if result.returncode and not missing:
+        raise RuntimeError('target ELF loader probe failed for ' + str(extension or program) + ': ' + output[-2000:])
+    if not output.strip():
+        raise RuntimeError('target ELF loader returned no closure for ' + str(extension or program))
+    if extension is not None and not missing:
+        if not any(line.strip().startswith(str(extension) + ' (') for line in output.splitlines()):
+            raise RuntimeError('target ELF loader did not map the requested extension: ' + str(extension))
+    if not search_paths:
+        return {('soname', name) for name in missing}
+    if not missing:
+        return {}
+    environment['LD_DEBUG'] = 'libs'
+    with _template_operation('elf-loader-search-paths'):
+        traced = subprocess.run(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    paths = {name: set() for name in missing}
+    current = None
+    for line in traced.stderr.decode(errors='strict').splitlines():
+        match = re.search(r'find library=(\S+) \[\d+\]; searching', line)
+        if match:
+            current = match.group(1)
+        match = re.search(r'trying file=(/\S+)\s*$', line)
+        if match and current in paths:
+            candidate = os.path.normpath(match.group(1)).lstrip('/')
+            if candidate.endswith('/' + current) and candidate.startswith(('usr/lib/', 'lib/', 'lib64/', 'usr/lib64/')):
+                paths[current].add(candidate)
+                if candidate.startswith(('lib/', 'lib64/')):
+                    paths[current].add('usr/' + candidate)
+    result = {}
+    for name, candidates in sorted(paths.items()):
+        if not candidates:
+            raise RuntimeError('target loader exposed no system search path for ' + name)
+        candidates = sorted(candidates)
+        identity = hashlib.sha256(json.dumps(candidates, separators=(',', ':')).encode()).hexdigest()
+        result['soname:' + name + '@' + identity] = candidates
+    return result
+
+
+def _target_elf_inventory(prefix, selected):
+    code = r'''import importlib.metadata, importlib.machinery, json, os, sys
+from pathlib import Path
+from pip._vendor.packaging.utils import canonicalize_name
+wanted = json.loads(sys.argv[1])
+roots = {}
+for dist in importlib.metadata.distributions():
+    name = canonicalize_name(dist.metadata['Name'])
+    if wanted is not None and name not in wanted:
+        continue
+    if name in roots:
+        raise RuntimeError('ambiguous ELF distribution inventory: ' + name)
+    files = dist.files
+    if files is not None:
+        roots[name] = [str(dist.locate_file(path).absolute()) for path in files]
+    else:
+        roots[name] = []
+print(json.dumps({'python': sys.executable, 'prefix': sys.prefix,
+                  'env': dict(os.environ), 'distributions': roots,
+                  'extension_suffixes': importlib.machinery.EXTENSION_SUFFIXES}))
+'''
+    output = run(str(CONDA), 'run', '--prefix', str(prefix), '--no-capture-output',
+                 str(Path(prefix) / 'bin/python'), '-I', '-c', code,
+                 json.dumps(None if selected is None else sorted(selected)), env=build_limits())
+    result = json.loads(output.decode())
+    if Path(result['prefix']).resolve(strict=True) != Path(prefix).resolve(strict=True):
+        raise RuntimeError('target ELF inventory belongs to another interpreter')
+    return result
+
+
+def verify_native_elf(prefix, *, selected=None):
+    """Trace executable and Python-extension roots in their actual target userland.
+
+    DT_NEEDED closure is delegated to the loader, including RPATH/RUNPATH,
+    ld.so.cache and already loaded libraries. Arbitrary later dlopen calls
+    cannot be inferred from ELF metadata and remain covered by real recipes.
+    """
+    prefix = Path(prefix).resolve(strict=True)
+    evidence = _target_elf_inventory(prefix, selected)
+    python = Path(evidence['python'])
+    root = _elf_program(python)
+    if not root or not root['dynamic'] or not root['interpreter']:
+        raise RuntimeError('target Python has no dynamic ELF interpreter')
+    environment = evidence['env']
+    observations = _elf_loader_missing(root['interpreter'], python, environment, search_paths=True)
+    seen = {python.resolve()}
+    # Only target executables on the activated PATH are independent entrypoints.
+    # A Conda sysroot may also contain foreign/toolchain-only executable data.
+    paths = {Path(directory) for directory in environment['PATH'].split(os.pathsep)
+             if Path(directory).is_absolute() and Path(directory).resolve().is_relative_to(prefix)}
+    groups = dict(evidence['distributions'])
+    if selected is None:
+        groups['$target-bin'] = [str(path) for directory in sorted(paths) if directory.is_dir()
+                                 for path in directory.iterdir() if path.is_file()]
+    for name, files in sorted(groups.items()):
+        roots = []
+        with _template_operation('elf-package-inventory'):
+            for raw in files:
+                path = Path(raw)
+                if (path.parent not in paths and not any(path.name.endswith(suffix)
+                        for suffix in evidence['extension_suffixes'])):
+                    continue
+                if not path.is_absolute() or not path.is_file():
+                    continue
+                actual = path.resolve(strict=True)
+                if actual in seen or not actual.is_relative_to(prefix):
+                    continue
+                seen.add(actual)
+                row = _elf_program(actual)
+                if row is None or not row['dynamic'] or row['abi'] != root['abi']:
+                    continue
+                roots.append((path, row))
+        for path, row in roots:
+            if row['interpreter'] and path.parent in paths:
+                if Path(row['interpreter']).resolve() != Path(root['interpreter']).resolve():
+                    raise RuntimeError('installed executable selects a different ELF interpreter: ' + str(path))
+                observations.update(_elf_loader_missing(root['interpreter'], path, environment, search_paths=True))
+            elif row['kind'] == 3 and not row['interpreter'] and _elf_exports_python_module(path):
+                observations.update(_elf_loader_missing(root['interpreter'], python, environment, extension=path, search_paths=True))
+    return runpy.run_path(str(ROOT / 'os_packages.py'))['native_requirement_paths'](observations)
+
+
 def verify_native_python_headers(prefix):
     profile = _native_profile(prefix)
     return _native_requests(prefix, {('header', name) for name in profile['missing']}, profile=profile)
@@ -1716,6 +2136,26 @@ def build_common(inputs):
         raise RuntimeError("invalid common archive provenance")
     runpy.run_path(str(ROOT / 'os_packages.py'))['require_build_tools'](ROOT)
     native_requests = {}
+    manifest = json.loads((ROOT / 'os-manifest.json').read_bytes())
+    os_identity = hashlib.sha256(json.dumps({key: manifest[key] for key in
+        ('artifacts', 'installed_before', 'installed_after')}, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    def check_native(prefix, env_hash, inventory):
+        requests = verify_native_python_headers(prefix)
+        # The ELF proof is independent of transient acquisition observations.
+        proof = {'schema': 1, 'os_identity': os_identity, 'inventory': inventory}
+        path = ROOT / 'environments' / (env_hash + '.elf.json')
+        if path.is_symlink():
+            raise RuntimeError('unsafe ELF checkpoint')
+        if not path.is_file() or json.loads(path.read_bytes()) != proof:
+            missing = verify_native_elf(prefix)
+            requests.update(missing)
+            if not missing:
+                _durable_json(path, proof)
+        for key, paths in requests.items():
+            if key in native_requests and native_requests[key] != paths:
+                raise RuntimeError('conflicting native observation identity')
+            native_requests[key] = paths
     for env_hash, record in sorted(inputs["environments"].items()):
         commands = locked_environment_script(env_hash, record, lock)
         recipe_proof = {"lock_sha256": lock_sha256, "transactions": len(lock["environments"][env_hash]["transactions"])}
@@ -1724,8 +2164,7 @@ def build_common(inputs):
         recipe_file = ROOT / "environments" / (env_hash + ".recipe.json")
         expected_proof = json.dumps(recipe_proof, sort_keys=True)
         if common_environment_ready(prefix, inventory_file, recipe_file, expected_proof):
-            for key, paths in verify_native_python_headers(prefix).items():
-                native_requests[key] = sorted(set(native_requests.get(key, [])) | set(paths))
+            check_native(prefix, env_hash, json.loads(inventory_file.read_bytes()))
             print("SWE-Gym verified environment checkpoint: " + env_hash, flush=True)
             continue
         print("SWE-Gym environment " + env_hash + ": exact Conda lock transaction replay", flush=True)
@@ -1761,9 +2200,8 @@ def build_common(inputs):
                 time.sleep(min(90, 3 * 2 ** min(attempt - 1, 5)))
         # Persist proof only after all official commands and the exact installed
         # package inventory succeeded. Atomic rename avoids torn JSON checkpoints.
-        for key, paths in verify_native_python_headers(prefix).items():
-            native_requests[key] = sorted(set(native_requests.get(key, [])) | set(paths))
         inventory = env_inventory(prefix)
+        check_native(prefix, env_hash, inventory)
         run("sync", "-f", str(prefix))
         _durable_json(inventory_file, inventory)
         _durable_json(recipe_file, recipe_proof)
