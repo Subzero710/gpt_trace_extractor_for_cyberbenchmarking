@@ -1,4 +1,4 @@
-"""Contract tests for minimal locked metadata runtimes and resumable CAS downloads."""
+"""Contract tests for exact locked metadata runtimes and resumable CAS downloads."""
 from __future__ import annotations
 
 import hashlib
@@ -103,34 +103,17 @@ def test_refuses_http_200_when_existing_prefix_is_present(tmp_path):
     assert path.read_bytes() == b'prefix'
 
 
-def test_minimal_native_closure_ignores_unrelated_science_stack():
-    items = {
-        'python': ('a' * 64, ('libffi >=3', 'openssl >=3', '__glibc >=2.17')),
-        'pip': ('b' * 64, ('python >=3', 'setuptools >=1')),
-        'setuptools': ('c' * 64, ('python >=3',)),
-        'wheel': ('d' * 64, ('python >=3',)),
-        'libffi': ('e' * 64, ('libgcc-ng >=12',)),
-        'openssl': ('f' * 64, ('libgcc-ng >=12',)),
-        'libgcc-ng': ('1' * 64, ()),
-        'pyspark': ('2' * 64, ('python >=3',)),
-        'arrow-cpp': ('3' * 64, ('libgcc-ng >=12',)),
-    }
-    artifacts = {sha: {'name': name} for name, (sha, _) in items.items()}
-    pool_instance = types.SimpleNamespace(conda_lock={
-        'artifacts': artifacts,
-        'environments': {'one': {'transactions': [
-            {'key': 'env-locked', 'packages': [sha for sha, _ in items.values()]}]}}
-    })
-    acquired = []
-    def index(_pool, _runtime, sha, _key):
-        acquired.append(sha)
-        return {'depends': list(next(deps for _, (key, deps) in items.items() if key == sha))}
-
-    with patch.object(pool, '_native_conda_package_index', side_effect=index):
-        key, selected = pool._native_minimal_python_packages(pool_instance, {}, items['python'][0])
-    assert key == 'env-locked'
-    assert set(selected) == {items[name][0] for name in items if name not in ('pyspark', 'arrow-cpp', 'wheel')}
-    assert len(acquired) == len(selected)
+def test_native_target_rejects_python_from_a_different_transaction():
+    first, second = (hashlib.sha256(value).hexdigest() for value in (b'first python', b'second python'))
+    lock = {'artifacts': {sha: {'name': 'python'} for sha in (first, second)},
+            'environments': {'one': {'transactions': [{'key': 'first', 'packages': [first]}]},
+                             'two': {'transactions': [{'key': 'second', 'packages': [second]}]}}}
+    candidate = types.SimpleNamespace(conda_lock=lock)
+    target = types.SimpleNamespace(source='locked-conda:one:first', python_artifact_sha256=second)
+    with patch.object(pool, '_native_pool_runtime', return_value={}), \
+         patch.object(pool, '_coerce_target', side_effect=lambda value: value):
+        with pytest.raises(RuntimeError, match='differs from locked Conda transaction'):
+            pool._native_locked_python(candidate, target)
 
 
 def test_large_slow_download_rolls_at_operation_deadline_without_consuming_retries(tmp_path):

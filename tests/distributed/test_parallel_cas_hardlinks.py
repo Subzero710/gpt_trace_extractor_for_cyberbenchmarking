@@ -116,16 +116,15 @@ def test_parallel_conda_targets_share_verified_cas_archive_without_failure(tmp_p
                 'key': sha, 'packages': (sha_common, sha_pip, sha)
             }]} for sha in (sha_a, sha_b)},
         }
-        runtime = {'root': root, 'env': {}, 'prefixes': {}, 'bootstrapped': True,
+        runtime = {'root': root, 'guest_local': root, 'env': {}, 'prefixes': {}, 'bootstrapped': True,
                    'conda_install_lock': threading.RLock()}
         monkeypatch.setattr(pool_module, '_native_pool_runtime', lambda _instance: runtime)
         monkeypatch.setattr(pool_module, '_coerce_target', lambda target: target)
         monkeypatch.setattr(instance, 'download', lambda url, category, key, *, sha: sha)
         fake_conda = root / 'conda' / 'bin' / 'conda'
         monkeypatch.setattr(pool_module, '_native_bootstrap', lambda *args: fake_conda)
-        monkeypatch.setattr(pool_module, '_native_conda_package_index',
-                            lambda _pool, _runtime, package_sha, _key:
-                            {'depends': ['shared']} if package_sha in versions else {'depends': []})
+        identities = {hashlib.sha256(pool_module.json.dumps([sha_common, sha_pip, sha],
+                      separators=(',', ':')).encode()).hexdigest(): version for sha, version in versions.items()}
         def run(argv, _runtime, **kwargs):
             if 'create' in argv:
                 prefix = Path(argv[argv.index('--prefix') + 1])
@@ -133,13 +132,13 @@ def test_parallel_conda_targets_share_verified_cas_archive_without_failure(tmp_p
                 (prefix / 'bin' / 'python').write_bytes(b'verified fixture interpreter')
                 return b''
             if '-c' in argv:
-                return versions[Path(argv[0]).parent.parent.name].encode()
+                return identities[Path(argv[0]).parent.parent.name].encode()
             if '--version' in argv:
                 return b'pip fixture'
             raise AssertionError('unexpected native command: ' + str(argv))
         monkeypatch.setattr(pool_module, '_native_run', run)
         targets = [SimpleNamespace(python_artifact_sha256=sha,
-                                   python_full_version=versions[sha])
+                                   python_full_version=versions[sha], source=f'locked-conda:{sha}:{sha}')
                    for sha in (sha_a, sha_b)]
         barrier = threading.Barrier(2, timeout=10)
         def provision(target):
@@ -151,7 +150,7 @@ def test_parallel_conda_targets_share_verified_cas_archive_without_failure(tmp_p
         assert len(set(result)) == 2
         for target, python in zip(targets, result):
             assert python.is_file()
-            archive = root / 'archives' / target.python_artifact_sha256 / sha_common / 'shared-1-0.conda'
+            archive = root / 'archives' / sha_common / 'shared-1-0.conda'
             assert archive.samefile(cas_common)
             assert pool_module.digest(archive) == sha_common
         assert len(runtime['prefixes']) == 2

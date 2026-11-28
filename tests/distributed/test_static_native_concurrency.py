@@ -156,7 +156,7 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
 
     root = tmp_path / 'native'
     root.mkdir()
-    runtime = {'root': root, 'env': {}, 'prefixes': {},
+    runtime = {'root': root, 'guest_local': root, 'env': {}, 'prefixes': {},
                'conda_install_lock': threading.RLock(), 'bootstrapped': False}
     # Exercise the real CAS API: native provisioning now links through
     # Pool.link_verified_object rather than using raw os.link/digest.
@@ -186,6 +186,8 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
         sha: {'transactions': [{'key': sha, 'packages': [sha, shared_sha]}]}
         for sha, version in target_rows}}
     candidate.conda_lock = lock
+    identities = {hashlib.sha256(json.dumps([sha, shared_sha], separators=(',', ':')).encode()).hexdigest(): version
+                  for sha, version in target_rows}
     downloader_barrier = threading.Barrier(len(target_rows), timeout=5)
     observed_downloads = []
     condas_running = 0
@@ -217,18 +219,17 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
             return b''
         if '-c' in argv:
             sha = str(Path(argv[0]).parent.parent.name)
-            version = dict(target_rows)[sha]
+            version = identities[sha]
             return version.encode()
         return b''
 
     with patch.object(pool, '_native_pool_runtime', return_value=runtime), \
          patch.object(pool, '_coerce_target', side_effect=lambda t: t), \
          patch.object(pool, '_native_bootstrap', side_effect=bootstrap), \
-         patch.object(pool, '_native_conda_package_index', side_effect=lambda *_: {'depends': []}), \
          patch.object(pool, '_native_run', side_effect=run):
         candidate.download = download
         targets = [SimpleNamespace(python_artifact_sha256=sha,
-                                   python_full_version=version)
+                                   python_full_version=version, source=f'locked-conda:{sha}:{sha}')
                    for sha, version in target_rows]
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(target_rows)) as workers:
             actual = list(workers.map(lambda t: pool._native_locked_python(candidate, t), targets))
@@ -238,7 +239,8 @@ def test_locked_conda_downloads_overlap_but_prefix_mutations_do_not(tmp_path, re
         assert not runtime['locked_python_inflight']
         assert len(runtime['prefixes']) == len(target_rows)
         for target, interpreter in zip(targets, actual):
-            assert interpreter == root / 'envs' / target.python_artifact_sha256 / 'bin' / 'python'
+            assert interpreter == root / 'envs' / hashlib.sha256(json.dumps(
+                [target.python_artifact_sha256, shared_sha], separators=(',', ':')).encode()).hexdigest() / 'bin' / 'python'
             assert pool._native_locked_python(candidate, target) == interpreter
         assert len(observed_downloads) == len(targets) * 2
 
@@ -270,65 +272,86 @@ def test_static_progress_tracks_actual_completion_without_reordering_results():
 
 
 @pytest.fixture
-def conda_index_inputs(tmp_path, monkeypatch):
+def conda_transaction_inputs(tmp_path, monkeypatch):
     import hashlib
 
     candidate = pool.Pool(tmp_path / 'stage')
-    runtime = {'root': tmp_path / 'native', 'conda_install_lock': pool._OwnedLock()}
+    root = tmp_path / 'native'
+    root.mkdir()
+    runtime = {'root': root, 'guest_local': root, 'prefixes': {},
+               'conda_install_lock': pool._OwnedLock()}
     artifacts = {}
-    for name in ('generated-one', 'generated-two'):
+    for name in ('python', 'pip', 'native-dependency'):
         content = name.encode()
         sha = hashlib.sha256(content).hexdigest()
         path = candidate.objects / sha[:2] / sha
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-        artifacts[sha] = {'name': name, 'version': '1.0', 'build': 'generated',
+        artifacts[sha] = {'name': name, 'version': '1.0',
                           'url': 'https://example.invalid/' + name + '.conda'}
-    candidate.conda_lock = {'artifacts': artifacts}
+    python, pip, extra = artifacts
+    transactions = {'one': [python, pip], 'two': [python, pip, extra]}
+    candidate.conda_lock = {'artifacts': artifacts, 'environments': {
+        name: {'transactions': [{'key': name, 'packages': packages}]}
+        for name, packages in transactions.items()}}
     downloads = []
     def download(url, category, key, sha):
-        downloads.append(sha)
+        downloads.append((key, sha))
         return candidate.reference(sha, category, key, candidate.verify_object(sha))
     monkeypatch.setattr(candidate, 'download', download)
-    monkeypatch.setattr(pool, '_native_bootstrap', lambda *_: tmp_path / 'conda' / 'bin' / 'conda')
+    monkeypatch.setattr(pool, '_native_pool_runtime', lambda _: runtime)
+    monkeypatch.setattr(pool, '_coerce_target', lambda target: target)
+    monkeypatch.setattr(pool, '_native_bootstrap', lambda *_: root / 'conda/bin/conda')
+    targets = {key: SimpleNamespace(source=f'locked-conda:{key}:{key}', python_artifact_sha256=python,
+                                    python_full_version=artifacts[python]['version']) for key in transactions}
+    def check_command(argv, packages):
+        from urllib.parse import urlparse, unquote
+        explicit = Path(argv[argv.index('--file') + 1]).read_text().splitlines()
+        assert explicit[0] == '@EXPLICIT'
+        assert len(explicit) == len(packages) + 1
+        for uri, sha in zip(explicit[1:], packages):
+            archive = Path(unquote(urlparse(uri).path))
+            assert archive.samefile(candidate.objects / sha[:2] / sha)
+        assert '--offline' in argv
     try:
-        yield candidate, runtime, artifacts, downloads
+        yield candidate, runtime, targets, transactions, downloads, check_command
     finally:
         candidate._pip_cache_context.cleanup()
 
 
 @pytest.mark.parametrize('fail', [False, True])
-def test_shared_conda_index_has_one_extractor_and_one_outcome(conda_index_inputs, monkeypatch, fail):
-    candidate, runtime, artifacts, downloads = conda_index_inputs
-    sha = next(iter(artifacts))
-    metadata = {key: artifacts[sha][key] for key in ('name', 'version', 'build')}
-    metadata['depends'] = []
+def test_shared_conda_transaction_has_one_installer_and_one_outcome(conda_transaction_inputs, monkeypatch, fail):
+    candidate, runtime, targets, transactions, downloads, check_command = conda_transaction_inputs
+    target = targets['two']
     entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
-    extractions = []
-    error = RuntimeError('generated extraction failure')
+    installations = []
+    error = RuntimeError('generated installation failure')
     original_wait = pool._shared_future_result
 
     def wait(future):
         waiting.set()
         return original_wait(future)
 
-    def extract(argv, _runtime, **_kwargs):
-        archive, destination = map(Path, argv[-2:])
-        extractions.append(destination)
-        assert archive.samefile(candidate.objects / sha[:2] / sha)
-        destination.mkdir()
-        entered.set()
-        assert release.wait(timeout=5)
-        if fail:
-            raise error
-        return json.dumps(metadata).encode()
+    def run(argv, _runtime, **_kwargs):
+        if argv[1:4] == ['-m', 'conda', 'create']:
+            check_command(argv, transactions['two'])
+            installations.append(argv)
+            entered.set()
+            assert release.wait(timeout=5)
+            if fail:
+                raise error
+            return b''
+        if '-c' in argv:
+            return target.python_full_version.encode()
+        assert argv[1:] == ['-m', 'pip', '--version']
+        return b''
 
     monkeypatch.setattr(pool, '_shared_future_result', wait)
-    monkeypatch.setattr(pool, '_native_run', extract)
+    monkeypatch.setattr(pool, '_native_run', run)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
-        first = workers.submit(pool._native_conda_package_index, candidate, runtime, sha, 'first')
+        first = workers.submit(pool._native_locked_python, candidate, target)
         assert entered.wait(timeout=5)
-        second = workers.submit(pool._native_conda_package_index, candidate, runtime, sha, 'second')
+        second = workers.submit(pool._native_locked_python, candidate, target)
         try:
             assert waiting.wait(timeout=5)
             assert not second.done()
@@ -340,37 +363,44 @@ def test_shared_conda_index_has_one_extractor_and_one_outcome(conda_index_inputs
                     future.result(timeout=5)
                 assert caught.value is error
             else:
-                assert future.result(timeout=5) == metadata
+                assert future.result(timeout=5) == Path(installations[0][installations[0].index('--prefix') + 1]) / 'bin/python'
     if fail:
-        assert not runtime['conda_package_indices']
+        assert not runtime['prefixes']
         with pytest.raises(RuntimeError) as caught:
-            pool._native_conda_package_index(candidate, runtime, sha, 'third')
+            pool._native_locked_python(candidate, target)
         assert caught.value is error
     else:
-        assert not runtime['conda_package_indices_inflight']
-        assert pool._native_conda_package_index(candidate, runtime, sha, 'third') == metadata
-    assert downloads == [sha]
-    assert len(extractions) == 1
+        assert not runtime['locked_python_inflight']
+        assert pool._native_locked_python(candidate, target) == first.result()
+    assert downloads == [('two', sha) for sha in transactions['two']]
+    assert len(installations) == 1
 
 
-def test_distinct_conda_indices_extract_concurrently(conda_index_inputs, monkeypatch):
-    candidate, runtime, artifacts, downloads = conda_index_inputs
-    rendezvous = threading.Barrier(len(artifacts), timeout=5)
-
-    def extract(argv, _runtime, **_kwargs):
-        archive, destination = map(Path, argv[-2:])
-        sha = destination.parent.name
-        assert archive.samefile(candidate.objects / sha[:2] / sha)
-        destination.mkdir()
-        rendezvous.wait()
-        return json.dumps({key: artifacts[sha][key] for key in ('name', 'version', 'build')}
-                          | {'depends': []}).encode()
-
-    monkeypatch.setattr(pool, '_native_run', extract)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(artifacts)) as workers:
-        futures = {sha: workers.submit(pool._native_conda_package_index,
-                                       candidate, runtime, sha, sha) for sha in artifacts}
-        for sha, future in futures.items():
-            assert future.result(timeout=10)['name'] == artifacts[sha]['name']
-    assert sorted(downloads) == sorted(artifacts)
-    assert not runtime['conda_package_indices_inflight']
+def test_distinct_conda_transactions_with_same_python_remain_distinct(conda_transaction_inputs, monkeypatch):
+    candidate, runtime, targets, transactions, downloads, check_command = conda_transaction_inputs
+    rendezvous = threading.Barrier(len(targets), timeout=5)
+    original_download = candidate.download
+    def download(url, category, key, sha):
+        if sha == transactions[key][0]:
+            rendezvous.wait()
+        return original_download(url, category, key, sha)
+    monkeypatch.setattr(candidate, 'download', download)
+    seen = []
+    def run(argv, _runtime, **_kwargs):
+        if argv[1:4] == ['-m', 'conda', 'create']:
+            explicit = Path(argv[argv.index('--file') + 1]).read_text().splitlines()
+            key, = [name for name, packages in transactions.items() if len(packages) == len(explicit) - 1]
+            check_command(argv, transactions[key])
+            seen.append(key)
+            return b''
+        if '-c' in argv:
+            return next(iter(targets.values())).python_full_version.encode()
+        assert argv[1:] == ['-m', 'pip', '--version']
+        return b''
+    monkeypatch.setattr(pool, '_native_run', run)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as workers:
+        results = list(workers.map(lambda target: pool._native_locked_python(candidate, target), targets.values()))
+    assert len(set(results)) == len(targets)
+    assert set(seen) == set(targets)
+    assert sorted(downloads) == sorted((key, sha) for key, packages in transactions.items() for sha in packages)
+    assert not runtime['locked_python_inflight']

@@ -55,6 +55,17 @@ def test_common_build_hashes_lock_once_and_preserves_checkpoints(tmp_path, monke
     manifest = guest.ROOT / 'environment-cache-provenance.json'
     proof = {'schema': 1, 'kind': 'verified-input-archives', 'conda': {}}
     manifest.write_text(json.dumps(proof))
+    os_manifest = {'artifacts': {}, 'installed_before': {}, 'installed_after': {}}
+    (guest.ROOT / 'os-manifest.json').write_text(json.dumps(os_manifest))
+    os_payload = json.dumps(os_manifest, sort_keys=True, separators=(',', ':')).encode()
+    tools_checks = []
+    def load_tools(path):
+        assert Path(path) == guest.ROOT / 'os_packages.py'
+        return {'require_build_tools': lambda root: tools_checks.append(root)}
+    monkeypatch.setattr(guest.runpy, 'run_path', load_tools)
+    monkeypatch.setattr(guest, 'verify_native_python_headers', lambda prefix: {})
+    elf_checks = []
+    monkeypatch.setattr(guest, 'verify_native_elf', lambda prefix: elf_checks.append(prefix) or {})
     real_sha = hashlib.sha256
     calls = []
     monkeypatch.setattr(guest.hashlib, 'sha256', lambda value: calls.append(value) or real_sha(value))
@@ -73,9 +84,14 @@ def test_common_build_hashes_lock_once_and_preserves_checkpoints(tmp_path, monke
             (conda.parent.parent / 'envs' / rows[key]['stored_name']).mkdir(parents=True)
             executions.append(key)
     monkeypatch.setattr(guest, 'shell', shell)
+    def sync(*args):
+        assert args[:2] == ('sync', '-f') and Path(args[2]).is_dir()
+    monkeypatch.setattr(guest, 'run', sync)
     guest.build_common({'environments': rows})
-    assert calls == [raw]
+    assert calls == [raw, os_payload]
     assert executions == list(rows)
+    assert len(elf_checks) == len(rows)
+    assert tools_checks == [guest.ROOT]
     assert json.loads(manifest.read_text()) == proof
     for key in rows:
         assert json.loads((guest.ROOT / 'environments' / (key + '.recipe.json')).read_text()) == {
@@ -83,8 +99,10 @@ def test_common_build_hashes_lock_once_and_preserves_checkpoints(tmp_path, monke
     calls.clear()
     executions.clear()
     guest.build_common({'environments': rows})
-    assert calls == [raw]
+    assert calls == [raw, os_payload]
     assert not executions
+    assert len(elf_checks) == len(rows)
+    assert tools_checks == [guest.ROOT, guest.ROOT]
     manifest.unlink()
     with pytest.raises(RuntimeError, match='provenance is missing'):
         guest.build_common({'environments': rows})

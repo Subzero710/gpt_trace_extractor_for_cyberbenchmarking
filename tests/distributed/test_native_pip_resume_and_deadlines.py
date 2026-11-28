@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +35,7 @@ def test_cached_http_body_is_reused_and_not_published(tmp_path):
     pool.write_new(old / 'STAGING', 'failed stage\n')
     previous = pool.Pool(old)
     previous.conda_lock = {'artifacts': {}}
+    previous.native_guest = SimpleNamespace(local=old / 'target')
     runtime = pool._native_pool_runtime(previous)
     persistent = Path(runtime['env']['PIP_CACHE_DIR'])
     assert persistent == old / 'pip-http-cache'
@@ -49,6 +51,7 @@ def test_cached_http_body_is_reused_and_not_published(tmp_path):
     assert not copied.samefile(body)
     recovered = pool.Pool(new)
     recovered.conda_lock = {'artifacts': {}}
+    recovered.native_guest = SimpleNamespace(local=new / 'target')
     active = pool._native_pool_runtime(recovered)
     sha = hashlib.sha256(data).hexdigest()
     assert pool._native_acquired_archive(

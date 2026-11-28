@@ -43,9 +43,12 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
     release = threading.Event()
     candidate = SimpleNamespace(conda_lock=lock)
     candidate.download = lambda _url, _category, _key, sha: calls.append(sha)
-    candidate.link_verified_object = lambda _sha, dest: os.link({sha: object_path, pip_sha: pip_object}[_sha], dest)
+    def link(package_sha, dest):
+        os.link({sha: object_path, pip_sha: pip_object}[package_sha], dest)
+        return dest
+    candidate.link_verified_object = link
     runtime = {
-        'root': root, 'env': {}, 'prefixes': {},
+        'root': root, 'guest_local': root, 'env': {}, 'prefixes': {},
         'conda_install_lock': threading.RLock(),
         'bootstrapped': True,
     }
@@ -53,7 +56,7 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
     conda.parent.mkdir(parents=True)
     conda.write_text('instrumented conda')
     target = SimpleNamespace(python_artifact_sha256=sha,
-                             python_full_version=version)
+                             python_full_version=version, source='locked-conda:target:target')
 
     def native_run(argv, _runtime, **_kwargs):
         if list(argv[1:4]) == ['-m', 'conda', 'create']:
@@ -67,7 +70,6 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
     with patch.object(pool, '_native_pool_runtime', return_value=runtime), \
          patch.object(pool, '_coerce_target', side_effect=lambda value: value), \
          patch.object(pool, '_native_bootstrap', return_value=conda), \
-         patch.object(pool, '_native_conda_package_index', side_effect=lambda *_: {'depends': []}), \
          patch.object(pool, '_native_run', side_effect=native_run), \
          patch.object(pool, '_operation_timeout', return_value=0.04), \
          patch.object(pool, '_conda_progress_interval', return_value=0.01):
@@ -80,7 +82,8 @@ def test_waiter_survives_an_owner_longer_than_one_operation(tmp_path):
                 assert not waiter.done()
             finally:
                 release.set()
-            expected = root / 'envs' / sha / 'bin' / 'python'
+            identity = hashlib.sha256(pool.json.dumps([sha, pip_sha], separators=(',', ':')).encode()).hexdigest()
+            expected = root / 'envs' / identity / 'bin' / 'python'
             assert owner.result(timeout=3) == expected
             assert waiter.result(timeout=3) == expected
     assert set(calls) == {sha, pip_sha}

@@ -174,7 +174,9 @@ def test_common_recipe_never_runs_floating_apt_or_builds_task_sources():
     assert not hasattr(os_packages, "resolve")
     assert not hasattr(os_packages, "PACKAGES")
     assert "upgrade" not in inspect.getsource(os_packages.resolve_from_pool)
-    assert "--no-download" in inspect.getsource(os_packages.install)
+    assert "_install_verified" in inspect.getsource(os_packages.install)
+    install = inspect.getsource(os_packages._install_verified)
+    assert "--no-download" in install and "--net" in install
     builder_source = inspect.getsource(builder.build)
     assert builder_source.index("generation = generation_identity(resolved)") > builder_source.index("qemu-img\", \"check")
     assert "builder-mirrors" not in builder_source

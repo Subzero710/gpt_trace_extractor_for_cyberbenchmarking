@@ -180,6 +180,7 @@ def test_real_pep517_metadata_observes_the_complete_pinned_source_tree(
         generated_graph, tmp_path, monkeypatch):
     """Run an actual pip/PEP 517 backend, not a mocked metadata command."""
     import sys
+    import threading
 
     graph = generated_graph
     source = graph.roots['fixture/root']
@@ -217,9 +218,15 @@ def build_wheel(*args, **kwargs):
     candidate = pool.Pool(graph.stage)
     candidate.conda_lock = {}
     try:
-        runtime = pool._native_pool_runtime(candidate)
-        runtime['env']['PIP_NO_INDEX'] = '1'
-        runtime['env']['GIT_ALLOW_PROTOCOL'] = 'file'
+        # Deliberately use a local test runtime for the generated, trusted backend.
+        # The production runtime factory still requires the broker-owned guest.
+        runtime = {'root': tmp_path / 'metadata-runtime',
+                   'env': {**os.environ, 'PIP_NO_INDEX': '1', 'GIT_ALLOW_PROTOCOL': 'file',
+                           'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1'},
+                   'submodule_lock': threading.RLock(),
+                   '_pip_byte_progress': pool._NativePipByteProgress(pool._conda_progress_interval())}
+        runtime['root'].mkdir()
+        monkeypatch.setattr(pool, '_native_pool_runtime', lambda _candidate: runtime)
         monkeypatch.setattr(pool, '_native_locked_python', lambda _pool, _target: Path(sys.executable))
         target = pool._target_environment_module().capture_current()
         dependencies, remotes = pool._native_local_metadata(
@@ -227,5 +234,5 @@ def build_wheel(*args, **kwargs):
         assert dependencies == set()
         assert remotes == set()
     finally:
-        pool._native_close(candidate)
+        runtime['_pip_byte_progress'].close()
         candidate._pip_cache_context.cleanup()

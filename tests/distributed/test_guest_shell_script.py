@@ -36,21 +36,27 @@ def test_pinned_conda_scripts_exceed_exec_argument_limit_but_parse_as_files(tmp_
 def test_large_recipe_preserves_shell_state_and_cleans_script(tmp_path, monkeypatch, trace):
     serial = tmp_path / 'serial'
     monkeypatch.setenv('GPTTRACE_TEMPLATE_TRACE', '1' if trace else '0')
-    real_trace = runtime['_template_script']
-    monkeypatch.setitem(shell.__globals__, '_template_script', lambda commands: (
-        line.replace('>/dev/ttyS0', '>>' + str(serial)) for line in real_trace(commands)))
+    contract = tmp_path / 'guest-contract.json'
+    contract.write_text(json.dumps({'progress_interval_seconds': 1, 'cleanup_timeout_seconds': 3}))
+    monkeypatch.setenv('GPTTRACE_TEMPLATE_TIMEOUT', '3')
+    paths = {'/dev/ttyS0': serial, '/opt/gpt-trace/bundle/guest-contract.json': contract}
+    monkeypatch.setitem(shell.__globals__, 'Path', lambda value: paths.get(str(value), Path(value)))
     (tmp_path / 'subdir').mkdir()
     limit = 32 * os.sysconf('SC_PAGE_SIZE')
     commands = ['value=preserved', 'cd subdir', ': ' + 'x' * limit,
                 'printf "%s\\n" "$value" "$PWD" "$1"', 'printf "%s\\n" "$0" > ../script-path']
+    if trace:
+        commands.append('sleep 1.2')
     log = tmp_path / 'recipe.log'
     shell(commands, cwd=tmp_path, log=log)
     assert log.read_text().splitlines() == ['preserved', str(tmp_path / 'subdir'), '']
     assert not Path((tmp_path / 'script-path').read_text().strip()).exists()
     if trace:
-        assert serial.read_text().splitlines() == [
-            f'GPTTRACE_TEMPLATE {state} recipe-{index}'
-            for index in range(len(commands)) for state in ('begin', 'end')]
+        events = [line.split() for line in serial.read_text().splitlines()]
+        assert events and all(tag == 'GPTTRACE_TEMPLATE' and marker.startswith('pip-')
+                              for tag, _, marker in events)
+        assert sorted(marker for _, state, marker in events if state == 'begin') == sorted(
+            marker for _, state, marker in events if state == 'end')
 
 
 def test_failed_recipe_keeps_log_and_pipefail(tmp_path, monkeypatch):
