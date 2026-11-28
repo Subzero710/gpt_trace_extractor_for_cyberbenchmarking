@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 import pytest
 
@@ -68,17 +69,52 @@ def native_pool(tmp_path_factory):
         candidate._pip_cache_context.cleanup()
 
 
+@pytest.fixture(scope='module')
+def host_native_pool(native_pool):
+    # Production acquisition must reject an absent broker. The external suite
+    # explicitly exercises real tools in private host prefixes, with generated
+    # metadata projects only; this is not a test of the broker or its guest.
+    with pytest.raises(RuntimeError, match='broker-owned target guest'):
+        pool._native_pool_runtime(native_pool)
+    temporary = tempfile.TemporaryDirectory(prefix='host-native-contract-', dir=native_pool.stage)
+    try:
+        root = Path(temporary.name)
+        home = root / 'home'
+        home.mkdir(mode=0o700)
+        cache = root / 'pip-cache'
+        cache.mkdir(mode=0o700)
+        native_pool._native_runtime = {
+            'context': temporary, 'root': root, 'guest_local': root,
+            'env': {
+                'PATH': os.environ['PATH'], 'HOME': str(home),
+                'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+                'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+                'PIP_CONFIG_FILE': os.devnull, 'PIP_DISABLE_PIP_VERSION_CHECK': '1',
+                'PIP_NO_INPUT': '1', 'PIP_NO_INDEX': '1', 'PIP_CACHE_DIR': str(cache),
+                'CONDARC': os.devnull, 'CONDA_PKGS_DIRS': str(root / 'conda-pkgs'),
+                'CONDA_ENVS_DIRS': str(root / 'envs'), 'CONDA_OFFLINE': 'true',
+            },
+            'prefixes': {}, 'bootstrapped': False,
+            'conda_install_lock': pool._OwnedLock(),
+            '_pip_byte_progress': pool._NativePipByteProgress(pool._conda_progress_interval()),
+        }
+        yield native_pool
+    finally:
+        pool._native_close(native_pool)
+        temporary.cleanup()
+
+
 @pytest.mark.parametrize('minor,environment,transaction', transaction_matrix(),
                          ids=[row[0] for row in transaction_matrix()])
-def test_locked_interpreter_and_native_build_metadata(native_pool, tmp_path, minor, environment, transaction):
+def test_locked_interpreter_and_native_build_metadata(host_native_pool, tmp_path, minor, environment, transaction):
     module = pool._target_environment_module()
     target = module.locked_transaction_target(
         LOCK, environment, transaction, base_target=module.capture_current())
     assert target.python_version == minor
-    python = pool._native_locked_python(native_pool, target)
-    runtime = pool._native_pool_runtime(native_pool)
-    assert pool._native_locked_python(native_pool, target) == python
-    assert pool._native_bootstrap(native_pool, runtime).is_file()
+    python = pool._native_locked_python(host_native_pool, target)
+    runtime = pool._native_pool_runtime(host_native_pool)
+    assert pool._native_locked_python(host_native_pool, target) == python
+    assert pool._native_bootstrap(host_native_pool, runtime).is_file()
     names, project, index = metadata_project(tmp_path)
     report = tmp_path/'metadata.json'
     offline = {**runtime, '_native_build_resolver': metadata_fixture_resolver(index),
