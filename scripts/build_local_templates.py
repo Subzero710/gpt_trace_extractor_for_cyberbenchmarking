@@ -775,15 +775,18 @@ def atomic_json(path, value):
     finally: os.close(fd)
 
 
-def template_golden_isolation_arguments(guest_root=Path("/")):
-    """Mask the inherited golden constructor before starting a template guest."""
-    import shlex
-    unit = "gpt-trace-golden-build.service"
+def offline_service_mask_arguments(unit, guest_root=Path("/")):
+    """Disable an installed service and replace its offline unit with a mask."""
     guest_root = Path(guest_root)
     unit_path = guest_root / "etc/systemd/system" / unit
     disable = shlex.join(["systemctl", "--root=" + str(guest_root), "disable", unit])
     mask = shlex.join(["ln", "-sfnT", "/dev/null", str(unit_path)])
     return ["--run-command", disable + " && " + mask]
+
+
+def template_golden_isolation_arguments(guest_root=Path("/")):
+    """Mask the inherited golden constructor before starting a template guest."""
+    return offline_service_mask_arguments("gpt-trace-golden-build.service", guest_root)
 
 
 def template_bundle_upload_arguments(directory, installed_contract, current_contract, source_root=ROOT):

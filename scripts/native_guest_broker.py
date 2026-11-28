@@ -231,7 +231,8 @@ def metadata_guest(manager, stage, source, account, *, donor=None, reuse=None, r
             subprocess.run(['qemu-img', 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', str(safe(manager.base, immutable=True)), str(image)], check=True, timeout=limit)
             subprocess.run(['virt-customize', '--no-network', '-a', str(image),
                             *builder.template_golden_isolation_arguments(),
-                            '--run-command', 'systemctl mask gpt-trace-workstation-agent.service'], check=True, timeout=limit)
+                            *builder.offline_service_mask_arguments('gpt-trace-workstation-agent.service')],
+                           check=True, timeout=limit)
             # Resize only the disposable overlay; the actual Golden stays read-only.
             virtual_gib = controls['build']['virtual_disk_gib']
             info = json.loads(subprocess.check_output(['qemu-img', 'info', '--output=json', str(image)], timeout=limit))

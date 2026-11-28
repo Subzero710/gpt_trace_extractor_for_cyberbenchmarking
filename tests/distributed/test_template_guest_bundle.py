@@ -113,6 +113,34 @@ def test_golden_constructor_is_masked_offline_even_without_completion_marker(tmp
     assert source.read_bytes() == original
 
 
+@pytest.mark.parametrize('enabled', [False, True])
+def test_metadata_guest_masks_installed_agent_offline(tmp_path, enabled):
+    import shutil
+    import subprocess
+
+    root = tmp_path / 'guest'
+    units = root / 'etc/systemd/system'
+    wants = units / 'multi-user.target.wants'
+    wants.mkdir(parents=True)
+    source = ROOT / 'infra/workstation/systemd/gpt-trace-workstation-agent.service'
+    unit = units / source.name
+    shutil.copyfile(source, unit)
+    link = wants / source.name
+    if enabled:
+        link.symlink_to(Path('..') / source.name)
+    original = source.read_bytes()
+    flag, command = builder.offline_service_mask_arguments(source.name, root)
+    assert flag == '--run-command'
+    for _ in range(2):
+        subprocess.run(['sh', '-ec', command], check=True, capture_output=True)
+        assert unit.is_symlink() and unit.readlink() == Path('/dev/null')
+        assert not link.exists() and not link.is_symlink()
+        status = subprocess.run(['systemctl', '--root=' + str(root), 'is-enabled', source.name],
+                                capture_output=True, text=True)
+        assert status.stdout.strip() == 'masked'
+    assert source.read_bytes() == original
+
+
 def test_template_boot_does_not_append_previous_attempt_log():
     script = builder.firstboot('true')
     assert 'exec > /var/log/swe-gym-lite-builder.log 2>&1' in script
