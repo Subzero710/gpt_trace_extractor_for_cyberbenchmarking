@@ -254,7 +254,7 @@ def metadata_guest(manager, stage, source, account, *, donor=None, reuse=None, r
             link_path = control / 'links.sock'
             serial = Path(temporary) / 'serial.log'
             argv = [builder.qemu_system_binary(), '-machine', 'accel=kvm', '-cpu', 'host',
-                    '-m', str(memory), '-smp', str(vcpus), '-runas', account.pw_name,
+                    '-m', str(memory), '-smp', str(vcpus), '-run-with', 'user=' + account.pw_name,
                     '-drive', 'file=' + _qemu_value(image) + ',format=qcow2,if=virtio,cache=writeback,discard=unmap',
                     '-nic', 'none', '-display', 'none', '-monitor', 'none', '-no-reboot',
                     '-serial', 'file:' + str(serial), '-device', 'virtio-serial-pci',
