@@ -1246,7 +1246,11 @@ def _fetch_failure_detail(status):
         cause=failures[-1].split('automatic cleanup:',1)[-1].strip()
     # APT stderr often carries the only package-specific reason. Retain the
     # latest unique diagnostic lines without dumping command arguments/tracebacks.
-    detail='\n'.join(dict.fromkeys(errors[-12:])) if 'APT' in str(phase) else ''
+    if 'metadata guest QEMU' in cause:
+        errors = [line for line in lines if re.match(r'^qemu-system-[^: ]+:', line)]
+        detail = '\n'.join(dict.fromkeys(errors[-12:]))
+    else:
+        detail='\n'.join(dict.fromkeys(errors[-12:])) if 'APT' in str(phase) else ''
     return str(phase)+': '+cause+('\n'+detail if detail else '')
 
 
@@ -1373,6 +1377,8 @@ def preparation_fetch(cfg, *, fetch_source=None):
                          'progress': status.get('progress')}
                         if phase in {'starting', 'running', 'validating'} else None)
     except TransportFailure as exc:
+        if isinstance(exc, RemoteFailure) and 400 <= exc.status < 500:
+            raise RuntimeError("preparation " + operation_id + " rejected by broker: " + str(exc)) from exc
         raise RuntimeError("preparation " + operation_id + " has an unconfirmed remote outcome: " + str(exc) +
             "; rerun make superbench-fetch ADAPTER=swe-gym-lite to rediscover it; no mutation was blindly retried") from exc
 

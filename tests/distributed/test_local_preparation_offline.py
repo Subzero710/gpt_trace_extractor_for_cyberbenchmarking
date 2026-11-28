@@ -608,6 +608,35 @@ finally:
         self.assertEqual(self.count.read_bytes(), b"one\none\n")
         self.assertEqual(self.files.registry_path.read_bytes(), before)
 
+    def test_explicit_retry_uses_same_donor_compatibility_as_acquisition(self):
+        self.mode = "error"
+        self.start()
+        self.wait_phase({"interrupted"})
+        for process in self.children:
+            process.wait(timeout=5)
+        ready = self.files.base.parent / 'dependency-pool' / 'ready'
+        ready.mkdir(parents=True, exist_ok=True)
+        current = self.identified['compatibility']
+        previous = copy.deepcopy(current)
+        name = 'scripts/native_guest_broker.py'
+        previous['fetch_sources'][name] = hashlib.sha256(b'earlier broker implementation').hexdigest()
+        self.assertTrue(jobs._metadata_artifact_compatible(previous, current))
+        def donor(manager, root, state, *, compatible=jobs._native_apt_repair_compatible):
+            self.assertIs(manager, self.manager)
+            self.assertEqual(root, ready.parent)
+            return (ready, {}, {}) if compatible(previous, state['compatibility']) else None
+        original_lock = self.manager._lock_file
+        def lock(name):
+            if name == 'build-slot.lock':
+                raise RuntimeError('retry admission reached build slot')
+            return original_lock(name)
+        with patch.object(jobs, '_apt_repair_source', side_effect=donor), \
+             patch.object(self.manager, '_lock_file', side_effect=lock):
+            with self.assertRaisesRegex(RuntimeError, 'retry admission reached build slot'):
+                self.start(retry=True)
+        self.assertTrue(ready.is_dir())
+        self.assertEqual(len(self.children), 1)
+
     def test_down_cancels_only_recorded_session_and_keeps_permanent_files(self):
         self.mode = "long"
         before = {p: p.read_bytes() for p in self.files.folder.rglob("*") if p.is_file()}

@@ -269,8 +269,11 @@ def metadata_guest(manager, stage, source, account, *, donor=None, reuse=None, r
             try:
                 deadline = time.monotonic() + limit
                 while not agent_path.is_socket():
-                    if process.poll() is not None or time.monotonic() >= deadline:
-                        raise RuntimeError('metadata guest failed to expose its agent socket')
+                    exit_code = process.poll()
+                    if exit_code is not None:
+                        raise RuntimeError(f'metadata guest QEMU exited with code {exit_code} before exposing its agent socket')
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('metadata guest QEMU did not expose its agent socket before the boot deadline')
                     time.sleep(min(cadence, 0.1))
                 os.chown(agent_path, account.pw_uid, account.pw_gid)
                 os.chmod(agent_path, 0o600)

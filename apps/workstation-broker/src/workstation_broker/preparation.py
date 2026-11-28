@@ -883,7 +883,8 @@ class PreparationManager:
                         and previous.get('result') is None
                         and (previous.get('publication_verified') is None or pending_integration)
                         and (pending_integration or not (self.base.parent/'dependency-pool'/'ready').exists()
-                             or _apt_repair_source(self,self.base.parent/'dependency-pool',previous) is not None)):
+                             or _apt_repair_source(self,self.base.parent/'dependency-pool',previous,
+                                                   compatible=_metadata_artifact_compatible) is not None)):
                     raise RuntimeError('explicit retry of failed/unpublished preparation required')
                 if JobScope.members(previous) or self._containers(previous):
                     raise RuntimeError("previous preparation process group remains; duplicate blocked")

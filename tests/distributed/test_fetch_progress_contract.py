@@ -347,3 +347,15 @@ def test_remote_failure_diagnostic_uses_actual_worker_error():
     assert message.count('E: Unmet dependencies')==1
     status['error']='TimeoutError: watchdog expired'
     assert 'watchdog expired' in dispatcher._fetch_failure_detail(status)
+
+
+def test_qemu_start_failure_exposes_existing_worker_stderr():
+    import base64
+    error = 'qemu-system-x86_64: generated launch failure'
+    raw = (error + '\n' + error + '\nTraceback (most recent call last):\n').encode()
+    status = {'error': 'RuntimeError: metadata guest QEMU exited with code 1 before exposing its agent socket',
+              'phase': 'interrupted', 'live_log': {'content_b64': base64.b64encode(raw).decode()}}
+    message = dispatcher._fetch_failure_detail(status)
+    assert message.count(error) == 1
+    assert 'exited with code 1' in message
+    assert 'Traceback' not in message
